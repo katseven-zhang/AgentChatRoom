@@ -1,0 +1,53 @@
+services:
+  postgres:
+    image: postgres:16
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:?Set POSTGRES_DB in deploy/.env}
+      POSTGRES_USER: ${POSTGRES_USER:?Set POSTGRES_USER in deploy/.env}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in deploy/.env}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+
+  room:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      AGENTCHATROOM_CONFIG: /app/config.server.toml
+      AGENTCHATROOM_DATA_DIR: /var/lib/agentchatroom
+      AGENTCHATROOM_DATABASE_URL: ${AGENTCHATROOM_DATABASE_URL:?Set AGENTCHATROOM_DATABASE_URL in deploy/.env}
+      AGENTCHATROOM_ADMIN_TOKEN: ${AGENTCHATROOM_ADMIN_TOKEN:?Set AGENTCHATROOM_ADMIN_TOKEN in deploy/.env}
+      AGENTCHATROOM_EXTERNAL_BASE_URL: ${AGENTCHATROOM_EXTERNAL_BASE_URL:?Set AGENTCHATROOM_EXTERNAL_BASE_URL in deploy/.env}
+    volumes:
+      - ./config.server.toml:/app/config.server.toml:ro
+      - room-data:/var/lib/agentchatroom
+    ports:
+      # Keep the application port reachable only from the host's local
+      # reverse proxy.  A Caddy/Nginx container on this Compose network can
+      # still use room:8765 directly.
+      - "127.0.0.1:${AGENTCHATROOM_BIND_PORT:-8765}:8765"
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - >-
+          import urllib.request;
+          urllib.request.urlopen('http://127.0.0.1:8765/health/ready', timeout=3).read()
+      interval: 10s
+      timeout: 5s
+      retries: 6
+
+volumes:
+  postgres-data:
+  room-data:

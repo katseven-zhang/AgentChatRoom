@@ -1,0 +1,45 @@
+[application]
+schema_version = 1
+deployment_profile = "server"
+
+[server]
+host = "0.0.0.0"
+port = 8765
+mcp_http_enabled = true
+mcp_http_path = "/mcp"
+mcp_http_stateless = false
+mcp_http_json_response = true
+mcp_bridge_command = "python"
+external_base_url = "https://room.example.com"
+trusted_proxy_headers = true
+trusted_proxy_ips = "127.0.0.1"
+
+[database]
+backend = "postgresql"
+url_env = "AGENTCHATROOM_DATABASE_URL"
+pool_min_size = 2
+pool_max_size = 20
+connect_timeout_seconds = 10.0
+
+[coordination]
+heartbeat_timeout_seconds = 45
+presence_keepalive_enabled = true
+presence_keepalive_interval_seconds = 15.0
+session_token_ttl_seconds = 43200
+default_lease_ttl_seconds = 1800
+max_lease_ttl_seconds = 86400
+sse_poll_interval_seconds = 0.5
+presence_refresh_interval_seconds = 1.0
+
+[security]
+agent_token_ttl_seconds = 2592000
+max_agent_token_ttl_seconds = 31536000
+mcp_http_auth_required = true
+management_auth_required = true
+management_token_env = "AGENTCHATROOM_ADMIN_TOKEN"
+management_session_ttl_seconds = 43200
+management_cookie_name = "agentchatroom_admin"
+
+[interface]
+product_name = "AgentChatRoom"
+default_theme = "system"

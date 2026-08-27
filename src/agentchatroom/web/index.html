@@ -1,0 +1,770 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="light">
+    <title>AgentChatRoom</title>
+    <link rel="icon" href="/assets/favicon.svg?v=1.0.0-central1" type="image/svg+xml">
+    <link rel="stylesheet" href="/assets/app.css?v=1.0.0-central14">
+  </head>
+  <body>
+    <div class="app-shell" id="app-shell">
+      <header class="topbar">
+        <div class="brand-block">
+          <div class="brand-mark" aria-hidden="true">AC</div>
+          <div>
+            <h1 id="product-name">AgentChatRoom</h1>
+            <p>本地 Agent 协作中心</p>
+          </div>
+        </div>
+        <div class="topbar-actions">
+          <div class="connection" id="connection-state" data-state="connecting">
+            <span class="connection-dot"></span>
+            <span id="connection-label">正在连接</span>
+          </div>
+          <button class="icon-button" id="refresh-button" type="button" title="刷新当前项目" aria-label="刷新当前项目">↻</button>
+          <button class="secondary-button is-hidden" id="logout-button" type="button">退出管理</button>
+          <button class="primary-button" id="add-project-button" type="button"><span aria-hidden="true">+</span> 添加项目</button>
+        </div>
+      </header>
+
+      <aside class="sidebar">
+        <section class="sidebar-section project-section">
+          <div class="section-heading">
+            <h2>项目</h2>
+            <span class="count" id="project-count">0</span>
+          </div>
+          <div class="project-list" id="project-list"></div>
+        </section>
+
+        <section class="sidebar-section agent-section">
+          <div class="section-heading">
+            <h2>Agent</h2>
+            <span class="count" id="agent-count">0</span>
+          </div>
+          <div class="agent-list" id="agent-list"></div>
+        </section>
+      </aside>
+
+      <div
+        class="panel-resizer panel-resizer-left"
+        id="left-panel-resizer"
+        data-panel-side="left"
+        role="separator"
+        aria-label="调整项目与 Agent 侧栏宽度"
+        aria-orientation="vertical"
+        aria-valuemin="252"
+        aria-valuemax="420"
+        aria-valuenow="288"
+        tabindex="0"
+        title="拖动或使用方向键调整左侧栏宽度；双击恢复默认"
+      ></div>
+
+      <main class="workspace">
+        <section class="workspace-header">
+          <div>
+            <p class="context-label">当前 Room</p>
+            <h2 id="room-name">尚未添加项目</h2>
+            <p class="room-path" id="room-path">添加本地项目后即可开始协作</p>
+          </div>
+          <div class="workspace-actions">
+            <button class="secondary-button" id="connect-agent-button" type="button" disabled>接入 Agent</button>
+            <button class="icon-button" id="project-settings-button" type="button" title="项目设置" aria-label="项目设置" disabled>⚙</button>
+            <button class="secondary-button" id="export-project-button" type="button" disabled>导出</button>
+            <button class="danger-button" id="archive-project-button" type="button" disabled>归档项目</button>
+            <button class="primary-button" id="create-task-button" type="button" disabled><span aria-hidden="true">+</span> 新建任务</button>
+          </div>
+        </section>
+
+        <nav class="tabs" aria-label="项目视图">
+          <button type="button" class="tab is-active" data-tab="overview"><span class="tab-label">总览</span></button>
+          <button type="button" class="tab" data-tab="tasks" title="当前功能尚未形成完整闭环" aria-label="任务，未闭环"><span class="tab-label">任务</span><span class="tab-status">未闭环</span></button>
+          <button type="button" class="tab" data-tab="leases" title="当前功能尚未形成完整闭环" aria-label="文件占用，未闭环"><span class="tab-label">文件占用</span><span class="tab-status">未闭环</span></button>
+          <button type="button" class="tab" data-tab="reviews" title="当前功能尚未形成完整闭环" aria-label="验证，未闭环"><span class="tab-label">验证</span><span class="tab-status">未闭环</span></button>
+          <button type="button" class="tab" data-tab="management" title="当前功能尚未形成完整闭环" aria-label="管理，未闭环"><span class="tab-label">管理</span><span class="tab-status">未闭环</span></button>
+        </nav>
+
+        <section class="tab-panel is-active" id="panel-overview">
+          <section class="onboarding is-hidden" id="onboarding">
+            <h3>三步开始多 Agent 协作</h3>
+            <ol class="onboarding-steps">
+              <li><strong>1. 添加项目</strong><span>把本地工作目录注册为协作 Room（右上角「+ 添加项目」）</span></li>
+              <li><strong>2. 接入 Agent</strong><span>打开「接入 Agent」，复制 MCP 配置给 WorkBuddy、Codex 或 Grok，让它加入这个 Room</span></li>
+              <li><strong>3. 派发第一件工作</strong><span>「新建任务」写清要做什么和验收条件，Agent 认领后在这里跟踪进展、消息和验证结论</span></li>
+            </ol>
+          </section>
+          <div class="metric-strip">
+            <div class="metric"><span>已接入 Agent</span><strong id="metric-agents">0</strong></div>
+            <div class="metric"><span>进行中</span><strong id="metric-active">0</strong></div>
+            <div class="metric"><span>文件占用</span><strong id="metric-leases">0</strong></div>
+            <div class="metric warning"><span>待验证</span><strong id="metric-reviews">0</strong></div>
+          </div>
+          <div class="overview-grid">
+            <section class="data-section">
+              <div class="section-heading">
+                <h3>正在进行</h3>
+                <span class="secondary-text">按优先级排列</span>
+              </div>
+              <div id="active-task-list" class="compact-list"></div>
+            </section>
+            <section class="data-section">
+              <div class="section-heading">
+                <h3>最近活动</h3>
+                <span class="secondary-text">实时更新</span>
+              </div>
+              <div id="recent-event-list" class="compact-list"></div>
+            </section>
+          </div>
+        </section>
+
+        <section class="tab-panel" id="panel-tasks">
+          <div class="scope-status"><span>未闭环</span><p>当前支持创建、派发和跟踪；Agent 自动接单与执行仍需在对话中触发 MCP。</p></div>
+          <div class="panel-toolbar">
+            <div class="segmented-control" id="task-filter" aria-label="任务状态筛选">
+              <button type="button" class="is-active" data-filter="">全部</button>
+              <button type="button" data-filter="todo">待认领</button>
+              <button type="button" data-filter="in_progress">进行中</button>
+              <button type="button" data-filter="awaiting_review">待验证</button>
+              <button type="button" data-filter="done">已完成</button>
+              <button type="button" data-filter="cancelled">已取消</button>
+            </div>
+          </div>
+          <div id="task-table" class="task-table"></div>
+        </section>
+
+        <section class="tab-panel" id="panel-leases">
+          <div class="scope-status"><span>未闭环</span><p>当前只展示 Agent 通过 MCP 申请的租约；网页端暂不提供申请与释放。</p></div>
+          <div class="data-section unframed">
+            <div class="section-heading">
+              <div>
+                <h3>活跃文件占用</h3>
+                <p class="secondary-text">Agent 编辑前声明的路径范围</p>
+              </div>
+            </div>
+            <div id="lease-list" class="lease-list"></div>
+          </div>
+        </section>
+
+        <section class="tab-panel" id="panel-reviews">
+          <div class="scope-status"><span>未闭环</span><p>当前只展示工作报告和独立验证结果；网页端暂不提供评审提交。</p></div>
+          <div class="data-section unframed">
+            <div class="section-heading">
+              <div>
+                <h3>验证队列</h3>
+                <p class="secondary-text">执行完成不等于验证通过</p>
+              </div>
+            </div>
+            <div id="review-list" class="review-list"></div>
+          </div>
+        </section>
+
+        <section class="tab-panel" id="panel-management">
+          <div class="scope-status"><span>未闭环</span><p>当前管理能力处于试运行阶段；成员、Token、Workspace 与审计仍缺少完整使用闭环。</p></div>
+          <div class="management-stack">
+            <section class="data-section unframed management-section">
+              <div class="section-heading">
+                <div>
+                  <h3>中心运行状态</h3>
+                  <p class="secondary-text">生效配置、进程和脱敏日志</p>
+                </div>
+                <button class="secondary-button" id="refresh-runtime-button" type="button" disabled>刷新</button>
+              </div>
+              <div id="runtime-status" class="runtime-grid"></div>
+              <details class="runtime-details">
+                <summary>查看生效配置</summary>
+                <pre id="runtime-config" class="code-block runtime-code"></pre>
+              </details>
+              <details class="runtime-details">
+                <summary>查看最近日志</summary>
+                <pre id="runtime-log" class="code-block runtime-log"></pre>
+              </details>
+            </section>
+
+            <section class="data-section unframed management-section">
+              <div class="section-heading">
+                <div>
+                  <h3>项目成员</h3>
+                  <p class="secondary-text">版本化身份、角色和接入关联</p>
+                </div>
+                <button class="primary-button" id="create-member-button" type="button" disabled>添加成员</button>
+              </div>
+              <div id="member-list" class="management-list"></div>
+            </section>
+
+            <section class="data-section unframed management-section">
+              <div class="section-heading">
+                <div>
+                  <h3>Agent Token</h3>
+                  <p class="secondary-text">项目级接入凭据</p>
+                </div>
+                <button class="primary-button" id="create-token-button" type="button" disabled>签发 Token</button>
+              </div>
+              <div id="token-list" class="management-list"></div>
+            </section>
+
+            <section class="data-section unframed management-section">
+              <div class="section-heading">
+                <div>
+                  <h3>Host 与 Workspace</h3>
+                  <p class="secondary-text">跨电脑项目路径</p>
+                </div>
+                <button class="secondary-button" id="register-workspace-button" type="button" disabled>登记 Workspace</button>
+              </div>
+              <div id="workspace-list" class="management-list"></div>
+            </section>
+
+            <section class="data-section unframed management-section">
+              <div class="section-heading audit-heading">
+                <div>
+                  <h3>审计历史</h3>
+                  <p class="secondary-text">追加式事件记录</p>
+                </div>
+                <div class="audit-controls">
+                  <select id="audit-event-filter" aria-label="审计事件类型" disabled>
+                    <option value="">全部事件</option>
+                    <option value="credential.issued">Token 签发</option>
+                    <option value="credential.rotated">Token 轮换</option>
+                    <option value="credential.revoked">Token 吊销</option>
+                    <option value="member.created">成员创建</option>
+                    <option value="member.updated">成员更新</option>
+                    <option value="member.revoked">成员吊销</option>
+                    <option value="workspace.registered">Workspace 登记</option>
+                    <option value="task.assigned">任务派发</option>
+                    <option value="task.handoff_requested">任务交接</option>
+                    <option value="task.completed">执行完成</option>
+                    <option value="review.submitted">独立验证</option>
+                    <option value="task.integration_completed">集成完成</option>
+                    <option value="task.integration_failed">集成失败</option>
+                  </select>
+                  <button class="secondary-button" id="refresh-audit-button" type="button" disabled>刷新</button>
+                </div>
+              </div>
+              <div id="audit-list" class="management-list audit-list"></div>
+            </section>
+          </div>
+        </section>
+      </main>
+
+      <div
+        class="panel-resizer panel-resizer-right"
+        id="right-panel-resizer"
+        data-panel-side="right"
+        role="separator"
+        aria-label="调整 Room 动态侧栏宽度"
+        aria-orientation="vertical"
+        aria-valuemin="360"
+        aria-valuemax="720"
+        aria-valuenow="480"
+        tabindex="0"
+        title="拖动或使用方向键调整 Room 动态宽度；双击恢复默认"
+      ></div>
+
+      <aside class="chat-panel">
+        <div class="chat-header">
+          <div>
+            <h2>Room 动态</h2>
+            <p id="chat-subtitle">等待选择项目</p>
+          </div>
+          <select id="event-filter" aria-label="筛选动态" disabled>
+            <option value="all">全部动态</option>
+            <option value="messages">只看消息</option>
+            <option value="decisions">决策与阻塞</option>
+          </select>
+        </div>
+        <div class="chat-viewport">
+          <div class="chat-stream" id="chat-stream" aria-live="polite"></div>
+          <button class="new-message-notice is-hidden" id="new-message-notice" type="button">↓ 有新消息，回到底部</button>
+        </div>
+        <form class="composer" id="message-form">
+          <label class="sr-only" for="message-input">发送 Room 消息</label>
+          <textarea id="message-input" rows="3" placeholder="向当前 Room 发送消息（Ctrl+Enter 发送）" disabled></textarea>
+          <div class="composer-actions">
+            <details class="composer-advanced" id="composer-advanced">
+              <summary>高级选项</summary>
+              <div class="composer-options">
+                <select id="message-kind" aria-label="消息类型" disabled>
+                  <option value="message">普通消息</option>
+                  <option value="decision">决策</option>
+                  <option value="blocker">阻塞</option>
+                </select>
+                <select id="message-channel" aria-label="消息频道" disabled>
+                  <option value="public">公共频道</option>
+                  <option value="review">评审频道</option>
+                  <option value="system">系统频道</option>
+                </select>
+                <select id="message-task" aria-label="关联任务" disabled>
+                  <option value="">不关联任务</option>
+                </select>
+                <select id="message-priority" aria-label="消息优先级" disabled>
+                  <option value="0">紧急</option>
+                  <option value="1">高</option>
+                  <option value="2" selected>普通</option>
+                  <option value="3">低</option>
+                </select>
+                <label class="check-control"><input id="message-requires-ack" type="checkbox" disabled> 需要确认</label>
+              </div>
+            </details>
+            <button class="primary-button" id="send-message-button" type="submit" disabled>发送</button>
+          </div>
+        </form>
+      </aside>
+    </div>
+
+    <dialog id="project-dialog">
+      <form method="dialog" class="dialog-form" id="project-form">
+        <div class="dialog-header">
+          <div>
+            <p class="context-label">项目 Room</p>
+            <h2>添加本地项目</h2>
+          </div>
+          <button type="button" class="icon-button dialog-close" title="关闭" aria-label="关闭">×</button>
+        </div>
+        <label>项目名称 <input id="project-name-input" name="name" autocomplete="off" placeholder="可选，默认使用文件夹名"></label>
+        <label>项目文件夹 <input id="project-path-input" name="root_path" autocomplete="off" required placeholder="粘贴需要协作的项目目录"></label>
+        <label>逻辑子目录 <input id="project-logical-path-input" name="logical_path" autocomplete="off" placeholder="可选，例如 packages/api"></label>
+        <label>项目标识 <input id="project-key-input" name="project_key" autocomplete="off" placeholder="可选，用于关联不同 worktree"></label>
+        <p class="form-hint">服务只记录本地路径和 Git 元数据，不上传源码。</p>
+        <div class="dialog-actions">
+          <button type="button" class="secondary-button dialog-close">取消</button>
+          <button type="submit" class="primary-button">添加项目</button>
+        </div>
+      </form>
+    </dialog>
+
+    <dialog id="task-dialog">
+      <form method="dialog" class="dialog-form" id="task-form">
+        <div class="dialog-header">
+          <div>
+            <p class="context-label">工作单元</p>
+            <h2>新建任务</h2>
+          </div>
+          <button type="button" class="icon-button dialog-close" title="关闭" aria-label="关闭">×</button>
+        </div>
+        <label>任务标题 <input id="task-title-input" name="title" autocomplete="off" required></label>
+        <label>说明 <textarea id="task-description-input" name="description" rows="4"></textarea></label>
+        <label>验收条件 <textarea id="task-criteria-input" name="criteria" rows="4" required placeholder="每行一条验收条件"></textarea></label>
+        <fieldset class="dependency-fieldset">
+          <legend>依赖任务（可选）</legend>
+          <div id="task-dependency-options" class="dependency-options"></div>
+        </fieldset>
+        <label>优先级
+          <select id="task-priority-input" name="priority">
+            <option value="0">P0 紧急</option>
+            <option value="1">P1 高</option>
+            <option value="2" selected>P2 普通</option>
+            <option value="3">P3 低</option>
+            <option value="4">P4 待办</option>
+          </select>
+        </label>
+        <div class="dialog-actions">
+          <button type="button" class="secondary-button dialog-close">取消</button>
+          <button type="submit" class="primary-button">创建任务</button>
+        </div>
+      </form>
+    </dialog>
+
+    <dialog id="task-edit-dialog">
+      <form method="dialog" class="dialog-form" id="task-edit-form">
+        <div class="dialog-header">
+          <div>
+            <p class="context-label">任务管理</p>
+            <h2>任务详情</h2>
+          </div>
+          <button type="button" class="icon-button dialog-close" title="关闭" aria-label="关闭">×</button>
+        </div>
+        <input id="task-edit-id" type="hidden">
+        <label>任务标题 <input id="task-edit-title" autocomplete="off" required></label>
+        <label>说明 <textarea id="task-edit-description" rows="3"></textarea></label>
+        <label>验收条件 <textarea id="task-edit-criteria" rows="3" required></textarea></label>
+        <fieldset class="dependency-fieldset">
+          <legend>依赖任务</legend>
+          <div id="task-edit-dependencies" class="dependency-options"></div>
+        </fieldset>
+        <div class="form-grid">
+          <label>状态 <select id="task-edit-status"></select></label>
+          <label>优先级
+            <select id="task-edit-priority">
+              <option value="0">P0 紧急</option>
+              <option value="1">P1 高</option>
+              <option value="2">P2 普通</option>
+              <option value="3">P3 低</option>
+              <option value="4">P4 待办</option>
+            </select>
+          </label>
+          <label>完成度 <input id="task-edit-progress" type="number" min="0" max="100"></label>
+          <label>当前步骤 <input id="task-edit-current-step" autocomplete="off"></label>
+        </div>
+        <label>阻塞原因 <input id="task-edit-blocker" autocomplete="off"></label>
+        <label>下一步 <input id="task-edit-next-step" autocomplete="off"></label>
+        <p class="form-hint" id="task-edit-owner"></p>
+        <section class="dialog-subsection">
+          <div class="section-heading">
+            <h3>派发记录</h3>
+            <button type="button" class="secondary-button" id="task-assign-button">派发</button>
+          </div>
+          <div id="task-assignment-list" class="management-list compact-management-list"></div>
+        </section>
+        <section class="dialog-subsection">
+          <div class="section-heading">
+            <h3>交接记录</h3>
+            <button type="button" class="secondary-button" id="task-handoff-button">交接</button>
+          </div>
+          <div id="task-handoff-list" class="management-list compact-management-list"></div>
+        </section>
+        <section class="dialog-subsection">
+          <div class="section-heading">
+            <h3>集成记录</h3>
+            <button type="button" class="secondary-button" id="task-integration-button">提交集成</button>
+          </div>
+          <div id="task-integration-list" class="management-list compact-management-list"></div>
+        </section>
+        <div class="dialog-actions">
+          <button type="button" class="secondary-button dialog-close">取消</button>
+          <button type="submit" class="primary-button">保存任务</button>
+        </div>
+      </form>
+    </dialog>
+
+    <dialog id="task-assign-dialog">
+      <form method="dialog" class="dialog-form" id="task-assign-form">
+        <div class="dialog-header">
+          <div>
+            <p class="context-label">任务派发</p>
+            <h2 id="task-assign-title">派发任务</h2>
+          </div>
+          <button type="button" class="icon-button dialog-close" title="关闭" aria-label="关闭">×</button>
+        </div>
+        <label>目标 Agent
+          <select id="task-assign-agent">
+            <option value="">不指定 Agent</option>
+          </select>
+        </label>
+        <div class="form-grid">
+          <label>目标角色 <input id="task-assign-role" autocomplete="off"></label>
+          <label>所需能力 <input id="task-assign-capability" autocomplete="off"></label>
+        </div>
+        <label>说明 <textarea id="task-assign-note" rows="3"></textarea></label>
+        <div class="dialog-actions">
+          <button type="button" class="secondary-button dialog-close">取消</button>
+          <button type="submit" class="primary-button">确认派发</button>
+        </div>
+      </form>
+    </dialog>
+
+    <dialog id="task-handoff-dialog">
+      <form method="dialog" class="dialog-form" id="task-handoff-form">
+        <div class="dialog-header">
+          <div>
+            <p class="context-label">任务交接</p>
+            <h2 id="task-handoff-title">交接任务</h2>
+          </div>
+          <button type="button" class="icon-button dialog-close" title="关闭" aria-label="关闭">×</button>
+        </div>
+        <label>接收 Agent <select id="task-handoff-agent" required></select></label>
+        <label>当前结论 <textarea id="task-handoff-summary" rows="3" required></textarea></label>
+        <div class="form-grid">
+          <label>已完成事项 <textarea id="task-handoff-completed" rows="3"></textarea></label>
+          <label>待完成事项 <textarea id="task-handoff-pending" rows="3"></textarea></label>
+        </div>
+        <div class="form-grid">
+          <label>关联文件 <textarea id="task-handoff-files" rows="3"></textarea></label>
+          <label>风险 <textarea id="task-handoff-risks" rows="3"></textarea></label>
+        </div>
+        <label>下一步 <input id="task-handoff-next-step" autocomplete="off" required></label>
+        <div class="dialog-actions">
+          <button type="button" class="secondary-button dialog-close">取消</button>
+          <button type="submit" class="primary-button">请求交接</button>
+        </div>
+      </form>
+    </dialog>
+
+    <dialog id="task-integration-dialog">
+      <form method="dialog" class="dialog-form" id="task-integration-form">
+        <div class="dialog-header">
+          <div>
+            <p class="context-label">最终集成</p>
+            <h2 id="task-integration-title">提交集成结果</h2>
+          </div>
+          <button type="button" class="icon-button dialog-close" title="关闭" aria-label="关闭">×</button>
+        </div>
+        <label>结果
+          <select id="task-integration-result">
+            <option value="done">集成通过</option>
+            <option value="failed">集成失败</option>
+          </select>
+        </label>
+        <label>集成摘要 <textarea id="task-integration-summary" rows="3" required></textarea></label>
+        <div class="form-grid">
+          <label>关联文件 <textarea id="task-integration-files" rows="3"></textarea></label>
+          <label>Commit <input id="task-integration-commit" autocomplete="off"></label>
+        </div>
+        <label>集成测试 <textarea id="task-integration-tests" rows="4" required placeholder="pytest::0"></textarea></label>
+        <div class="dialog-actions">
+          <button type="button" class="secondary-button dialog-close">取消</button>
+          <button type="submit" class="primary-button">提交结果</button>
+        </div>
+      </form>
+    </dialog>
+
+    <dialog id="settings-dialog">
+      <form method="dialog" class="dialog-form" id="settings-form">
+        <div class="dialog-header">
+          <div>
+            <p class="context-label">Room 配置</p>
+            <h2>项目设置</h2>
+          </div>
+          <button type="button" class="icon-button dialog-close" title="关闭" aria-label="关闭">×</button>
+        </div>
+        <label>项目名称 <input id="settings-project-name" autocomplete="off" required></label>
+        <label>租约冲突策略
+          <select id="settings-lease-policy">
+            <option value="advisory">提示并记录</option>
+            <option value="pre_commit_block">提交前阻断</option>
+          </select>
+        </label>
+        <label>项目角色 <textarea id="settings-roles" rows="4" placeholder="每行一个角色名称"></textarea></label>
+        <p class="form-hint">角色列表用于项目协作约定；Agent 仍可声明其他自定义角色。</p>
+        <div class="dialog-actions">
+          <button type="button" class="secondary-button dialog-close">取消</button>
+          <button type="submit" class="primary-button">保存设置</button>
+        </div>
+      </form>
+    </dialog>
+
+    <dialog id="archive-dialog">
+      <form method="dialog" class="dialog-form" id="archive-form">
+        <div class="dialog-header">
+          <div>
+            <p class="context-label">项目管理</p>
+            <h2>归档项目</h2>
+          </div>
+          <button type="button" class="icon-button dialog-close" title="关闭" aria-label="关闭">×</button>
+        </div>
+        <p>归档后项目将从列表隐藏，历史数据仍然保留。重新添加相同项目文件夹可以恢复。</p>
+        <p class="archive-project-name" id="archive-project-name"></p>
+        <label class="check-control danger-confirm"><input id="permanent-delete-input" type="checkbox"> 永久删除全部 Room 数据</label>
+        <p class="form-hint" id="remove-project-hint">永久删除无法恢复，请先导出需要保留的数据。</p>
+        <div class="dialog-actions">
+          <button type="button" class="secondary-button dialog-close">取消</button>
+          <button type="submit" class="danger-button" id="remove-project-submit">确认归档</button>
+        </div>
+      </form>
+    </dialog>
+
+    <dialog id="integration-dialog" class="wide-dialog">
+      <div class="dialog-form">
+        <div class="dialog-header">
+          <div>
+            <p class="context-label">Agent 连接</p>
+            <h2>接入当前 Room</h2>
+          </div>
+          <button type="button" class="icon-button dialog-close" title="关闭" aria-label="关闭">×</button>
+        </div>
+
+        <section class="integration-section integration-chooser">
+          <div>
+            <p class="integration-choice-label">目标 Agent</p>
+            <div class="segmented-control integration-tabs" id="integration-format-tabs" aria-label="目标 Agent"></div>
+          </div>
+          <div>
+            <p class="integration-choice-label">连接方式</p>
+            <div class="segmented-control integration-transport-tabs" aria-label="MCP 连接方式">
+              <button type="button" class="is-active" data-integration-transport="local">本机 stdio</button>
+              <button type="button" data-integration-transport="http">直接 HTTP MCP</button>
+              <button type="button" data-integration-transport="remote">远程 Bridge</button>
+            </div>
+          </div>
+        </section>
+
+        <section class="integration-section onboarding-section">
+          <div class="integration-heading">
+            <div>
+              <h3>复制给 Agent</h3>
+              <p class="secondary-text">这段提示词包含当前项目、MCP 配置、加入 Room 和协作规则</p>
+            </div>
+            <button class="primary-button copy-button" type="button" data-copy-target="integration-onboarding-prompt">复制提示词</button>
+          </div>
+          <pre id="integration-onboarding-prompt" class="code-block onboarding-prompt"></pre>
+        </section>
+
+        <details class="integration-fallback integration-advanced">
+          <summary>高级手动配置</summary>
+
+          <div class="integration-runtime">
+            <span class="runtime-status"><span class="connection-dot"></span> 后端在线</span>
+            <span>数据 <code id="integration-data-dir"></code></span>
+            <span>日志 <code id="integration-log-path"></code></span>
+          </div>
+
+          <section class="integration-section">
+            <div class="integration-heading">
+              <div>
+                <h3>MCP Server 配置</h3>
+                <p id="integration-config-path" class="secondary-text">标准 MCP 配置片段</p>
+              </div>
+              <button class="secondary-button copy-button" type="button" data-copy-target="integration-config-code">复制</button>
+            </div>
+            <pre id="integration-config-code" class="code-block"></pre>
+          </section>
+
+          <section class="integration-section">
+            <div class="integration-heading">
+              <div>
+                <h3>首次调用 room_join</h3>
+                <p class="secondary-text">稳定 Agent 标识、客户端、模型与角色由各 Agent 自行填写</p>
+              </div>
+              <button class="secondary-button copy-button" type="button" data-copy-target="integration-join-code">复制</button>
+            </div>
+            <pre id="integration-join-code" class="code-block"></pre>
+          </section>
+
+          <section class="integration-section">
+            <div class="integration-heading">
+              <div>
+                <h3>项目级协作规则</h3>
+                <p id="integration-project-rules-path" class="secondary-text">放入客户端实际读取的项目指令文件</p>
+              </div>
+              <button class="secondary-button copy-button" type="button" data-copy-target="integration-project-rules-code">复制</button>
+            </div>
+            <pre id="integration-project-rules-code" class="code-block project-rules-code"></pre>
+          </section>
+
+          <div class="integration-heading">
+            <code id="integration-cli-code" class="inline-command"></code>
+            <button class="secondary-button copy-button" type="button" data-copy-target="integration-cli-code">复制</button>
+          </div>
+        </details>
+
+        <div class="dialog-actions">
+          <button type="button" class="primary-button dialog-close">完成</button>
+        </div>
+      </div>
+    </dialog>
+
+    <dialog id="login-dialog" class="auth-dialog">
+      <form method="dialog" class="dialog-form" id="login-form">
+        <div class="dialog-header">
+          <div>
+            <p class="context-label">管理认证</p>
+            <h2>登录 AgentChatRoom</h2>
+          </div>
+        </div>
+        <input class="sr-only" id="login-username" name="username" type="text" value="admin" autocomplete="username" tabindex="-1" aria-hidden="true">
+        <label>管理员 Secret <input id="login-token" type="password" autocomplete="current-password" required></label>
+        <p class="form-error" id="login-error" role="alert"></p>
+        <div class="dialog-actions">
+          <button type="submit" class="primary-button">登录</button>
+        </div>
+      </form>
+    </dialog>
+
+    <dialog id="member-dialog">
+      <form method="dialog" class="dialog-form" id="member-form">
+        <div class="dialog-header">
+          <div>
+            <p class="context-label">项目身份</p>
+            <h2 id="member-dialog-title">添加项目成员</h2>
+          </div>
+          <button type="button" class="icon-button dialog-close" title="关闭" aria-label="关闭">×</button>
+        </div>
+        <input id="member-id" type="hidden">
+        <label>成员标识 <input id="member-key" autocomplete="off" required></label>
+        <div class="form-grid">
+          <label>名称 <input id="member-name" autocomplete="off" required></label>
+          <label>类型 <input id="member-kind" autocomplete="off" value="agent" required></label>
+        </div>
+        <div class="form-grid">
+          <label>角色 <input id="member-role" autocomplete="off" placeholder="例如 executor"></label>
+          <label>状态
+            <select id="member-status" required>
+              <option value="invited">待邀请</option>
+              <option value="active">有效</option>
+              <option value="suspended">已暂停</option>
+              <option value="revoked">已吊销</option>
+            </select>
+          </label>
+        </div>
+        <label>元数据 JSON <textarea id="member-metadata" rows="3" placeholder="{}"></textarea></label>
+        <p class="form-hint">成员标识创建后不可修改；吊销只改变派生状态，不删除历史事件。</p>
+        <div class="dialog-actions">
+          <button type="button" class="secondary-button dialog-close">取消</button>
+          <button type="submit" class="primary-button" id="member-submit">保存</button>
+        </div>
+      </form>
+    </dialog>
+
+    <dialog id="token-dialog">
+      <form method="dialog" class="dialog-form" id="token-form">
+        <div class="dialog-header">
+          <div>
+            <p class="context-label">Agent 凭据</p>
+            <h2>签发 Token</h2>
+          </div>
+          <button type="button" class="icon-button dialog-close" title="关闭" aria-label="关闭">×</button>
+        </div>
+        <label>名称 <input id="token-name" autocomplete="off" required></label>
+        <label>关联成员
+          <select id="token-member">
+            <option value="">不关联成员</option>
+          </select>
+        </label>
+        <label>有效天数 <input id="token-days" type="number" min="1" max="365" value="30" required></label>
+        <fieldset class="dependency-fieldset">
+          <legend>权限</legend>
+          <div id="token-permissions" class="permission-grid"></div>
+        </fieldset>
+        <div class="dialog-actions">
+          <button type="button" class="secondary-button dialog-close">取消</button>
+          <button type="submit" class="primary-button">签发</button>
+        </div>
+      </form>
+    </dialog>
+
+    <dialog id="token-secret-dialog">
+      <div class="dialog-form">
+        <div class="dialog-header">
+          <div>
+            <p class="context-label">一次性 Secret</p>
+            <h2>保存 Agent Token</h2>
+          </div>
+        </div>
+        <pre id="token-secret-value" class="code-block secret-block"></pre>
+        <p class="form-hint">关闭后不会再次显示。</p>
+        <div class="dialog-actions">
+          <button class="secondary-button copy-button" type="button" data-copy-target="token-secret-value">复制</button>
+          <button type="button" class="primary-button" id="token-secret-close">完成</button>
+        </div>
+      </div>
+    </dialog>
+
+    <dialog id="workspace-dialog">
+      <form method="dialog" class="dialog-form" id="workspace-form">
+        <div class="dialog-header">
+          <div>
+            <p class="context-label">跨电脑关联</p>
+            <h2>登记 Workspace</h2>
+          </div>
+          <button type="button" class="icon-button dialog-close" title="关闭" aria-label="关闭">×</button>
+        </div>
+        <div class="form-grid">
+          <label>Host 名称 <input id="workspace-host-name" autocomplete="off" required></label>
+          <label>Host Key <input id="workspace-host-key" autocomplete="off" required></label>
+        </div>
+        <label>本地项目路径 <input id="workspace-local-path" autocomplete="off" required></label>
+        <div class="form-grid">
+          <label>分支 <input id="workspace-branch" autocomplete="off"></label>
+          <label>Worktree <input id="workspace-worktree" autocomplete="off"></label>
+        </div>
+        <label>Git Remote <input id="workspace-git-remote" autocomplete="off"></label>
+        <div class="dialog-actions">
+          <button type="button" class="secondary-button dialog-close">取消</button>
+          <button type="submit" class="primary-button">登记</button>
+        </div>
+      </form>
+    </dialog>
+
+    <div class="toast-region" id="toast-region" aria-live="assertive"></div>
+    <script src="/assets/app.js?v=1.0.0-central14" defer></script>
+  </body>
+</html>

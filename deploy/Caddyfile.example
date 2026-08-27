@@ -1,0 +1,7 @@
+# Copy to the Caddy configuration and replace the site address.
+# The Caddy process must share the Compose network with the `room` service.
+room.example.com {
+    reverse_proxy room:8765 {
+        flush_interval -1
+    }
+}
