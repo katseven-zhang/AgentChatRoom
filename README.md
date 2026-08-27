@@ -206,6 +206,10 @@ git diff --check
 
 本机验收脚本产生的临时数据库、日志和协议结果统一写入
 `.agentchatroom/verification/`，不会散落到仓库源码目录或进入 Git。
+PostgreSQL 验收脚本在未安装可选数据库依赖时仍可查看 `--help`；实际执行
+需要安装 `postgresql` extra 和测试专用的 `pgserver` 包。GitHub Actions
+会在 Windows 与 Ubuntu 的干净环境中运行完整基础测试，以避免本机已安装包
+掩盖依赖或跨平台问题。
 
 检查全部可达 Git 历史是否含旧的运行数据：
 

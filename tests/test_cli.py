@@ -99,6 +99,18 @@ def test_stop_removes_stale_pid_file(settings):
     assert process_is_running(os.getpid())
 
 
+def test_posix_process_check_treats_linux_zombie_as_stopped(monkeypatch):
+    monkeypatch.setattr(cli.sys, "platform", "linux")
+    monkeypatch.setattr(cli, "_linux_process_state", lambda _pid: "Z")
+
+    def unexpected_kill(*_args):
+        pytest.fail("A zombie process must not be probed as running")
+
+    monkeypatch.setattr(cli.os, "kill", unexpected_kill)
+
+    assert cli._posix_process_is_running(1234) is False
+
+
 def test_serve_passes_configured_proxy_trust_to_uvicorn(monkeypatch, settings):
     configured = replace(
         settings,

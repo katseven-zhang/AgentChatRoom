@@ -10,7 +10,7 @@ SCRIPT = Path(__file__).parents[1] / "scripts" / "verify_postgresql_http.py"
 
 def test_postgresql_http_acceptance_script_has_help_entrypoint():
     result = subprocess.run(
-        [sys.executable, str(SCRIPT), "--help"],
+        [sys.executable, "-S", str(SCRIPT), "--help"],
         check=False,
         capture_output=True,
         text=True,

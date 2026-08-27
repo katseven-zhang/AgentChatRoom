@@ -17,9 +17,7 @@ import sys
 import time
 import uuid
 from pathlib import Path
-
-import httpx
-from pgserver._commands import POSTGRES_BIN_PATH, initdb
+from typing import Any
 
 # When this file is executed directly (the documented use), Python puts the
 # ``scripts`` directory on ``sys.path`` rather than the repository root. Add
@@ -28,15 +26,6 @@ from pgserver._commands import POSTGRES_BIN_PATH, initdb
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
-
-from scripts.verify_postgresql import (
-    available_port,
-    create_database,
-    drop_database,
-    start_postgres,
-    stop_postgres,
-    wait_for_postgres,
-)
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -85,7 +74,11 @@ def stop_app(process: subprocess.Popen[bytes] | None) -> None:
         log.close()
 
 
-def wait_for_ready(client: httpx.Client, process: subprocess.Popen[bytes], timeout: float) -> None:
+def wait_for_ready(
+    client: Any, process: subprocess.Popen[bytes], timeout: float
+) -> None:
+    import httpx
+
     deadline = time.monotonic() + timeout
     last_error: Exception | None = None
     while time.monotonic() < deadline:
@@ -104,6 +97,25 @@ def wait_for_ready(client: httpx.Client, process: subprocess.Popen[bytes], timeo
 
 def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
+    try:
+        import httpx
+        from pgserver._commands import POSTGRES_BIN_PATH, initdb
+
+        from scripts.verify_postgresql import (
+            available_port,
+            create_database,
+            drop_database,
+            start_postgres,
+            stop_postgres,
+            wait_for_postgres,
+        )
+    except ModuleNotFoundError as error:
+        raise SystemExit(
+            "PostgreSQL HTTP verification requires optional dependencies. "
+            "Install the project with .[dev,postgresql] and the pgserver test "
+            "package."
+        ) from error
+
     root = (
         args.data_dir
         or ROOT

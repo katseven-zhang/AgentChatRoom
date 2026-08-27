@@ -16,15 +16,6 @@ import time
 import uuid
 from pathlib import Path
 
-import psycopg
-from fastapi.testclient import TestClient
-from pgserver._commands import POSTGRES_BIN_PATH, initdb
-
-from agentchatroom.api import create_app
-from agentchatroom.backup import backup_postgresql, restore_postgresql
-from agentchatroom.config import Settings
-
-
 ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -37,6 +28,8 @@ def parse_args() -> argparse.Namespace:
 
 
 def create_database(admin_url: str, database_name: str) -> str:
+    import psycopg
+
     connection = psycopg.connect(admin_url, autocommit=True)
     try:
         connection.execute(f'CREATE DATABASE "{database_name}"')
@@ -46,6 +39,8 @@ def create_database(admin_url: str, database_name: str) -> str:
 
 
 def drop_database(admin_url: str, database_name: str) -> None:
+    import psycopg
+
     connection = psycopg.connect(admin_url, autocommit=True)
     try:
         connection.execute(
@@ -59,6 +54,8 @@ def drop_database(admin_url: str, database_name: str) -> None:
 
 
 def count_rows(database_url: str, table: str) -> int:
+    import psycopg
+
     connection = psycopg.connect(database_url)
     try:
         return int(connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
@@ -73,6 +70,8 @@ def available_port() -> int:
 
 
 def start_postgres(pgdata: Path, port: int, log_path: Path) -> subprocess.Popen[bytes]:
+    from pgserver._commands import POSTGRES_BIN_PATH
+
     log = log_path.open("wb")
     process = subprocess.Popen(
         [
@@ -94,6 +93,8 @@ def start_postgres(pgdata: Path, port: int, log_path: Path) -> subprocess.Popen[
 
 
 def wait_for_postgres(database_url: str, process: subprocess.Popen[bytes]) -> None:
+    import psycopg
+
     deadline = time.monotonic() + 15
     last_error: Exception | None = None
     while time.monotonic() < deadline:
@@ -126,6 +127,19 @@ def stop_postgres(process: subprocess.Popen[bytes] | None) -> None:
 
 def main() -> None:
     args = parse_args()
+    try:
+        from fastapi.testclient import TestClient
+        from pgserver._commands import POSTGRES_BIN_PATH, initdb
+
+        from agentchatroom.api import create_app
+        from agentchatroom.backup import backup_postgresql, restore_postgresql
+        from agentchatroom.config import Settings
+    except ModuleNotFoundError as error:
+        raise SystemExit(
+            "PostgreSQL verification requires optional dependencies. Install "
+            "the project with .[dev,postgresql] and the pgserver test package."
+        ) from error
+
     root = ROOT / ".agentchatroom" / "verification" / "postgres-acceptance"
     root.mkdir(parents=True, exist_ok=True)
     run_dir = root / f"run-{uuid.uuid4().hex[:10]}"
@@ -142,7 +156,7 @@ def main() -> None:
     restored_database = ""
     restored_url = ""
     admin_url = ""
-    settings: Settings | None = None
+    settings = None
     management_token_env = "AGENTCHATROOM_POSTGRES_TEST_ADMIN"
     management_token = "postgres-management-test-token"
     try:

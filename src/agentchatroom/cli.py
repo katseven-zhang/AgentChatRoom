@@ -158,6 +158,30 @@ def parse_json_object(value: str, label: str) -> dict[str, Any]:
     return parsed
 
 
+def _linux_process_state(pid: int) -> str | None:
+    try:
+        stat = (Path("/proc") / str(pid) / "stat").read_text(encoding="ascii")
+    except OSError:
+        return None
+    command_end = stat.rfind(")")
+    if command_end < 0:
+        return None
+    fields = stat[command_end + 1 :].strip().split(maxsplit=1)
+    return fields[0] if fields else None
+
+
+def _posix_process_is_running(pid: int) -> bool:
+    if sys.platform.startswith("linux") and _linux_process_state(pid) == "Z":
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
 def process_is_running(pid: int) -> bool:
     if pid <= 0:
         return False
@@ -185,13 +209,7 @@ def process_is_running(pid: int) -> bool:
             return exit_code.value == still_active
         finally:
             kernel32.CloseHandle(handle)
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    return True
+    return _posix_process_is_running(pid)
 
 
 def ensure_service_stopped(settings) -> None:

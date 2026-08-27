@@ -1,3 +1,4 @@
+import os
 import subprocess
 import sys
 import tomllib
@@ -70,12 +71,17 @@ def test_windows_launcher_generator_is_portable_and_config_driven(tmp_path) -> N
     source = generator.read_text(encoding="utf-8")
 
     assert "D:\\\\claw" not in source
-    subprocess.run(
+    environment = os.environ.copy()
+    environment["PYTHONIOENCODING"] = "ascii"
+    result = subprocess.run(
         [sys.executable, str(generator), "--root", str(tmp_path)],
-        check=True,
+        check=False,
         capture_output=True,
+        env=environment,
         text=True,
     )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.count("generated:") == 2
 
     start_bytes = (tmp_path / "启动 AgentChatRoom.cmd").read_bytes()
     stop_bytes = (tmp_path / "关闭 AgentChatRoom.cmd").read_bytes()
@@ -89,3 +95,12 @@ def test_windows_launcher_generator_is_portable_and_config_driven(tmp_path) -> N
     assert "serve --open-browser" in start
     assert "load_settings().port" in stop
     assert ":8765" not in stop
+
+
+def test_ci_uses_node_24_action_runtimes() -> None:
+    workflow = (ROOT / ".github" / "workflows" / "ci.yml").read_text(
+        encoding="utf-8"
+    )
+
+    assert "actions/checkout@v7" in workflow
+    assert "actions/setup-python@v7" in workflow

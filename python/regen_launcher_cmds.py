@@ -98,8 +98,8 @@ def main(argv: list[str] | None = None) -> None:
     )
     args = parser.parse_args(argv)
     start_path, stop_path = write_launchers(args.root)
-    print(f"generated: {start_path}")
-    print(f"generated: {stop_path}")
+    print(f"generated: {start_path!a}")
+    print(f"generated: {stop_path!a}")
 
 
 if __name__ == "__main__":
