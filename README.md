@@ -11,29 +11,6 @@ AgentChatRoom 是一个面向异构 AI 编程 Agent 的项目级实时协作中�
 - 执行完成、独立验证和最终集成是三个独立状态面。
 - 事件历史追加写入；派生状态可以变化，历史事件不能改写。
 - 浏览器是人类管理和观察界面，后端数据库才是共享事实源。
-- 所有真实运行数据都在被 Git 忽略的 `.agentchatroom/` 中，不进入公开仓库。
-
-## 数据与隐私边界
-
-新克隆默认使用当前仓库目录下的：
-
-```text
-.agentchatroom/
-  runtime/       # config.toml、SQLite、PID、服务日志
-  verification/  # 自动化与协议验收输出
-  artifacts/     # 截图、导出和人工检查材料
-  backups/       # 本机备份
-  research/      # 隔离 POC 和第三方检出
-```
-
-以下内容不会进入 Git：
-
-- Project、Room、Task、Session、Message、Event、Lease 和审计数据。
-- Agent Token、Session Token、管理员 Secret、数据库密码和 Cookie。
-- 用户绝对路径、日常项目名称、模型使用记录、运行日志、PID 和截图。
-- `.agentchatroom/`、`docs/`、`.codex/`、`.grok/`、`.trae/` 和 `.workbuddy/`。
-
-`docs/` 被保留为本机内部记录目录，公开安装和使用说明全部维护在本 README。
 
 ## 系统要求
 
@@ -41,6 +18,16 @@ AgentChatRoom 是一个面向异构 AI 编程 Agent 的项目级实时协作中�
 - Windows 一键入口需要 PowerShell 或 CMD。
 - 前端无需单独安装 Node.js；Node.js 只用于开发阶段的 JavaScript 语法检查。
 - PostgreSQL、Docker 和 Caddy 仅在对应服务器部署方式中需要。
+
+## 平台支持边界
+
+AgentChatRoom 的核心 Python 后端、Web 前端、CLI 和 MCP 服务支持
+Windows、Linux 和 macOS。当前仓库提供完整的 Windows 一键启动与关闭入口；
+Linux 或 macOS 使用下方的手动命令启动和停止，也可以使用 Docker/Podman
+进行服务器部署。
+
+GitHub Actions 当前持续验证 Windows 与 Ubuntu；macOS 的命令路径已按
+跨平台 Python/CLI 设计，但尚未加入 CI 矩阵。
 
 ## Windows 一键启动
 
@@ -79,8 +66,16 @@ python3 -m venv .venv
 
 停止分离运行的本机服务：
 
+Windows PowerShell：
+
 ```powershell
 .venv\Scripts\agentchatroom.exe stop
+```
+
+Linux 或 macOS：
+
+```bash
+.venv/bin/agentchatroom stop
 ```
 
 查看日志：

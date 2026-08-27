@@ -66,6 +66,16 @@ def test_runtime_and_package_versions_match() -> None:
     assert metadata["project"]["version"] == __version__ == "0.2.0"
 
 
+def test_readme_documents_cross_platform_support_boundary() -> None:
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+
+    assert "核心 Python 后端、Web 前端、CLI 和 MCP 服务支持" in readme
+    assert "Windows、Linux 和 macOS" in readme
+    assert "完整的 Windows 一键启动与关闭入口" in readme
+    assert ".venv/bin/agentchatroom serve --open-browser" in readme
+    assert ".venv/bin/agentchatroom stop" in readme
+
+
 def test_windows_launcher_generator_is_portable_and_config_driven(tmp_path) -> None:
     generator = ROOT / "python" / "regen_launcher_cmds.py"
     source = generator.read_text(encoding="utf-8")
