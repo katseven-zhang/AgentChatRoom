@@ -55,6 +55,10 @@ AUTO_IDEMPOTENCY_TOOL_NAMES = frozenset(
         "work_report",
         "review_submit",
         "integration_submit",
+        "knowledge_candidate_submit",
+        "knowledge_review",
+        "knowledge_supersede",
+        "knowledge_archive",
     }
 )
 ResultT = TypeVar("ResultT")
@@ -348,14 +352,7 @@ class BridgePresenceManager:
                     "project_id": project_id,
                     "session_id": session_id,
                     "token": token,
-                    "status": "idle",
                 }
-        elif name == "session_heartbeat":
-            session_id = str(arguments.get("session_id", ""))
-            if session_id in self.sessions:
-                self.sessions[session_id]["status"] = str(
-                    arguments.get("status", "idle")
-                )
         elif name == "session_leave":
             self.sessions.pop(str(arguments.get("session_id", "")), None)
 

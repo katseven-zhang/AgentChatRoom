@@ -44,7 +44,8 @@ def test_web_bootstrap_and_remote_bridge_hooks_are_complete():
     assert 'payload.host_name = "<computer-name>"' in javascript
     assert '"<path-to-project-on-this-computer>"' in javascript
     assert "function renderProjectInstructions()" in javascript
-    assert 'localStorage.getItem("agentchatroom.projectKey")' in javascript
+    assert 'localStorage.getItem("agentchatroom.projectKey")' not in javascript
+    assert 'localStorage.setItem("agentchatroom.projectKey"' not in javascript
     assert 'id="integration-project-rules-code"' in markup
     assert 'model: "<actual model or unknown>"' in javascript
     assert "function messageModelBadge(event)" in javascript
@@ -78,6 +79,16 @@ def test_web_renders_explicit_no_code_work_evidence():
     assert "无代码变更" in javascript
 
 
+def test_web_treats_cancelled_tasks_as_not_requiring_integration():
+    javascript = (WEB_DIR / "app.js").read_text(encoding="utf-8")
+
+    assert 'task.execution_status === "cancelled" ? "无需集成"' in javascript
+    assert 'task.execution_status === "cancelled" ? "not_required"' in javascript
+    assert "taskIntegrationStatus(task)" in javascript
+    assert "taskIntegrationStatusClass(task)" in javascript
+    assert '!["todo", "done", "cancelled"].includes(task.status)' in javascript
+
+
 def test_web_supports_human_reading_and_guided_interactions():
     javascript = (WEB_DIR / "app.js").read_text(encoding="utf-8")
     markup = (WEB_DIR / "index.html").read_text(encoding="utf-8")
@@ -101,8 +112,8 @@ def test_web_supports_human_reading_and_guided_interactions():
     assert "snapshot.agent_identities" in javascript
     assert "当前连接" in javascript
     assert "累计" in javascript and "次接入" in javascript
-    assert 'app.css?v=1.0.0-central14' in markup
-    assert 'app.js?v=1.0.0-central14' in markup
+    assert 'app.css?v=1.0.0-central16' in markup
+    assert 'app.js?v=1.0.0-central16' in markup
     assert "function renderIntegrationTabs()" in javascript
     assert 'class="segmented-control integration-tabs" id="integration-format-tabs"' in markup
     assert "state.integration.profiles" in javascript

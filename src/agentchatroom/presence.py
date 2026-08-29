@@ -5,7 +5,7 @@ import threading
 from dataclasses import dataclass
 
 from .errors import DomainError
-from .services import AGENT_STATUSES, AgentChatRoomService
+from .services import AgentChatRoomService
 
 
 logger = logging.getLogger(__name__)
@@ -16,7 +16,7 @@ class PresenceSession:
     project_id: str
     session_id: str
     token: str
-    status: str = "idle"
+    agent_key: str
 
 
 class LocalPresenceManager:
@@ -53,6 +53,16 @@ class LocalPresenceManager:
         if thread is not None:
             thread.join(timeout=max(1.0, self.interval_seconds + 1.0))
         self._thread = None
+        with self._lock:
+            sessions = list(self._sessions.values())
+            self._sessions.clear()
+        for session in sessions:
+            try:
+                self.room_service.leave_session(
+                    session.project_id, session.session_id, session.token
+                )
+            except DomainError:
+                pass
 
     def register(
         self,
@@ -60,24 +70,42 @@ class LocalPresenceManager:
         session_id: str,
         token: str,
         *,
-        status: str = "idle",
+        agent_key: str,
     ) -> None:
         if not self.enabled:
             return
-        normalized_status = self._validate_status(status)
+        superseded: list[PresenceSession] = []
         with self._lock:
+            superseded = [
+                session
+                for session in self._sessions.values()
+                if session.project_id == project_id
+                and session.agent_key == agent_key
+                and session.session_id != session_id
+            ]
+            for session in superseded:
+                self._sessions.pop(session.session_id, None)
             self._sessions[session_id] = PresenceSession(
                 project_id=project_id,
                 session_id=session_id,
                 token=token,
-                status=normalized_status,
+                agent_key=agent_key,
             )
+        for session in superseded:
+            try:
+                self.room_service.leave_session(
+                    session.project_id, session.session_id, session.token
+                )
+            except DomainError:
+                pass
 
     def ensure_registered(
         self,
         project_id: str,
         session_id: str,
         token: str,
+        *,
+        agent_key: str = "",
     ) -> bool:
         """Register a live session for background heartbeat if missing.
 
@@ -90,6 +118,19 @@ class LocalPresenceManager:
         """
         if not self.enabled:
             return False
+        resolved_agent_key = agent_key.strip()
+        if not resolved_agent_key:
+            try:
+                sessions = self.room_service.snapshot(project_id)["agents"]
+            except DomainError:
+                return False
+            session = next(
+                (item for item in sessions if str(item["id"]) == session_id),
+                None,
+            )
+            if session is None:
+                return False
+            resolved_agent_key = str(session.get("agent_key") or session_id)
         with self._lock:
             if session_id in self._sessions:
                 return False
@@ -97,22 +138,9 @@ class LocalPresenceManager:
                 project_id=project_id,
                 session_id=session_id,
                 token=token,
+                agent_key=resolved_agent_key,
             )
             return True
-
-    def set_status(self, session_id: str, status: str) -> None:
-        if not self.enabled:
-            return
-        normalized_status = self._validate_status(status)
-        with self._lock:
-            current = self._sessions.get(session_id)
-            if current is not None:
-                self._sessions[session_id] = PresenceSession(
-                    project_id=current.project_id,
-                    session_id=current.session_id,
-                    token=current.token,
-                    status=normalized_status,
-                )
 
     def unregister(self, session_id: str) -> None:
         with self._lock:
@@ -127,10 +155,13 @@ class LocalPresenceManager:
                     session.project_id,
                     session.session_id,
                     session.token,
-                    status=session.status,
                 )
             except DomainError as error:
-                if error.code in {"session_not_found", "invalid_session_token"}:
+                if error.code in {
+                    "session_not_found",
+                    "invalid_session_token",
+                    "session_closed",
+                }:
                     self.unregister(session.session_id)
                 logger.warning(
                     "Presence heartbeat failed for session %s: %s",
@@ -146,10 +177,3 @@ class LocalPresenceManager:
     def _run(self) -> None:
         while not self._stop.wait(self.interval_seconds):
             self.heartbeat_once()
-
-    @staticmethod
-    def _validate_status(status: str) -> str:
-        normalized = status.strip().lower()
-        if normalized not in AGENT_STATUSES - {"offline"}:
-            raise ValueError(f"Unsupported presence status: {status}")
-        return normalized

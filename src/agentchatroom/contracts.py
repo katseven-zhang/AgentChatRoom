@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import re
 from typing import Any
 from typing_extensions import NotRequired, TypedDict
 
 
 DOMAIN_SCHEMA_VERSION = 5
 PROJECT_MEMBER_SCHEMA_VERSION = 1
+KNOWLEDGE_SCHEMA_VERSION = 1
 MODEL_DISPLAY_NAME_MAX_LENGTH = 160
 
 PROJECT_MEMBER_STATUSES = {"invited", "active", "suspended", "revoked"}
@@ -54,6 +56,33 @@ HANDOFF_STATUSES = {"pending", "accepted", "declined", "blocked", "cancelled"}
 HANDOFF_RESPONSES = {"accepted", "declined", "blocked"}
 INTEGRATION_RESULTS = {"done", "failed"}
 
+KNOWLEDGE_ASSET_STATUSES = {
+    "candidate",
+    "approved",
+    "rejected",
+    "superseded",
+    "archived",
+}
+KNOWLEDGE_ASSET_TRANSITIONS = {
+    "candidate": {"approved", "rejected", "archived"},
+    "approved": {"superseded", "archived"},
+    "rejected": {"candidate", "archived"},
+    "superseded": {"candidate", "archived"},
+    "archived": set(),
+}
+KNOWLEDGE_DEFAULT_KINDS = (
+    "decision",
+    "procedure",
+    "pitfall",
+    "verification",
+    "preference",
+    "reference",
+)
+KNOWLEDGE_KIND_PATTERN = re.compile(r"^[a-z][a-z0-9_-]{0,63}$")
+KNOWLEDGE_OWNER_KINDS = {"agent_key", "member"}
+KNOWLEDGE_SOURCE_TYPES = {"manual", "task_result", "import", "extractor"}
+KNOWLEDGE_REVIEW_VERDICTS = {"approved", "changes_requested"}
+
 
 class TestEvidence(TypedDict, total=False):
     """Structured command evidence shared by work reports and integrations."""
@@ -69,6 +98,50 @@ class ReviewCriterion(TypedDict, total=False):
     criterion: str
     status: str
     evidence: NotRequired[str]
+
+
+class KnowledgeProvenance(TypedDict, total=False):
+    """Where a Knowledge Asset version came from, kept append-only."""
+
+    source_type: str
+    source_task_id: str
+    source_report_id: str
+    source_review_id: str
+    source_integration_id: str
+    source_event_ids: list[int]
+    created_by_session_id: str
+    created_by_agent_key: str
+
+
+class KnowledgeVersionSummary(TypedDict, total=False):
+    """The current projection of one Knowledge Asset version."""
+
+    version_id: str
+    version: int
+    title: str
+    summary: str
+    tags: list[str]
+    content_hash: str
+    supersedes_version_id: str
+
+
+def knowledge_contract(
+    *,
+    kinds: tuple[str, ...] | list[str],
+) -> dict[str, Any]:
+    """Project the versioned Knowledge contract for adapters and clients."""
+    return {
+        "schema_version": KNOWLEDGE_SCHEMA_VERSION,
+        "asset_statuses": sorted(KNOWLEDGE_ASSET_STATUSES),
+        "asset_transitions": {
+            status: sorted(next_states)
+            for status, next_states in KNOWLEDGE_ASSET_TRANSITIONS.items()
+        },
+        "kinds": list(kinds),
+        "owner_kinds": sorted(KNOWLEDGE_OWNER_KINDS),
+        "source_types": sorted(KNOWLEDGE_SOURCE_TYPES),
+        "review_verdicts": sorted(KNOWLEDGE_REVIEW_VERDICTS),
+    }
 
 
 def task_state_for_legacy_status(

@@ -11,7 +11,7 @@ if TYPE_CHECKING:
     from .config import Settings
 
 
-SCHEMA_VERSION = 12
+SCHEMA_VERSION = 16
 
 
 class DatabaseBackend(Protocol):
@@ -306,6 +306,68 @@ CREATE TABLE IF NOT EXISTS event_acknowledgements (
     created_at TEXT NOT NULL,
     PRIMARY KEY(event_id, session_id)
 );
+
+CREATE TABLE IF NOT EXISTS knowledge_assets (
+    id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    kind TEXT NOT NULL,
+    owner_kind TEXT NOT NULL,
+    owner_id TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'candidate',
+    current_version_id TEXT,
+    created_by_session_id TEXT REFERENCES agent_sessions(id),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_knowledge_assets_project
+ON knowledge_assets(project_id, status, updated_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_knowledge_assets_kind
+ON knowledge_assets(project_id, kind, created_at);
+
+CREATE TABLE IF NOT EXISTS knowledge_asset_versions (
+    id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    asset_id TEXT NOT NULL REFERENCES knowledge_assets(id) ON DELETE CASCADE,
+    version INTEGER NOT NULL,
+    title TEXT NOT NULL,
+    body TEXT NOT NULL,
+    summary TEXT NOT NULL DEFAULT '',
+    content_hash TEXT NOT NULL,
+    tags_json TEXT NOT NULL DEFAULT '[]',
+    source_type TEXT NOT NULL DEFAULT 'manual',
+    source_task_id TEXT REFERENCES tasks(id),
+    source_report_id TEXT REFERENCES work_reports(id),
+    source_review_id TEXT REFERENCES reviews(id),
+    source_integration_id TEXT REFERENCES task_integrations(id),
+    source_event_ids_json TEXT NOT NULL DEFAULT '[]',
+    created_by_session_id TEXT REFERENCES agent_sessions(id),
+    supersedes_version_id TEXT,
+    created_at TEXT NOT NULL,
+    UNIQUE(asset_id, version)
+);
+
+CREATE INDEX IF NOT EXISTS idx_knowledge_asset_versions_asset
+ON knowledge_asset_versions(project_id, asset_id, version DESC);
+
+CREATE INDEX IF NOT EXISTS idx_knowledge_asset_versions_task
+ON knowledge_asset_versions(project_id, source_task_id, created_at);
+
+CREATE TABLE IF NOT EXISTS knowledge_reviews (
+    id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    asset_id TEXT NOT NULL REFERENCES knowledge_assets(id) ON DELETE CASCADE,
+    version_id TEXT NOT NULL REFERENCES knowledge_asset_versions(id) ON DELETE CASCADE,
+    reviewer_session_id TEXT NOT NULL REFERENCES agent_sessions(id),
+    verdict TEXT NOT NULL,
+    criteria_json TEXT NOT NULL DEFAULT '[]',
+    notes TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_knowledge_reviews_asset
+ON knowledge_reviews(project_id, asset_id, created_at);
 """
 
 MIGRATIONS = {
@@ -509,6 +571,69 @@ MIGRATIONS = {
     12: """
         CREATE INDEX IF NOT EXISTS idx_agent_sessions_project_agent_key
         ON agent_sessions(project_id, agent_key, last_heartbeat DESC);
+    """,
+    13: """SELECT 1;""",
+    14: """DROP TABLE IF EXISTS project_deletion_markers;""",
+    15: """
+        CREATE TABLE IF NOT EXISTS knowledge_assets (
+            id TEXT PRIMARY KEY,
+            project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+            kind TEXT NOT NULL,
+            owner_kind TEXT NOT NULL,
+            owner_id TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'candidate',
+            current_version_id TEXT,
+            created_by_session_id TEXT REFERENCES agent_sessions(id),
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_knowledge_assets_project
+        ON knowledge_assets(project_id, status, updated_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_knowledge_assets_kind
+        ON knowledge_assets(project_id, kind, created_at);
+        CREATE TABLE IF NOT EXISTS knowledge_asset_versions (
+            id TEXT PRIMARY KEY,
+            project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+            asset_id TEXT NOT NULL REFERENCES knowledge_assets(id) ON DELETE CASCADE,
+            version INTEGER NOT NULL,
+            title TEXT NOT NULL,
+            body TEXT NOT NULL,
+            summary TEXT NOT NULL DEFAULT '',
+            content_hash TEXT NOT NULL,
+            tags_json TEXT NOT NULL DEFAULT '[]',
+            source_type TEXT NOT NULL DEFAULT 'manual',
+            source_task_id TEXT REFERENCES tasks(id),
+            source_report_id TEXT REFERENCES work_reports(id),
+            source_review_id TEXT REFERENCES reviews(id),
+            source_integration_id TEXT REFERENCES task_integrations(id),
+            source_event_ids_json TEXT NOT NULL DEFAULT '[]',
+            created_by_session_id TEXT REFERENCES agent_sessions(id),
+            supersedes_version_id TEXT,
+            created_at TEXT NOT NULL,
+            UNIQUE(asset_id, version)
+        );
+        CREATE INDEX IF NOT EXISTS idx_knowledge_asset_versions_asset
+        ON knowledge_asset_versions(project_id, asset_id, version DESC);
+        CREATE INDEX IF NOT EXISTS idx_knowledge_asset_versions_task
+        ON knowledge_asset_versions(project_id, source_task_id, created_at);
+        CREATE TABLE IF NOT EXISTS knowledge_reviews (
+            id TEXT PRIMARY KEY,
+            project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+            asset_id TEXT NOT NULL REFERENCES knowledge_assets(id) ON DELETE CASCADE,
+            version_id TEXT NOT NULL REFERENCES knowledge_asset_versions(id) ON DELETE CASCADE,
+            reviewer_session_id TEXT NOT NULL REFERENCES agent_sessions(id),
+            verdict TEXT NOT NULL,
+            criteria_json TEXT NOT NULL DEFAULT '[]',
+            notes TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_knowledge_reviews_asset
+        ON knowledge_reviews(project_id, asset_id, created_at);
+    """,
+    16: """
+        UPDATE projects
+        SET project_key = 'prj_' || substr(id, 9)
+        WHERE project_key <> 'prj_' || substr(id, 9);
     """,
 }
 

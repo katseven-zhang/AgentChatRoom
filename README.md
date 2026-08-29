@@ -4,6 +4,20 @@ AgentChatRoom 是一个面向异构 AI 编程 Agent 的项目级实时协作中�
 
 当前版本提供 Python 后端、浏览器管理端、REST、SSE、MCP stdio、Streamable HTTP MCP、远程 stdio Bridge、CLI、SQLite 本地档案和 PostgreSQL 服务器适配器。
 
+## 2026-08-29 修复更新
+
+本次修复版包版本为 `0.2.1`，重点收口 Project/Room 生命周期和单机协作的事实来源：
+
+- Project key 改由后端从 `project_id` 派生；Agent、REST、CLI 和 Web 不再自定义或猜测 key。
+- Git 或本地路径来源由后端依据实际 checkout 自动检测；同一规范化作用域只允许一个活动 Project/Room。
+- `.agentchatroom/project.json` 由后端维护并作为 checkout 注册；永久删除后的孤儿登记不会复活旧 Project。
+- 归档保留 `archived_at` 和追加式历史；永久删除物理清除 Project 及级联 Room 数据，不保留 tombstone。
+- Presence 只表示连接存活；任务认领、Work Report、独立 Review 和 Integration 才是工作进展事实，Work Report 会释放本任务 Lease。
+- 取消任务在 Web 中显示“已取消 / 无需验证 / 无需集成”，并从总览“正在进行”列表排除。
+- Knowledge Asset Batch A 已完成版本化、独立审核、来源追溯和 REST/MCP/CLI 统一适配；外部 Agent、跨机器协作、服务器部署和代码同步仍不属于一期范围。
+
+本次更新已通过完整测试、Python/JavaScript 语法检查、公开发布审计、差异检查和本地浏览器回归；运行时数据、凭据和本地 `docs/` 资料不纳入版本提交。
+
 ## 核心原则
 
 - 标准化、配置化，不在业务代码中硬编码 Agent 厂商、模型、角色、项目路径、端口或部署环境。
@@ -11,6 +25,27 @@ AgentChatRoom 是一个面向异构 AI 编程 Agent 的项目级实时协作中�
 - 执行完成、独立验证和最终集成是三个独立状态面。
 - 事件历史追加写入；派生状态可以变化，历史事件不能改写。
 - 浏览器是人类管理和观察界面，后端数据库才是共享事实源。
+
+## 一期产品范围
+
+一期以**单机使用闭环**为核心：AgentChatRoom 后端、浏览器管理端、代码
+checkout 和参与协作的 Agent 客户端运行在同一台电脑上。当前优先完善
+Project/Room 生命周期、Agent 接入、消息、Task、文件 Lease、工作证据、独立
+Review、Integration 和 Knowledge Asset，使单机日常开发可以稳定、可审计地
+完成完整协作流程。
+
+以下能力暂缓，不作为一期完成或发布验收条件：
+
+- 通过网络接入的外部 Agent；
+- 多台电脑共同参与同一 Project/Room；
+- 中心服务器、正式公网入口和生产 PostgreSQL 部署；
+- 为跨机器协作自动同步代码、分支、工作树、未提交改动或构建产物。
+
+跨机器协作不只是让 Agent 能连接同一个 Room。它还需要定义并验证代码同步
+边界，包括仓库身份、commit/branch 基线、工作树状态、未提交改动、冲突处理、
+任务证据对应的代码版本，以及不同机器间的权限和凭据管理。在这些问题形成
+独立方案并完成端到端验证前，现有 Streamable HTTP、远程 Bridge、PostgreSQL
+适配器和部署文件仅作为后续演进基础，不能据此声称已经支持完整跨机器协作。
 
 ## 系统要求
 
@@ -114,6 +149,24 @@ Linux 或 macOS：
 
 同一个 Agent 应在一个 Project 中长期复用稳定 `agent_key`。每次执行可以创建新 Session，但不能通过更换名称制造新的 Agent Identity。
 
+Project 的创建、归档、永久删除和 Agent 接入使用不同语义：代码项目作用域还
+没有 Room 时，第一个 Agent 的 `room_join` 可以请求后端创建它，Web 管理端、REST 和
+CLI 也可以显式创建；作用域已经存在活动 Room 后，其他 Agent只能加入，不能
+另建。归档保留完整 Room 数据并设置 `archived_at`，Agent不能绕过归档另建；
+永久删除会物理删除 Project 及其级联 Room 数据，不保留删除标记，删除后作用
+域重新为空，后续第一个 Agent可以创建新的 Room。
+
+Project key 是后端生成的无语义外部查询键，默认不在 UI 展示，也不接受 Agent、
+REST、CLI 或 Web 自定义。Agent 只提供实际 `project_path`；后端自动检测工作区
+识别方式：存在有效 Git origin 时使用规范化 Git remote，否则使用规范化本地
+路径。`logical_path` 默认空，只有用户明确划分单仓库子项目时才设置。
+
+一个规范化代码项目作用域对应一个活动 Project/Room。同一 Git remote 与
+`logical_path`，或同一本地规范化路径与 `logical_path`，不能创建第二个活动
+Room。`room_join` 会从忽略的 `.agentchatroom/project.json` 读取后端登记并自动
+加入该作用域唯一的活动 Room；如果登记仍指向已永久删除的 Project，只返回失效
+登记错误，不会用旧 key 复活。只有本地登记和数据库作用域都为空时才创建新 Room。
+
 ## MCP 接入
 
 生成通用本机 stdio JSON：
@@ -153,7 +206,46 @@ room_join -> room_sync
 -> lease_release / session_leave
 ```
 
-后台 MCP/Bridge 进程负责 Presence。`session_heartbeat` 只用于改变 `idle`、`working` 或 `blocked` 语义状态；不要使用 `room_sync` 充当定时心跳。
+后台 MCP/Bridge 进程只负责连接 Presence。`session_heartbeat` 只刷新连接存活，
+不再依赖 Agent 主动提交 `working`、`idle` 或 `blocked`。左侧显示已连接/未连接、
+当前任务阶段和最后活动；任务认领、Work Report、独立 Review 与 Integration 才是
+工作进展的事实来源。Work Report 会自动释放该任务的文件 Lease。
+任务被取消后即为终止状态，不再进入独立验证或最终集成；Web 会明确显示
+“已取消 / 无需验证 / 无需集成”，避免把取消任务误解为仍有待办。
+
+## 知识资产（Knowledge Asset）
+
+Room 中的沉淀知识以版本化 Knowledge Asset 保存，默认类型包括决策、流程、坑点、验证方式、偏好和参考资料。知识资产与任务执行相互独立：Agent 先提交候选版本，再由不同 Agent Identity 独立审核，未通过审核的知识不会进入已批准状态。
+
+资产生命周期为 `candidate -> approved / rejected -> superseded -> archived`：
+
+- 修改正文总是追加新版本并记录内容哈希，历史版本只读；普通操作不能覆盖或删除历史内容。
+- 已批准资产不能被直接修改，必须先标记 `superseded`，再以新候选版本重新提交审核。
+- `rejected` 资产可以修改后重新进入审核；`archived` 是终态。
+
+每个版本记录可追溯来源：`source_type`（manual、task_result、import、extractor）、可选的 Task/Work Report/Review/Integration 引用、相关事件 ID，以及创建者 Session 和 Agent Identity。来源引用会规范化：只提供 Report/Review/Integration 而省略 Task 时，自动从被引用记录派生 Task 链接；`task_result` 来源必须直接或间接标识其 Task。默认配置下，关联 Task 的资产在批准前要求该 Task 已通过独立验证。
+
+每个资产的 `kind` 在创建时固定，修订版本不能变更类型；需要换类型时创建新资产。
+
+三端入口复用同一个领域服务：
+
+- REST：`GET/POST /api/v1/projects/{id}/knowledge/assets`、`GET .../assets/{asset_id}`（支持 `version_id` 读取历史）、`POST .../assets/{asset_id}/reviews|supersede|archive`。
+- MCP：`knowledge_candidate_submit`、`knowledge_review`、`knowledge_supersede`、`knowledge_archive`、`knowledge_get`、`knowledge_list`。
+- CLI：`agentchatroom knowledge-submit | knowledge-review | knowledge-supersede | knowledge-archive | knowledge-list | knowledge-get`。CLI 审核通过 `--criterion "描述::passed"` 或 `--criterion "描述::failed"` 表达每项判定（省略后缀默认 passed）。
+
+项目导出（REST `/export`、CLI `project-export`）包含全部知识资产的版本与审核历史。
+
+默认配置见 `config.example.toml` 的 `[knowledge]` 节：
+
+```toml
+[knowledge]
+kinds = ["decision", "procedure", "pitfall", "verification", "preference", "reference"]
+require_verified_task = true
+```
+
+`kinds` 控制本部署启用的知识类型，可自定义但不可为空；`require_verified_task` 控制关联 Task 的资产是否必须先通过独立验证。两者都可通过环境变量覆盖。
+
+当前批次不引入 LLM 抽取、Embedding 检索、Node 服务、额外容器、MemoryProxy 或自动 Prompt 注入；知识入库由 Agent 显式调用，检索按状态、类型和来源过滤。
 
 ## 服务器部署
 
@@ -216,10 +308,16 @@ PostgreSQL 验收脚本在未安装可选数据库依赖时仍可查看 `--help`
 
 ## 当前边界
 
-- 本地 SQLite、REST、MCP、CLI、Web、Bridge 和 PostgreSQL 适配器已经进入主线。
+- 一期发布与验收只覆盖同一台电脑上的本地 SQLite、REST、MCP、CLI 和 Web
+  协作闭环。
+- Streamable HTTP、远程 Bridge、PostgreSQL 适配器和服务器部署文件已经进入
+  代码库，但属于后续跨机器阶段的基础能力，不代表跨机器协作已经验收通过。
+- 版本化知识资产（提交、独立审核、状态转换、导出）已经进入主线；LLM 抽取与语义检索仍是后续批次。
 - Web 的任务、文件占用、验证和管理能力仍有部分流程标记为未闭环。
-- 正式公网 TLS、生产 PostgreSQL、正式备份演练和两台物理电脑互联仍需独立发布验收。
-- 第三方 Agent 宿主是否长期保留 MCP 子进程取决于对应客户端生命周期；中心不会伪造永久在线。
+- 外部 Agent、正式公网 TLS、生产 PostgreSQL、正式备份演练、代码同步和两台
+  物理电脑互联均暂缓，不作为一期完成条件。
+- 本机第三方 Agent 宿主是否长期保留 MCP 子进程取决于对应客户端生命周期；
+  中心不会伪造永久在线。
 - 自动选择第三方模型、读取隐藏推理或强制外部 Agent 遵守规则不在产品保证范围内。
 
 ## License

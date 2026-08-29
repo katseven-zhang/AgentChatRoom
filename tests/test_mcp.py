@@ -15,6 +15,8 @@ from mcp.server.fastmcp.exceptions import ToolError
 
 from agentchatroom import mcp_bridge, mcp_server
 from agentchatroom.api import create_app
+from agentchatroom.config import Settings
+from agentchatroom.database import Database
 from agentchatroom.mcp_bridge import (
     BridgeSettings,
     ReconnectingUpstream,
@@ -52,6 +54,12 @@ def test_mcp_exposes_standard_tool_set():
         "work_report",
         "review_submit",
         "integration_submit",
+        "knowledge_candidate_submit",
+        "knowledge_review",
+        "knowledge_supersede",
+        "knowledge_archive",
+        "knowledge_get",
+        "knowledge_list",
     }
 
 
@@ -118,6 +126,7 @@ def test_mcp_project_member_tools_share_the_domain_service(
     monkeypatch, service, project_dir
 ):
     monkeypatch.setattr(mcp_server, "service", service)
+    service.create_project(root_path=str(project_dir))
     joined = mcp_server.room_join(
         str(project_dir),
         "member-admin-main",
@@ -230,7 +239,7 @@ async def test_bridge_presence_tracks_joined_session_and_sends_independent_heart
     assert calls[0][0] == "session_heartbeat"
     assert calls[0][1]["project_id"] == "project_1"
     assert calls[0][1]["session_id"] == "agent_1"
-    assert calls[0][1]["status"] == "idle"
+    assert "status" not in calls[0][1]
     assert "request_id" not in calls[0][1]
 
     manager.observe(
@@ -363,6 +372,7 @@ def test_mcp_request_id_replays_and_session_can_leave(
     monkeypatch, service, project_dir
 ):
     monkeypatch.setattr(mcp_server, "service", service)
+    service.create_project(root_path=str(project_dir))
     joined = mcp_server.room_join(
         str(project_dir),
         "reliable-mcp-main",
@@ -400,13 +410,12 @@ def test_mcp_request_id_replays_and_session_can_leave(
             project_id,
             joined["agent"]["id"],
             joined["token"],
-            status="working",
         )
         for _ in range(5)
     ]
     heartbeat = heartbeats[-1]
     assert heartbeat["ok"] is True
-    assert heartbeat["result"]["status"] == "working"
+    assert heartbeat["result"]["status"] == "online"
     with service.database.connect() as connection:
         assert service.latest_cursor(connection, project_id) == cursor_before_heartbeat
         uncached_heartbeat_count = connection.execute(
@@ -419,14 +428,12 @@ def test_mcp_request_id_replays_and_session_can_leave(
         project_id,
         joined["agent"]["id"],
         joined["token"],
-        status="idle",
         request_id="mcp-heartbeat-1",
     )
     explicit_replay = mcp_server.session_heartbeat(
         project_id,
         joined["agent"]["id"],
         joined["token"],
-        status="idle",
         request_id="mcp-heartbeat-1",
     )
     assert explicit["result"]["idempotent_replay"] is False
@@ -452,6 +459,7 @@ def test_mcp_handoff_and_integration_share_the_domain_service(
     monkeypatch, service, project_dir
 ):
     monkeypatch.setattr(mcp_server, "service", service)
+    service.create_project(root_path=str(project_dir))
     executor = mcp_server.room_join(
         str(project_dir), "executor-main", "Executor", "codex", "unknown", role="executor"
     )["result"]
@@ -597,11 +605,33 @@ def test_mcp_room_join_uses_configurable_agent_identity(monkeypatch, service, pr
     assert agent["name"] == "Fourth Agent"
     assert agent["client"] == "custom-client"
     assert agent["role"] == "specialist"
+    assert len(service.list_projects()) == 1
+
+
+def test_mcp_room_join_uses_unique_existing_room_without_project_key(
+    monkeypatch, service, project_dir
+):
+    monkeypatch.setattr(mcp_server, "service", service)
+    existing = service.create_project(root_path=str(project_dir))
+
+    response = mcp_server.room_join(
+        str(project_dir),
+        "trae-main",
+        "Trae",
+        "trae",
+        model="unknown",
+    )
+
+    assert response["ok"] is True
+    assert response["result"]["project"]["id"] == existing["id"]
+    assert response["result"]["project"]["project_key"] == existing["project_key"]
+    assert len(service.list_projects()) == 1
 
 
 @pytest.mark.asyncio
 async def test_mcp_compatibility_is_schema_directed(monkeypatch, service, project_dir):
     monkeypatch.setattr(mcp_server, "service", service)
+    service.create_project(root_path=str(project_dir))
     joined = await mcp_server.mcp._tool_manager.call_tool(
         "room_join",
         {
@@ -718,7 +748,14 @@ async def test_mcp_compatibility_is_schema_directed(monkeypatch, service, projec
 @pytest.mark.asyncio
 async def test_mcp_stdio_round_trip(tmp_path, project_dir):
     environment = os.environ.copy()
-    environment["AGENTCHATROOM_DATA_DIR"] = str(tmp_path / "mcp-data")
+    data_dir = tmp_path / "mcp-data"
+    environment["AGENTCHATROOM_DATA_DIR"] = str(data_dir)
+    bootstrap_settings = Settings(data_dir=data_dir)
+    bootstrap_service = mcp_server.AgentChatRoomService(
+        Database(bootstrap_settings.database_path), bootstrap_settings
+    )
+    bootstrap_service.initialize()
+    bootstrap_service.create_project(root_path=str(project_dir))
     process = await asyncio.create_subprocess_exec(
         sys.executable,
         "-m",

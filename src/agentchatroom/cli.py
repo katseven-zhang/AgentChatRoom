@@ -148,6 +148,23 @@ def parse_test_evidence(values: list[str]) -> list[dict[str, Any]]:
     return evidence
 
 
+def parse_knowledge_criteria(values: list[str]) -> list[dict[str, Any]]:
+    criteria = []
+    for value in values:
+        criterion, separator, status = value.rpartition("::")
+        if separator and status in ("passed", "failed"):
+            criterion = criterion.strip()
+        else:
+            criterion, status = value.strip(), "passed"
+        if not criterion:
+            raise SystemExit(
+                "Each --criterion must be a non-empty description, optionally "
+                "suffixed with ::passed or ::failed"
+            )
+        criteria.append({"criterion": criterion, "status": status})
+    return criteria
+
+
 def parse_json_object(value: str, label: str) -> dict[str, Any]:
     try:
         parsed = json.loads(value)
@@ -415,7 +432,6 @@ def build_parser() -> argparse.ArgumentParser:
     project = commands.add_parser("project-add", help="Add a project")
     project.add_argument("root_path")
     project.add_argument("--name")
-    project.add_argument("--project-key")
 
     commands.add_parser("project-list", help="List projects")
 
@@ -664,6 +680,76 @@ def build_parser() -> argparse.ArgumentParser:
     integration.add_argument("--file", action="append", default=[])
     integration.add_argument("--test", action="append", required=True, help="COMMAND::EXIT_CODE")
     integration.add_argument("--commit", default="")
+
+    knowledge_submit = commands.add_parser(
+        "knowledge-submit", help="Submit a Knowledge Asset candidate version"
+    )
+    knowledge_submit.add_argument("project_id")
+    knowledge_submit.add_argument("title")
+    knowledge_submit.add_argument("body")
+    knowledge_submit.add_argument("--kind", required=True)
+    knowledge_submit.add_argument("--session-id", required=True)
+    knowledge_submit.add_argument("--token", required=True)
+    knowledge_submit.add_argument("--summary", default="")
+    knowledge_submit.add_argument("--tag", action="append", default=[])
+    knowledge_submit.add_argument("--source-type", default="manual")
+    knowledge_submit.add_argument("--source-task-id", default="")
+    knowledge_submit.add_argument("--source-report-id", default="")
+    knowledge_submit.add_argument("--source-review-id", default="")
+    knowledge_submit.add_argument("--source-integration-id", default="")
+    knowledge_submit.add_argument("--source-event", action="append", type=int, default=[])
+    knowledge_submit.add_argument("--asset-id", default="")
+
+    knowledge_list = commands.add_parser(
+        "knowledge-list", help="List Knowledge Assets"
+    )
+    knowledge_list.add_argument("project_id")
+    knowledge_list.add_argument("--status")
+    knowledge_list.add_argument("--kind")
+    knowledge_list.add_argument("--source-task-id")
+
+    knowledge_get = commands.add_parser(
+        "knowledge-get", help="Read one Knowledge Asset with its history"
+    )
+    knowledge_get.add_argument("project_id")
+    knowledge_get.add_argument("asset_id")
+    knowledge_get.add_argument("--version-id", default="")
+
+    knowledge_review = commands.add_parser(
+        "knowledge-review", help="Review a candidate Knowledge Asset version"
+    )
+    knowledge_review.add_argument("project_id")
+    knowledge_review.add_argument("asset_id")
+    knowledge_review.add_argument("--session-id", required=True)
+    knowledge_review.add_argument("--token", required=True)
+    knowledge_review.add_argument(
+        "--verdict", choices=["approved", "changes_requested"], required=True
+    )
+    knowledge_review.add_argument(
+        "--criterion",
+        action="append",
+        required=True,
+        help="CRITERION::passed or CRITERION::failed (defaults to passed)",
+    )
+    knowledge_review.add_argument("--notes", default="")
+
+    knowledge_supersede = commands.add_parser(
+        "knowledge-supersede", help="Supersede an approved Knowledge Asset"
+    )
+    knowledge_supersede.add_argument("project_id")
+    knowledge_supersede.add_argument("asset_id")
+    knowledge_supersede.add_argument("--session-id", required=True)
+    knowledge_supersede.add_argument("--token", required=True)
+    knowledge_supersede.add_argument("--reason", default="")
+
+    knowledge_archive = commands.add_parser(
+        "knowledge-archive", help="Archive a Knowledge Asset"
+    )
+    knowledge_archive.add_argument("project_id")
+    knowledge_archive.add_argument("asset_id")
+    knowledge_archive.add_argument("--session-id", required=True)
+    knowledge_archive.add_argument("--token", required=True)
+    knowledge_archive.add_argument("--reason", default="")
     return parser
 
 
@@ -793,7 +879,7 @@ def main(argv: list[str] | None = None) -> None:
         result = call_api(
             "POST",
             "/api/v1/projects",
-            {"root_path": args.root_path, "name": args.name, "project_key": args.project_key},
+            {"root_path": args.root_path, "name": args.name},
         )
     elif args.command == "project-list":
         result = call_api("GET", "/api/v1/projects")
@@ -1070,6 +1156,81 @@ def main(argv: list[str] | None = None) -> None:
                 "tests": parse_test_evidence(args.test),
                 "commit_hash": args.commit,
             },
+        )
+    elif args.command == "knowledge-submit":
+        result = call_api(
+            "POST",
+            f"/api/v1/projects/{args.project_id}/knowledge/assets",
+            {
+                "session_id": args.session_id,
+                "token": args.token,
+                "title": args.title,
+                "body": args.body,
+                "kind": args.kind,
+                "summary": args.summary,
+                "tags": args.tag,
+                "source_type": args.source_type,
+                "source_task_id": args.source_task_id,
+                "source_report_id": args.source_report_id,
+                "source_review_id": args.source_review_id,
+                "source_integration_id": args.source_integration_id,
+                "source_event_ids": args.source_event,
+                "asset_id": args.asset_id,
+            },
+        )
+    elif args.command == "knowledge-list":
+        query = urllib.parse.urlencode(
+            {
+                key: value
+                for key, value in {
+                    "status": args.status,
+                    "kind": args.kind,
+                    "source_task_id": args.source_task_id,
+                }.items()
+                if value
+            }
+        )
+        suffix = f"?{query}" if query else ""
+        result = call_api(
+            "GET", f"/api/v1/projects/{args.project_id}/knowledge/assets{suffix}"
+        )
+    elif args.command == "knowledge-get":
+        query = (
+            f"?{urllib.parse.urlencode({'version_id': args.version_id})}"
+            if args.version_id
+            else ""
+        )
+        result = call_api(
+            "GET",
+            f"/api/v1/projects/{args.project_id}/knowledge/assets/"
+            f"{args.asset_id}{query}",
+        )
+    elif args.command == "knowledge-review":
+        result = call_api(
+            "POST",
+            f"/api/v1/projects/{args.project_id}/knowledge/assets/"
+            f"{args.asset_id}/reviews",
+            {
+                "reviewer_session_id": args.session_id,
+                "token": args.token,
+                "verdict": args.verdict,
+                "criteria": parse_knowledge_criteria(args.criterion),
+                "notes": args.notes,
+            },
+        )
+    elif args.command == "knowledge-supersede":
+        result = call_api(
+            "POST",
+            f"/api/v1/projects/{args.project_id}/knowledge/assets/"
+            f"{args.asset_id}/supersede",
+            {"session_id": args.session_id, "token": args.token, "reason": args.reason},
+        )
+    elif args.command == "knowledge-archive":
+        result = call_api(
+            "POST",
+            f"/api/v1/projects/{args.project_id}/knowledge/assets/"
+            f"{args.asset_id}/archive",
+            {"session_id": args.session_id, "token": args.token, "reason": args.reason},
         )
     else:
         parser.error("Unsupported command")

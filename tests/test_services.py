@@ -1002,6 +1002,49 @@ def test_conflicting_exclusive_lease_is_rejected(service, project, joined_agents
     assert any(event["event_type"] == "lease.conflict" for event in events)
 
 
+def test_work_report_releases_task_leases(service, project, joined_agents):
+    executor, _reviewer = joined_agents
+    task = service.create_task(
+        project["id"],
+        title="Release task leases",
+        acceptance_criteria=["Lease is released with the work report"],
+    )["task"]
+    service.claim_task(
+        project["id"], task["id"], executor["agent"]["id"], executor["token"]
+    )
+    lease = service.acquire_lease(
+        project["id"],
+        session_id=executor["agent"]["id"],
+        token=executor["token"],
+        task_id=task["id"],
+        path_pattern="src/agentchatroom/services.py",
+    )["lease"]
+
+    report = service.submit_work_report(
+        project["id"],
+        task["id"],
+        session_id=executor["agent"]["id"],
+        token=executor["token"],
+        summary="Lease lifecycle completed",
+        files=["src/agentchatroom/services.py"],
+        tests=[{"command": "pytest", "exit_code": 0}],
+    )
+
+    event = next(
+        event
+        for event in service.list_events(project["id"])["events"]
+        if event["event_type"] == "work.reported"
+    )
+    historical = next(
+        item
+        for item in service.list_leases(project["id"], include_inactive=True)
+        if item["id"] == lease["id"]
+    )
+    assert event["payload"]["released_lease_ids"] == [lease["id"]]
+    assert historical["released_at"] is not None
+    assert report["task_status"] == "awaiting_review"
+
+
 def test_work_must_be_independently_reviewed(service, project, joined_agents):
     executor, reviewer = joined_agents
     task = service.create_task(
@@ -1540,6 +1583,62 @@ def test_archived_project_is_hidden_and_can_be_restored(service, project_dir):
     assert restored["archived_at"] is None
 
 
+def test_agent_join_resolution_does_not_restore_archived_project(
+    service, project_dir
+):
+    project = service.create_project(root_path=str(project_dir))
+    service.archive_project(project["id"])
+
+    with pytest.raises(DomainError) as archived:
+        service.resolve_project_for_join(
+            root_path=str(project_dir),
+            registered_project_key=project["project_key"],
+        )
+
+    assert archived.value.code == "project_archived"
+    assert service.list_projects() == []
+
+
+def test_agent_join_resolution_and_explicit_create_reuse_repository_scope(
+    service, project_dir
+):
+    project = service.create_project(root_path=str(project_dir))
+    resolved = service.resolve_project_for_join(root_path=str(project_dir))
+    assert resolved["id"] == project["id"]
+    repeated = service.create_project(root_path=str(project_dir))
+    assert repeated["id"] == project["id"]
+    assert len(service.list_projects()) == 1
+
+
+def test_archived_repository_scope_must_be_restored_instead_of_duplicated(
+    service, project_dir
+):
+    project = service.create_project(root_path=str(project_dir))
+    service.archive_project(project["id"])
+
+    restored = service.create_project(root_path=str(project_dir))
+    assert restored["id"] == project["id"]
+    assert restored["archived_at"] is None
+
+
+def test_deleted_project_can_be_recreated_by_first_agent_join(
+    service, project_dir
+):
+    project = service.create_project(root_path=str(project_dir))
+    service.delete_project(project["id"])
+
+    with pytest.raises(DomainError) as orphaned:
+        service.resolve_project_for_join(
+            root_path=str(project_dir),
+            registered_project_key=project["project_key"],
+        )
+    assert orphaned.value.code == "project_registration_orphaned"
+
+    recreated = service.resolve_project_for_join(root_path=str(project_dir))
+    assert recreated["id"] != project["id"]
+    assert recreated["project_key"] != project["project_key"]
+
+
 def test_project_can_be_permanently_deleted(service, project, joined_agents):
     service.post_message(project["id"], body="Delete this room")
     deleted = service.delete_project(project["id"])
@@ -1751,9 +1850,7 @@ def test_readonly_lease_does_not_conflict_and_heartbeat_preserves_ttl(
     )["lease"]
     assert readonly["active"] is True
 
-    service.heartbeat(
-        project["id"], first["agent"]["id"], first["token"], status="working"
-    )
+    service.heartbeat(project["id"], first["agent"]["id"], first["token"])
     renewed = next(
         lease
         for lease in service.list_leases(project["id"])

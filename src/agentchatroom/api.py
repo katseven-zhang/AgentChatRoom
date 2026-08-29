@@ -24,6 +24,10 @@ from .database import create_database
 from .errors import DomainError
 from .integrations import build_mcp_integration
 from .mcp_server import create_mcp
+from .project_registration import (
+    register_checkout_project,
+    remove_checkout_project_registration,
+)
 from .contracts import (
     ASSIGNMENT_RESPONSES,
     ASSIGNMENT_STATUSES,
@@ -37,6 +41,7 @@ from .contracts import (
     TASK_EXECUTION_STATUSES,
     TASK_INTEGRATION_STATUSES,
     TASK_VERIFICATION_STATUSES,
+    knowledge_contract,
 )
 from .services import (
     AGENT_STATUSES,
@@ -164,7 +169,6 @@ def _management_session_hash(session_id: str) -> str:
 class ProjectCreate(StrictModel):
     root_path: str
     name: str | None = None
-    project_key: str | None = None
     logical_path: str = ""
     settings: dict[str, Any] = Field(default_factory=dict)
 
@@ -189,7 +193,6 @@ class AgentJoin(StrictModel):
 
 class AgentHeartbeat(StrictModel):
     token: str
-    status: Literal["online", "idle", "working", "blocked"] = "online"
 
 
 class AgentLeave(StrictModel):
@@ -370,6 +373,37 @@ class IntegrationCreate(StrictModel):
     files: list[str] = Field(default_factory=list)
     tests: list[dict[str, Any]]
     commit_hash: str = ""
+
+
+class KnowledgeCandidateCreate(StrictModel):
+    session_id: str
+    token: str
+    title: str
+    body: str
+    kind: str
+    summary: str = ""
+    tags: list[str] = Field(default_factory=list)
+    source_type: str = "manual"
+    source_task_id: str = ""
+    source_report_id: str = ""
+    source_review_id: str = ""
+    source_integration_id: str = ""
+    source_event_ids: list[int] = Field(default_factory=list)
+    asset_id: str = ""
+
+
+class KnowledgeReviewCreate(StrictModel):
+    reviewer_session_id: str
+    token: str
+    verdict: Literal["approved", "changes_requested"]
+    criteria: list[dict[str, Any]]
+    notes: str = ""
+
+
+class KnowledgeAssetAction(StrictModel):
+    session_id: str
+    token: str
+    reason: str = ""
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
@@ -615,17 +649,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 "handoff_responses": sorted(HANDOFF_RESPONSES),
                 "integration_results": sorted(INTEGRATION_RESULTS),
                 "agent_permissions": sorted(AGENT_PERMISSIONS),
-                "agent_session_statuses": sorted(AGENT_STATUSES),
+                "agent_session_statuses": ["online", "offline"],
                 "agent_connection_statuses": ["connected", "disconnected"],
                 "agent_identity_statuses": [
                     "registered",
                     "online",
-                    "idle",
-                    "working",
-                    "blocked",
                 ],
                 "project_member_schema_version": PROJECT_MEMBER_SCHEMA_VERSION,
                 "project_member_statuses": sorted(PROJECT_MEMBER_STATUSES),
+                "knowledge": knowledge_contract(kinds=resolved.knowledge_kinds),
             },
             "project_settings_defaults": PROJECT_SETTINGS_DEFAULTS,
         }
@@ -682,7 +714,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.post("/api/v1/projects", status_code=201)
     def create_project(body: ProjectCreate) -> dict[str, Any]:
-        return service.create_project(**body.model_dump())
+        values = body.model_dump()
+        project = service.create_project(**values)
+        register_checkout_project(body.root_path, project, replace_existing=True)
+        return project
 
     @app.delete("/api/v1/projects/{project_id}")
     def remove_project(
@@ -690,7 +725,35 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         permanent: bool = Query(False),
     ) -> dict[str, Any]:
         if permanent:
-            return service.delete_project(project_id)
+            snapshot = service.snapshot(project_id)
+            project = snapshot["project"]
+            checkout_paths = {
+                str(project["root_path"]),
+                *(
+                    str(agent.get("worktree", "")).strip()
+                    for agent in snapshot["agents"]
+                    if str(agent.get("worktree", "")).strip()
+                ),
+            }
+            deleted = service.delete_project(project_id)
+            removed = 0
+            cleanup_errors: list[dict[str, Any]] = []
+            for checkout_path in sorted(checkout_paths):
+                try:
+                    removed += int(
+                        remove_checkout_project_registration(
+                            checkout_path,
+                            project_key=str(project["project_key"]),
+                            logical_path=str(project.get("logical_path", "") or ""),
+                        )
+                    )
+                except DomainError as error:
+                    cleanup_errors.append(error.as_dict()["error"])
+            deleted["project_registration"] = {
+                "removed": removed,
+                "cleanup_errors": cleanup_errors,
+            }
+            return deleted
         return service.archive_project(project_id)
 
     @app.patch("/api/v1/projects/{project_id}")
@@ -884,7 +947,6 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             project_id,
             session_id,
             body.token,
-            status=body.status,
             request_id=request.state.idempotency_request_id,
         )
 
@@ -1125,6 +1187,87 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return service.submit_integration(
             project_id,
             task_id,
+            **body.model_dump(),
+            request_id=request.state.request_id,
+        )
+
+    @app.get("/api/v1/projects/{project_id}/knowledge/assets")
+    def list_knowledge_assets(
+        project_id: str,
+        status: str | None = None,
+        kind: str | None = None,
+        source_task_id: str | None = None,
+    ) -> dict[str, Any]:
+        return {
+            "assets": service.list_knowledge_assets(
+                project_id,
+                status=status,
+                kind=kind,
+                source_task_id=source_task_id,
+            )
+        }
+
+    @app.post("/api/v1/projects/{project_id}/knowledge/assets", status_code=201)
+    def knowledge_candidate_submit(
+        request: Request,
+        project_id: str,
+        body: KnowledgeCandidateCreate,
+    ) -> dict[str, Any]:
+        return service.submit_knowledge_candidate(
+            project_id,
+            **body.model_dump(),
+            request_id=request.state.request_id,
+        )
+
+    @app.get("/api/v1/projects/{project_id}/knowledge/assets/{asset_id}")
+    def get_knowledge_asset(
+        project_id: str, asset_id: str, version_id: str = ""
+    ) -> dict[str, Any]:
+        return service.get_knowledge_asset(project_id, asset_id, version_id=version_id)
+
+    @app.post(
+        "/api/v1/projects/{project_id}/knowledge/assets/{asset_id}/reviews",
+        status_code=201,
+    )
+    def knowledge_review_submit(
+        request: Request,
+        project_id: str,
+        asset_id: str,
+        body: KnowledgeReviewCreate,
+    ) -> dict[str, Any]:
+        return service.submit_knowledge_review(
+            project_id,
+            asset_id,
+            **body.model_dump(),
+            request_id=request.state.request_id,
+        )
+
+    @app.post(
+        "/api/v1/projects/{project_id}/knowledge/assets/{asset_id}/supersede"
+    )
+    def knowledge_supersede(
+        request: Request,
+        project_id: str,
+        asset_id: str,
+        body: KnowledgeAssetAction,
+    ) -> dict[str, Any]:
+        return service.supersede_knowledge_asset(
+            project_id,
+            asset_id,
+            **body.model_dump(),
+            request_id=request.state.request_id,
+        )
+
+    @app.post("/api/v1/projects/{project_id}/knowledge/assets/{asset_id}/archive")
+    def knowledge_archive(
+        request: Request,
+        project_id: str,
+        asset_id: str,
+        body: KnowledgeAssetAction,
+    ) -> dict[str, Any]:
+        return service.archive_knowledge_asset(
+            project_id,
+            asset_id,
             **body.model_dump(),
             request_id=request.state.request_id,
         )

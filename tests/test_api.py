@@ -79,8 +79,8 @@ def test_health_and_project_room_flow(settings, project_dir):
             f"/api/v1/projects/{project['id']}/integrations/mcp"
         )
         assert project_integration.status_code == 200
-        assert project_integration.json()["project"]["project_key"] == project["project_key"]
-        assert project["project_key"] in project_integration.json()[
+        assert "project_key" not in project_integration.json()["project"]
+        assert project["project_key"] not in project_integration.json()[
             "profiles"
         ]["workbuddy"]["project_memory_text"]
         assert "workbuddy-main" in project_integration.json()["profiles"][
@@ -689,7 +689,7 @@ def test_api_returns_stable_domain_error(settings, project_dir):
         ).json()
         response = client.post(
             f"/api/v1/projects/{project['id']}/agents/missing/heartbeat",
-            json={"token": "wrong", "status": "online"},
+            json={"token": "wrong"},
         )
 
         assert response.status_code == 401
@@ -721,7 +721,7 @@ def test_api_heartbeat_only_caches_explicit_idempotency_keys(settings, project_d
             f"/api/v1/projects/{project['id']}/agents/"
             f"{joined['agent']['id']}/heartbeat"
         )
-        body = {"token": joined["token"], "status": "working"}
+        body = {"token": joined["token"]}
 
         responses = [client.post(heartbeat_url, json=body) for _ in range(5)]
 
@@ -899,6 +899,11 @@ def test_api_can_archive_and_permanently_delete_projects(settings, tmp_path):
             "/api/v1/projects", json={"root_path": str(deleted_path)}
         ).json()
 
+        archived_registration = archived_path / ".agentchatroom" / "project.json"
+        deleted_registration = deleted_path / ".agentchatroom" / "project.json"
+        assert archived_registration.is_file()
+        assert deleted_registration.is_file()
+
         archived_response = client.delete(f"/api/v1/projects/{archived['id']}")
         deleted_response = client.delete(
             f"/api/v1/projects/{deleted['id']}", params={"permanent": True}
@@ -906,6 +911,12 @@ def test_api_can_archive_and_permanently_delete_projects(settings, tmp_path):
 
         assert archived_response.json()["archived"] is True
         assert deleted_response.json()["deleted"] is True
+        assert archived_registration.is_file()
+        assert not deleted_registration.exists()
+        assert deleted_response.json()["project_registration"] == {
+            "removed": 1,
+            "cleanup_errors": [],
+        }
         assert client.get(
             f"/api/v1/projects/{deleted['id']}/snapshot"
         ).status_code == 404

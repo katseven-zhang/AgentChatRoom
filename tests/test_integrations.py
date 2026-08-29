@@ -94,22 +94,24 @@ def test_project_integration_builds_stable_workbuddy_memory_without_live_state(t
     memory = result["profiles"]["workbuddy"]["project_memory_text"]
 
     assert result["schema_version"] == 3
-    assert result["project"] == {
-        "name": "AgentChatRoom",
-        "project_key": "sample-project",
-    }
-    assert "project_key: `sample-project`" in memory
+    assert result["project"] == {"name": "AgentChatRoom"}
+    assert "sample-project" not in memory
     assert "`OFF`" in memory and "`OBSERVE`" in memory and "`COORDINATE`" in memory
     assert "session_heartbeat" in memory
     assert "`room_join.agent_key`" in memory
     assert "Do not begin project work while disconnected" in memory
     assert "use `unknown`" in memory
+    assert ".agentchatroom/project.json" in memory
+    assert "must not edit it, supply a key" in memory
 
     prompt = result["onboarding_prompt"]
     assert "完成 AgentChatRoom 接入" in prompt
-    assert "project_key：sample-project" in prompt
+    assert "project_key：sample-project" not in prompt
+    assert "不要提交或推断 project_key" in prompt
     assert "room_join" in prompt
     assert "model_display_name" in prompt
+    assert "不要另建 Room" in prompt
+    assert ".agentchatroom/project.json" in prompt
     assert "<当前客户端名称小写>-main" in prompt
     assert '"mcpServers"' in prompt
     assert "project_runtime_only" not in memory

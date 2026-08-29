@@ -35,6 +35,21 @@ max_lease_ttl_seconds = 86400
 sse_poll_interval_seconds = 0.5
 presence_refresh_interval_seconds = 1.0
 
+[knowledge]
+# Knowledge Asset kinds enabled for this deployment. Each kind must match
+# ^[a-z][a-z0-9_-]{0,63}$ and at least one kind is required.
+kinds = [
+    "decision",
+    "procedure",
+    "pitfall",
+    "verification",
+    "preference",
+    "reference",
+]
+# Approving a Knowledge Asset tied to a task requires that task to be
+# independently verified first.
+require_verified_task = true
+
 [security]
 agent_token_ttl_seconds = 2592000
 max_agent_token_ttl_seconds = 31536000

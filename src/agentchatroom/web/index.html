@@ -6,7 +6,7 @@
     <meta name="color-scheme" content="light">
     <title>AgentChatRoom</title>
     <link rel="icon" href="/assets/favicon.svg?v=1.0.0-central1" type="image/svg+xml">
-    <link rel="stylesheet" href="/assets/app.css?v=1.0.0-central14">
+    <link rel="stylesheet" href="/assets/app.css?v=1.0.0-central16">
   </head>
   <body>
     <div class="app-shell" id="app-shell">
@@ -323,8 +323,7 @@
         <label>项目名称 <input id="project-name-input" name="name" autocomplete="off" placeholder="可选，默认使用文件夹名"></label>
         <label>项目文件夹 <input id="project-path-input" name="root_path" autocomplete="off" required placeholder="粘贴需要协作的项目目录"></label>
         <label>逻辑子目录 <input id="project-logical-path-input" name="logical_path" autocomplete="off" placeholder="可选，例如 packages/api"></label>
-        <label>项目标识 <input id="project-key-input" name="project_key" autocomplete="off" placeholder="可选，用于关联不同 worktree"></label>
-        <p class="form-hint">服务只记录本地路径和 Git 元数据，不上传源码。</p>
+        <p class="form-hint">工作区类型由后端自动检测为 Git 仓库或本地目录；Project key 由后端生成。服务不上传源码。</p>
         <div class="dialog-actions">
           <button type="button" class="secondary-button dialog-close">取消</button>
           <button type="submit" class="primary-button">添加项目</button>
@@ -765,6 +764,6 @@
     </dialog>
 
     <div class="toast-region" id="toast-region" aria-live="assertive"></div>
-    <script src="/assets/app.js?v=1.0.0-central14" defer></script>
+    <script src="/assets/app.js?v=1.0.0-central16" defer></script>
   </body>
 </html>

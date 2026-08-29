@@ -420,3 +420,83 @@ ON agent_sessions(project_id, agent_key, last_heartbeat DESC);
     assert version == SCHEMA_VERSION
     assert "agent_key" in session_columns
     assert "idx_agent_sessions_project_agent_key" in indexes
+
+
+def test_database_migrates_v13_removes_project_deletion_markers(settings):
+    settings.data_dir.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(settings.database_path) as connection:
+        connection.executescript(SCHEMA)
+        connection.executescript(
+            """
+            CREATE TABLE project_deletion_markers (
+                project_key TEXT PRIMARY KEY,
+                project_id TEXT NOT NULL,
+                root_path TEXT NOT NULL,
+                git_remote TEXT,
+                logical_path TEXT NOT NULL DEFAULT '',
+                deleted_at TEXT NOT NULL
+            );
+            """
+        )
+        connection.execute("INSERT INTO schema_meta(version) VALUES (13)")
+
+    Database(settings.database_path).initialize()
+
+    with sqlite3.connect(settings.database_path) as connection:
+        version = connection.execute("SELECT version FROM schema_meta").fetchone()[0]
+        tables = {
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            )
+        }
+
+    assert version == SCHEMA_VERSION
+    assert "project_deletion_markers" not in tables
+
+
+def test_database_migrates_v15_project_keys_to_backend_generated_form(settings):
+    settings.data_dir.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(settings.database_path) as connection:
+        connection.executescript(SCHEMA)
+        connection.executemany(
+            """
+            INSERT INTO projects(
+                id, project_key, name, root_path, git_remote, logical_path,
+                settings_json, archived_at, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, NULL, '', '{}', NULL, ?, ?)
+            """,
+            [
+                (
+                    "project_1234567890abcdef1234",
+                    "path:d:/example:",
+                    "Example",
+                    "D:/example",
+                    "2026-08-29T00:00:00Z",
+                    "2026-08-29T00:00:00Z",
+                ),
+                (
+                    "project_abcdef1234567890abcd",
+                    "prj_semantic-but-wrong",
+                    "Malformed Prefix",
+                    "D:/malformed-prefix",
+                    "2026-08-29T00:00:00Z",
+                    "2026-08-29T00:00:00Z",
+                ),
+            ],
+        )
+        connection.execute("INSERT INTO schema_meta(version) VALUES (15)")
+
+    Database(settings.database_path).initialize()
+
+    with sqlite3.connect(settings.database_path) as connection:
+        version = connection.execute("SELECT version FROM schema_meta").fetchone()[0]
+        project_keys = dict(
+            connection.execute("SELECT id, project_key FROM projects").fetchall()
+        )
+
+    assert version == SCHEMA_VERSION
+    assert project_keys == {
+        "project_1234567890abcdef1234": "prj_1234567890abcdef1234",
+        "project_abcdef1234567890abcd": "prj_abcdef1234567890abcd",
+    }

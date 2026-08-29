@@ -7,6 +7,8 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
+from .contracts import KNOWLEDGE_DEFAULT_KINDS, KNOWLEDGE_KIND_PATTERN
+
 
 CONFIG_FILE_SCHEMA: dict[str, dict[str, tuple[type, ...]]] = {
     "application": {
@@ -31,6 +33,10 @@ CONFIG_FILE_SCHEMA: dict[str, dict[str, tuple[type, ...]]] = {
         "pool_min_size": (int,),
         "pool_max_size": (int,),
         "connect_timeout_seconds": (int, float),
+    },
+    "knowledge": {
+        "kinds": (list,),
+        "require_verified_task": (bool,),
     },
     "coordination": {
         "heartbeat_timeout_seconds": (int,),
@@ -90,6 +96,28 @@ def default_data_dir(explicit: str | Path | None = None) -> Path:
     return (default_application_root() / ".agentchatroom" / "runtime").resolve()
 
 
+def normalize_knowledge_kinds(values: Any) -> tuple[str, ...]:
+    """Validate and normalize configured Knowledge kinds from any adapter."""
+    if values is None:
+        return tuple(KNOWLEDGE_DEFAULT_KINDS)
+    if isinstance(values, str):
+        values = [item for item in values.split(",")]
+    if not isinstance(values, (list, tuple)) or not values:
+        raise ValueError("knowledge kinds must be a non-empty list")
+    normalized: list[str] = []
+    for value in values:
+        kind = str(value).strip()
+        if not KNOWLEDGE_KIND_PATTERN.fullmatch(kind):
+            raise ValueError(
+                "every knowledge kind must match ^[a-z][a-z0-9_-]{0,63}$"
+            )
+        normalized.append(kind)
+    unique = tuple(dict.fromkeys(normalized))
+    if not unique:
+        raise ValueError("knowledge kinds must contain at least one kind")
+    return unique
+
+
 @dataclass(frozen=True, slots=True)
 class Settings:
     data_dir: Path
@@ -126,6 +154,8 @@ class Settings:
     max_lease_ttl_seconds: int = 86400
     sse_poll_interval_seconds: float = 0.5
     presence_refresh_interval_seconds: float = 1.0
+    knowledge_kinds: tuple[str, ...] = tuple(KNOWLEDGE_DEFAULT_KINDS)
+    knowledge_require_verified_task: bool = True
     product_name: str = "AgentChatRoom"
     default_theme: str = "system"
 
@@ -175,6 +205,8 @@ def _merge_toml(path: Path) -> dict[str, Any]:
             if invalid:
                 names = " or ".join(item.__name__ for item in expected)
                 raise ValueError(f"[{section}].{key} must be {names}")
+        if section == "knowledge" and "kinds" in values:
+            values["kinds"] = list(normalize_knowledge_kinds(values["kinds"]))
     return {
         "config_schema_version": raw.get("application", {}).get("schema_version"),
         "deployment_profile": raw.get("application", {}).get("deployment_profile"),
@@ -198,6 +230,10 @@ def _merge_toml(path: Path) -> dict[str, Any]:
         "database_pool_max_size": raw.get("database", {}).get("pool_max_size"),
         "database_connect_timeout_seconds": raw.get("database", {}).get(
             "connect_timeout_seconds"
+        ),
+        "knowledge_kinds": raw.get("knowledge", {}).get("kinds"),
+        "knowledge_require_verified_task": raw.get("knowledge", {}).get(
+            "require_verified_task"
         ),
         "heartbeat_timeout_seconds": raw.get("coordination", {}).get(
             "heartbeat_timeout_seconds"
@@ -423,6 +459,15 @@ def load_settings(
                 "AGENTCHATROOM_PRESENCE_REFRESH_INTERVAL_SECONDS",
                 file_values.get("presence_refresh_interval_seconds", 1.0),
             )
+        ),
+        "knowledge_kinds": normalize_knowledge_kinds(
+            os.getenv("AGENTCHATROOM_KNOWLEDGE_KINDS")
+            if os.getenv("AGENTCHATROOM_KNOWLEDGE_KINDS") is not None
+            else file_values.get("knowledge_kinds")
+        ),
+        "knowledge_require_verified_task": environment_bool(
+            "AGENTCHATROOM_KNOWLEDGE_REQUIRE_VERIFIED_TASK",
+            file_values.get("knowledge_require_verified_task", True),
         ),
         "product_name": os.getenv(
             "AGENTCHATROOM_PRODUCT_NAME", file_values.get("product_name", "AgentChatRoom")

@@ -23,6 +23,12 @@ from .contracts import (
     HANDOFF_RESPONSES,
     HANDOFF_STATUSES,
     INTEGRATION_RESULTS,
+    KNOWLEDGE_ASSET_STATUSES,
+    KNOWLEDGE_ASSET_TRANSITIONS,
+    KNOWLEDGE_OWNER_KINDS,
+    KNOWLEDGE_REVIEW_VERDICTS,
+    KNOWLEDGE_SCHEMA_VERSION,
+    KNOWLEDGE_SOURCE_TYPES,
     LEGACY_TASK_STATUSES,
     LEGACY_TASK_TRANSITIONS,
     MODEL_DISPLAY_NAME_MAX_LENGTH,
@@ -53,6 +59,7 @@ AGENT_PERMISSIONS = {
     "task:write",
     "lease:write",
     "review:write",
+    "knowledge:write",
     "integration:write",
     "audit:read",
     "member:read",
@@ -253,6 +260,23 @@ def _project_git_info(root: Path) -> tuple[str, Path]:
         return remote, Path(top).resolve() if top else root
     except (OSError, subprocess.SubprocessError):
         return "", root
+
+
+def _project_scope(
+    remote: str, git_root: Path, logical_path: str
+) -> tuple[str, str, str]:
+    if remote:
+        return ("git", normalize_remote(remote), logical_path)
+    return ("path", os.path.normcase(str(git_root.resolve())), logical_path)
+
+
+def _stored_project_scope(project: Mapping[str, Any]) -> tuple[str, str, str]:
+    logical_path = str(project["logical_path"] or "")
+    remote = str(project["git_remote"] or "")
+    if remote:
+        return ("git", normalize_remote(remote), logical_path)
+    root_path = Path(str(project["root_path"])).expanduser().resolve()
+    return ("path", os.path.normcase(str(root_path)), logical_path)
 
 
 class AgentChatRoomService:
@@ -506,9 +530,12 @@ class AgentChatRoomService:
         return hashlib.sha256(fingerprint.encode()).hexdigest()
 
     def _agent_identities(
-        self, agents: Iterable[Mapping[str, Any]]
+        self,
+        agents: Iterable[Mapping[str, Any]],
+        tasks: Iterable[Mapping[str, Any]] = (),
     ) -> list[dict[str, Any]]:
         sessions_list = list(agents)
+        tasks_list = list(tasks)
         explicit_keys_by_legacy_fingerprint: dict[str, set[str]] = {}
         explicit_keys_by_legacy_scope: dict[str, set[str]] = {}
         for agent in sessions_list:
@@ -561,12 +588,16 @@ class AgentChatRoomService:
                     str(session.get("created_at") or ""),
                 ),
             )
-            activity_status = (
-                max(
-                    (str(session["status"]) for session in connected),
-                    key=lambda status: AGENT_ACTIVITY_PRIORITY.get(status, -1),
-                )
-                if connected
+            session_ids = {str(session["id"]) for session in sessions}
+            owned_tasks = [
+                task
+                for task in tasks_list
+                if str(task.get("owner_session_id") or "") in session_ids
+                and str(task.get("status") or "") not in {"done", "cancelled"}
+            ]
+            current_task = (
+                max(owned_tasks, key=lambda task: str(task.get("updated_at") or ""))
+                if owned_tasks
                 else None
             )
             last_activity_values = [
@@ -591,8 +622,17 @@ class AgentChatRoomService:
                     "client": representative["client"],
                     "role": representative["role"],
                     "connection_status": "connected" if connected else "disconnected",
-                    "activity_status": activity_status,
-                    "status": activity_status or "registered",
+                    "activity_status": None,
+                    "status": "online" if connected else "registered",
+                    "current_task_id": str(current_task.get("id") or "")
+                    if current_task
+                    else "",
+                    "current_task_title": str(current_task.get("title") or "")
+                    if current_task
+                    else "",
+                    "current_task_status": str(current_task.get("status") or "")
+                    if current_task
+                    else "",
                     "session_count": len(sessions),
                     "active_session_count": len(connected),
                     "session_ids": [str(session["id"]) for session in sessions],
@@ -678,6 +718,47 @@ class AgentChatRoomService:
         data["tests"] = json_load(data.pop("tests_json"), [])
         return data
 
+    def _knowledge_version_dict(self, row: Mapping[str, Any]) -> dict[str, Any]:
+        data = dict(row)
+        data["tags"] = json_load(data.pop("tags_json"), [])
+        data["source_event_ids"] = [
+            int(item) for item in json_load(data.pop("source_event_ids_json"), [])
+        ]
+        return data
+
+    def _knowledge_review_dict(self, row: Mapping[str, Any]) -> dict[str, Any]:
+        data = dict(row)
+        data["criteria"] = json_load(data.pop("criteria_json"), [])
+        return data
+
+    def _knowledge_asset_dict(
+        self, connection: Any, row: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        data = dict(row)
+        data["schema_version"] = KNOWLEDGE_SCHEMA_VERSION
+        current = connection.execute(
+            """
+            SELECT id, version, title, summary, tags_json, content_hash,
+                   supersedes_version_id, created_at
+            FROM knowledge_asset_versions WHERE id = ?
+            """,
+            (row["current_version_id"],),
+        ).fetchone() if row["current_version_id"] else None
+        if current is not None:
+            data["current_version"] = {
+                "version_id": current["id"],
+                "version": int(current["version"]),
+                "title": current["title"],
+                "summary": current["summary"],
+                "tags": json_load(current["tags_json"], []),
+                "content_hash": current["content_hash"],
+                "supersedes_version_id": current["supersedes_version_id"],
+                "created_at": current["created_at"],
+            }
+        else:
+            data["current_version"] = None
+        return data
+
     def _task_with_dependencies(
         self, connection: Any, row: Mapping[str, Any]
     ) -> dict[str, Any]:
@@ -740,7 +821,6 @@ class AgentChatRoomService:
         *,
         root_path: str,
         name: str | None = None,
-        project_key: str | None = None,
         logical_path: str = "",
         settings: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
@@ -753,35 +833,63 @@ class AgentChatRoomService:
             )
         remote, git_root = _project_git_info(root)
         logical = logical_path.strip().replace("\\", "/").strip("/")
-        identity = project_key or (
-            f"git:{normalize_remote(remote)}:{logical}"
-            if remote
-            else f"path:{os.path.normcase(str(git_root))}:{logical}"
-        )
-        digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:20]
+        candidate_scope = _project_scope(remote, git_root, logical)
         now = iso_now()
         normalized_settings = normalize_project_settings(settings)
         with self.database.connect(write=True) as connection:
-            existing = connection.execute(
-                "SELECT * FROM projects WHERE project_key = ?", (identity,)
-            ).fetchone()
-            if existing:
-                if existing["archived_at"] is not None:
-                    connection.execute(
-                        "UPDATE projects SET archived_at = NULL, updated_at = ? WHERE id = ?",
-                        (now, existing["id"]),
-                    )
-                    self._emit(
-                        connection,
-                        existing["id"],
-                        "project.restored",
-                        payload={"root_path": str(root)},
-                    )
-                    existing = connection.execute(
-                        "SELECT * FROM projects WHERE id = ?", (existing["id"],)
-                    ).fetchone()
-                return self._project_dict(existing)
-            project_id = f"project_{digest}"
+            scope_projects = [
+                project
+                for project in connection.execute("SELECT * FROM projects").fetchall()
+                if _stored_project_scope(project) == candidate_scope
+            ]
+            active_conflicts = [
+                project
+                for project in scope_projects
+                if project["archived_at"] is None
+            ]
+            if len(active_conflicts) == 1:
+                return self._project_dict(active_conflicts[0])
+            if len(active_conflicts) > 1:
+                raise DomainError(
+                    "project_scope_conflict",
+                    "This repository scope has multiple active Rooms and requires operator cleanup",
+                    status_code=409,
+                    details={
+                        "project_ids": [project["id"] for project in active_conflicts],
+                        "project_keys": [project["project_key"] for project in active_conflicts],
+                    },
+                )
+            archived_scope = [
+                project for project in scope_projects if project["archived_at"] is not None
+            ]
+            if len(archived_scope) == 1:
+                archived = archived_scope[0]
+                connection.execute(
+                    "UPDATE projects SET archived_at = NULL, updated_at = ? WHERE id = ?",
+                    (now, archived["id"]),
+                )
+                self._emit(
+                    connection,
+                    archived["id"],
+                    "project.restored",
+                    payload={"root_path": str(root)},
+                )
+                restored = connection.execute(
+                    "SELECT * FROM projects WHERE id = ?", (archived["id"],)
+                ).fetchone()
+                return self._project_dict(restored)
+            if len(archived_scope) > 1:
+                raise DomainError(
+                    "project_scope_conflict",
+                    "This repository scope has multiple archived Rooms and requires operator cleanup",
+                    status_code=409,
+                    details={
+                        "project_ids": [project["id"] for project in archived_scope],
+                        "project_keys": [project["project_key"] for project in archived_scope],
+                    },
+                )
+            project_id = new_id("project")
+            project_key = f"prj_{project_id.removeprefix('project_')}"
             connection.execute(
                 """
                 INSERT INTO projects(
@@ -791,7 +899,7 @@ class AgentChatRoomService:
                 """,
                 (
                     project_id,
-                    identity,
+                    project_key,
                     name or root.name,
                     str(root),
                     remote or None,
@@ -811,6 +919,83 @@ class AgentChatRoomService:
                 "SELECT * FROM projects WHERE id = ?", (project_id,)
             ).fetchone()
             return self._project_dict(row)
+
+    def resolve_project_for_join(
+        self,
+        *,
+        root_path: str,
+        registered_project_key: str | None = None,
+        logical_path: str = "",
+    ) -> dict[str, Any]:
+        root = Path(root_path).expanduser().resolve()
+        if not root.is_dir():
+            raise DomainError(
+                "project_path_not_found",
+                "Project root must be an existing directory",
+                details={"root_path": str(root)},
+            )
+        remote, git_root = _project_git_info(root)
+        logical = logical_path.strip().replace("\\", "/").strip("/")
+        candidate_scope = _project_scope(remote, git_root, logical)
+        with self.database.connect() as connection:
+            scope_projects = [
+                project
+                for project in connection.execute("SELECT * FROM projects").fetchall()
+                if _stored_project_scope(project) == candidate_scope
+            ]
+            active_scope = [
+                project for project in scope_projects if project["archived_at"] is None
+            ]
+            if len(active_scope) == 1:
+                return self._project_dict(active_scope[0])
+            if len(active_scope) > 1:
+                raise DomainError(
+                    "project_scope_conflict",
+                    "This repository scope has multiple active Rooms and requires operator cleanup",
+                    status_code=409,
+                    details={
+                        "project_ids": [project["id"] for project in active_scope],
+                        "project_keys": [project["project_key"] for project in active_scope],
+                    },
+                )
+            archived_scope = [
+                project for project in scope_projects if project["archived_at"] is not None
+            ]
+            if len(archived_scope) == 1:
+                archived = archived_scope[0]
+                raise DomainError(
+                    "project_archived",
+                    "Project is archived and must be restored explicitly before agents join",
+                    status_code=409,
+                    details={
+                        "project_id": archived["id"],
+                        "project_key": archived["project_key"],
+                        "archived_at": archived["archived_at"],
+                    },
+                )
+            if archived_scope:
+                raise DomainError(
+                    "project_scope_conflict",
+                    "This repository scope has multiple archived Rooms and requires operator cleanup",
+                    status_code=409,
+                    details={
+                        "project_ids": [project["id"] for project in archived_scope],
+                        "project_keys": [
+                            project["project_key"] for project in archived_scope
+                        ],
+                    },
+                )
+            if str(registered_project_key or "").strip():
+                raise DomainError(
+                    "project_registration_orphaned",
+                    "Checkout registration points to a Project that no longer exists; create a new Project explicitly",
+                    status_code=409,
+                    details={"registered_project_key": registered_project_key},
+                )
+        return self.create_project(
+            root_path=str(root),
+            logical_path=logical,
+        )
 
     def list_projects(self) -> list[dict[str, Any]]:
         with self.database.connect() as connection:
@@ -1812,11 +1997,7 @@ class AgentChatRoomService:
         project_id: str,
         session_id: str,
         token: str,
-        *,
-        status: str = "online",
     ) -> dict[str, Any]:
-        if status not in AGENT_STATUSES - {"offline"}:
-            raise DomainError("invalid_agent_status", "Unsupported agent status")
         with self.database.connect(write=True) as connection:
             self._authenticate(connection, project_id, session_id, token)
             now = iso_now()
@@ -1829,7 +2010,7 @@ class AgentChatRoomService:
                 SET status = ?, last_heartbeat = ?, token_expires_at = ?
                 WHERE id = ?
                 """,
-                (status, now, token_expires_at, session_id),
+                ("online", now, token_expires_at, session_id),
             )
             leases = connection.execute(
                 """
@@ -2002,13 +2183,8 @@ class AgentChatRoomService:
             )
         if session_id:
             with self.database.connect() as connection:
-                agent = self._authenticate(connection, project_id, session_id, token or "")
-            self.heartbeat(
-                project_id,
-                session_id,
-                token or "",
-                status=agent["status"] if agent["status"] != "offline" else "online",
-            )
+                self._authenticate(connection, project_id, session_id, token or "")
+            self.heartbeat(project_id, session_id, token or "")
         event_result = self.list_events(project_id, after=after)
         unread_count = None
         if session_id:
@@ -3518,6 +3694,24 @@ class AgentChatRoomService:
                 """,
                 (now, task_id),
             )
+            active_leases = connection.execute(
+                """
+                SELECT id FROM file_leases
+                WHERE project_id = ? AND task_id = ? AND session_id = ?
+                  AND released_at IS NULL
+                """,
+                (project_id, task_id, session_id),
+            ).fetchall()
+            released_lease_ids = [row["id"] for row in active_leases]
+            if released_lease_ids:
+                connection.execute(
+                    """
+                    UPDATE file_leases SET released_at = ?
+                    WHERE project_id = ? AND task_id = ? AND session_id = ?
+                      AND released_at IS NULL
+                    """,
+                    (now, project_id, task_id, session_id),
+                )
             report_event_id = self._emit(
                 connection,
                 project_id,
@@ -3532,6 +3726,7 @@ class AgentChatRoomService:
                     "commit_hash": commit_hash.strip(),
                     "tests": tests,
                     "system_evidence": system_evidence,
+                    "released_lease_ids": released_lease_ids,
                 },
             )
             completion_event_id = self._emit(
@@ -3819,6 +4014,750 @@ class AgentChatRoomService:
                 "cursor": event_id,
             }
 
+    def _require_knowledge_asset(
+        self, connection: Any, project_id: str, asset_id: str
+    ) -> Mapping[str, Any]:
+        row = connection.execute(
+            "SELECT * FROM knowledge_assets WHERE id = ? AND project_id = ?",
+            (asset_id, project_id),
+        ).fetchone()
+        if row is None:
+            raise DomainError(
+                "knowledge_asset_not_found",
+                "Knowledge asset does not exist in this project",
+                status_code=404,
+            )
+        return row
+
+    def _validate_knowledge_source(
+        self,
+        connection: Any,
+        project_id: str,
+        *,
+        source_type: str,
+        source_task_id: str,
+        source_report_id: str,
+        source_review_id: str,
+        source_integration_id: str,
+        source_event_ids: list[int],
+    ) -> str:
+        if source_type not in KNOWLEDGE_SOURCE_TYPES:
+            raise DomainError(
+                "invalid_knowledge_source_type",
+                "Knowledge source type must be one of "
+                + ", ".join(sorted(KNOWLEDGE_SOURCE_TYPES)),
+                details={"source_type": source_type},
+            )
+        task: Mapping[str, Any] | None = None
+        if source_task_id:
+            task = connection.execute(
+                "SELECT id, verification_status FROM tasks WHERE id = ? AND project_id = ?",
+                (source_task_id, project_id),
+            ).fetchone()
+            if task is None:
+                raise DomainError(
+                    "knowledge_source_not_found",
+                    "Source task does not exist in this project",
+                    status_code=404,
+                    details={"source_task_id": source_task_id},
+                )
+        referenced_task_ids: set[str] = set()
+        for field, value, table in (
+            ("source_report_id", source_report_id, "work_reports"),
+            ("source_review_id", source_review_id, "reviews"),
+            ("source_integration_id", source_integration_id, "task_integrations"),
+        ):
+            if not value:
+                continue
+            row = connection.execute(
+                f"SELECT id, task_id FROM {table} WHERE id = ? AND project_id = ?",
+                (value, project_id),
+            ).fetchone()
+            if row is None:
+                raise DomainError(
+                    "knowledge_source_not_found",
+                    f"{field} does not exist in this project",
+                    status_code=404,
+                    details={field: value},
+                )
+            if row["task_id"]:
+                referenced_task_ids.add(str(row["task_id"]))
+            if source_task_id and row["task_id"] != source_task_id:
+                raise DomainError(
+                    "knowledge_source_mismatch",
+                    f"{field} belongs to a different task than source_task_id",
+                    status_code=409,
+                    details={field: value, "source_task_id": source_task_id},
+                )
+        if len(referenced_task_ids) > 1:
+            raise DomainError(
+                "knowledge_source_mismatch",
+                "Referenced sources belong to different tasks",
+                status_code=409,
+                details={"source_task_ids": sorted(referenced_task_ids)},
+            )
+        derived_task_id = next(iter(referenced_task_ids), "")
+        normalized_task_id = source_task_id or derived_task_id
+        if source_type == "task_result" and not normalized_task_id:
+            raise DomainError(
+                "knowledge_source_task_required",
+                "task_result knowledge must identify its source task directly or "
+                "through a referenced report, review, or integration",
+                status_code=409,
+                details={"source_type": source_type},
+            )
+        for event_id in source_event_ids:
+            row = connection.execute(
+                "SELECT id FROM events WHERE id = ? AND project_id = ?",
+                (event_id, project_id),
+            ).fetchone()
+            if row is None:
+                raise DomainError(
+                    "knowledge_source_not_found",
+                    "source_event_ids must reference events in this project",
+                    status_code=404,
+                    details={"event_id": event_id},
+                )
+        return normalized_task_id
+
+    @idempotent_write("knowledge.candidate_submit")
+    def submit_knowledge_candidate(
+        self,
+        project_id: str,
+        *,
+        session_id: str,
+        token: str,
+        title: str,
+        body: str,
+        kind: str,
+        summary: str = "",
+        tags: list[str] | None = None,
+        source_type: str = "manual",
+        source_task_id: str = "",
+        source_report_id: str = "",
+        source_review_id: str = "",
+        source_integration_id: str = "",
+        source_event_ids: list[int] | None = None,
+        asset_id: str = "",
+    ) -> dict[str, Any]:
+        clean_title = title.strip()
+        clean_body = body.strip()
+        clean_kind = kind.strip()
+        clean_summary = summary.strip()
+        clean_tags = sorted({str(tag).strip() for tag in (tags or []) if str(tag).strip()})
+        clean_event_ids = sorted({int(event_id) for event_id in (source_event_ids or [])})
+        if not clean_title or not clean_body:
+            raise DomainError(
+                "insufficient_knowledge_content",
+                "Knowledge candidate requires a title and a body",
+            )
+        allowed_kinds = self.settings.knowledge_kinds
+        if clean_kind not in allowed_kinds:
+            raise DomainError(
+                "invalid_knowledge_kind",
+                "Knowledge kind is not enabled for this deployment",
+                details={"kind": clean_kind, "allowed": list(allowed_kinds)},
+            )
+        clean_task_id = source_task_id.strip()
+        clean_report_id = source_report_id.strip()
+        clean_review_id = source_review_id.strip()
+        clean_integration_id = source_integration_id.strip()
+        clean_source_type = source_type.strip()
+        with self.database.connect(write=True) as connection:
+            agent = self._authenticate(connection, project_id, session_id, token)
+            self._require_project(connection, project_id)
+            clean_task_id = self._validate_knowledge_source(
+                connection,
+                project_id,
+                source_type=clean_source_type,
+                source_task_id=clean_task_id,
+                source_report_id=clean_report_id,
+                source_review_id=clean_review_id,
+                source_integration_id=clean_integration_id,
+                source_event_ids=clean_event_ids,
+            )
+            now = iso_now()
+            target_asset_id = asset_id.strip()
+            revision = False
+            if target_asset_id:
+                asset = self._require_knowledge_asset(
+                    connection, project_id, target_asset_id
+                )
+                if clean_kind != asset["kind"]:
+                    raise DomainError(
+                        "knowledge_kind_immutable",
+                        "Knowledge kind is fixed per asset; create a new asset for "
+                        "a different kind",
+                        status_code=409,
+                        details={"asset_kind": asset["kind"], "kind": clean_kind},
+                    )
+                if asset["status"] == "archived":
+                    raise DomainError(
+                        "knowledge_asset_archived",
+                        "Archived knowledge assets cannot receive new versions",
+                        status_code=409,
+                    )
+                if asset["status"] != "candidate" and "candidate" not in (
+                    KNOWLEDGE_ASSET_TRANSITIONS[asset["status"]]
+                ):
+                    raise DomainError(
+                        "knowledge_invalid_transition",
+                        f"Knowledge asset in status {asset['status']} must be "
+                        "superseded before a new version is submitted",
+                        status_code=409,
+                        details={
+                            "status": asset["status"],
+                            "allowed": sorted(
+                                KNOWLEDGE_ASSET_TRANSITIONS[asset["status"]]
+                            ),
+                        },
+                    )
+                revision = True
+                previous_version_id = asset["current_version_id"]
+                next_version_number = int(
+                    connection.execute(
+                        "SELECT COALESCE(MAX(version), 0) AS latest FROM knowledge_asset_versions WHERE asset_id = ?",
+                        (target_asset_id,),
+                    ).fetchone()["latest"]
+                ) + 1
+                previous_status = asset["status"]
+                owner_kind = asset["owner_kind"]
+                owner_id = asset["owner_id"]
+                new_asset_id = target_asset_id
+            else:
+                agent_key = str(agent["agent_key"] or "").strip()
+                if agent_key:
+                    owner_kind, owner_id = "agent_key", agent_key
+                elif agent["member_id"]:
+                    owner_kind, owner_id = "member", agent["member_id"]
+                else:
+                    owner_kind, owner_id = "agent_key", ""
+                previous_version_id = None
+                next_version_number = 1
+                previous_status = None
+                new_asset_id = new_id("kasset")
+            version_id = new_id("kversion")
+            content_hash = hashlib.sha256(
+                json_dump(
+                    {
+                        "title": clean_title,
+                        "body": clean_body,
+                        "summary": clean_summary,
+                        "tags": clean_tags,
+                    }
+                ).encode()
+            ).hexdigest()
+            if revision:
+                connection.execute(
+                    """
+                    UPDATE knowledge_assets
+                    SET status = 'candidate', updated_at = ?
+                    WHERE id = ? AND project_id = ?
+                    """,
+                    (now, new_asset_id, project_id),
+                )
+            else:
+                connection.execute(
+                    """
+                    INSERT INTO knowledge_assets(
+                        id, project_id, kind, owner_kind, owner_id, status,
+                        current_version_id, created_by_session_id, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, 'candidate', NULL, ?, ?, ?)
+                    """,
+                    (
+                        new_asset_id,
+                        project_id,
+                        clean_kind,
+                        owner_kind,
+                        owner_id,
+                        session_id,
+                        now,
+                        now,
+                    ),
+                )
+            connection.execute(
+                """
+                INSERT INTO knowledge_asset_versions(
+                    id, project_id, asset_id, version, title, body, summary,
+                    content_hash, tags_json, source_type, source_task_id,
+                    source_report_id, source_review_id, source_integration_id,
+                    source_event_ids_json, created_by_session_id,
+                    supersedes_version_id, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    version_id,
+                    project_id,
+                    new_asset_id,
+                    next_version_number,
+                    clean_title,
+                    clean_body,
+                    clean_summary,
+                    content_hash,
+                    json_dump(clean_tags),
+                    clean_source_type,
+                    clean_task_id or None,
+                    clean_report_id or None,
+                    clean_review_id or None,
+                    clean_integration_id or None,
+                    json_dump(clean_event_ids),
+                    session_id,
+                    previous_version_id,
+                    now,
+                ),
+            )
+            connection.execute(
+                """
+                UPDATE knowledge_assets
+                SET current_version_id = ?, updated_at = ?
+                WHERE id = ? AND project_id = ?
+                """,
+                (version_id, now, new_asset_id, project_id),
+            )
+            payload = {
+                "asset_id": new_asset_id,
+                "version_id": version_id,
+                "version": next_version_number,
+                "kind": clean_kind,
+                "title": clean_title,
+                "owner_kind": owner_kind,
+                "owner_id": owner_id,
+                "source_type": clean_source_type,
+                "source_task_id": clean_task_id,
+                "source_report_id": clean_report_id,
+                "source_review_id": clean_review_id,
+                "source_integration_id": clean_integration_id,
+                "source_event_ids": clean_event_ids,
+                "supersedes_version_id": previous_version_id,
+                "status": "candidate",
+                "created_by_agent_key": str(agent["agent_key"] or "").strip(),
+            }
+            if revision:
+                payload["previous_status"] = previous_status
+            event_id = self._emit(
+                connection,
+                project_id,
+                "knowledge.candidate_submitted",
+                actor_session_id=session_id,
+                task_id=clean_task_id or None,
+                payload=payload,
+            )
+            asset_row = connection.execute(
+                "SELECT * FROM knowledge_assets WHERE id = ?", (new_asset_id,)
+            ).fetchone()
+            return {
+                "asset": self._knowledge_asset_dict(connection, asset_row),
+                "version_id": version_id,
+                "version": next_version_number,
+                "status": "candidate",
+                "revision": revision,
+                "event_id": event_id,
+                "cursor": event_id,
+            }
+
+    @idempotent_write("knowledge.review")
+    def submit_knowledge_review(
+        self,
+        project_id: str,
+        asset_id: str,
+        *,
+        reviewer_session_id: str,
+        token: str,
+        verdict: str,
+        criteria: list[dict[str, Any]],
+        notes: str = "",
+    ) -> dict[str, Any]:
+        if verdict not in KNOWLEDGE_REVIEW_VERDICTS:
+            raise DomainError(
+                "invalid_review_verdict", "Unsupported review verdict"
+            )
+        if not criteria:
+            raise DomainError(
+                "missing_review_criteria", "Review must assess acceptance criteria"
+            )
+        assessed = {
+            str(item.get("criterion", "")).strip(): str(item.get("status", "")).strip()
+            for item in criteria
+        }
+        if not all(assessed) or any(
+            status not in {"passed", "failed"} for status in assessed.values()
+        ):
+            raise DomainError(
+                "invalid_review_criteria",
+                "Every review criterion requires a criterion and passed/failed status",
+            )
+        if verdict == "approved" and any(
+            status != "passed" for status in assessed.values()
+        ):
+            raise DomainError(
+                "acceptance_criteria_not_satisfied",
+                "Approved reviews must mark every criterion as passed",
+                status_code=409,
+                details={"assessed": assessed},
+            )
+        with self.database.connect(write=True) as connection:
+            self._authenticate(connection, project_id, reviewer_session_id, token)
+            asset = self._require_knowledge_asset(connection, project_id, asset_id)
+            if asset["status"] != "candidate":
+                raise DomainError(
+                    "knowledge_not_reviewable",
+                    "Only candidate knowledge assets can be reviewed",
+                    status_code=409,
+                    details={"status": asset["status"]},
+                )
+            version = connection.execute(
+                "SELECT * FROM knowledge_asset_versions WHERE id = ?",
+                (asset["current_version_id"],),
+            ).fetchone()
+            if version is None:
+                raise DomainError(
+                    "knowledge_version_not_found",
+                    "Knowledge asset has no current version",
+                    status_code=409,
+                )
+            creator = connection.execute(
+                "SELECT id, agent_key FROM agent_sessions WHERE id = ?",
+                (version["created_by_session_id"],),
+            ).fetchone()
+            reviewer_key = str(
+                connection.execute(
+                    "SELECT agent_key FROM agent_sessions WHERE id = ?",
+                    (reviewer_session_id,),
+                ).fetchone()["agent_key"]
+                or ""
+            ).strip()
+            creator_key = str(creator["agent_key"] or "").strip() if creator else ""
+            if reviewer_session_id == version["created_by_session_id"] or (
+                creator_key and reviewer_key and reviewer_key == creator_key
+            ):
+                raise DomainError(
+                    "knowledge_reviewer_not_independent",
+                    "The submitting agent cannot independently approve its own "
+                    "knowledge candidate",
+                    status_code=409,
+                )
+            next_status = "approved" if verdict == "approved" else "rejected"
+            if next_status not in KNOWLEDGE_ASSET_TRANSITIONS[asset["status"]]:
+                raise DomainError(
+                    "knowledge_invalid_transition",
+                    f"Knowledge asset cannot move from {asset['status']} to {next_status}",
+                    status_code=409,
+                )
+            if verdict == "approved" and self.settings.knowledge_require_verified_task:
+                version_task_id = str(version["source_task_id"] or "")
+                if version["source_type"] == "task_result" and not version_task_id:
+                    raise DomainError(
+                        "knowledge_source_task_required",
+                        "task_result knowledge must identify its source task "
+                        "before approval",
+                        status_code=409,
+                    )
+                if version_task_id:
+                    source_task = connection.execute(
+                        "SELECT verification_status FROM tasks WHERE id = ? AND project_id = ?",
+                        (version_task_id, project_id),
+                    ).fetchone()
+                    if source_task is None or source_task["verification_status"] != "approved":
+                        raise DomainError(
+                            "knowledge_task_not_verified",
+                            "Knowledge tied to a task can be approved only after the task "
+                            "is independently verified",
+                            status_code=409,
+                            details={
+                                "source_task_id": version_task_id,
+                                "verification_status": (
+                                    source_task["verification_status"]
+                                    if source_task
+                                    else "missing"
+                                ),
+                            },
+                        )
+            review_id = new_id("kreview")
+            now = iso_now()
+            connection.execute(
+                """
+                INSERT INTO knowledge_reviews(
+                    id, project_id, asset_id, version_id, reviewer_session_id,
+                    verdict, criteria_json, notes, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    review_id,
+                    project_id,
+                    asset_id,
+                    version["id"],
+                    reviewer_session_id,
+                    verdict,
+                    json_dump(criteria),
+                    notes.strip(),
+                    now,
+                ),
+            )
+            connection.execute(
+                """
+                UPDATE knowledge_assets
+                SET status = ?, updated_at = ?
+                WHERE id = ? AND project_id = ?
+                """,
+                (next_status, now, asset_id, project_id),
+            )
+            review_event_id = self._emit(
+                connection,
+                project_id,
+                "knowledge.reviewed",
+                actor_session_id=reviewer_session_id,
+                task_id=version["source_task_id"] or None,
+                payload={
+                    "review_id": review_id,
+                    "asset_id": asset_id,
+                    "version_id": version["id"],
+                    "verdict": verdict,
+                    "criteria": criteria,
+                    "notes": notes.strip(),
+                    "from_status": asset["status"],
+                    "status": next_status,
+                },
+            )
+            event_id = review_event_id
+            if verdict == "approved":
+                event_id = self._emit(
+                    connection,
+                    project_id,
+                    "knowledge.approved",
+                    actor_session_id=reviewer_session_id,
+                    task_id=version["source_task_id"] or None,
+                    payload={
+                        "review_id": review_id,
+                        "asset_id": asset_id,
+                        "version_id": version["id"],
+                        "status": next_status,
+                    },
+                )
+            asset_row = connection.execute(
+                "SELECT * FROM knowledge_assets WHERE id = ?", (asset_id,)
+            ).fetchone()
+            review_row = connection.execute(
+                "SELECT * FROM knowledge_reviews WHERE id = ?", (review_id,)
+            ).fetchone()
+            return {
+                "asset": self._knowledge_asset_dict(connection, asset_row),
+                "review": self._knowledge_review_dict(review_row),
+                "status": next_status,
+                "review_event_id": review_event_id,
+                "event_id": event_id,
+                "cursor": event_id,
+            }
+
+    @idempotent_write("knowledge.supersede")
+    def supersede_knowledge_asset(
+        self,
+        project_id: str,
+        asset_id: str,
+        *,
+        session_id: str,
+        token: str,
+        reason: str = "",
+    ) -> dict[str, Any]:
+        with self.database.connect(write=True) as connection:
+            self._authenticate(connection, project_id, session_id, token)
+            asset = self._require_knowledge_asset(connection, project_id, asset_id)
+            if "superseded" not in KNOWLEDGE_ASSET_TRANSITIONS[asset["status"]]:
+                raise DomainError(
+                    "knowledge_invalid_transition",
+                    f"Knowledge asset in status {asset['status']} cannot be superseded",
+                    status_code=409,
+                    details={
+                        "status": asset["status"],
+                        "allowed": sorted(
+                            KNOWLEDGE_ASSET_TRANSITIONS[asset["status"]]
+                        ),
+                    },
+                )
+            now = iso_now()
+            connection.execute(
+                """
+                UPDATE knowledge_assets
+                SET status = 'superseded', updated_at = ?
+                WHERE id = ? AND project_id = ?
+                """,
+                (now, asset_id, project_id),
+            )
+            event_id = self._emit(
+                connection,
+                project_id,
+                "knowledge.superseded",
+                actor_session_id=session_id,
+                payload={
+                    "asset_id": asset_id,
+                    "version_id": asset["current_version_id"],
+                    "from_status": asset["status"],
+                    "status": "superseded",
+                    "reason": reason.strip(),
+                },
+            )
+            asset_row = connection.execute(
+                "SELECT * FROM knowledge_assets WHERE id = ?", (asset_id,)
+            ).fetchone()
+            return {
+                "asset": self._knowledge_asset_dict(connection, asset_row),
+                "status": "superseded",
+                "event_id": event_id,
+                "cursor": event_id,
+            }
+
+    @idempotent_write("knowledge.archive")
+    def archive_knowledge_asset(
+        self,
+        project_id: str,
+        asset_id: str,
+        *,
+        session_id: str,
+        token: str,
+        reason: str = "",
+    ) -> dict[str, Any]:
+        with self.database.connect(write=True) as connection:
+            self._authenticate(connection, project_id, session_id, token)
+            asset = self._require_knowledge_asset(connection, project_id, asset_id)
+            if "archived" not in KNOWLEDGE_ASSET_TRANSITIONS[asset["status"]]:
+                raise DomainError(
+                    "knowledge_invalid_transition",
+                    f"Knowledge asset in status {asset['status']} cannot be archived",
+                    status_code=409,
+                    details={
+                        "status": asset["status"],
+                        "allowed": sorted(
+                            KNOWLEDGE_ASSET_TRANSITIONS[asset["status"]]
+                        ),
+                    },
+                )
+            now = iso_now()
+            connection.execute(
+                """
+                UPDATE knowledge_assets
+                SET status = 'archived', updated_at = ?
+                WHERE id = ? AND project_id = ?
+                """,
+                (now, asset_id, project_id),
+            )
+            event_id = self._emit(
+                connection,
+                project_id,
+                "knowledge.archived",
+                actor_session_id=session_id,
+                payload={
+                    "asset_id": asset_id,
+                    "version_id": asset["current_version_id"],
+                    "from_status": asset["status"],
+                    "status": "archived",
+                    "reason": reason.strip(),
+                },
+            )
+            asset_row = connection.execute(
+                "SELECT * FROM knowledge_assets WHERE id = ?", (asset_id,)
+            ).fetchone()
+            return {
+                "asset": self._knowledge_asset_dict(connection, asset_row),
+                "status": "archived",
+                "event_id": event_id,
+                "cursor": event_id,
+            }
+
+    def get_knowledge_asset(
+        self, project_id: str, asset_id: str, *, version_id: str = ""
+    ) -> dict[str, Any]:
+        with self.database.connect() as connection:
+            self._require_project(connection, project_id)
+            asset = self._require_knowledge_asset(connection, project_id, asset_id)
+            data = self._knowledge_asset_dict(connection, asset)
+            versions = [
+                self._knowledge_version_dict(row)
+                for row in connection.execute(
+                    """
+                    SELECT * FROM knowledge_asset_versions
+                    WHERE asset_id = ? ORDER BY version ASC
+                    """,
+                    (asset_id,),
+                ).fetchall()
+            ]
+            reviews = [
+                self._knowledge_review_dict(row)
+                for row in connection.execute(
+                    """
+                    SELECT * FROM knowledge_reviews
+                    WHERE asset_id = ? ORDER BY created_at ASC
+                    """,
+                    (asset_id,),
+                ).fetchall()
+            ]
+            selected = None
+            clean_version_id = version_id.strip()
+            if clean_version_id:
+                selected = next(
+                    (item for item in versions if item["id"] == clean_version_id),
+                    None,
+                )
+                if selected is None:
+                    raise DomainError(
+                        "knowledge_version_not_found",
+                        "Knowledge version does not belong to this asset",
+                        status_code=404,
+                        details={"version_id": clean_version_id},
+                    )
+            else:
+                selected = next(
+                    (item for item in versions if item["id"] == asset["current_version_id"]),
+                    None,
+                )
+            return {
+                **data,
+                "versions": versions,
+                "reviews": reviews,
+                "version": selected,
+            }
+
+    def list_knowledge_assets(
+        self,
+        project_id: str,
+        *,
+        status: str | None = None,
+        kind: str | None = None,
+        source_task_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        clean_status = (status or "").strip()
+        if clean_status and clean_status not in KNOWLEDGE_ASSET_STATUSES:
+            raise DomainError(
+                "invalid_knowledge_status",
+                "Unsupported knowledge asset status",
+                details={"status": clean_status},
+            )
+        clauses = ["a.project_id = ?"]
+        parameters: list[Any] = [project_id]
+        if clean_status:
+            clauses.append("a.status = ?")
+            parameters.append(clean_status)
+        clean_kind = (kind or "").strip()
+        if clean_kind:
+            clauses.append("a.kind = ?")
+            parameters.append(clean_kind)
+        clean_task_id = (source_task_id or "").strip()
+        if clean_task_id:
+            clauses.append(
+                "a.current_version_id IN (SELECT id FROM knowledge_asset_versions "
+                "WHERE source_task_id = ?)"
+            )
+            parameters.append(clean_task_id)
+        with self.database.connect() as connection:
+            self._require_project(connection, project_id)
+            rows = connection.execute(
+                f"""
+                SELECT a.* FROM knowledge_assets a
+                WHERE {' AND '.join(clauses)}
+                ORDER BY a.updated_at DESC
+                """,
+                parameters,
+            ).fetchall()
+            return [self._knowledge_asset_dict(connection, row) for row in rows]
+
     def _collect_git_evidence(
         self,
         project: Mapping[str, Any],
@@ -3967,7 +4906,7 @@ class AgentChatRoomService:
                 "project": project,
                 "members": members,
                 "agents": agents,
-                "agent_identities": self._agent_identities(agents),
+                "agent_identities": self._agent_identities(agents, tasks),
                 "tasks": tasks,
                 "leases": leases,
                 "reports": reports,
@@ -3975,6 +4914,38 @@ class AgentChatRoomService:
                 "acknowledgements": acknowledgements,
                 "cursor": cursor,
             }
+
+    def _export_knowledge_assets(self, project_id: str) -> list[dict[str, Any]]:
+        with self.database.connect() as connection:
+            self._require_project(connection, project_id)
+            assets: list[dict[str, Any]] = []
+            for row in connection.execute(
+                "SELECT * FROM knowledge_assets WHERE project_id = ? ORDER BY created_at",
+                (project_id,),
+            ).fetchall():
+                asset = self._knowledge_asset_dict(connection, row)
+                asset["versions"] = [
+                    self._knowledge_version_dict(version)
+                    for version in connection.execute(
+                        """
+                        SELECT * FROM knowledge_asset_versions
+                        WHERE asset_id = ? ORDER BY version ASC
+                        """,
+                        (row["id"],),
+                    ).fetchall()
+                ]
+                asset["reviews"] = [
+                    self._knowledge_review_dict(review)
+                    for review in connection.execute(
+                        """
+                        SELECT * FROM knowledge_reviews
+                        WHERE asset_id = ? ORDER BY created_at ASC
+                        """,
+                        (row["id"],),
+                    ).fetchall()
+                ]
+                assets.append(asset)
+            return assets
 
     def export_project(self, project_id: str) -> dict[str, Any]:
         snapshot = self.snapshot(project_id)
@@ -4000,5 +4971,6 @@ class AgentChatRoomService:
             "reports": snapshot["reports"],
             "reviews": snapshot["reviews"],
             "acknowledgements": snapshot["acknowledgements"],
+            "knowledge_assets": self._export_knowledge_assets(project_id),
             "events": events,
         }

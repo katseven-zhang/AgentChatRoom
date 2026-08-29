@@ -3,74 +3,96 @@ from __future__ import annotations
 from agentchatroom.presence import LocalPresenceManager
 
 
-def test_local_presence_keeps_status_without_advancing_room_cursor(service, project):
-    joined = service.join_room(
+def test_new_same_identity_session_supersedes_process_owned_session(service, project):
+    first = service.join_room(
         project["id"],
-        agent_key="presence-main",
-        name="Presence Agent",
-        client="generic",
+        agent_key="trae-main",
+        name="Trae",
+        client="trae",
         model="unknown",
     )
-    with service.database.connect() as connection:
-        cursor = service.latest_cursor(connection, project["id"])
+    second = service.join_room(
+        project["id"],
+        agent_key="trae-main",
+        name="Trae",
+        client="trae",
+        model="unknown",
+    )
+    manager = LocalPresenceManager(service, enabled=True, interval_seconds=60)
 
-    manager = LocalPresenceManager(service, enabled=True, interval_seconds=1)
     manager.register(
+        project["id"],
+        first["agent"]["id"],
+        first["token"],
+        agent_key="trae-main",
+    )
+    manager.register(
+        project["id"],
+        second["agent"]["id"],
+        second["token"],
+        agent_key="trae-main",
+    )
+
+    agents = {agent["id"]: agent for agent in service.snapshot(project["id"])["agents"]}
+    assert agents[first["agent"]["id"]]["status"] == "offline"
+    assert agents[second["agent"]["id"]]["status"] == "online"
+
+    manager.stop()
+    agents = {agent["id"]: agent for agent in service.snapshot(project["id"])["agents"]}
+    assert agents[second["agent"]["id"]]["status"] == "offline"
+
+
+def test_recovered_session_restores_identity_before_new_join(service, project):
+    first = service.join_room(
+        project["id"],
+        agent_key="codex-main",
+        name="Codex",
+        client="codex",
+        model="unknown",
+    )
+    second = service.join_room(
+        project["id"],
+        agent_key="codex-main",
+        name="Codex",
+        client="codex",
+        model="unknown",
+    )
+    manager = LocalPresenceManager(service, enabled=True, interval_seconds=60)
+
+    assert manager.ensure_registered(
+        project["id"], first["agent"]["id"], first["token"]
+    )
+    manager.register(
+        project["id"],
+        second["agent"]["id"],
+        second["token"],
+        agent_key="codex-main",
+    )
+
+    agents = {agent["id"]: agent for agent in service.snapshot(project["id"])["agents"]}
+    assert agents[first["agent"]["id"]]["status"] == "offline"
+    assert agents[second["agent"]["id"]]["status"] == "online"
+
+    manager.stop()
+
+
+def test_heartbeat_is_connection_liveness_not_manual_activity(service, project):
+    joined = service.join_room(
+        project["id"],
+        agent_key="codex-main",
+        name="Codex",
+        client="codex",
+        model="unknown",
+    )
+
+    heartbeat = service.heartbeat(
         project["id"],
         joined["agent"]["id"],
         joined["token"],
-        status="working",
     )
-    manager.heartbeat_once()
+    identity = service.snapshot(project["id"])["agent_identities"][0]
 
-    snapshot = service.snapshot(project["id"])
-    agent = next(item for item in snapshot["agents"] if item["id"] == joined["agent"]["id"])
-    assert agent["status"] == "working"
-    with service.database.connect() as connection:
-        assert service.latest_cursor(connection, project["id"]) == cursor
-
-
-def test_ensure_registered_recovers_presence_after_process_restart(service, project):
-    joined = service.join_room(
-        project["id"],
-        agent_key="presence-recovery",
-        name="Recovery Agent",
-        client="generic",
-        model="unknown",
-    )
-    session_id = joined["agent"]["id"]
-    token = joined["token"]
-
-    # First process registers presence, then "restarts" (registry lost).
-    first = LocalPresenceManager(service, enabled=True, interval_seconds=1)
-    first.register(project["id"], session_id, token, status="idle")
-    first.heartbeat_once()
-    restarted = LocalPresenceManager(service, enabled=True, interval_seconds=1)
-
-    # After restart, a successful authenticated room_sync proves liveness.
-    assert restarted.ensure_registered(project["id"], session_id, token) is True
-    # Idempotent: repeated calls do not duplicate registration.
-    assert restarted.ensure_registered(project["id"], session_id, token) is False
-    restarted.heartbeat_once()
-
-    snapshot = service.snapshot(project["id"])
-    agent = next(item for item in snapshot["agents"] if item["id"] == session_id)
-    assert agent["status"] != "offline"
-
-
-def test_ensure_registered_rejects_invalid_session_via_heartbeat(service, project):
-    joined = service.join_room(
-        project["id"],
-        agent_key="presence-invalid",
-        name="Invalid Agent",
-        client="generic",
-        model="unknown",
-    )
-    manager = LocalPresenceManager(service, enabled=True, interval_seconds=1)
-    # Bogus token registers eagerly but self-heals on the next heartbeat.
-    assert manager.ensure_registered(project["id"], joined["agent"]["id"], "bad-token") is True
-    manager.heartbeat_once()
-    manager.heartbeat_once()
-    # The session was unregistered after the first failed heartbeat.
-    with manager._lock:
-        assert joined["agent"]["id"] not in manager._sessions
+    assert heartbeat["status"] == "online"
+    assert identity["connection_status"] == "connected"
+    assert identity["activity_status"] is None
+    assert identity["status"] == "online"

@@ -17,16 +17,22 @@
 - Coordination is opt-in per checkout. This public file never contains a live Project,
   `project_key`, Session, Token, cursor, task, lease, or online-state snapshot.
 - Local coordination settings and all Room data belong under the ignored
-  `.agentchatroom/` directory. When no explicit Project key is configured, derive a
-  stable default from the canonical repository directory name.
+  `.agentchatroom/` directory. The backend/MCP generates an opaque Project key and
+  writes the stable checkout registration to `.agentchatroom/project.json`;
+  Agents must not edit it, supply a key, infer identity from it, or invent another
+  key. When the file and database scope are both empty, the first Agent may ask
+  the backend to create the Room.
 - Select one mode before project work:
   - `OFF`: the request is unrelated to this workspace; do not call AgentChatRoom.
-  - `OBSERVE`: read-only inspection; use the locally configured Project key, call `room_join`, then `room_sync`, but do not claim tasks or acquire leases.
+  - `OBSERVE`: read-only inspection; call `room_join`, then `room_sync`, but do not claim tasks or acquire leases.
   - `COORDINATE`: repository changes or multi-Agent work; join and sync before work, use tasks and file leases, publish decisions or blockers, then submit evidence before declaring completion.
-- Before inspecting or editing this repository in `OBSERVE` or `COORDINATE`, resolve the Project key from local ignored configuration, call `room_join`, keep the MCP/Bridge process alive, then call `room_sync`. Do not begin project work while disconnected.
+- Before inspecting or editing this repository in `OBSERVE` or `COORDINATE`, call `room_join` for the checkout. Local stdio resolves `.agentchatroom/project.json`; Agents do not supply a `project_key`. Keep the MCP/Bridge process alive, then call `room_sync`. Do not begin project work while disconnected.
 - Every Agent must use a stable, project-scoped `room_join.agent_key` across task executions, for example `codex-main`, `workbuddy-main`, or `grok-build-main`. A new execution may create a new Session, but it must not invent a new Agent identity.
 - `room_join.model` is required initial Session metadata, not the authoritative model for later messages. Use the exact client model code when available; otherwise explicitly use `unknown`. Never guess or pin a model name in project rules.
 - Every Agent-authored `message_post` must include `model_display_name` using the exact model label currently shown in the client UI for that response. If the client exposes no model label, use `unknown`. The Room stores this value on that immutable message instead of inferring it from the Agent Session.
-- The stdio MCP or remote Bridge process owns background Presence. Use `session_heartbeat` only when changing semantic state (`idle`, `working`, or `blocked`); do not use `room_sync` as a timer.
+- The stdio MCP or remote Bridge process owns connection Presence.
+  `session_heartbeat` only refreshes connection liveness; Task events record
+  claimed, in-progress, blocked, reported, reviewed, and completed work. Do not
+  use `room_sync` as a timer or manually claim real-time working/idle state.
 - Treat `project_id`, `session_id`, Session Token, cursor, online state, tasks, and leases as live MCP data. Never persist those values here as current facts.
 - Completion and independent verification are separate. A reviewer must return `approved` or `changes_requested` with evidence.

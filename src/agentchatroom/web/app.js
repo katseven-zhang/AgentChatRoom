@@ -7,7 +7,6 @@ const state = {
   authenticated: false,
   projects: [],
   projectId: localStorage.getItem("agentchatroom.projectId") || null,
-  projectKey: localStorage.getItem("agentchatroom.projectKey") || null,
   snapshot: null,
   events: [],
   eventIds: new Set(),
@@ -41,7 +40,7 @@ const elements = Object.fromEntries(
     "message-form", "message-input", "message-kind", "message-channel", "message-task", "message-priority",
     "message-requires-ack", "send-message-button", "onboarding", "new-message-notice",
     "project-dialog", "project-form", "project-name-input", "project-path-input",
-    "project-logical-path-input", "project-key-input",
+    "project-logical-path-input",
     "task-dialog", "task-form", "task-title-input", "task-description-input",
     "task-criteria-input", "task-priority-input", "task-dependency-options",
     "task-edit-dialog", "task-edit-form", "task-edit-id", "task-edit-title",
@@ -322,7 +321,7 @@ function formatRelativeTime(value) {
 
 function agentStatus(status) {
   return {
-    online: "在线", idle: "空闲", working: "工作中", blocked: "阻塞", offline: "离线", registered: "已接入",
+    connected: "已连接", disconnected: "未连接", online: "已连接", offline: "未连接", registered: "已接入",
   }[status] || status;
 }
 
@@ -356,6 +355,14 @@ function verificationStatus(status) {
 
 function integrationStatus(status) {
   return { pending: "待集成", done: "已集成", failed: "集成失败" }[status] || status;
+}
+
+function taskIntegrationStatus(task) {
+  return task.execution_status === "cancelled" ? "无需集成" : integrationStatus(task.integration_status);
+}
+
+function taskIntegrationStatusClass(task) {
+  return task.execution_status === "cancelled" ? "not_required" : task.integration_status;
 }
 
 function assignmentStatus(status) {
@@ -534,18 +541,12 @@ async function loadProjects() {
   const result = await api("/api/v1/projects");
   state.projects = result.projects;
   let selected = state.projects.find((project) => project.id === state.projectId);
-  if (!selected && state.projectKey) {
-    selected = state.projects.find((project) => project.project_key === state.projectKey);
-  }
   if (!selected) selected = state.projects[0] || null;
   state.projectId = selected?.id || null;
-  state.projectKey = selected?.project_key || null;
   if (selected) {
     localStorage.setItem("agentchatroom.projectId", selected.id);
-    localStorage.setItem("agentchatroom.projectKey", selected.project_key);
   } else {
     localStorage.removeItem("agentchatroom.projectId");
-    localStorage.removeItem("agentchatroom.projectKey");
   }
   renderProjects();
   if (state.projectId) {
@@ -556,11 +557,8 @@ async function loadProjects() {
 }
 
 async function selectProject(projectId) {
-  const selected = state.projects.find((project) => project.id === projectId);
   state.projectId = projectId;
-  state.projectKey = selected?.project_key || null;
   localStorage.setItem("agentchatroom.projectId", projectId);
-  if (state.projectKey) localStorage.setItem("agentchatroom.projectKey", state.projectKey);
   state.events = [];
   state.eventIds = new Set();
   renderProjects();
@@ -676,11 +674,11 @@ function renderProjects() {
     const collapsed = showHeaders && state.collapsedGroups.has(groupKey);
     const items = collapsed ? "" : projects.map((project) => `
       <button class="project-item ${project.id === state.projectId ? "is-active" : ""}" data-project-id="${escapeHtml(project.id)}" type="button"
-        title="${escapeHtml(`${project.name}\n${project.root_path}\nKey: ${project.project_key}\nID: ${project.id}\n来源: ${projectSource(project)}`)}">
+        title="${escapeHtml(`${project.name}\n${project.root_path}\nID: ${project.id}\n工作区类型: ${projectSource(project)}`)}">
         <span class="project-indicator"></span>
         <span class="project-copy">
           <strong>${escapeHtml(project.name)}</strong>
-          <small class="project-identity">${escapeHtml(project.project_key)} · ${escapeHtml(shortId(project.id))} · ${escapeHtml(projectSource(project))}</small>
+          <small class="project-identity">${escapeHtml(shortId(project.id))} · ${escapeHtml(projectSource(project))}</small>
           ${showHeaders ? "" : `<small>${escapeHtml(project.root_path)}</small>`}
         </span>
       </button>`).join("");
@@ -763,16 +761,19 @@ function renderAgents(agents) {
       const connectionSummary = connected
         ? `${agent.active_session_count} 当前连接 · 累计接入 ${agent.session_count} 次`
         : `已接入 · 未连接 · 累计接入 ${agent.session_count} 次`;
-      const presenceStatus = connected ? agent.status : "disconnected";
-      const presenceLabel = connected ? agentStatus(agent.status) : "未连接";
-      const details = `${agent.name}\nAgent key: ${agent.agent_key}\n客户端: ${agent.client}\n角色: ${agent.role}\n${connectionSummary}\n最后心跳: ${heartbeat}\n最后活动: ${activity}`;
+      const presenceStatus = connected ? "online" : "offline";
+      const presenceLabel = connected ? "已连接" : "未连接";
+      const taskSummary = agent.current_task_id
+        ? `任务：${agent.current_task_title} · ${taskStatus(agent.current_task_status)}`
+        : "当前无任务";
+      const details = `${agent.name}\nAgent key: ${agent.agent_key}\n客户端: ${agent.client}\n角色: ${agent.role}\n${connectionSummary}\n${taskSummary}\n最后心跳: ${heartbeat}\n最后活动: ${activity}`;
       return `
       <div class="agent-item ${connected ? "" : "is-disconnected"}" title="${escapeHtml(details)}">
         <span class="agent-avatar ${avatarColorClass(agent.id)}">${escapeHtml(initials(agent.name))}</span>
         <span class="agent-copy">
           <strong>${escapeHtml(agent.name)}${agent.unread_count ? ` <span class="unread-count" title="未读事件数：该 Agent 最前沿 Session 的已读游标之后、尚未同步的 Room 事件数">${agent.unread_count}</span>` : ""}</strong>
           <small>${escapeHtml(agent.client)} · ${escapeHtml(agent.role)}</small>
-          <small>${escapeHtml(connectionSummary)}</small>
+          <small>${escapeHtml(taskSummary)}</small>
           <small>心跳 ${escapeHtml(heartbeat)} · 活动 ${escapeHtml(activity)}</small>
         </span>
         <span class="agent-presence ${escapeHtml(presenceStatus)}"><span class="status-dot ${escapeHtml(presenceStatus)}"></span>${escapeHtml(presenceLabel)}</span>
@@ -787,7 +788,7 @@ function renderMetrics(agents, tasks, leases) {
   elements["metric-leases"].textContent = leases.length;
   elements["metric-reviews"].textContent = tasks.filter((task) => task.status === "awaiting_review").length;
 
-  const active = tasks.filter((task) => !["todo", "done"].includes(task.status)).slice(0, 6);
+  const active = tasks.filter((task) => !["todo", "done", "cancelled"].includes(task.status)).slice(0, 6);
   elements["active-task-list"].innerHTML = active.length
     ? active.map((task) => `
       <div class="compact-item">
@@ -827,7 +828,7 @@ function renderTasks(tasks) {
         <div class="task-meta">
           <span class="status-badge ${escapeHtml(task.execution_status)}">${escapeHtml(executionStatus(task.execution_status))}</span>
           <span class="status-badge ${escapeHtml(task.verification_status)}">${escapeHtml(verificationStatus(task.verification_status))}</span>
-          <span class="status-badge ${escapeHtml(task.integration_status)}">${escapeHtml(integrationStatus(task.integration_status))}</span>
+          <span class="status-badge ${escapeHtml(taskIntegrationStatusClass(task))}">${escapeHtml(taskIntegrationStatus(task))}</span>
           <span class="secondary-text">${task.progress_percent}%${task.owner_session_id ? ` · ${escapeHtml(names[task.owner_session_id] || shortId(task.owner_session_id))}` : ""}${task.depends_on?.length ? ` · 依赖 ${task.depends_on.length} 项` : ""}</span>
         </div>
       </button>`).join("")
@@ -1347,7 +1348,6 @@ elements["project-form"].addEventListener("submit", async (event) => {
         name: elements["project-name-input"].value.trim() || null,
         root_path: elements["project-path-input"].value.trim(),
         logical_path: elements["project-logical-path-input"].value.trim(),
-        project_key: elements["project-key-input"].value.trim() || null,
       }),
     });
     elements["project-dialog"].close();
@@ -1447,9 +1447,7 @@ elements["archive-form"].addEventListener("submit", async (event) => {
     await api(`/api/v1/projects/${state.projectId}${permanent ? "?permanent=true" : ""}`, { method: "DELETE" });
     elements["archive-dialog"].close();
     localStorage.removeItem("agentchatroom.projectId");
-    localStorage.removeItem("agentchatroom.projectKey");
     state.projectId = null;
-    state.projectKey = null;
     await loadProjects();
     showToast(permanent ? "项目数据已永久删除" : "项目已归档");
   } catch (error) {
@@ -1986,7 +1984,7 @@ function renderProjectInstructions() {
     : "放入该客户端实际读取的项目级指令或记忆文件";
   elements["integration-project-rules-code"].textContent = profile?.project_instructions_text
     || state.integration.project_instructions_text
-    || "当前项目尚未配置稳定 project_key。";
+    || "当前项目尚未生成协作规则。";
 }
 
 function renderIntegrationJoin() {
@@ -2003,7 +2001,6 @@ function renderIntegrationJoin() {
     role: "executor",
     branch: "<git branch>",
     worktree: workspacePath,
-    project_key: project.project_key || "",
   };
   if (remote) {
     payload.host_key = "<stable-host-key>";

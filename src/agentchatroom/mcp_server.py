@@ -18,6 +18,11 @@ from .database import create_database
 from .errors import DomainError
 from .mcp_compat import CompatibleToolManager
 from .presence import LocalPresenceManager
+from .project_registration import (
+    register_checkout_project,
+    resolve_checkout_project_key,
+    validate_project_scope,
+)
 from .services import AgentChatRoomService, new_id, parse_time
 
 
@@ -58,7 +63,10 @@ class ServiceBoundToolManager(CompatibleToolManager):
 
 
 MCP_INSTRUCTIONS = (
-    "Join the current project before doing work. Sync before claiming a task, "
+    "Join the current project before doing work. Never supply, infer, or replace "
+    "a project_key: the backend owns it and local room_join reads the server-managed "
+    ".agentchatroom/project.json registration. It may create a Room only when "
+    "the repository scope is genuinely empty. Sync before claiming a task, "
     "before editing files, and before reporting completion. Acquire file leases "
     "before edits and include evidence in work reports. Every Agent-authored "
     "message must include model_display_name exactly as shown in the client UI."
@@ -127,7 +135,7 @@ def _register_local_presence(payload: dict[str, Any]) -> None:
             str(project["id"]),
             str(agent["id"]),
             token,
-            status="idle",
+            agent_key=str(agent.get("agent_key") or agent["id"]),
         )
 
 
@@ -198,14 +206,14 @@ def room_join(
     role: str = "executor",
     branch: str = "",
     worktree: str = "",
-    project_key: str = "",
     capabilities: dict[str, Any] | None = None,
     host_key: str = "",
     host_name: str = "",
     git_remote: str = "",
     member_id: str = "",
+    logical_path: str = "",
 ) -> dict[str, Any]:
-    """Ensure a local project exists, register this agent session, and return its token."""
+    """Join the checkout-registered Room; create only when its scope is empty."""
     try:
         room_service = get_service()
         access = get_access_token()
@@ -237,10 +245,17 @@ def room_join(
             payload = {"project": room_service.get_project(project_id), **joined}
             _register_local_presence(payload)
             return {"ok": True, "result": payload}
-        project = room_service.create_project(
-            root_path=project_path,
-            project_key=project_key or None,
+        resolved_project_key, _ = resolve_checkout_project_key(
+            project_path,
+            logical_path=logical_path,
         )
+        project = room_service.resolve_project_for_join(
+            root_path=project_path,
+            registered_project_key=resolved_project_key,
+            logical_path=logical_path,
+        )
+        validate_project_scope(project_path, project, logical_path=logical_path)
+        register_checkout_project(project_path, project, replace_existing=True)
         joined = room_service.join_room(
             project["id"],
             agent_key=agent_key,
@@ -289,10 +304,9 @@ def session_heartbeat(
     project_id: str,
     session_id: str,
     token: str,
-    status: str = "idle",
     request_id: str = "",
 ) -> dict[str, Any]:
-    """Refresh session Presence without reading events or advancing the Room cursor."""
+    """Refresh connection liveness without advancing the Room cursor."""
     try:
         _authorize_remote(project_id, "room:join")
     except DomainError as error:
@@ -302,13 +316,10 @@ def session_heartbeat(
         project_id,
         session_id,
         token,
-        status=status,
         request_id=request_id.strip() or None,
     )
     if result.get("ok"):
         _ensure_local_presence(project_id, session_id, token)
-        if presence_manager is not None:
-            presence_manager.set_status(session_id, status)
     return result
 
 
@@ -918,6 +929,170 @@ def integration_submit(
         tests=tests,
         commit_hash=commit_hash,
         request_id=_mcp_request_id(request_id),
+    )
+
+
+@mcp.tool()
+def knowledge_candidate_submit(
+    project_id: str,
+    session_id: str,
+    token: str,
+    title: str,
+    body: str,
+    kind: str,
+    summary: str = "",
+    tags: list[str] | None = None,
+    source_type: str = "manual",
+    source_task_id: str = "",
+    source_report_id: str = "",
+    source_review_id: str = "",
+    source_integration_id: str = "",
+    source_event_ids: list[int] | None = None,
+    asset_id: str = "",
+    request_id: str = "",
+) -> dict[str, Any]:
+    """Submit a Knowledge Asset candidate version with traceable provenance."""
+    try:
+        _authorize_remote(project_id, "knowledge:write")
+    except DomainError as error:
+        return {"ok": False, **error.as_dict()}
+    return _tool_result(
+        get_service().submit_knowledge_candidate,
+        project_id,
+        session_id=session_id,
+        token=token,
+        title=title,
+        body=body,
+        kind=kind,
+        summary=summary,
+        tags=tags,
+        source_type=source_type,
+        source_task_id=source_task_id,
+        source_report_id=source_report_id,
+        source_review_id=source_review_id,
+        source_integration_id=source_integration_id,
+        source_event_ids=source_event_ids,
+        asset_id=asset_id,
+        request_id=_mcp_request_id(request_id),
+    )
+
+
+@mcp.tool()
+def knowledge_review(
+    project_id: str,
+    asset_id: str,
+    reviewer_session_id: str,
+    token: str,
+    verdict: str,
+    criteria: list[ReviewCriterion],
+    notes: str = "",
+    request_id: str = "",
+) -> dict[str, Any]:
+    """Review a candidate Knowledge Asset version with an independent verdict."""
+    try:
+        _authorize_remote(project_id, "review:write")
+    except DomainError as error:
+        return {"ok": False, **error.as_dict()}
+    return _tool_result(
+        get_service().submit_knowledge_review,
+        project_id,
+        asset_id,
+        reviewer_session_id=reviewer_session_id,
+        token=token,
+        verdict=verdict,
+        criteria=criteria,
+        notes=notes,
+        request_id=_mcp_request_id(request_id),
+    )
+
+
+@mcp.tool()
+def knowledge_supersede(
+    project_id: str,
+    asset_id: str,
+    session_id: str,
+    token: str,
+    reason: str = "",
+    request_id: str = "",
+) -> dict[str, Any]:
+    """Mark an approved Knowledge Asset as superseded by newer knowledge."""
+    try:
+        _authorize_remote(project_id, "knowledge:write")
+    except DomainError as error:
+        return {"ok": False, **error.as_dict()}
+    return _tool_result(
+        get_service().supersede_knowledge_asset,
+        project_id,
+        asset_id,
+        session_id=session_id,
+        token=token,
+        reason=reason,
+        request_id=_mcp_request_id(request_id),
+    )
+
+
+@mcp.tool()
+def knowledge_archive(
+    project_id: str,
+    asset_id: str,
+    session_id: str,
+    token: str,
+    reason: str = "",
+    request_id: str = "",
+) -> dict[str, Any]:
+    """Archive a Knowledge Asset so it stops receiving new versions."""
+    try:
+        _authorize_remote(project_id, "knowledge:write")
+    except DomainError as error:
+        return {"ok": False, **error.as_dict()}
+    return _tool_result(
+        get_service().archive_knowledge_asset,
+        project_id,
+        asset_id,
+        session_id=session_id,
+        token=token,
+        reason=reason,
+        request_id=_mcp_request_id(request_id),
+    )
+
+
+@mcp.tool()
+def knowledge_get(
+    project_id: str,
+    asset_id: str,
+    version_id: str = "",
+) -> dict[str, Any]:
+    """Read one Knowledge Asset with its full version and review history."""
+    try:
+        _authorize_remote(project_id, "room:read")
+    except DomainError as error:
+        return {"ok": False, **error.as_dict()}
+    return _tool_result(
+        get_service().get_knowledge_asset,
+        project_id,
+        asset_id,
+        version_id=version_id,
+    )
+
+
+@mcp.tool()
+def knowledge_list(
+    project_id: str,
+    status: str = "",
+    kind: str = "",
+    source_task_id: str = "",
+) -> dict[str, Any]:
+    """List Knowledge Assets filtered by status, kind, or source task."""
+    try:
+        _authorize_remote(project_id, "room:read")
+    except DomainError as error:
+        return {"ok": False, **error.as_dict()}
+    return _tool_result(
+        get_service().list_knowledge_assets,
+        project_id,
+        status=status or None,
+        kind=kind or None,
+        source_task_id=source_task_id or None,
     )
 
 

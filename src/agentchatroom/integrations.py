@@ -50,26 +50,22 @@ MCP_CLIENT_PROFILES: dict[str, dict[str, str]] = {
 
 def build_project_coordination_instructions(project: Mapping[str, Any]) -> str:
     """Build stable project-scoped rules without persisting live session state."""
-    project_key = str(project.get("project_key", "")).strip()
     project_name = str(project.get("name", "Project")).strip() or "Project"
-    if not project_key:
-        return ""
     safe_name = project_name.replace("`", "'")
-    safe_key = project_key.replace("`", "'")
     return f"""## AgentChatRoom project coordination
 
 - enabled: true
 - project: `{safe_name}`
-- project_key: `{safe_key}`
+- The backend owns the opaque Project key and keeps the checkout registration in ignored `.agentchatroom/project.json`. Agents must not edit it, supply a key, infer identity from it, or invent another key.
 - Select one mode before project work:
   - `OFF`: the request is unrelated to this workspace; do not call AgentChatRoom.
-  - `OBSERVE`: read-only inspection; call `room_join` with the project key, then `room_sync`, but do not claim tasks or acquire leases.
+  - `OBSERVE`: read-only inspection; call `room_join`, then `room_sync`, but do not claim tasks or acquire leases.
   - `COORDINATE`: repository changes or multi-Agent work; join and sync before work, use tasks and file leases, publish decisions or blockers, then submit evidence before declaring completion.
 - Before inspecting or editing this repository in `OBSERVE` or `COORDINATE`, call `room_join`, keep the MCP/Bridge process alive, then call `room_sync`. Do not begin project work while disconnected.
 - Every Agent must use a stable, project-scoped `room_join.agent_key` across task executions, for example `codex-main` or `workbuddy-main`. A new execution may create a new Session, but it must not invent a new Agent identity.
 - `room_join.model` is required initial Session metadata, not the authoritative model for later messages. Use the exact client model code when available; otherwise explicitly use `unknown`. Never guess or pin a model name in project rules.
 - Every Agent-authored `message_post` must include `model_display_name` using the exact model label currently shown in the client UI for that response. If the client exposes no model label, use `unknown`. The Room stores this value on that immutable message instead of inferring it from the Agent Session.
-- The stdio MCP or remote Bridge process owns background Presence. Use `session_heartbeat` only when changing semantic state (`idle`, `working`, or `blocked`); do not use `room_sync` as a timer.
+- The stdio MCP or remote Bridge process owns connection Presence. `session_heartbeat` only refreshes liveness; Task state records work progress. Do not use `room_sync` as a timer.
 - Treat `project_id`, `session_id`, Session Token, cursor, online state, tasks, and leases as live MCP data. Never persist those values here as current facts.
 - Completion and independent verification are separate. A reviewer must return `approved` or `changes_requested` with evidence.
 """
@@ -128,7 +124,6 @@ def build_onboarding_prompt(
 ) -> str:
     """Build one complete prompt for one client profile and transport."""
     project_name = str(project.get("name", "")).strip() or "Project"
-    project_key = str(project.get("project_key", "")).strip()
     root_path = str(project.get("root_path", "")).strip() or "<本机项目路径>"
     client_label = str(profile.get("label", profile_id)).strip() or profile_id
     config_path_hint = str(profile.get("config_path_hint", "")).strip()
@@ -178,7 +173,6 @@ def build_onboarding_prompt(
 
 目标
 - Project：{project_name}
-- project_key：{project_key}
 - 目标客户端：{client_label}
 - 连接方式：{transport_details['label']}
 - 说明：{transport_details['scope']}
@@ -196,26 +190,27 @@ def build_onboarding_prompt(
 二、写入当前项目的协作规则
 {instruction_target}
 
-{project_instructions_text.rstrip() or '当前项目尚未配置稳定 project_key，先停止并告知用户。'}
+{project_instructions_text.rstrip() or '当前项目尚未生成协作规则，先停止并告知用户。'}
 
 三、加入并同步 Room
 工具加载后调用 room_join：
 - project_path：{transport_details['project_path']}
-- project_key：{project_key}
 - agent_key：{agent_key}，跨任务稳定复用，不要为每次执行创建新身份
 - agent_name：使用当前客户端名称
 - client：{client_value}
 - model：使用当前界面显示的模型标签；完全不可见时填 unknown
 - role：按本次工作填写，例如 executor、reviewer 或 coordinator
 
-room_join 成功后立即调用 room_sync，并把状态切换为 working。开始项目检查、修改或评审前都必须先同步。
+不要另建 Room，也不要提交或推断 project_key。本机 stdio 会读取并校验 `.agentchatroom/project.json`，Project key 只由后端生成。只有当前规范化项目作用域在数据库和本地登记中都为空时，首个 Agent 才允许请求后端创建 Room。
+
+room_join 成功后立即调用 room_sync。开始项目检查、修改或评审前都必须先同步；Task 状态由认领、工作报告和审核事件推进，不要手工声称实时 working/idle。
 
 四、执行协作约定
 - 发布 Agent 消息时填写本次回复真实的 model_display_name。
 - 认领任务使用 task_claim；编辑文件前使用 lease_acquire，结束后释放租约。
 - 完成工作使用 work_report 提交修改文件和测试证据；执行完成不等于独立验证通过。
 - project_id、session_id、Session Token 和 cursor 只保存在当前运行时，不得写入项目文件。
-- 本次工作结束后把状态切换为 idle，但保持 MCP 进程连接。"""
+- 本次工作结束后提交 Work Report；连接状态由 MCP 进程自动维护。"""
 
 
 def build_mcp_integration(
@@ -365,7 +360,6 @@ def build_mcp_integration(
         "project": (
             {
                 "name": str(project.get("name", "")),
-                "project_key": str(project.get("project_key", "")),
             }
             if project
             else None
