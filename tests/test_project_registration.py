@@ -20,6 +20,18 @@ from agentchatroom.project_registration import (
 )
 
 
+def _configure_local_software(
+    monkeypatch,
+    *,
+    key: str,
+    name: str,
+    client: str,
+) -> None:
+    monkeypatch.setenv(mcp_server.SOFTWARE_KEY_ENV, key)
+    monkeypatch.setenv(mcp_server.SOFTWARE_NAME_ENV, name)
+    monkeypatch.setenv(mcp_server.SOFTWARE_CLIENT_ENV, client)
+
+
 def test_checkout_registration_persists_backend_generated_project_key(
     service, project_dir
 ):
@@ -173,6 +185,12 @@ def test_checkout_registration_supports_derived_logical_subprojects_and_removal(
 
 def test_local_mcp_join_creates_then_joins_one_room(monkeypatch, service, project_dir):
     monkeypatch.setattr(mcp_server, "service", service)
+    _configure_local_software(
+        monkeypatch,
+        key="generic-client",
+        name="Generic Client",
+        client="generic-client",
+    )
 
     first = mcp_server.room_join(
         project_path=str(project_dir), model="unknown", agent_key="first-main",
@@ -212,6 +230,12 @@ def test_local_mcp_join_derives_monorepo_subproject_from_project_path(
         capture_output=True,
     )
     monkeypatch.setattr(mcp_server, "service", service)
+    _configure_local_software(
+        monkeypatch,
+        key="generic-client",
+        name="Generic Client",
+        client="generic-client",
+    )
 
     root_join = mcp_server.room_join(
         project_path=str(repository), model="unknown", agent_key="root-main",
@@ -237,6 +261,9 @@ def test_orphaned_checkout_registration_does_not_recreate_deleted_project(
     monkeypatch, service, project_dir
 ):
     monkeypatch.setattr(mcp_server, "service", service)
+    _configure_local_software(
+        monkeypatch, key="trae", name="Trae", client="trae"
+    )
     project = service.create_project(root_path=str(project_dir))
     register_checkout_project(project_dir, project)
     service.delete_project(project["id"])
@@ -255,6 +282,9 @@ def test_backend_refreshes_registration_after_project_key_migration(
     monkeypatch, service, project_dir
 ):
     monkeypatch.setattr(mcp_server, "service", service)
+    _configure_local_software(
+        monkeypatch, key="codex", name="Codex", client="codex"
+    )
     project = service.create_project(root_path=str(project_dir))
     path = register_checkout_project(project_dir, project)
     document = json.loads(path.read_text(encoding="utf-8"))

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 from agentchatroom.config import Settings
 from agentchatroom.integrations import build_mcp_integration
 
@@ -135,5 +137,10 @@ def test_project_integration_builds_stable_workbuddy_memory_without_live_state(t
     assert "目标客户端：Codex" in codex_prompts["local"]
     assert "AGENTCHATROOM_SOFTWARE_KEY" in codex_prompts["local"]
     assert 'AGENTCHATROOM_SOFTWARE_KEY = "codex"' in codex_prompts["local"]
+    assert (
+        f"AGENTCHATROOM_PROJECT_PATH = {json.dumps(str(tmp_path))}"
+        in codex_prompts["local"]
+    )
+    assert "会自动建立连接 Presence" in codex_prompts["local"]
     assert "[mcp_servers.agentchatroom]" in codex_prompts["local"]
     assert "bearer_token_env_var" in codex_prompts["http"]

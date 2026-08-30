@@ -16,6 +16,7 @@ AGENT_TOKEN_ENV_VAR = "AGENTCHATROOM_AGENT_TOKEN"
 SOFTWARE_KEY_ENV_VAR = "AGENTCHATROOM_SOFTWARE_KEY"
 SOFTWARE_NAME_ENV_VAR = "AGENTCHATROOM_SOFTWARE_NAME"
 SOFTWARE_CLIENT_ENV_VAR = "AGENTCHATROOM_SOFTWARE_CLIENT"
+PROJECT_PATH_ENV_VAR = "AGENTCHATROOM_PROJECT_PATH"
 
 # Client-specific details live at the integration boundary. The MCP server and
 # its domain model remain vendor-neutral; adding a client only adds a profile.
@@ -171,6 +172,12 @@ def build_onboarding_prompt(
         if project_instruction_path_hint
         else "把项目规则写入该客户端实际会读取的项目级指令或记忆文件；不要创建客户端不会读取的文件。"
     )
+    join_intro = (
+        "本机 stdio MCP 加载完整软件身份和 checkout 路径配置后会自动建立连接 Presence；"
+        "Agent 开始工作前仍调用 room_join 获取本次运行凭据："
+        if transport == "local"
+        else "工具加载后调用 room_join："
+    )
 
     return f"""请直接为当前工作空间完成 AgentChatRoom 接入，不要只解释步骤。
 
@@ -196,7 +203,7 @@ def build_onboarding_prompt(
 {project_instructions_text.rstrip() or '当前项目尚未生成协作规则，先停止并告知用户。'}
 
 三、加入并同步 Room
-工具加载后调用 room_join：
+{join_intro}
 - project_path：{transport_details['project_path']}
 - 软件身份：由 MCP 配置中的 {SOFTWARE_KEY_ENV_VAR}、{SOFTWARE_NAME_ENV_VAR} 和 {SOFTWARE_CLIENT_ENV_VAR} 注入；不要在任务、审核或运行检查中改名或创建新身份
 - model：使用当前界面显示的模型标签；完全不可见时填 unknown
@@ -249,6 +256,8 @@ def build_mcp_integration(
     }
     if settings.config_path is not None:
         environment["AGENTCHATROOM_CONFIG"] = str(settings.config_path)
+    if project and str(project.get("root_path", "")).strip():
+        environment[PROJECT_PATH_ENV_VAR] = str(project["root_path"])
 
     environment.update(
         _profile_identity_environment("generic", MCP_CLIENT_PROFILES["generic"])

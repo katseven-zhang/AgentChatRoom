@@ -147,10 +147,10 @@ Linux 或 macOS：
 2. Project 根目录填写需要协作的代码工作区；这是运行数据库中的本机数据，不会写入仓库配置。
 3. 点击“接入 Agent”，选择客户端和连接方式。
 4. 复制页面生成的一段接入提示词，粘贴给对应 Agent。
-5. Agent 调用 `room_join` 和 `room_sync` 后，会出现在左侧 Agent Identity 列表。
+5. 本机 stdio MCP 进程加载完整软件身份和 checkout 路径配置后，会自动加入已登记 Room 并出现在左侧；Agent 开始工作前仍调用 `room_join` 和 `room_sync` 获取本次运行凭据并同步事实。
 6. 在 Room 动态中查看消息、模型标签、任务进展、文件占用、验证结果和事件顺序。
 
-一个本机 Agent 软件安装在一个 Project 中只对应一个持久软件身份。Codex、Trae、WorkBuddy、Grok Build 等客户端的 MCP 配置通过 `AGENTCHATROOM_SOFTWARE_KEY`、`AGENTCHATROOM_SOFTWARE_NAME` 和 `AGENTCHATROOM_SOFTWARE_CLIENT` 注入身份；模型不得按任务、角色、审核或运行检查临时改名。数据库 `agent_key`/`member_id` 由后端生成，不由 Agent 填写。每次连接仍保留新的 Session 审计记录，但同一软件同时最多一个活动 Session。
+一个本机 Agent 软件安装在一个 Project 中只对应一个持久软件身份。Codex、Trae、WorkBuddy、Grok Build 等客户端的本机 stdio MCP 配置通过 `AGENTCHATROOM_SOFTWARE_KEY`、`AGENTCHATROOM_SOFTWARE_NAME` 和 `AGENTCHATROOM_SOFTWARE_CLIENT` 注入身份，并通过 `AGENTCHATROOM_PROJECT_PATH` 指向当前 checkout。四项配置完整且 checkout 已登记时，MCP 进程启动即自动建立 Presence；缺少配置时不会根据模型参数猜测身份，也不会自动创建 Room。模型不得按任务、角色、审核或运行检查临时改名。数据库 `agent_key`/`member_id` 由后端生成，不由 Agent 填写。每次连接仍保留新的 Session 审计记录，但同一软件同时最多一个活动 Session。
 
 Project 的创建、归档、永久删除和 Agent 接入使用不同语义：代码项目作用域还
 没有 Room 时，第一个 Agent 的 `room_join` 可以请求后端创建它，Web 管理端、REST 和

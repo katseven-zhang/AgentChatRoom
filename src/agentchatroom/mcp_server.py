@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import logging
 import os
 import sys
 from collections.abc import Callable
@@ -29,6 +30,7 @@ from .services import AgentChatRoomService, new_id, parse_time
 
 service: AgentChatRoomService | None = None
 presence_manager: LocalPresenceManager | None = None
+logger = logging.getLogger(__name__)
 ServiceProvider = Callable[[], AgentChatRoomService]
 _bound_service_provider: ContextVar[ServiceProvider | None] = ContextVar(
     "agentchatroom_mcp_service_provider",
@@ -70,6 +72,9 @@ MCP_INSTRUCTIONS = (
     "the backend derives it from project_path relative to the detected repository root. "
     "The MCP process owns one configured software identity. Agents must not invent "
     "or rename agent_key, agent_name, or client values for different tasks or roles. "
+    "A fully configured local stdio process automatically establishes Presence for "
+    "an existing registered checkout, but Agents still call room_join and room_sync "
+    "before work to obtain runtime credentials and synchronize current facts. "
     "room_join may create a Room only when "
     "the repository scope is genuinely empty. Sync before claiming a task, "
     "before editing files, and before reporting completion. Acquire file leases "
@@ -80,15 +85,40 @@ MCP_INSTRUCTIONS = (
 SOFTWARE_KEY_ENV = "AGENTCHATROOM_SOFTWARE_KEY"
 SOFTWARE_NAME_ENV = "AGENTCHATROOM_SOFTWARE_NAME"
 SOFTWARE_CLIENT_ENV = "AGENTCHATROOM_SOFTWARE_CLIENT"
+PROJECT_PATH_ENV = "AGENTCHATROOM_PROJECT_PATH"
 
 
 def _configured_local_identity() -> tuple[str, str, str] | None:
     software_key = os.getenv(SOFTWARE_KEY_ENV, "").strip()
-    if not software_key:
+    software_name = os.getenv(SOFTWARE_NAME_ENV, "").strip()
+    client = os.getenv(SOFTWARE_CLIENT_ENV, "").strip()
+    values = (software_key, software_name, client)
+    if not all(values) or any(value.startswith("<") for value in values):
         return None
-    software_name = os.getenv(SOFTWARE_NAME_ENV, "").strip() or software_key
-    client = os.getenv(SOFTWARE_CLIENT_ENV, "").strip() or software_key
     return software_key, software_name, client
+
+
+def _auto_join_local_checkout() -> dict[str, Any] | None:
+    """Create startup Presence only for a fully configured registered checkout."""
+    project_path = os.getenv(PROJECT_PATH_ENV, "").strip()
+    if not project_path or _configured_local_identity() is None:
+        return None
+    try:
+        registered_project_key, _ = resolve_checkout_project_key(project_path)
+    except DomainError as error:
+        logger.warning("Local MCP auto-join skipped: %s", error.code)
+        return None
+    if not registered_project_key:
+        return None
+    response = room_join(project_path=project_path, model="unknown")
+    if not response.get("ok"):
+        error = response.get("error") or {}
+        logger.warning(
+            "Local MCP auto-join skipped: %s",
+            error.get("code", "unknown_error"),
+        )
+        return None
+    return response["result"]
 
 
 def _new_mcp(
@@ -264,18 +294,11 @@ def room_join(
             return {"ok": True, "result": payload}
         configured_identity = _configured_local_identity()
         if configured_identity is None:
-            effective_client = client.strip() or agent_key.strip()
-            effective_name = agent_name.strip() or effective_client
-            effective_software_key = effective_client
-        else:
-            effective_software_key, effective_name, effective_client = (
-                configured_identity
-            )
-        if not effective_client or not effective_name:
             raise DomainError(
                 "software_identity_not_configured",
                 "Local MCP must configure a stable software identity",
             )
+        effective_software_key, effective_name, effective_client = configured_identity
 
         resolved_project_key, _ = resolve_checkout_project_key(project_path)
         project = room_service.resolve_project_for_join(
@@ -1191,6 +1214,7 @@ def main(argv: list[str] | None = None) -> None:
         interval_seconds=settings.presence_keepalive_interval_seconds,
     )
     presence_manager.start()
+    _auto_join_local_checkout()
     try:
         mcp.run(transport="stdio")
     finally:

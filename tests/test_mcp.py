@@ -24,6 +24,19 @@ from agentchatroom.mcp_bridge import (
 )
 from agentchatroom.mcp_compat import coerce_schema_value
 from agentchatroom.mcp_compat import coerce_schema_value
+from agentchatroom.project_registration import register_checkout_project
+
+
+def _configure_local_software(
+    monkeypatch,
+    *,
+    key: str,
+    name: str,
+    client: str,
+) -> None:
+    monkeypatch.setenv(mcp_server.SOFTWARE_KEY_ENV, key)
+    monkeypatch.setenv(mcp_server.SOFTWARE_NAME_ENV, name)
+    monkeypatch.setenv(mcp_server.SOFTWARE_CLIENT_ENV, client)
 
 
 def test_mcp_exposes_standard_tool_set():
@@ -121,12 +134,20 @@ def test_mcp_room_join_requires_project_path_and_model_only():
     assert "project_path" in room_join.parameters["required"]
     assert "model" in room_join.parameters["required"]
     assert "agent_key" not in room_join.parameters["required"]
+    assert "automatically establishes Presence" in mcp_server.MCP_INSTRUCTIONS
+    assert "still call room_join and room_sync" in mcp_server.MCP_INSTRUCTIONS
 
 
 def test_mcp_project_member_tools_share_the_domain_service(
     monkeypatch, service, project_dir
 ):
     monkeypatch.setattr(mcp_server, "service", service)
+    _configure_local_software(
+        monkeypatch,
+        key="member-admin",
+        name="Member Admin",
+        client="codex",
+    )
     service.create_project(root_path=str(project_dir))
     joined = mcp_server.room_join(
         project_path=str(project_dir),
@@ -373,6 +394,12 @@ def test_mcp_request_id_replays_and_session_can_leave(
     monkeypatch, service, project_dir
 ):
     monkeypatch.setattr(mcp_server, "service", service)
+    _configure_local_software(
+        monkeypatch,
+        key="reliable-mcp",
+        name="Reliable MCP",
+        client="grok-build",
+    )
     service.create_project(root_path=str(project_dir))
     joined = mcp_server.room_join(
         project_path=str(project_dir),
@@ -461,10 +488,22 @@ def test_mcp_handoff_and_integration_share_the_domain_service(
 ):
     monkeypatch.setattr(mcp_server, "service", service)
     service.create_project(root_path=str(project_dir))
+    _configure_local_software(
+        monkeypatch,
+        key="executor",
+        name="Executor",
+        client="codex",
+    )
     executor = mcp_server.room_join(
         project_path=str(project_dir), model="unknown", agent_key="executor-main",
         agent_name="Executor", client="codex", role="executor"
     )["result"]
+    _configure_local_software(
+        monkeypatch,
+        key="successor",
+        name="Successor",
+        client="grok-build",
+    )
     successor = mcp_server.room_join(
         project_path=str(project_dir),
         model="test-model",
@@ -473,6 +512,12 @@ def test_mcp_handoff_and_integration_share_the_domain_service(
         client="grok-build",
         role="executor",
     )["result"]
+    _configure_local_software(
+        monkeypatch,
+        key="reviewer",
+        name="Reviewer",
+        client="trae",
+    )
     reviewer = mcp_server.room_join(
         project_path=str(project_dir), model="unknown", agent_key="reviewer-main",
         agent_name="Reviewer", client="trae", role="reviewer"
@@ -591,6 +636,12 @@ def test_mcp_command_help_does_not_initialize_storage(tmp_path):
 
 def test_mcp_room_join_generates_the_database_identity(monkeypatch, service, project_dir):
     monkeypatch.setattr(mcp_server, "service", service)
+    _configure_local_software(
+        monkeypatch,
+        key="custom-client",
+        name="Fourth Agent",
+        client="custom-client",
+    )
     response = mcp_server.room_join(
         project_path=str(project_dir),
         model="local-model",
@@ -612,13 +663,63 @@ def test_mcp_room_join_generates_the_database_identity(monkeypatch, service, pro
     assert len(service.list_projects()) == 1
 
 
+def test_local_mcp_requires_a_fully_configured_software_identity(
+    monkeypatch, service, project_dir
+):
+    monkeypatch.setattr(mcp_server, "service", service)
+    monkeypatch.delenv(mcp_server.SOFTWARE_KEY_ENV, raising=False)
+    monkeypatch.delenv(mcp_server.SOFTWARE_NAME_ENV, raising=False)
+    monkeypatch.delenv(mcp_server.SOFTWARE_CLIENT_ENV, raising=False)
+
+    response = mcp_server.room_join(project_path=str(project_dir), model="unknown")
+
+    assert response["ok"] is False
+    assert response["error"]["code"] == "software_identity_not_configured"
+    assert service.list_projects() == []
+
+
+def test_local_mcp_startup_auto_joins_a_registered_checkout(
+    monkeypatch, service, project_dir
+):
+    monkeypatch.setattr(mcp_server, "service", service)
+    project = service.create_project(root_path=str(project_dir))
+    register_checkout_project(project_dir, project)
+    monkeypatch.setenv(mcp_server.PROJECT_PATH_ENV, str(project_dir))
+    _configure_local_software(
+        monkeypatch, key="codex", name="Codex", client="codex"
+    )
+
+    joined = mcp_server._auto_join_local_checkout()
+
+    assert joined is not None
+    assert joined["project"]["id"] == project["id"]
+    assert joined["agent"]["member_id"] == joined["identity"]["id"]
+    assert joined["identity"]["member_key"] == "software:codex"
+    assert service.snapshot(project["id"])["agent_identities"][0][
+        "connection_status"
+    ] == "connected"
+
+
+def test_local_mcp_startup_does_not_guess_or_create_without_registration(
+    monkeypatch, service, project_dir
+):
+    monkeypatch.setattr(mcp_server, "service", service)
+    monkeypatch.setenv(mcp_server.PROJECT_PATH_ENV, str(project_dir))
+    _configure_local_software(
+        monkeypatch, key="codex", name="Codex", client="codex"
+    )
+
+    assert mcp_server._auto_join_local_checkout() is None
+    assert service.list_projects() == []
+
+
 def test_mcp_configured_software_identity_ignores_task_aliases(
     monkeypatch, service, project_dir
 ):
     monkeypatch.setattr(mcp_server, "service", service)
-    monkeypatch.setenv(mcp_server.SOFTWARE_KEY_ENV, "codex")
-    monkeypatch.setenv(mcp_server.SOFTWARE_NAME_ENV, "Codex")
-    monkeypatch.setenv(mcp_server.SOFTWARE_CLIENT_ENV, "codex")
+    _configure_local_software(
+        monkeypatch, key="codex", name="Codex", client="codex"
+    )
 
     first = mcp_server.room_join(
         project_path=str(project_dir),
@@ -648,6 +749,9 @@ def test_mcp_room_join_uses_unique_existing_room_without_project_key(
     monkeypatch, service, project_dir
 ):
     monkeypatch.setattr(mcp_server, "service", service)
+    _configure_local_software(
+        monkeypatch, key="trae", name="Trae", client="trae"
+    )
     existing = service.create_project(root_path=str(project_dir))
 
     response = mcp_server.room_join(
@@ -667,6 +771,12 @@ def test_mcp_room_join_uses_unique_existing_room_without_project_key(
 @pytest.mark.asyncio
 async def test_mcp_compatibility_is_schema_directed(monkeypatch, service, project_dir):
     monkeypatch.setattr(mcp_server, "service", service)
+    _configure_local_software(
+        monkeypatch,
+        key="string-wrapped",
+        name="String Wrapped Agent",
+        client="grok-build",
+    )
     service.create_project(root_path=str(project_dir))
     joined = await mcp_server.mcp._tool_manager.call_tool(
         "room_join",
@@ -782,10 +892,93 @@ async def test_mcp_compatibility_is_schema_directed(monkeypatch, service, projec
 
 
 @pytest.mark.asyncio
+async def test_local_mcp_stdio_startup_auto_joins_and_disconnects_on_exit(
+    tmp_path, project_dir
+):
+    environment = os.environ.copy()
+    data_dir = tmp_path / "auto-join-data"
+    environment.update(
+        {
+            "AGENTCHATROOM_DATA_DIR": str(data_dir),
+            "AGENTCHATROOM_PRESENCE_KEEPALIVE_ENABLED": "true",
+            "AGENTCHATROOM_PRESENCE_KEEPALIVE_INTERVAL_SECONDS": "0.05",
+            "AGENTCHATROOM_PROJECT_PATH": str(project_dir),
+            "AGENTCHATROOM_SOFTWARE_KEY": "startup-test",
+            "AGENTCHATROOM_SOFTWARE_NAME": "Startup Test",
+            "AGENTCHATROOM_SOFTWARE_CLIENT": "pytest",
+        }
+    )
+    bootstrap_settings = Settings(data_dir=data_dir)
+    bootstrap_service = mcp_server.AgentChatRoomService(
+        Database(bootstrap_settings.database_path), bootstrap_settings
+    )
+    bootstrap_service.initialize()
+    project = bootstrap_service.create_project(root_path=str(project_dir))
+    register_checkout_project(project_dir, project)
+    process = await asyncio.create_subprocess_exec(
+        sys.executable,
+        "-m",
+        "agentchatroom.mcp_server",
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        env=environment,
+    )
+    assert process.stdin is not None
+
+    try:
+        deadline = asyncio.get_running_loop().time() + 10
+        identity = None
+        while asyncio.get_running_loop().time() < deadline:
+            if process.returncode is not None:
+                stderr = await process.stderr.read()
+                pytest.fail(
+                    "MCP exited before startup Presence was established: "
+                    f"{stderr.decode(errors='replace')}"
+                )
+            identities = bootstrap_service.snapshot(project["id"])[
+                "agent_identities"
+            ]
+            identity = next(
+                (
+                    item
+                    for item in identities
+                    if item["software_key"] == "startup-test"
+                ),
+                None,
+            )
+            if identity and identity["connection_status"] == "connected":
+                break
+            await asyncio.sleep(0.05)
+        else:
+            pytest.fail("MCP startup did not establish Presence")
+
+        assert identity is not None
+        assert identity["active_session_count"] == 1
+
+        process.stdin.close()
+        await process.stdin.wait_closed()
+        await asyncio.wait_for(process.wait(), timeout=10)
+
+        disconnected = bootstrap_service.snapshot(project["id"])[
+            "agent_identities"
+        ][0]
+        assert disconnected["connection_status"] == "disconnected"
+        assert disconnected["active_session_count"] == 0
+    finally:
+        if process.returncode is None:
+            process.terminate()
+            await asyncio.wait_for(process.wait(), timeout=5)
+
+
+@pytest.mark.asyncio
 async def test_mcp_stdio_round_trip(tmp_path, project_dir):
     environment = os.environ.copy()
     data_dir = tmp_path / "mcp-data"
     environment["AGENTCHATROOM_DATA_DIR"] = str(data_dir)
+    environment["AGENTCHATROOM_SOFTWARE_KEY"] = "protocol-agent"
+    environment["AGENTCHATROOM_SOFTWARE_NAME"] = "Protocol Agent"
+    environment["AGENTCHATROOM_SOFTWARE_CLIENT"] = "generic-mcp-client"
     bootstrap_settings = Settings(data_dir=data_dir)
     bootstrap_service = mcp_server.AgentChatRoomService(
         Database(bootstrap_settings.database_path), bootstrap_settings

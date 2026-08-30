@@ -593,10 +593,16 @@ def test_mcp_tools_reuse_domain_service(monkeypatch, service, project_dir):
 
     monkeypatch.setattr(mcp_server, "service", service)
     service.create_project(root_path=str(project_dir))
+    monkeypatch.setenv(mcp_server.SOFTWARE_KEY_ENV, "mcp-builder")
+    monkeypatch.setenv(mcp_server.SOFTWARE_NAME_ENV, "Mcp Builder")
+    monkeypatch.setenv(mcp_server.SOFTWARE_CLIENT_ENV, "codex")
     executor = mcp_server.room_join(
         project_path=str(project_dir), model="test-model",
         agent_key="mcp-builder-main", agent_name="Mcp Builder", client="codex"
     )["result"]
+    monkeypatch.setenv(mcp_server.SOFTWARE_KEY_ENV, "mcp-reviewer")
+    monkeypatch.setenv(mcp_server.SOFTWARE_NAME_ENV, "Mcp Reviewer")
+    monkeypatch.setenv(mcp_server.SOFTWARE_CLIENT_ENV, "qoder")
     reviewer = mcp_server.room_join(
         project_path=str(project_dir),
         model="test-model",
