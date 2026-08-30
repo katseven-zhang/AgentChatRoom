@@ -518,7 +518,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     join = commands.add_parser("room-join", help="Join a project room")
     join.add_argument("project_id")
-    join.add_argument("--agent-key", required=True)
+    join.add_argument("--agent-key", default="", help=argparse.SUPPRESS)
+    join.add_argument(
+        "--software-key",
+        default="",
+        help="Stable installed software code; defaults to --client",
+    )
     join.add_argument("--name", required=True)
     join.add_argument("--client", required=True)
     join.add_argument("--model", required=True)
@@ -972,6 +977,7 @@ def main(argv: list[str] | None = None) -> None:
             f"/api/v1/projects/{args.project_id}/agents/join",
             {
                 "agent_key": args.agent_key,
+                "software_key": args.software_key,
                 "name": args.name,
                 "client": args.client,
                 "model": args.model,

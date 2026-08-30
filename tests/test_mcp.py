@@ -115,11 +115,12 @@ def test_mcp_message_post_requires_message_level_model_provenance():
     assert message_post.parameters["properties"]["model_display_name"]["type"] == "string"
 
 
-def test_mcp_room_join_requires_stable_identity_and_model_code():
+def test_mcp_room_join_requires_project_path_and_model_only():
     room_join = mcp_server.mcp._tool_manager.get_tool("room_join")
 
-    assert "agent_key" in room_join.parameters["required"]
+    assert "project_path" in room_join.parameters["required"]
     assert "model" in room_join.parameters["required"]
+    assert "agent_key" not in room_join.parameters["required"]
 
 
 def test_mcp_project_member_tools_share_the_domain_service(
@@ -128,11 +129,11 @@ def test_mcp_project_member_tools_share_the_domain_service(
     monkeypatch.setattr(mcp_server, "service", service)
     service.create_project(root_path=str(project_dir))
     joined = mcp_server.room_join(
-        str(project_dir),
-        "member-admin-main",
-        "Member Admin",
-        "codex",
-        "unknown",
+        project_path=str(project_dir),
+        model="unknown",
+        agent_key="member-admin-main",
+        agent_name="Member Admin",
+        client="codex",
         role="coordinator",
     )["result"]
     project_id = joined["project"]["id"]
@@ -148,7 +149,7 @@ def test_mcp_project_member_tools_share_the_domain_service(
     member_id = created["result"]["member"]["id"]
     listed = mcp_server.member_list(project_id)
     assert listed["ok"] is True
-    assert listed["result"][0]["id"] == member_id
+    assert any(item["id"] == member_id for item in listed["result"])
     updated = mcp_server.member_update(
         project_id,
         member_id,
@@ -374,11 +375,11 @@ def test_mcp_request_id_replays_and_session_can_leave(
     monkeypatch.setattr(mcp_server, "service", service)
     service.create_project(root_path=str(project_dir))
     joined = mcp_server.room_join(
-        str(project_dir),
-        "reliable-mcp-main",
-        "Reliable MCP",
-        "grok-build",
-        "test-model",
+        project_path=str(project_dir),
+        model="test-model",
+        agent_key="reliable-mcp-main",
+        agent_name="Reliable MCP",
+        client="grok-build",
         role="executor",
     )["result"]
     project_id = joined["project"]["id"]
@@ -461,18 +462,20 @@ def test_mcp_handoff_and_integration_share_the_domain_service(
     monkeypatch.setattr(mcp_server, "service", service)
     service.create_project(root_path=str(project_dir))
     executor = mcp_server.room_join(
-        str(project_dir), "executor-main", "Executor", "codex", "unknown", role="executor"
+        project_path=str(project_dir), model="unknown", agent_key="executor-main",
+        agent_name="Executor", client="codex", role="executor"
     )["result"]
     successor = mcp_server.room_join(
-        str(project_dir),
-        "successor-main",
-        "Successor",
-        "grok-build",
-        "test-model",
+        project_path=str(project_dir),
+        model="test-model",
+        agent_key="successor-main",
+        agent_name="Successor",
+        client="grok-build",
         role="executor",
     )["result"]
     reviewer = mcp_server.room_join(
-        str(project_dir), "reviewer-main", "Reviewer", "codex", "unknown", role="reviewer"
+        project_path=str(project_dir), model="unknown", agent_key="reviewer-main",
+        agent_name="Reviewer", client="trae", role="reviewer"
     )["result"]
     project_id = executor["project"]["id"]
     created = mcp_server.task_create(
@@ -586,14 +589,14 @@ def test_mcp_command_help_does_not_initialize_storage(tmp_path):
     assert not data_dir.exists()
 
 
-def test_mcp_room_join_uses_configurable_agent_identity(monkeypatch, service, project_dir):
+def test_mcp_room_join_generates_the_database_identity(monkeypatch, service, project_dir):
     monkeypatch.setattr(mcp_server, "service", service)
     response = mcp_server.room_join(
-        str(project_dir),
-        "fourth-agent-main",
-        "Fourth Agent",
-        "custom-client",
+        project_path=str(project_dir),
         model="local-model",
+        agent_key="fourth-agent-main",
+        agent_name="Fourth Agent",
+        client="custom-client",
         role="specialist",
         capabilities={"mcp": True, "notifications": False},
     )
@@ -601,11 +604,44 @@ def test_mcp_room_join_uses_configurable_agent_identity(monkeypatch, service, pr
     assert response["ok"] is True
     assert response["result"]["event_id"] == response["result"]["cursor"]
     agent = response["result"]["agent"]
-    assert agent["agent_key"] == "fourth-agent-main"
+    assert agent["agent_key"] == agent["member_id"]
+    assert response["result"]["identity"]["member_key"] == "software:custom-client"
     assert agent["name"] == "Fourth Agent"
     assert agent["client"] == "custom-client"
     assert agent["role"] == "specialist"
     assert len(service.list_projects()) == 1
+
+
+def test_mcp_configured_software_identity_ignores_task_aliases(
+    monkeypatch, service, project_dir
+):
+    monkeypatch.setattr(mcp_server, "service", service)
+    monkeypatch.setenv(mcp_server.SOFTWARE_KEY_ENV, "codex")
+    monkeypatch.setenv(mcp_server.SOFTWARE_NAME_ENV, "Codex")
+    monkeypatch.setenv(mcp_server.SOFTWARE_CLIENT_ENV, "codex")
+
+    first = mcp_server.room_join(
+        project_path=str(project_dir),
+        model="unknown",
+        agent_key="runtime-check-main",
+        agent_name="Runtime Check",
+        client="validation",
+    )["result"]
+    second = mcp_server.room_join(
+        project_path=str(project_dir),
+        model="unknown",
+        agent_key="codex-review-main",
+        agent_name="Codex Review",
+        client="reviewer",
+        role="reviewer",
+    )["result"]
+
+    assert first["agent"]["member_id"] == second["agent"]["member_id"]
+    assert second["agent"]["name"] == "Codex"
+    assert second["agent"]["client"] == "codex"
+    identities = service.snapshot(second["project"]["id"])["agent_identities"]
+    assert len(identities) == 1
+    assert identities[0]["active_session_count"] == 1
 
 
 def test_mcp_room_join_uses_unique_existing_room_without_project_key(
@@ -615,11 +651,11 @@ def test_mcp_room_join_uses_unique_existing_room_without_project_key(
     existing = service.create_project(root_path=str(project_dir))
 
     response = mcp_server.room_join(
-        str(project_dir),
-        "trae-main",
-        "Trae",
-        "trae",
+        project_path=str(project_dir),
         model="unknown",
+        agent_key="trae-main",
+        agent_name="Trae",
+        client="trae",
     )
 
     assert response["ok"] is True

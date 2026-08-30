@@ -15,21 +15,24 @@ def test_mcp_integration_uses_explicit_runtime_configuration(tmp_path):
     server = result["generic_json"]["mcpServers"]["agentchatroom"]
     assert server["command"].endswith("python.exe")
     assert server["args"] == ["-m", "agentchatroom.mcp_server"]
-    assert server["env"] == {
-        "AGENTCHATROOM_DATA_DIR": str(settings.data_dir),
-        "AGENTCHATROOM_PRESENCE_KEEPALIVE_ENABLED": "true",
-        "AGENTCHATROOM_PRESENCE_KEEPALIVE_INTERVAL_SECONDS": "15.0",
-        "AGENTCHATROOM_CONFIG": str(config_path),
-    }
+    assert server["env"]["AGENTCHATROOM_DATA_DIR"] == str(settings.data_dir)
+    assert server["env"]["AGENTCHATROOM_CONFIG"] == str(config_path)
+    assert server["env"]["AGENTCHATROOM_SOFTWARE_KEY"] == "<stable-software-key>"
+    assert server["env"]["AGENTCHATROOM_SOFTWARE_NAME"] == "<Software name>"
+    assert server["env"]["AGENTCHATROOM_SOFTWARE_CLIENT"] == "<software-client-code>"
     assert result["runtime"]["log_path"] == str(settings.data_dir / "server.log")
     assert result["profiles"]["workbuddy"]["vendor"] == "Tencent"
     assert result["profiles"]["workbuddy"]["format"] == "json"
     assert '"mcpServers"' in result["profiles"]["workbuddy"]["config_text"]
     assert "[mcp_servers.agentchatroom]" in result["profiles"]["grok_build"]["config_text"]
     assert "[mcp_servers.agentchatroom]" in result["profiles"]["codex"]["config_text"]
+    assert result["profiles"]["trae"]["vendor"] == "ByteDance"
+    assert '"AGENTCHATROOM_SOFTWARE_KEY": "trae"' in result["profiles"]["trae"][
+        "config_text"
+    ]
     assert result["profiles"]["generic"]["format"] == "json"
     assert '"mcpServers"' in result["profiles"]["generic"]["config_text"]
-    assert "Trae" in result["profiles"]["generic"]["config_path_hint"]
+    assert "OpenCode" in result["profiles"]["generic"]["config_path_hint"]
     assert '"mcpServers"' in result["profiles"]["generic"]["streamable_http_config_text"]
     assert "agentchatroom.mcp_bridge" in result["profiles"]["generic"][
         "remote_bridge_config_text"
@@ -98,7 +101,7 @@ def test_project_integration_builds_stable_workbuddy_memory_without_live_state(t
     assert "sample-project" not in memory
     assert "`OFF`" in memory and "`OBSERVE`" in memory and "`COORDINATE`" in memory
     assert "session_heartbeat" in memory
-    assert "`room_join.agent_key`" in memory
+    assert "must not supply, rename, or invent an `agent_key`" in memory
     assert "Do not begin project work while disconnected" in memory
     assert "use `unknown`" in memory
     assert ".agentchatroom/project.json" in memory
@@ -112,7 +115,7 @@ def test_project_integration_builds_stable_workbuddy_memory_without_live_state(t
     assert "model_display_name" in prompt
     assert "不要另建 Room" in prompt
     assert ".agentchatroom/project.json" in prompt
-    assert "<当前客户端名称小写>-main" in prompt
+    assert "AGENTCHATROOM_SOFTWARE_KEY" in prompt
     assert '"mcpServers"' in prompt
     assert "project_runtime_only" not in memory
     assert "Session Token" in memory
@@ -120,7 +123,8 @@ def test_project_integration_builds_stable_workbuddy_memory_without_live_state(t
     workbuddy_prompts = result["profiles"]["workbuddy"]["onboarding_prompts"]
     assert set(workbuddy_prompts) == {"local", "http", "remote"}
     assert "目标客户端：WorkBuddy" in workbuddy_prompts["local"]
-    assert "agent_key：workbuddy-main" in workbuddy_prompts["local"]
+    assert "AGENTCHATROOM_SOFTWARE_KEY" in workbuddy_prompts["local"]
+    assert '"AGENTCHATROOM_SOFTWARE_KEY": "workbuddy"' in workbuddy_prompts["local"]
     assert '"mcpServers"' in workbuddy_prompts["local"]
     assert "直接 HTTP MCP" in workbuddy_prompts["http"]
     assert "<paste-issued-agent-token>" in workbuddy_prompts["http"]
@@ -129,6 +133,7 @@ def test_project_integration_builds_stable_workbuddy_memory_without_live_state(t
 
     codex_prompts = result["profiles"]["codex"]["onboarding_prompts"]
     assert "目标客户端：Codex" in codex_prompts["local"]
-    assert "agent_key：codex-main" in codex_prompts["local"]
+    assert "AGENTCHATROOM_SOFTWARE_KEY" in codex_prompts["local"]
+    assert 'AGENTCHATROOM_SOFTWARE_KEY = "codex"' in codex_prompts["local"]
     assert "[mcp_servers.agentchatroom]" in codex_prompts["local"]
     assert "bearer_token_env_var" in codex_prompts["http"]

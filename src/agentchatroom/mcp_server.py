@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 from collections.abc import Callable
 from contextvars import ContextVar
@@ -65,12 +66,29 @@ class ServiceBoundToolManager(CompatibleToolManager):
 MCP_INSTRUCTIONS = (
     "Join the current project before doing work. Never supply, infer, or replace "
     "a project_key: the backend owns it and local room_join reads the server-managed "
-    ".agentchatroom/project.json registration. It may create a Room only when "
+    ".agentchatroom/project.json registration. Agents also do not supply logical_path; "
+    "the backend derives it from project_path relative to the detected repository root. "
+    "The MCP process owns one configured software identity. Agents must not invent "
+    "or rename agent_key, agent_name, or client values for different tasks or roles. "
+    "room_join may create a Room only when "
     "the repository scope is genuinely empty. Sync before claiming a task, "
     "before editing files, and before reporting completion. Acquire file leases "
     "before edits and include evidence in work reports. Every Agent-authored "
     "message must include model_display_name exactly as shown in the client UI."
 )
+
+SOFTWARE_KEY_ENV = "AGENTCHATROOM_SOFTWARE_KEY"
+SOFTWARE_NAME_ENV = "AGENTCHATROOM_SOFTWARE_NAME"
+SOFTWARE_CLIENT_ENV = "AGENTCHATROOM_SOFTWARE_CLIENT"
+
+
+def _configured_local_identity() -> tuple[str, str, str] | None:
+    software_key = os.getenv(SOFTWARE_KEY_ENV, "").strip()
+    if not software_key:
+        return None
+    software_name = os.getenv(SOFTWARE_NAME_ENV, "").strip() or software_key
+    client = os.getenv(SOFTWARE_CLIENT_ENV, "").strip() or software_key
+    return software_key, software_name, client
 
 
 def _new_mcp(
@@ -199,9 +217,6 @@ class AgentCredentialTokenVerifier:
 @mcp.tool()
 def room_join(
     project_path: str,
-    agent_key: str,
-    agent_name: str,
-    client: str,
     model: str,
     role: str = "executor",
     branch: str = "",
@@ -211,9 +226,11 @@ def room_join(
     host_name: str = "",
     git_remote: str = "",
     member_id: str = "",
-    logical_path: str = "",
+    agent_key: str = "",
+    agent_name: str = "",
+    client: str = "",
 ) -> dict[str, Any]:
-    """Join the checkout-registered Room; create only when its scope is empty."""
+    """Join as this MCP process's configured software identity."""
     try:
         room_service = get_service()
         access = get_access_token()
@@ -245,22 +262,34 @@ def room_join(
             payload = {"project": room_service.get_project(project_id), **joined}
             _register_local_presence(payload)
             return {"ok": True, "result": payload}
-        resolved_project_key, _ = resolve_checkout_project_key(
-            project_path,
-            logical_path=logical_path,
-        )
+        configured_identity = _configured_local_identity()
+        if configured_identity is None:
+            effective_client = client.strip() or agent_key.strip()
+            effective_name = agent_name.strip() or effective_client
+            effective_software_key = effective_client
+        else:
+            effective_software_key, effective_name, effective_client = (
+                configured_identity
+            )
+        if not effective_client or not effective_name:
+            raise DomainError(
+                "software_identity_not_configured",
+                "Local MCP must configure a stable software identity",
+            )
+
+        resolved_project_key, _ = resolve_checkout_project_key(project_path)
         project = room_service.resolve_project_for_join(
             root_path=project_path,
             registered_project_key=resolved_project_key,
-            logical_path=logical_path,
         )
-        validate_project_scope(project_path, project, logical_path=logical_path)
+        validate_project_scope(project_path, project)
         register_checkout_project(project_path, project, replace_existing=True)
         joined = room_service.join_room(
             project["id"],
             agent_key=agent_key,
-            name=agent_name,
-            client=client,
+            software_key=effective_software_key,
+            name=effective_name,
+            client=effective_client,
             model=model,
             role=role,
             branch=branch,

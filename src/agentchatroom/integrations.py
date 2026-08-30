@@ -13,12 +13,15 @@ MCP_MODULE = "agentchatroom.mcp_server"
 MCP_BRIDGE_MODULE = "agentchatroom.mcp_bridge"
 AGENT_TOKEN_PLACEHOLDER = "<paste-issued-agent-token>"
 AGENT_TOKEN_ENV_VAR = "AGENTCHATROOM_AGENT_TOKEN"
+SOFTWARE_KEY_ENV_VAR = "AGENTCHATROOM_SOFTWARE_KEY"
+SOFTWARE_NAME_ENV_VAR = "AGENTCHATROOM_SOFTWARE_NAME"
+SOFTWARE_CLIENT_ENV_VAR = "AGENTCHATROOM_SOFTWARE_CLIENT"
 
 # Client-specific details live at the integration boundary. The MCP server and
 # its domain model remain vendor-neutral; adding a client only adds a profile.
-# The "generic" profile covers every client that speaks the standard MCP
-# JSON shape (`mcpServers` with command/args/env), including Trae, OpenCode,
-# Claude Code and Cursor, so new clients need no code change to onboard.
+# The "generic" profile covers every additional client that speaks the standard
+# MCP JSON shape (`mcpServers` with command/args/env), so new clients need no
+# core-domain branch to onboard.
 MCP_CLIENT_PROFILES: dict[str, dict[str, str]] = {
     "workbuddy": {
         "label": "WorkBuddy",
@@ -39,11 +42,17 @@ MCP_CLIENT_PROFILES: dict[str, dict[str, str]] = {
         "format": "toml",
         "config_path_hint": "~/.codex/config.toml 或项目 .codex/config.toml",
     },
+    "trae": {
+        "label": "Trae",
+        "vendor": "ByteDance",
+        "format": "json",
+        "config_path_hint": "使用 Trae 当前实际读取的 MCP JSON 配置文件",
+    },
     "generic": {
         "label": "通用（标准 MCP）",
         "vendor": "Standard MCP",
         "format": "json",
-        "config_path_hint": "适用于 Trae、OpenCode、Claude Code、Cursor 等任何支持标准 MCP 的客户端；配置文件位置请参考各客户端文档（多为 JSON mcpServers 格式）",
+        "config_path_hint": "适用于 OpenCode、Claude Code、Cursor 等其他支持标准 MCP 的客户端；配置文件位置请参考各客户端文档（多为 JSON mcpServers 格式）",
     },
 }
 
@@ -62,7 +71,8 @@ def build_project_coordination_instructions(project: Mapping[str, Any]) -> str:
   - `OBSERVE`: read-only inspection; call `room_join`, then `room_sync`, but do not claim tasks or acquire leases.
   - `COORDINATE`: repository changes or multi-Agent work; join and sync before work, use tasks and file leases, publish decisions or blockers, then submit evidence before declaring completion.
 - Before inspecting or editing this repository in `OBSERVE` or `COORDINATE`, call `room_join`, keep the MCP/Bridge process alive, then call `room_sync`. Do not begin project work while disconnected.
-- Every Agent must use a stable, project-scoped `room_join.agent_key` across task executions, for example `codex-main` or `workbuddy-main`. A new execution may create a new Session, but it must not invent a new Agent identity.
+- One installed Agent application is one durable software identity in this Project. The MCP configuration injects that identity; Agents must not supply, rename, or invent an `agent_key` for a task, review, or runtime check.
+- Each software identity may have only one active Session. Reconnecting replaces the prior Session while preserving history and transferring unfinished owned work and active leases.
 - `room_join.model` is required initial Session metadata, not the authoritative model for later messages. Use the exact client model code when available; otherwise explicitly use `unknown`. Never guess or pin a model name in project rules.
 - Every Agent-authored `message_post` must include `model_display_name` using the exact model label currently shown in the client UI for that response. If the client exposes no model label, use `unknown`. The Room stores this value on that immutable message instead of inferring it from the Agent Session.
 - The stdio MCP or remote Bridge process owns connection Presence. `session_heartbeat` only refreshes liveness; Task state records work progress. Do not use `room_sync` as a timer.
@@ -130,13 +140,6 @@ def build_onboarding_prompt(
     project_instruction_path_hint = str(
         profile.get("project_instruction_path_hint", "")
     ).strip()
-    if profile_id == "generic":
-        client_value = "<当前客户端名称>"
-        agent_key = "<当前客户端名称小写>-main"
-    else:
-        client_value = client_label
-        agent_key = f"{profile_id.replace('_', '-')}-main"
-
     transport_details = {
         "local": {
             "label": "本机 stdio",
@@ -195,11 +198,9 @@ def build_onboarding_prompt(
 三、加入并同步 Room
 工具加载后调用 room_join：
 - project_path：{transport_details['project_path']}
-- agent_key：{agent_key}，跨任务稳定复用，不要为每次执行创建新身份
-- agent_name：使用当前客户端名称
-- client：{client_value}
+- 软件身份：由 MCP 配置中的 {SOFTWARE_KEY_ENV_VAR}、{SOFTWARE_NAME_ENV_VAR} 和 {SOFTWARE_CLIENT_ENV_VAR} 注入；不要在任务、审核或运行检查中改名或创建新身份
 - model：使用当前界面显示的模型标签；完全不可见时填 unknown
-- role：按本次工作填写，例如 executor、reviewer 或 coordinator
+- role：只是本次 Session 的任务角色，例如 executor、reviewer 或 coordinator，不是新的 Agent 身份
 
 不要另建 Room，也不要提交或推断 project_key。本机 stdio 会读取并校验 `.agentchatroom/project.json`，Project key 只由后端生成。只有当前规范化项目作用域在数据库和本地登记中都为空时，首个 Agent 才允许请求后端创建 Room。
 
@@ -211,6 +212,22 @@ room_join 成功后立即调用 room_sync。开始项目检查、修改或评审
 - 完成工作使用 work_report 提交修改文件和测试证据；执行完成不等于独立验证通过。
 - project_id、session_id、Session Token 和 cursor 只保存在当前运行时，不得写入项目文件。
 - 本次工作结束后提交 Work Report；连接状态由 MCP 进程自动维护。"""
+
+
+def _profile_identity_environment(
+    profile_id: str, profile: Mapping[str, Any]
+) -> dict[str, str]:
+    if profile_id == "generic":
+        return {
+            SOFTWARE_KEY_ENV_VAR: "<stable-software-key>",
+            SOFTWARE_NAME_ENV_VAR: "<Software name>",
+            SOFTWARE_CLIENT_ENV_VAR: "<software-client-code>",
+        }
+    return {
+        SOFTWARE_KEY_ENV_VAR: profile_id.replace("_", "-"),
+        SOFTWARE_NAME_ENV_VAR: str(profile.get("label") or profile_id),
+        SOFTWARE_CLIENT_ENV_VAR: profile_id.replace("_", "-"),
+    }
 
 
 def build_mcp_integration(
@@ -233,6 +250,10 @@ def build_mcp_integration(
     if settings.config_path is not None:
         environment["AGENTCHATROOM_CONFIG"] = str(settings.config_path)
 
+    environment.update(
+        _profile_identity_environment("generic", MCP_CLIENT_PROFILES["generic"])
+    )
+
     server = {
         "command": command,
         "args": ["-m", MCP_MODULE],
@@ -254,6 +275,9 @@ def build_mcp_integration(
             settings.presence_keepalive_interval_seconds
         ),
     }
+    bridge_environment.update(
+        _profile_identity_environment("generic", MCP_CLIENT_PROFILES["generic"])
+    )
     bridge_server = {
         # The remote Bridge runs on the Agent computer, not on the center.
         # Keep its launcher independently configurable instead of leaking the
@@ -291,11 +315,54 @@ def build_mcp_integration(
     )
     profiles: dict[str, dict[str, Any]] = {}
     for profile_id, profile in MCP_CLIENT_PROFILES.items():
-        config_text = generic_json_text if profile["format"] == "json" else toml_text
-        remote_config_text = (
-            remote_bridge_json_text
+        local_environment = {
+            key: value
+            for key, value in environment.items()
+            if key
+            not in {
+                SOFTWARE_KEY_ENV_VAR,
+                SOFTWARE_NAME_ENV_VAR,
+                SOFTWARE_CLIENT_ENV_VAR,
+            }
+        }
+        local_environment.update(_profile_identity_environment(profile_id, profile))
+        local_server = {
+            "command": command,
+            "args": ["-m", MCP_MODULE],
+            "env": local_environment,
+        }
+        local_json = {"mcpServers": {MCP_SERVER_NAME: local_server}}
+        config_text = (
+            json.dumps(local_json, ensure_ascii=False, indent=2) + "\n"
             if profile["format"] == "json"
-            else remote_bridge_toml
+            else _build_toml(local_server, local_environment)
+        )
+
+        profile_bridge_environment = {
+            key: value
+            for key, value in bridge_environment.items()
+            if key
+            not in {
+                SOFTWARE_KEY_ENV_VAR,
+                SOFTWARE_NAME_ENV_VAR,
+                SOFTWARE_CLIENT_ENV_VAR,
+            }
+        }
+        profile_bridge_environment.update(
+            _profile_identity_environment(profile_id, profile)
+        )
+        profile_bridge_server = {
+            "command": settings.mcp_bridge_command,
+            "args": ["-m", MCP_BRIDGE_MODULE],
+            "env": profile_bridge_environment,
+        }
+        profile_bridge_json = {
+            "mcpServers": {MCP_SERVER_NAME: profile_bridge_server}
+        }
+        remote_config_text = (
+            json.dumps(profile_bridge_json, ensure_ascii=False, indent=2) + "\n"
+            if profile["format"] == "json"
+            else _build_toml(profile_bridge_server, profile_bridge_environment)
         )
         if profile["format"] == "json":
             http_config_text = streamable_http_json_text
@@ -306,7 +373,7 @@ def build_mcp_integration(
         profiles[profile_id] = {
             **profile,
             "server_name": MCP_SERVER_NAME,
-            "config": generic_json if profile["format"] == "json" else toml_text,
+            "config": local_json if profile["format"] == "json" else config_text,
             "config_text": config_text,
             "local_config_text": config_text,
             "remote_bridge_config_text": remote_config_text,

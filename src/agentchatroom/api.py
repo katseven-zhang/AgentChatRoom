@@ -179,7 +179,8 @@ class ProjectUpdate(StrictModel):
 
 
 class AgentJoin(StrictModel):
-    agent_key: str
+    agent_key: str = ""
+    software_key: str = ""
     name: str
     client: str
     model: str

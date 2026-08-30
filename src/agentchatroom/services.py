@@ -42,6 +42,7 @@ from .contracts import (
 )
 from .database import DatabaseBackend
 from .errors import DomainError
+from .project_registration import derive_logical_path
 
 
 TASK_STATUSES = LEGACY_TASK_STATUSES
@@ -71,6 +72,7 @@ PROJECT_SETTINGS_DEFAULTS: dict[str, Any] = {
     "roles": [],
     "extensions": {},
 }
+SOFTWARE_MEMBER_PREFIX = "software:"
 REQUEST_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 SENSITIVE_REQUEST_FIELDS = {
     "token",
@@ -496,88 +498,27 @@ class AgentChatRoomService:
             data["status"] = "offline"
         return data
 
-    @staticmethod
-    def _agent_workspace_key(agent: Mapping[str, Any]) -> str:
-        return (
-            str(agent.get("workspace_id") or "").strip()
-            or str(agent.get("worktree") or "").strip().replace("\\", "/").rstrip("/")
-            or str(agent.get("host_id") or "").strip()
-        ).casefold()
-
-    @classmethod
-    def _legacy_agent_key(cls, agent: Mapping[str, Any]) -> str:
-        """Project one stable identity for Sessions created before agent_key existed."""
-        fingerprint = json_dump(
-            {
-                "client": str(agent.get("client") or "").strip().casefold(),
-                "name": str(agent.get("name") or "").strip().casefold(),
-                "role": str(agent.get("role") or "").strip().casefold(),
-                "workspace": cls._agent_workspace_key(agent),
-            }
-        )
-        return f"legacy-{hashlib.sha256(fingerprint.encode()).hexdigest()[:16]}"
-
-    @classmethod
-    def _legacy_agent_scope_key(cls, agent: Mapping[str, Any]) -> str:
-        """Return the broadest safe scope for mapping legacy Sessions to one key."""
-        fingerprint = json_dump(
-            {
-                "client": str(agent.get("client") or "").strip().casefold(),
-                "workspace": cls._agent_workspace_key(agent),
-                "member_id": str(agent.get("member_id") or "").strip(),
-            }
-        )
-        return hashlib.sha256(fingerprint.encode()).hexdigest()
-
     def _agent_identities(
         self,
         agents: Iterable[Mapping[str, Any]],
         tasks: Iterable[Mapping[str, Any]] = (),
+        members: Iterable[Mapping[str, Any]] = (),
     ) -> list[dict[str, Any]]:
         sessions_list = list(agents)
         tasks_list = list(tasks)
-        explicit_keys_by_legacy_fingerprint: dict[str, set[str]] = {}
-        explicit_keys_by_legacy_scope: dict[str, set[str]] = {}
-        for agent in sessions_list:
-            explicit_key = str(agent.get("agent_key") or "").strip()
-            if explicit_key:
-                fingerprint = self._legacy_agent_key(agent)
-                explicit_keys_by_legacy_fingerprint.setdefault(
-                    fingerprint, set()
-                ).add(explicit_key)
-                if self._agent_workspace_key(agent):
-                    scope = self._legacy_agent_scope_key(agent)
-                    explicit_keys_by_legacy_scope.setdefault(scope, set()).add(
-                        explicit_key
-                    )
-
+        member_by_id = {
+            str(member["id"]): member
+            for member in members
+            if str(member.get("id") or "").strip()
+        }
         grouped: dict[str, list[Mapping[str, Any]]] = {}
         for agent in sessions_list:
-            explicit_key = str(agent.get("agent_key") or "").strip()
-            legacy_key = self._legacy_agent_key(agent)
-            exact_candidates = explicit_keys_by_legacy_fingerprint.get(
-                legacy_key, set()
-            )
-            workspace_key = self._agent_workspace_key(agent)
-            scope_candidates = (
-                explicit_keys_by_legacy_scope.get(
-                    self._legacy_agent_scope_key(agent), set()
-                )
-                if workspace_key
-                else set()
-            )
-            inferred_key = (
-                next(iter(exact_candidates))
-                if len(exact_candidates) == 1
-                else next(iter(scope_candidates))
-                if len(scope_candidates) == 1
-                else legacy_key
-            )
-            identity_key = explicit_key or inferred_key
-            grouped.setdefault(identity_key, []).append(agent)
+            member_id = str(agent.get("member_id") or "").strip()
+            if member_id:
+                grouped.setdefault(member_id, []).append(agent)
 
         identities: list[dict[str, Any]] = []
-        for agent_key, sessions in grouped.items():
+        for member_id, sessions in grouped.items():
             connected = [session for session in sessions if session["status"] != "offline"]
             representative_pool = connected or sessions
             representative = max(
@@ -605,21 +546,24 @@ class AgentChatRoomService:
                 for session in sessions
                 if session.get("last_activity_at")
             ]
+            member = member_by_id.get(member_id, {})
+            member_metadata = member.get("metadata") or {}
             identities.append(
                 {
                     "schema_version": DOMAIN_SCHEMA_VERSION,
-                    "id": agent_key,
-                    "agent_key": agent_key,
-                    "legacy_identity": not any(
-                        str(session.get("agent_key") or "").strip()
-                        for session in sessions
+                    "id": member_id,
+                    "member_id": member_id,
+                    "agent_key": member_id,
+                    "software_key": str(member_metadata.get("software_key") or ""),
+                    "managed_identity": bool(
+                        member_metadata.get("managed_identity", False)
                     ),
-                    "legacy_session_count": sum(
-                        not bool(str(session.get("agent_key") or "").strip())
-                        for session in sessions
+                    "legacy_identity": False,
+                    "legacy_session_count": 0,
+                    "name": str(member.get("name") or representative["name"]),
+                    "client": str(
+                        member_metadata.get("client") or representative["client"]
                     ),
-                    "name": representative["name"],
-                    "client": representative["client"],
                     "role": representative["role"],
                     "connection_status": "connected" if connected else "disconnected",
                     "activity_status": None,
@@ -662,7 +606,7 @@ class AgentChatRoomService:
             key=lambda identity: (
                 identity["connection_status"] != "connected",
                 str(identity["name"]).casefold(),
-                str(identity["agent_key"]),
+                str(identity["member_id"]),
             ),
         )
 
@@ -681,6 +625,198 @@ class AgentChatRoomService:
         data["schema_version"] = PROJECT_MEMBER_SCHEMA_VERSION
         data["active"] = data["status"] in {"invited", "active", "suspended"}
         return data
+
+    @staticmethod
+    def _normalize_software_key(value: str) -> str:
+        clean = re.sub(r"[^a-z0-9._-]+", "-", value.strip().casefold()).strip("-.")
+        if not clean:
+            raise DomainError(
+                "invalid_software_identity",
+                "A stable software identity is required",
+            )
+        return clean
+
+    def _ensure_software_member(
+        self,
+        connection: Any,
+        project_id: str,
+        *,
+        software_key: str,
+        name: str,
+        client: str,
+    ) -> tuple[Mapping[str, Any], bool]:
+        normalized_key = self._normalize_software_key(software_key)
+        member_key = f"{SOFTWARE_MEMBER_PREFIX}{normalized_key}"
+        member = connection.execute(
+            "SELECT * FROM project_members WHERE project_id = ? AND member_key = ?",
+            (project_id, member_key),
+        ).fetchone()
+        if member is not None:
+            if member["status"] != "active":
+                raise DomainError(
+                    "software_identity_inactive",
+                    "This software identity is not active in the Project",
+                    status_code=409,
+                )
+            metadata = json_load(member["metadata_json"], {})
+            expected_client = str(metadata.get("client") or "").strip().casefold()
+            if expected_client and expected_client != client.strip().casefold():
+                raise DomainError(
+                    "software_identity_client_mismatch",
+                    "The software identity is already bound to another client",
+                    status_code=409,
+                )
+            return member, False
+
+        now = iso_now()
+        member_id = new_id("member")
+        connection.execute(
+            """
+            INSERT INTO project_members(
+                id, project_id, member_key, name, kind, role, status,
+                metadata_json, created_at, updated_at, revoked_at
+            ) VALUES (?, ?, ?, ?, 'software_agent', '', 'active', ?, ?, ?, NULL)
+            """,
+            (
+                member_id,
+                project_id,
+                member_key,
+                name.strip(),
+                json_dump(
+                    {
+                        "managed_identity": True,
+                        "software_key": normalized_key,
+                        "client": client.strip(),
+                    }
+                ),
+                now,
+                now,
+            ),
+        )
+        member = connection.execute(
+            "SELECT * FROM project_members WHERE id = ?", (member_id,)
+        ).fetchone()
+        return member, True
+
+    @staticmethod
+    def _same_agent_identity(
+        first: Mapping[str, Any] | None,
+        second: Mapping[str, Any] | None,
+    ) -> bool:
+        if first is None or second is None:
+            return False
+        first_data = dict(first)
+        second_data = dict(second)
+        first_member = str(first_data.get("member_id") or "").strip()
+        second_member = str(second_data.get("member_id") or "").strip()
+        if first_member and second_member:
+            return first_member == second_member
+        first_key = str(first_data.get("agent_key") or "").strip()
+        second_key = str(second_data.get("agent_key") or "").strip()
+        return bool(first_key and second_key and first_key == second_key)
+
+    def _replace_identity_sessions(
+        self,
+        connection: Any,
+        project_id: str,
+        *,
+        member_id: str,
+        session_id: str,
+        now: str,
+    ) -> dict[str, Any]:
+        previous = connection.execute(
+            """
+            SELECT id FROM agent_sessions
+            WHERE project_id = ? AND member_id = ? AND id <> ? AND left_at IS NULL
+            ORDER BY created_at
+            """,
+            (project_id, member_id, session_id),
+        ).fetchall()
+        previous_ids = [str(row["id"]) for row in previous]
+        identity_sessions = connection.execute(
+            """
+            SELECT id FROM agent_sessions
+            WHERE project_id = ? AND member_id = ? AND id <> ?
+            ORDER BY created_at
+            """,
+            (project_id, member_id, session_id),
+        ).fetchall()
+        identity_session_ids = [str(row["id"]) for row in identity_sessions]
+        transferred_task_ids: list[str] = []
+        transferred_lease_ids: list[str] = []
+        if not identity_session_ids:
+            return {
+                "previous_session_ids": [],
+                "transferred_task_ids": [],
+                "transferred_lease_ids": [],
+            }
+
+        for previous_id in identity_session_ids:
+            task_rows = connection.execute(
+                """
+                SELECT id FROM tasks
+                WHERE project_id = ? AND owner_session_id = ?
+                  AND execution_status <> 'cancelled' AND integration_status <> 'done'
+                """,
+                (project_id, previous_id),
+            ).fetchall()
+            transferred_task_ids.extend(str(row["id"]) for row in task_rows)
+            connection.execute(
+                """
+                UPDATE tasks SET owner_session_id = ?, updated_at = ?
+                WHERE project_id = ? AND owner_session_id = ?
+                  AND execution_status <> 'cancelled' AND integration_status <> 'done'
+                """,
+                (session_id, now, project_id, previous_id),
+            )
+            lease_rows = connection.execute(
+                """
+                SELECT id FROM file_leases
+                WHERE project_id = ? AND session_id = ? AND released_at IS NULL
+                """,
+                (project_id, previous_id),
+            ).fetchall()
+            transferred_lease_ids.extend(str(row["id"]) for row in lease_rows)
+            connection.execute(
+                """
+                UPDATE file_leases SET session_id = ?, renewed_at = ?
+                WHERE project_id = ? AND session_id = ? AND released_at IS NULL
+                """,
+                (session_id, now, project_id, previous_id),
+            )
+            connection.execute(
+                """
+                UPDATE task_assignments SET assigned_to_session_id = ?
+                WHERE project_id = ? AND assigned_to_session_id = ? AND status = 'pending'
+                """,
+                (session_id, project_id, previous_id),
+            )
+            connection.execute(
+                """
+                UPDATE task_handoffs SET from_session_id = ?
+                WHERE project_id = ? AND from_session_id = ? AND status = 'pending'
+                """,
+                (session_id, project_id, previous_id),
+            )
+            connection.execute(
+                """
+                UPDATE task_handoffs SET to_session_id = ?
+                WHERE project_id = ? AND to_session_id = ? AND status = 'pending'
+                """,
+                (session_id, project_id, previous_id),
+            )
+        connection.execute(
+            """
+            UPDATE agent_sessions SET status = 'offline', left_at = ?
+            WHERE project_id = ? AND member_id = ? AND id <> ? AND left_at IS NULL
+            """,
+            (now, project_id, member_id, session_id),
+        )
+        return {
+            "previous_session_ids": previous_ids,
+            "transferred_task_ids": sorted(set(transferred_task_ids)),
+            "transferred_lease_ids": sorted(set(transferred_lease_ids)),
+        }
 
     def _host_dict(self, row: Mapping[str, Any]) -> dict[str, Any]:
         data = dict(row)
@@ -832,7 +968,7 @@ class AgentChatRoomService:
                 details={"root_path": str(root)},
             )
         remote, git_root = _project_git_info(root)
-        logical = logical_path.strip().replace("\\", "/").strip("/")
+        logical = derive_logical_path(root, git_root, logical_path)
         candidate_scope = _project_scope(remote, git_root, logical)
         now = iso_now()
         normalized_settings = normalize_project_settings(settings)
@@ -935,7 +1071,7 @@ class AgentChatRoomService:
                 details={"root_path": str(root)},
             )
         remote, git_root = _project_git_info(root)
-        logical = logical_path.strip().replace("\\", "/").strip("/")
+        logical = derive_logical_path(root, git_root, logical_path)
         candidate_scope = _project_scope(remote, git_root, logical)
         with self.database.connect() as connection:
             scope_projects = [
@@ -1803,7 +1939,8 @@ class AgentChatRoomService:
         self,
         project_id: str,
         *,
-        agent_key: str,
+        agent_key: str = "",
+        software_key: str = "",
         name: str,
         client: str,
         model: str,
@@ -1817,8 +1954,6 @@ class AgentChatRoomService:
         credential_id: str | None = None,
         member_id: str | None = None,
     ) -> dict[str, Any]:
-        if not agent_key.strip():
-            raise DomainError("invalid_agent_key", "Stable Agent key is required")
         if not name.strip() or not client.strip():
             raise DomainError("invalid_agent", "Agent name and client are required")
         if not model.strip():
@@ -1880,6 +2015,28 @@ class AgentChatRoomService:
                         "Agent session can only join as an active project member",
                         status_code=409,
                     )
+                member_created = False
+            else:
+                member, member_created = self._ensure_software_member(
+                    connection,
+                    project_id,
+                    software_key=software_key or client,
+                    name=name,
+                    client=client,
+                )
+                member_id = str(member["id"])
+
+            canonical_agent_key = str(member_id)
+            # Adopt matching pre-managed Sessions so historical role/name aliases
+            # remain audit history under the software installation that created them.
+            connection.execute(
+                """
+                UPDATE agent_sessions SET member_id = ?, agent_key = ?
+                WHERE project_id = ? AND member_id IS NULL
+                  AND lower(trim(client)) = lower(trim(?))
+                """,
+                (member_id, canonical_agent_key, project_id, client),
+            )
             connection.execute(
                 """
                 INSERT INTO agent_sessions(
@@ -1893,7 +2050,7 @@ class AgentChatRoomService:
                     session_id,
                     project_id,
                     member_id,
-                    agent_key.strip(),
+                    canonical_agent_key,
                     name.strip(),
                     client.strip(),
                     model.strip(),
@@ -1911,13 +2068,47 @@ class AgentChatRoomService:
                     now,
                 ),
             )
+            replacement = self._replace_identity_sessions(
+                connection,
+                project_id,
+                member_id=canonical_agent_key,
+                session_id=session_id,
+                now=now,
+            )
+            if member_created:
+                self._emit(
+                    connection,
+                    project_id,
+                    "agent.identity_registered",
+                    actor_session_id=session_id,
+                    payload={
+                        "member_id": member_id,
+                        "software_key": self._normalize_software_key(
+                            software_key or client
+                        ),
+                        "name": name.strip(),
+                        "client": client.strip(),
+                    },
+                )
+            if replacement["previous_session_ids"]:
+                self._emit(
+                    connection,
+                    project_id,
+                    "agent.session_replaced",
+                    actor_session_id=session_id,
+                    payload=replacement,
+                )
             event_id = self._emit(
                 connection,
                 project_id,
                 "agent.joined",
                 actor_session_id=session_id,
                 payload={
-                    "agent_key": agent_key.strip(),
+                    "agent_key": canonical_agent_key,
+                    "member_id": member_id,
+                    "software_key": self._normalize_software_key(
+                        software_key or client
+                    ),
                     "name": name.strip(),
                     "client": client.strip(),
                     "model": model.strip(),
@@ -1934,6 +2125,8 @@ class AgentChatRoomService:
             ).fetchone()
             return {
                 "agent": self._agent_dict(row),
+                "identity": self._member_dict(member),
+                "replaced": replacement,
                 "token": token,
                 "event_id": event_id,
                 "cursor": event_id,
@@ -3772,7 +3965,9 @@ class AgentChatRoomService:
         if not criteria:
             raise DomainError("missing_review_criteria", "Review must assess acceptance criteria")
         with self.database.connect(write=True) as connection:
-            self._authenticate(connection, project_id, reviewer_session_id, token)
+            reviewer = self._authenticate(
+                connection, project_id, reviewer_session_id, token
+            )
             task = self._require_task(connection, project_id, task_id)
             if (
                 task["execution_status"] != "completed"
@@ -3781,10 +3976,14 @@ class AgentChatRoomService:
                 raise DomainError(
                     "invalid_transition", "Task is not awaiting review", status_code=409
                 )
-            if task["owner_session_id"] == reviewer_session_id:
+            owner = connection.execute(
+                "SELECT * FROM agent_sessions WHERE id = ?",
+                (task["owner_session_id"],),
+            ).fetchone()
+            if self._same_agent_identity(owner, reviewer):
                 raise DomainError(
                     "reviewer_not_independent",
-                    "The executing session cannot independently verify its own work",
+                    "The executing software identity cannot independently verify its own work",
                     status_code=409,
                 )
             expected = json_load(task["acceptance_criteria_json"], [])
@@ -4225,13 +4424,11 @@ class AgentChatRoomService:
                 owner_id = asset["owner_id"]
                 new_asset_id = target_asset_id
             else:
-                agent_key = str(agent["agent_key"] or "").strip()
-                if agent_key:
-                    owner_kind, owner_id = "agent_key", agent_key
-                elif agent["member_id"]:
+                if agent["member_id"]:
                     owner_kind, owner_id = "member", agent["member_id"]
                 else:
-                    owner_kind, owner_id = "agent_key", ""
+                    owner_kind = "agent_key"
+                    owner_id = str(agent["agent_key"] or "").strip()
                 previous_version_id = None
                 next_version_number = 1
                 previous_status = None
@@ -4396,7 +4593,9 @@ class AgentChatRoomService:
                 details={"assessed": assessed},
             )
         with self.database.connect(write=True) as connection:
-            self._authenticate(connection, project_id, reviewer_session_id, token)
+            reviewer = self._authenticate(
+                connection, project_id, reviewer_session_id, token
+            )
             asset = self._require_knowledge_asset(connection, project_id, asset_id)
             if asset["status"] != "candidate":
                 raise DomainError(
@@ -4416,23 +4615,13 @@ class AgentChatRoomService:
                     status_code=409,
                 )
             creator = connection.execute(
-                "SELECT id, agent_key FROM agent_sessions WHERE id = ?",
+                "SELECT id, member_id, agent_key FROM agent_sessions WHERE id = ?",
                 (version["created_by_session_id"],),
             ).fetchone()
-            reviewer_key = str(
-                connection.execute(
-                    "SELECT agent_key FROM agent_sessions WHERE id = ?",
-                    (reviewer_session_id,),
-                ).fetchone()["agent_key"]
-                or ""
-            ).strip()
-            creator_key = str(creator["agent_key"] or "").strip() if creator else ""
-            if reviewer_session_id == version["created_by_session_id"] or (
-                creator_key and reviewer_key and reviewer_key == creator_key
-            ):
+            if self._same_agent_identity(creator, reviewer):
                 raise DomainError(
                     "knowledge_reviewer_not_independent",
-                    "The submitting agent cannot independently approve its own "
+                    "The submitting software identity cannot independently approve its own "
                     "knowledge candidate",
                     status_code=409,
                 )
@@ -4906,7 +5095,7 @@ class AgentChatRoomService:
                 "project": project,
                 "members": members,
                 "agents": agents,
-                "agent_identities": self._agent_identities(agents, tasks),
+                "agent_identities": self._agent_identities(agents, tasks, members),
                 "tasks": tasks,
                 "leases": leases,
                 "reports": reports,

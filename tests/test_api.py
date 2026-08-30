@@ -83,9 +83,12 @@ def test_health_and_project_room_flow(settings, project_dir):
         assert project["project_key"] not in project_integration.json()[
             "profiles"
         ]["workbuddy"]["project_memory_text"]
-        assert "workbuddy-main" in project_integration.json()["profiles"][
+        assert "AGENTCHATROOM_SOFTWARE_KEY" in project_integration.json()["profiles"][
             "workbuddy"
         ]["onboarding_prompts"]["local"]
+        assert '"AGENTCHATROOM_SOFTWARE_KEY": "workbuddy"' in project_integration.json()[
+            "profiles"
+        ]["workbuddy"]["local_config_text"]
         assert "<paste-issued-agent-token>" in project_integration.json()["profiles"][
             "workbuddy"
         ]["onboarding_prompts"]["http"]
@@ -488,7 +491,7 @@ def test_api_allows_approved_task_handoff_before_integration(settings, project_d
             json={
                 "agent_key": "integrator-main",
                 "name": "Integrator",
-                "client": "codex",
+                "client": "trae",
                 "model": "unknown",
                 "role": "integrator",
             },
@@ -922,7 +925,7 @@ def test_api_can_archive_and_permanently_delete_projects(settings, tmp_path):
         ).status_code == 404
 
 
-def test_agent_join_requires_stable_key_and_model_but_accepts_unknown(
+def test_agent_join_generates_identity_key_and_requires_model(
     settings, project_dir
 ):
     with TestClient(create_app(settings)) as client:
@@ -932,7 +935,7 @@ def test_agent_join_requires_stable_key_and_model_but_accepts_unknown(
         ).json()
         endpoint = f"/api/v1/projects/{project['id']}/agents/join"
 
-        missing_key = client.post(
+        generated = client.post(
             endpoint,
             json={"name": "Agent", "client": "generic", "model": "unknown"},
         )
@@ -954,7 +957,8 @@ def test_agent_join_requires_stable_key_and_model_but_accepts_unknown(
             },
         )
 
-        assert missing_key.status_code == 422
+        assert generated.status_code == 201
         assert missing_model.status_code == 422
         assert accepted.status_code == 201
-        assert accepted.json()["agent"]["agent_key"] == "agent-main"
+        assert accepted.json()["agent"]["agent_key"] == accepted.json()["agent"]["member_id"]
+        assert accepted.json()["agent"]["member_id"] == generated.json()["agent"]["member_id"]

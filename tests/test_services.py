@@ -108,9 +108,7 @@ def test_session_leave_releases_leases_and_closes_token(
     assert failure.value.code == "session_closed"
 
 
-def test_stable_agent_identity_aggregates_sessions_and_disconnects_truthfully(
-    service, project
-):
+def test_software_identity_reconnect_replaces_the_previous_session(service, project):
     first = service.join_room(
         project["id"],
         agent_key="codex-main",
@@ -132,19 +130,18 @@ def test_stable_agent_identity_aggregates_sessions_and_disconnects_truthfully(
     assert len(snapshot["agents"]) == 2
     assert len(snapshot["agent_identities"]) == 1
     identity = snapshot["agent_identities"][0]
-    assert identity["agent_key"] == "codex-main"
+    assert identity["agent_key"] == second["agent"]["member_id"]
+    assert first["agent"]["member_id"] == second["agent"]["member_id"]
     assert identity["session_count"] == 2
-    assert identity["active_session_count"] == 2
+    assert identity["active_session_count"] == 1
     assert identity["connection_status"] == "connected"
     assert identity["status"] == "online"
     assert identity["models"] == ["codex-ui-model", "unknown"]
-
-    service.leave_session(
-        project["id"], first["agent"]["id"], first["token"]
+    first_session = next(
+        item for item in snapshot["agents"] if item["id"] == first["agent"]["id"]
     )
-    partially_connected = service.snapshot(project["id"])["agent_identities"][0]
-    assert partially_connected["active_session_count"] == 1
-    assert partially_connected["connection_status"] == "connected"
+    assert first_session["left_at"] is not None
+
     service.leave_session(
         project["id"], second["agent"]["id"], second["token"]
     )
@@ -155,208 +152,170 @@ def test_stable_agent_identity_aggregates_sessions_and_disconnects_truthfully(
     assert disconnected["status"] == "registered"
 
 
-def test_agent_identity_keys_separate_matching_profiles_and_collapse_legacy_sessions(
+def test_agent_key_aliases_cannot_create_another_software_identity(service, project):
+    first = service.join_room(
+        project["id"],
+        agent_key="codex-main",
+        name="Codex",
+        client="codex",
+        model="unknown",
+        role="executor",
+    )
+    second = service.join_room(
+        project["id"],
+        agent_key="codex-review-main",
+        name="Codex Review",
+        client="codex",
+        model="unknown",
+        role="reviewer",
+    )
+
+    identities = service.snapshot(project["id"])["agent_identities"]
+    assert len(identities) == 1
+    assert first["agent"]["member_id"] == second["agent"]["member_id"]
+    assert identities[0]["name"] == "Codex"
+    assert identities[0]["active_session_count"] == 1
+
+
+def test_reconnect_transfers_owned_task_and_active_lease(service, project):
+    first = service.join_room(
+        project["id"],
+        agent_key="codex-main",
+        name="Codex",
+        client="codex",
+        model="unknown",
+    )
+    task = service.create_task(
+        project["id"],
+        title="Continue after reconnect",
+        acceptance_criteria=["Ownership and lease survive reconnect"],
+    )["task"]
+    service.claim_task(
+        project["id"], task["id"], first["agent"]["id"], first["token"]
+    )
+    lease = service.acquire_lease(
+        project["id"],
+        session_id=first["agent"]["id"],
+        token=first["token"],
+        task_id=task["id"],
+        path_pattern="src/identity.py",
+    )["lease"]
+
+    second = service.join_room(
+        project["id"],
+        agent_key="codex-runtime-check",
+        name="Codex Runtime Check",
+        client="codex",
+        model="unknown",
+        role="reviewer",
+    )
+
+    assert second["replaced"]["previous_session_ids"] == [first["agent"]["id"]]
+    assert second["replaced"]["transferred_task_ids"] == [task["id"]]
+    assert second["replaced"]["transferred_lease_ids"] == [lease["id"]]
+    snapshot = service.snapshot(project["id"])
+    stored_task = next(item for item in snapshot["tasks"] if item["id"] == task["id"])
+    stored_lease = next(item for item in snapshot["leases"] if item["id"] == lease["id"])
+    assert stored_task["owner_session_id"] == second["agent"]["id"]
+    assert stored_lease["session_id"] == second["agent"]["id"]
+
+
+def test_reconnect_recovers_unfinished_task_from_a_closed_identity_session(
     service, project
 ):
     first = service.join_room(
         project["id"],
-        agent_key="agent-one",
-        name="Shared Name",
-        client="generic",
+        agent_key="codex-main",
+        name="Codex",
+        client="codex",
         model="unknown",
-        role="executor",
-        worktree="D:/shared/project",
     )
+    task = service.create_task(
+        project["id"],
+        title="Resume after explicit disconnect",
+        acceptance_criteria=["The software identity keeps unfinished work"],
+    )["task"]
+    service.claim_task(
+        project["id"], task["id"], first["agent"]["id"], first["token"]
+    )
+    service.update_task(
+        project["id"],
+        task["id"],
+        status="in_progress",
+        session_id=first["agent"]["id"],
+        token=first["token"],
+    )
+    service.leave_session(project["id"], first["agent"]["id"], first["token"])
+
     second = service.join_room(
         project["id"],
-        agent_key="agent-two",
-        name="Shared Name",
-        client="generic",
+        agent_key="runtime-check-main",
+        name="Runtime Check",
+        client="codex",
         model="unknown",
-        role="executor",
-        worktree="D:/shared/project",
+        role="reviewer",
     )
 
-    identities = service.snapshot(project["id"])["agent_identities"]
-    assert {identity["agent_key"] for identity in identities} == {
-        "agent-one",
-        "agent-two",
-    }
-
-    with service.database.connect(write=True) as connection:
-        connection.execute(
-            "UPDATE agent_sessions SET agent_key = '' WHERE id IN (?, ?)",
-            (first["agent"]["id"], second["agent"]["id"]),
-        )
-    legacy_snapshot = service.snapshot(project["id"])
-    assert len(legacy_snapshot["agents"]) == 2
-    assert len(legacy_snapshot["agent_identities"]) == 1
-    legacy_identity = legacy_snapshot["agent_identities"][0]
-    assert legacy_identity["legacy_identity"] is True
-    assert legacy_identity["agent_key"].startswith("legacy-")
-    assert legacy_identity["session_count"] == 2
+    assert second["replaced"]["previous_session_ids"] == []
+    assert second["replaced"]["transferred_task_ids"] == [task["id"]]
+    stored_task = next(
+        item for item in service.snapshot(project["id"])["tasks"] if item["id"] == task["id"]
+    )
+    assert stored_task["owner_session_id"] == second["agent"]["id"]
 
 
-def test_legacy_sessions_join_one_unambiguous_explicit_identity(service, project):
-    explicit = service.join_room(
+def test_different_software_clients_have_distinct_identities(service, project):
+    codex = service.join_room(
         project["id"],
         agent_key="codex-main",
-        name="Codex Coordinator",
+        name="Codex",
         client="codex",
         model="unknown",
-        role="coordinator",
-        worktree="D:/shared/project",
     )
-    legacy = service.join_room(
+    trae = service.join_room(
         project["id"],
-        agent_key="temporary-legacy-key",
-        name="Codex Coordinator",
-        client="codex",
-        model="older-model",
-        role="coordinator",
-        worktree="D:/shared/project",
+        agent_key="trae-main",
+        name="Trae",
+        client="trae",
+        model="unknown",
+    )
+    identities = service.snapshot(project["id"])["agent_identities"]
+    assert len(identities) == 2
+    assert codex["agent"]["member_id"] != trae["agent"]["member_id"]
+
+
+def test_unbound_legacy_sessions_remain_in_audit_but_not_the_software_roster(
+    service, project
+):
+    joined = service.join_room(
+        project["id"],
+        agent_key="legacy-main",
+        name="Legacy",
+        client="legacy-client",
+        model="unknown",
     )
     with service.database.connect(write=True) as connection:
         connection.execute(
-            "UPDATE agent_sessions SET agent_key = '' WHERE id = ?",
-            (legacy["agent"]["id"],),
+            "UPDATE agent_sessions SET member_id = NULL, agent_key = '' WHERE id = ?",
+            (joined["agent"]["id"],),
         )
 
     snapshot = service.snapshot(project["id"])
-    assert len(snapshot["agents"]) == 2
-    assert len(snapshot["agent_identities"]) == 1
-    identity = snapshot["agent_identities"][0]
-    assert identity["agent_key"] == explicit["agent"]["agent_key"]
-    assert identity["legacy_identity"] is False
-    assert identity["legacy_session_count"] == 1
-    assert identity["session_count"] == 2
-
-
-def test_legacy_session_joins_unique_client_workspace_identity_across_profile_changes(
-    service, project
-):
-    explicit = service.join_room(
-        project["id"],
-        agent_key="workbuddy-main",
-        name="Current Reviewer",
-        client="generic-desktop-agent",
-        model="current-model",
-        role="reviewer",
-        worktree="D:/shared/project",
-    )
-    legacy = service.join_room(
-        project["id"],
-        agent_key="temporary-legacy-key",
-        name="Older Local Agent",
-        client="generic-desktop-agent",
-        model="older-model",
-        role="executor",
-        worktree="D:/shared/project",
-    )
-    with service.database.connect(write=True) as connection:
-        connection.execute(
-            "UPDATE agent_sessions SET agent_key = '' WHERE id = ?",
-            (legacy["agent"]["id"],),
-        )
-
-    identities = service.snapshot(project["id"])["agent_identities"]
-    assert len(identities) == 1
-    identity = identities[0]
-    assert identity["agent_key"] == explicit["agent"]["agent_key"]
-    assert identity["legacy_session_count"] == 1
-    assert identity["session_count"] == 2
-    assert identity["models"] == ["current-model", "older-model"]
-
-
-def test_legacy_session_stays_separate_when_client_workspace_scope_is_ambiguous(
-    service, project
-):
-    for agent_key, name, role in (
-        ("agent-one", "First Agent", "executor"),
-        ("agent-two", "Second Agent", "reviewer"),
-    ):
-        service.join_room(
-            project["id"],
-            agent_key=agent_key,
-            name=name,
-            client="generic-desktop-agent",
-            model="current-model",
-            role=role,
-            worktree="D:/shared/project",
-        )
-    legacy = service.join_room(
-        project["id"],
-        agent_key="temporary-legacy-key",
-        name="Historical Agent",
-        client="generic-desktop-agent",
-        model="older-model",
-        role="coordinator",
-        worktree="D:/shared/project",
-    )
-    with service.database.connect(write=True) as connection:
-        connection.execute(
-            "UPDATE agent_sessions SET agent_key = '' WHERE id = ?",
-            (legacy["agent"]["id"],),
-        )
-
-    identities = service.snapshot(project["id"])["agent_identities"]
-    assert len(identities) == 3
-    assert {identity["agent_key"] for identity in identities} >= {
-        "agent-one",
-        "agent-two",
-    }
-    legacy_identity = next(
-        identity for identity in identities if identity["legacy_identity"]
-    )
-    assert legacy_identity["agent_key"].startswith("legacy-")
-    assert legacy_identity["session_count"] == 1
-
-
-def test_legacy_session_without_workspace_requires_an_exact_profile_match(
-    service, project
-):
-    service.join_room(
-        project["id"],
-        agent_key="desktop-main",
-        name="Current Agent",
-        client="generic-desktop-agent",
-        model="current-model",
-        role="reviewer",
-    )
-    legacy = service.join_room(
-        project["id"],
-        agent_key="temporary-legacy-key",
-        name="Historical Agent",
-        client="generic-desktop-agent",
-        model="older-model",
-        role="executor",
-    )
-    with service.database.connect(write=True) as connection:
-        connection.execute(
-            "UPDATE agent_sessions SET agent_key = '' WHERE id = ?",
-            (legacy["agent"]["id"],),
-        )
-
-    identities = service.snapshot(project["id"])["agent_identities"]
-    assert len(identities) == 2
-    assert any(identity["agent_key"] == "desktop-main" for identity in identities)
-    assert any(identity["legacy_identity"] for identity in identities)
+    assert len(snapshot["agents"]) == 1
+    assert snapshot["agent_identities"] == []
 
 
 @pytest.mark.parametrize(
-    ("agent_key", "model", "error_code"),
+    ("model", "error_code"),
     [
-        ("", "unknown", "invalid_agent_key"),
-        ("agent-main", "", "invalid_agent_model"),
+        ("", "invalid_agent_model"),
     ],
 )
-def test_join_room_requires_agent_key_and_model_code(
-    service, project, agent_key, model, error_code
-):
+def test_join_room_requires_model_code(service, project, model, error_code):
     with pytest.raises(DomainError) as failure:
         service.join_room(
             project["id"],
-            agent_key=agent_key,
+            agent_key="",
             name="Agent",
             client="generic",
             model=model,
@@ -1163,6 +1122,60 @@ def test_work_must_be_independently_reviewed(service, project, joined_agents):
     assert review_event["id"] < integration_event["id"]
 
 
+def test_same_software_cannot_become_an_independent_reviewer_by_reconnecting(
+    service, project
+):
+    executor = service.join_room(
+        project["id"],
+        agent_key="codex-main",
+        name="Codex",
+        client="codex",
+        model="unknown",
+        role="executor",
+    )
+    task = service.create_task(
+        project["id"],
+        title="Identity-aware review",
+        acceptance_criteria=["Review comes from another software identity"],
+    )["task"]
+    service.claim_task(
+        project["id"], task["id"], executor["agent"]["id"], executor["token"]
+    )
+    service.submit_work_report(
+        project["id"],
+        task["id"],
+        session_id=executor["agent"]["id"],
+        token=executor["token"],
+        summary="Implemented",
+        files=["src/identity.py"],
+        tests=[{"command": "pytest", "exit_code": 0}],
+    )
+    reviewer_alias = service.join_room(
+        project["id"],
+        agent_key="codex-review-main",
+        name="Codex Review",
+        client="codex",
+        model="unknown",
+        role="reviewer",
+    )
+
+    with pytest.raises(DomainError) as failure:
+        service.submit_review(
+            project["id"],
+            task["id"],
+            reviewer_session_id=reviewer_alias["agent"]["id"],
+            token=reviewer_alias["token"],
+            verdict="approved",
+            criteria=[
+                {
+                    "criterion": "Review comes from another software identity",
+                    "status": "passed",
+                }
+            ],
+        )
+    assert failure.value.code == "reviewer_not_independent"
+
+
 def test_approved_completed_task_can_handoff_to_integrator(
     service, project, joined_agents
 ):
@@ -1171,7 +1184,7 @@ def test_approved_completed_task_can_handoff_to_integrator(
         project["id"],
         agent_key="integrator-main",
         name="Integrator",
-        client="codex",
+        client="trae",
         model="unknown",
         role="integrator",
     )
@@ -1610,6 +1623,41 @@ def test_agent_join_resolution_and_explicit_create_reuse_repository_scope(
     assert len(service.list_projects()) == 1
 
 
+@pytest.mark.parametrize(
+    "logical_path",
+    [r"D:\\claw\\agentchatroom", "/srv/agentchatroom", "../agentchatroom"],
+)
+def test_project_scope_rejects_non_relative_logical_paths(
+    service, project_dir, logical_path
+):
+    with pytest.raises(DomainError) as invalid_create:
+        service.create_project(
+            root_path=str(project_dir), logical_path=logical_path
+        )
+    assert invalid_create.value.code == "invalid_logical_path"
+
+    with pytest.raises(DomainError) as invalid_join:
+        service.resolve_project_for_join(
+            root_path=str(project_dir), logical_path=logical_path
+        )
+    assert invalid_join.value.code == "invalid_logical_path"
+
+
+def test_project_scope_rejects_relative_path_that_does_not_match_project_directory(
+    service, tmp_path
+):
+    repository = tmp_path / "repository"
+    api_dir = repository / "packages" / "api"
+    api_dir.mkdir(parents=True)
+    subprocess.run(["git", "-C", str(repository), "init"], check=True, capture_output=True)
+
+    with pytest.raises(DomainError) as mismatch:
+        service.create_project(
+            root_path=str(api_dir), logical_path="packages/web"
+        )
+    assert mismatch.value.code == "invalid_logical_path"
+
+
 def test_archived_repository_scope_must_be_restored_instead_of_duplicated(
     service, project_dir
 ):
@@ -1757,7 +1805,7 @@ def test_identity_unread_count_reflects_freshest_session(service, project):
     identity = next(
         item
         for item in snapshot["agent_identities"]
-        if item["agent_key"] == "unread-main"
+        if item["member_id"] == freshest["agent"]["member_id"]
     )
     assert identity["session_count"] == 2
     # The stale session still has unread events, but the identity badge must
@@ -2037,6 +2085,10 @@ def test_git_worktrees_share_room_and_logical_projects_remain_distinct(
     )
     assert first["agent"]["project_id"] == second["agent"]["project_id"]
 
-    api_project = service.create_project(root_path=str(repository), logical_path="packages/api")
-    web_project = service.create_project(root_path=str(repository), logical_path="packages/web")
+    api_dir = repository / "packages" / "api"
+    web_dir = repository / "packages" / "web"
+    api_dir.mkdir(parents=True)
+    web_dir.mkdir(parents=True)
+    api_project = service.create_project(root_path=str(api_dir))
+    web_project = service.create_project(root_path=str(web_dir))
     assert api_project["id"] != web_project["id"]

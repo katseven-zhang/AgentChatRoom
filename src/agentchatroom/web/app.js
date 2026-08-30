@@ -759,14 +759,14 @@ function renderAgents(agents) {
       const heartbeat = formatRelativeTime(agent.last_heartbeat);
       const activity = formatRelativeTime(agent.last_activity_at);
       const connectionSummary = connected
-        ? `${agent.active_session_count} 当前连接 · 累计接入 ${agent.session_count} 次`
+        ? `当前已连接 · 累计接入 ${agent.session_count} 次`
         : `已接入 · 未连接 · 累计接入 ${agent.session_count} 次`;
       const presenceStatus = connected ? "online" : "offline";
       const presenceLabel = connected ? "已连接" : "未连接";
       const taskSummary = agent.current_task_id
         ? `任务：${agent.current_task_title} · ${taskStatus(agent.current_task_status)}`
         : "当前无任务";
-      const details = `${agent.name}\nAgent key: ${agent.agent_key}\n客户端: ${agent.client}\n角色: ${agent.role}\n${connectionSummary}\n${taskSummary}\n最后心跳: ${heartbeat}\n最后活动: ${activity}`;
+      const details = `${agent.name}\n软件: ${agent.client}\n本次角色: ${agent.role}\n${connectionSummary}\n${taskSummary}\n最后心跳: ${heartbeat}\n最后活动: ${activity}`;
       return `
       <div class="agent-item ${connected ? "" : "is-disconnected"}" title="${escapeHtml(details)}">
         <span class="agent-avatar ${avatarColorClass(agent.id)}">${escapeHtml(initials(agent.name))}</span>
@@ -1925,9 +1925,9 @@ async function openIntegrationDialog() {
     "agentchatroom",
     "--url", JSON.stringify(window.location.origin),
     "room-join", JSON.stringify(project.id),
-    "--agent-key", "AGENT_KEY",
-    "--name", "AGENT_NAME",
-    "--client", "CLIENT_NAME",
+    "--software-key", "SOFTWARE_CODE",
+    "--name", "SOFTWARE_NAME",
+    "--client", "SOFTWARE_CLIENT",
     "--model", "MODEL_CODE_OR_UNKNOWN",
   ].join(" ");
   renderIntegrationTabs();
@@ -1994,15 +1994,14 @@ function renderIntegrationJoin() {
   const workspacePath = remote ? "<path-to-project-on-this-computer>" : project.root_path;
   const payload = {
     project_path: workspacePath,
-    agent_key: "<stable project-scoped agent key>",
-    agent_name: "<Agent name>",
-    client: state.integration.profiles?.[state.integrationFormat]?.label || "<client name>",
     model: "<actual model or unknown>",
     role: "executor",
     branch: "<git branch>",
     worktree: workspacePath,
   };
   if (remote) {
+    payload.agent_name = "<Software name>";
+    payload.client = "<software-client-code>";
     payload.host_key = "<stable-host-key>";
     payload.host_name = "<computer-name>";
     payload.git_remote = "<git-remote-url>";

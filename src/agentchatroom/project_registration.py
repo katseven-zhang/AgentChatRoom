@@ -5,7 +5,7 @@ import os
 import re
 import subprocess
 import uuid
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any, Mapping
 
 from .errors import DomainError
@@ -17,6 +17,62 @@ PROJECT_REGISTRATION_RELATIVE_PATH = Path(".agentchatroom") / "project.json"
 
 def normalize_logical_path(value: str) -> str:
     return value.strip().replace("\\", "/").strip("/")
+
+
+def validate_logical_path(value: str) -> str:
+    raw = value.strip()
+    if not raw:
+        return ""
+    windows_path = PureWindowsPath(raw)
+    posix_path = PurePosixPath(raw.replace("\\", "/"))
+    if (
+        windows_path.drive
+        or windows_path.is_absolute()
+        or posix_path.is_absolute()
+        or ".." in posix_path.parts
+    ):
+        raise DomainError(
+            "invalid_logical_path",
+            "logical_path must be a repository-relative path",
+            details={"logical_path": raw},
+        )
+    normalized = posix_path.as_posix().strip("/")
+    if normalized == ".":
+        return ""
+    return os.path.normcase(normalized).replace("\\", "/")
+
+
+def derive_logical_path(
+    root: Path,
+    git_root: Path,
+    requested_logical_path: str = "",
+) -> str:
+    resolved_root = root.resolve()
+    resolved_git_root = git_root.resolve()
+    try:
+        relative = resolved_root.relative_to(resolved_git_root)
+    except ValueError as error:
+        raise DomainError(
+            "project_scope_conflict",
+            "Project path must be inside its detected repository root",
+            details={
+                "root_path": str(resolved_root),
+                "repository_root": str(resolved_git_root),
+            },
+        ) from error
+    derived = validate_logical_path(relative.as_posix())
+    requested = validate_logical_path(requested_logical_path)
+    if requested and requested != derived:
+        raise DomainError(
+            "invalid_logical_path",
+            "logical_path must match the path derived from project_path",
+            details={
+                "logical_path": requested,
+                "derived_logical_path": derived,
+                "root_path": str(resolved_root),
+            },
+        )
+    return derived
 
 
 def normalize_remote(value: str) -> str:
@@ -66,7 +122,7 @@ def checkout_scope(
             details={"root_path": str(root)},
         )
     remote, git_root = _git_info(root)
-    logical = normalize_logical_path(logical_path)
+    logical = derive_logical_path(root, git_root, logical_path)
     if remote:
         return {
             "kind": "git",
@@ -169,11 +225,15 @@ def resolve_checkout_project_key(
     *,
     logical_path: str = "",
 ) -> tuple[str | None, bool]:
-    registration = load_checkout_registration(root_path, logical_path=logical_path)
+    expected_scope = checkout_scope(root_path, logical_path=logical_path)
+    expected_logical_path = expected_scope["logical_path"]
+    registration = load_checkout_registration(
+        root_path,
+        logical_path=expected_logical_path,
+    )
     if registration is None:
         return None, False
 
-    expected_scope = checkout_scope(root_path, logical_path=logical_path)
     if registration["scope"] != expected_scope:
         raise DomainError(
             "project_registration_scope_conflict",

@@ -63,7 +63,7 @@ def test_local_agent_runtime_state_is_ignored() -> None:
 def test_runtime_and_package_versions_match() -> None:
     metadata = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
 
-    assert metadata["project"]["version"] == __version__ == "0.2.1"
+    assert metadata["project"]["version"] == __version__ == "0.2.2"
 
 
 def test_readme_documents_cross_platform_support_boundary() -> None:

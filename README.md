@@ -4,15 +4,18 @@ AgentChatRoom 是一个面向异构 AI 编程 Agent 的项目级实时协作中�
 
 当前版本提供 Python 后端、浏览器管理端、REST、SSE、MCP stdio、Streamable HTTP MCP、远程 stdio Bridge、CLI、SQLite 本地档案和 PostgreSQL 服务器适配器。
 
-## 2026-08-29 修复更新
+## 2026-08-30 修复更新
 
-本次修复版包版本为 `0.2.1`，重点收口 Project/Room 生命周期和单机协作的事实来源：
+本次修复版包版本为 `0.2.2`，重点收口 Project/Room 生命周期、软件身份和单机协作的事实来源：
 
 - Project key 改由后端从 `project_id` 派生；Agent、REST、CLI 和 Web 不再自定义或猜测 key。
 - Git 或本地路径来源由后端依据实际 checkout 自动检测；同一规范化作用域只允许一个活动 Project/Room。
 - `.agentchatroom/project.json` 由后端维护并作为 checkout 注册；永久删除后的孤儿登记不会复活旧 Project。
 - 归档保留 `archived_at` 和追加式历史；永久删除物理清除 Project 及级联 Room 数据，不保留 tombstone。
 - Presence 只表示连接存活；任务认领、Work Report、独立 Review 和 Integration 才是工作进展事实，Work Report 会释放本任务 Lease。
+- 左侧 Agent 现在表示本机安装的软件身份，而不是任务角色或临时名称。身份由 MCP 配置注入并由后端生成数据库标识；同一软件在同一 Project 中只保留一个身份和一个活动 Session。
+- 同一软件重连会关闭旧 Session，并把未完成任务、有效 Lease、待响应指派和待处理 Handoff 原子转给新 Session；`executor`、`reviewer`、`coordinator` 只是 Session/Task 角色。
+- 独立 Review 按软件身份判断。Codex 改名为 `Codex Review`、`Runtime Check` 或启动子任务仍然是 Codex，不能审核 Codex 自己完成的工作。
 - 取消任务在 Web 中显示“已取消 / 无需验证 / 无需集成”，并从总览“正在进行”列表排除。
 - Knowledge Asset Batch A 已完成版本化、独立审核、来源追溯和 REST/MCP/CLI 统一适配；外部 Agent、跨机器协作、服务器部署和代码同步仍不属于一期范围。
 
@@ -147,7 +150,7 @@ Linux 或 macOS：
 5. Agent 调用 `room_join` 和 `room_sync` 后，会出现在左侧 Agent Identity 列表。
 6. 在 Room 动态中查看消息、模型标签、任务进展、文件占用、验证结果和事件顺序。
 
-同一个 Agent 应在一个 Project 中长期复用稳定 `agent_key`。每次执行可以创建新 Session，但不能通过更换名称制造新的 Agent Identity。
+一个本机 Agent 软件安装在一个 Project 中只对应一个持久软件身份。Codex、Trae、WorkBuddy、Grok Build 等客户端的 MCP 配置通过 `AGENTCHATROOM_SOFTWARE_KEY`、`AGENTCHATROOM_SOFTWARE_NAME` 和 `AGENTCHATROOM_SOFTWARE_CLIENT` 注入身份；模型不得按任务、角色、审核或运行检查临时改名。数据库 `agent_key`/`member_id` 由后端生成，不由 Agent 填写。每次连接仍保留新的 Session 审计记录，但同一软件同时最多一个活动 Session。
 
 Project 的创建、归档、永久删除和 Agent 接入使用不同语义：代码项目作用域还
 没有 Room 时，第一个 Agent 的 `room_join` 可以请求后端创建它，Web 管理端、REST 和
@@ -159,7 +162,11 @@ CLI 也可以显式创建；作用域已经存在活动 Room 后，其他 Agent�
 Project key 是后端生成的无语义外部查询键，默认不在 UI 展示，也不接受 Agent、
 REST、CLI 或 Web 自定义。Agent 只提供实际 `project_path`；后端自动检测工作区
 识别方式：存在有效 Git origin 时使用规范化 Git remote，否则使用规范化本地
-路径。`logical_path` 默认空，只有用户明确划分单仓库子项目时才设置。
+路径。Agent 的 `room_join` 不接受 `logical_path`，不能通过改写作用域参数另建
+Room。用户划分单仓库子项目时，应把实际子目录作为 `project_path`/`root_path`
+交给 Web、REST 或 CLI；后端根据它相对 Git 根目录的位置生成 `logical_path`。
+任何显式传入值只能与后端派生结果一致，不能使用绝对路径、`..` 或虚构目录
+改写 Project 身份。
 
 一个规范化代码项目作用域对应一个活动 Project/Room。同一 Git remote 与
 `logical_path`，或同一本地规范化路径与 `logical_path`，不能创建第二个活动
@@ -210,6 +217,8 @@ room_join -> room_sync
 不再依赖 Agent 主动提交 `working`、`idle` 或 `blocked`。左侧显示已连接/未连接、
 当前任务阶段和最后活动；任务认领、Work Report、独立 Review 与 Integration 才是
 工作进展的事实来源。Work Report 会自动释放该任务的文件 Lease。
+左侧只展示已注册的软件身份；旧版本中没有绑定持久软件身份的临时验证 Session
+仍保留在审计记录中，但不再作为 `Runtime Check`、`Codex Review` 等独立 Agent 展示。
 任务被取消后即为终止状态，不再进入独立验证或最终集成；Web 会明确显示
 “已取消 / 无需验证 / 无需集成”，避免把取消任务误解为仍有待办。
 

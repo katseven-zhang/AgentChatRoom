@@ -99,8 +99,8 @@ def test_candidate_creates_first_version_with_provenance(service, project, joine
     asset = created["asset"]
     assert asset["kind"] == "decision"
     assert asset["status"] == "candidate"
-    assert asset["owner_kind"] == "agent_key"
-    assert asset["owner_id"] == "builder-main"
+    assert asset["owner_kind"] == "member"
+    assert asset["owner_id"] == executor["agent"]["member_id"]
     assert asset["current_version"]["title"] == "Use SQLite WAL mode"
     assert asset["current_version"]["tags"] == ["database", "testing"]
 
@@ -594,14 +594,15 @@ def test_mcp_tools_reuse_domain_service(monkeypatch, service, project_dir):
     monkeypatch.setattr(mcp_server, "service", service)
     service.create_project(root_path=str(project_dir))
     executor = mcp_server.room_join(
-        str(project_dir), "mcp-builder-main", "Mcp Builder", "codex", "test-model"
+        project_path=str(project_dir), model="test-model",
+        agent_key="mcp-builder-main", agent_name="Mcp Builder", client="codex"
     )["result"]
     reviewer = mcp_server.room_join(
-        str(project_dir),
-        "mcp-reviewer-main",
-        "Mcp Reviewer",
-        "qoder",
-        "test-model",
+        project_path=str(project_dir),
+        model="test-model",
+        agent_key="mcp-reviewer-main",
+        agent_name="Mcp Reviewer",
+        client="qoder",
         role="reviewer",
     )["result"]
     project_id = executor["project"]["id"]

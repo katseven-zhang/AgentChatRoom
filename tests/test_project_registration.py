@@ -10,11 +10,13 @@ from agentchatroom import mcp_server
 from agentchatroom.errors import DomainError
 from agentchatroom.project_registration import (
     checkout_scope,
+    derive_logical_path,
     load_checkout_registration,
     project_registration_path,
     register_checkout_project,
     remove_checkout_project_registration,
     resolve_checkout_project_key,
+    validate_logical_path,
 )
 
 
@@ -68,6 +70,43 @@ def test_checkout_scope_is_detected_by_backend(tmp_path):
         "logical_path": "",
     }
 
+    api = repository / "packages" / "api"
+    api.mkdir(parents=True)
+    assert checkout_scope(api) == {
+        "kind": "git",
+        "identity": "https://example.invalid/team/repo",
+        "logical_path": os.path.normcase("packages/api").replace("\\", "/"),
+    }
+
+
+@pytest.mark.parametrize(
+    "logical_path",
+    [r"D:\\claw\\agentchatroom", "/srv/agentchatroom", "../agentchatroom"],
+)
+def test_logical_path_must_be_repository_relative(project_dir, logical_path):
+    with pytest.raises(DomainError) as invalid:
+        checkout_scope(project_dir, logical_path=logical_path)
+
+    assert invalid.value.code == "invalid_logical_path"
+
+
+def test_logical_path_normalizes_safe_repository_relative_paths():
+    assert validate_logical_path(r"packages\\api") == "packages/api"
+    assert validate_logical_path(".") == ""
+
+
+def test_logical_path_must_match_actual_project_directory(tmp_path):
+    repository = tmp_path / "repository"
+    api = repository / "packages" / "api"
+    api.mkdir(parents=True)
+    subprocess.run(["git", "-C", str(repository), "init"], check=True, capture_output=True)
+
+    expected = os.path.normcase("packages/api").replace("\\", "/")
+    assert derive_logical_path(api, repository) == expected
+    with pytest.raises(DomainError) as mismatch:
+        derive_logical_path(api, repository, "packages/web")
+    assert mismatch.value.code == "invalid_logical_path"
+
 
 def test_checkout_registration_rejects_a_file_copied_from_another_scope(
     service, tmp_path
@@ -88,39 +127,60 @@ def test_checkout_registration_rejects_a_file_copied_from_another_scope(
     assert conflict.value.code == "project_registration_scope_conflict"
 
 
-def test_checkout_registration_supports_logical_subprojects_and_removal(
-    service, project_dir
+def test_checkout_registration_supports_derived_logical_subprojects_and_removal(
+    service, tmp_path
 ):
-    api = service.create_project(
-        root_path=str(project_dir), logical_path="packages/api"
+    repository = tmp_path / "repository"
+    api_dir = repository / "packages" / "api"
+    web_dir = repository / "packages" / "web"
+    api_dir.mkdir(parents=True)
+    web_dir.mkdir(parents=True)
+    subprocess.run(["git", "-C", str(repository), "init"], check=True, capture_output=True)
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(repository),
+            "remote",
+            "add",
+            "origin",
+            "git@example.invalid:team/repo.git",
+        ],
+        check=True,
+        capture_output=True,
     )
-    web = service.create_project(
-        root_path=str(project_dir), logical_path="packages/web"
-    )
-    register_checkout_project(project_dir, api)
-    register_checkout_project(project_dir, web)
+    api = service.create_project(root_path=str(api_dir))
+    web = service.create_project(root_path=str(web_dir))
+    register_checkout_project(api_dir, api)
+    register_checkout_project(web_dir, web)
 
+    api_logical = os.path.normcase("packages/api").replace("\\", "/")
+    web_logical = os.path.normcase("packages/web").replace("\\", "/")
     assert api["project_key"] != web["project_key"]
-    assert load_checkout_registration(
-        project_dir, logical_path="packages/api"
-    )["project_key"] == api["project_key"]
+    assert api["logical_path"] == api_logical
+    assert web["logical_path"] == web_logical
+    assert load_checkout_registration(api_dir, logical_path=api_logical)[
+        "project_key"
+    ] == api["project_key"]
     assert remove_checkout_project_registration(
-        project_dir,
+        api_dir,
         project_key=api["project_key"],
-        logical_path="packages/api",
+        logical_path=api_logical,
     )
-    assert load_checkout_registration(project_dir, logical_path="packages/api") is None
-    assert load_checkout_registration(project_dir, logical_path="packages/web") is not None
+    assert load_checkout_registration(api_dir, logical_path=api_logical) is None
+    assert load_checkout_registration(web_dir, logical_path=web_logical) is not None
 
 
 def test_local_mcp_join_creates_then_joins_one_room(monkeypatch, service, project_dir):
     monkeypatch.setattr(mcp_server, "service", service)
 
     first = mcp_server.room_join(
-        str(project_dir), "first-main", "First Agent", "generic-client", "unknown"
+        project_path=str(project_dir), model="unknown", agent_key="first-main",
+        agent_name="First Agent", client="generic-client"
     )
     second = mcp_server.room_join(
-        str(project_dir), "second-main", "Second Agent", "generic-client", "unknown"
+        project_path=str(project_dir), model="unknown", agent_key="second-main",
+        agent_name="Second Agent", client="generic-client"
     )
 
     assert first["ok"] is True
@@ -129,6 +189,48 @@ def test_local_mcp_join_creates_then_joins_one_room(monkeypatch, service, projec
     assert len(service.list_projects()) == 1
     registration = load_checkout_registration(project_dir)
     assert registration["project_key"] == first["result"]["project"]["project_key"]
+
+
+def test_local_mcp_join_derives_monorepo_subproject_from_project_path(
+    monkeypatch, service, tmp_path
+):
+    repository = tmp_path / "repository"
+    api_dir = repository / "packages" / "api"
+    api_dir.mkdir(parents=True)
+    subprocess.run(["git", "-C", str(repository), "init"], check=True, capture_output=True)
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(repository),
+            "remote",
+            "add",
+            "origin",
+            "git@example.invalid:team/repo.git",
+        ],
+        check=True,
+        capture_output=True,
+    )
+    monkeypatch.setattr(mcp_server, "service", service)
+
+    root_join = mcp_server.room_join(
+        project_path=str(repository), model="unknown", agent_key="root-main",
+        agent_name="Root Agent", client="generic-client"
+    )
+    api_join = mcp_server.room_join(
+        project_path=str(api_dir), model="unknown", agent_key="api-main",
+        agent_name="API Agent", client="generic-client"
+    )
+    api_repeat = mcp_server.room_join(
+        project_path=str(api_dir), model="unknown", agent_key="api-review",
+        agent_name="API Reviewer", client="generic-client"
+    )
+
+    expected = os.path.normcase("packages/api").replace("\\", "/")
+    assert root_join["result"]["project"]["logical_path"] == ""
+    assert api_join["result"]["project"]["logical_path"] == expected
+    assert api_repeat["result"]["project"]["id"] == api_join["result"]["project"]["id"]
+    assert api_join["result"]["project"]["id"] != root_join["result"]["project"]["id"]
 
 
 def test_orphaned_checkout_registration_does_not_recreate_deleted_project(
@@ -140,7 +242,8 @@ def test_orphaned_checkout_registration_does_not_recreate_deleted_project(
     service.delete_project(project["id"])
 
     response = mcp_server.room_join(
-        str(project_dir), "trae-main", "Trae", "trae", "unknown"
+        project_path=str(project_dir), model="unknown", agent_key="trae-main",
+        agent_name="Trae", client="trae"
     )
 
     assert response["ok"] is False
@@ -159,7 +262,8 @@ def test_backend_refreshes_registration_after_project_key_migration(
     path.write_text(json.dumps(document), encoding="utf-8")
 
     joined = mcp_server.room_join(
-        str(project_dir), "codex-main", "Codex", "codex", "unknown"
+        project_path=str(project_dir), model="unknown", agent_key="codex-main",
+        agent_name="Codex", client="codex"
     )
 
     assert joined["ok"] is True
@@ -167,10 +271,11 @@ def test_backend_refreshes_registration_after_project_key_migration(
     assert load_checkout_registration(project_dir)["project_key"] == project["project_key"]
 
 
-def test_mcp_schema_does_not_accept_agent_supplied_project_key():
+def test_mcp_schema_does_not_accept_agent_supplied_project_identity():
     room_join = mcp_server.mcp._tool_manager.get_tool("room_join")
 
     assert "Never supply, infer, or replace a project_key" in mcp_server.MCP_INSTRUCTIONS
     assert ".agentchatroom/project.json" in mcp_server.MCP_INSTRUCTIONS
     assert "project_key" not in room_join.parameters["properties"]
-    assert "logical_path" in room_join.parameters["properties"]
+    assert "logical_path" not in room_join.parameters["properties"]
+    assert "Agents also do not supply logical_path" in mcp_server.MCP_INSTRUCTIONS

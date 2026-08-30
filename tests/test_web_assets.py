@@ -112,8 +112,8 @@ def test_web_supports_human_reading_and_guided_interactions():
     assert "snapshot.agent_identities" in javascript
     assert "当前连接" in javascript
     assert "累计" in javascript and "次接入" in javascript
-    assert 'app.css?v=1.0.0-central16' in markup
-    assert 'app.js?v=1.0.0-central16' in markup
+    assert 'app.css?v=1.0.0-central17' in markup
+    assert 'app.js?v=1.0.0-central17' in markup
     assert "function renderIntegrationTabs()" in javascript
     assert 'class="segmented-control integration-tabs" id="integration-format-tabs"' in markup
     assert "state.integration.profiles" in javascript
