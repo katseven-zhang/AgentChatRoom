@@ -23,13 +23,25 @@ PROJECT_PATH_ENV_VAR = "AGENTCHATROOM_PROJECT_PATH"
 # The "generic" profile covers every additional client that speaks the standard
 # MCP JSON shape (`mcpServers` with command/args/env), so new clients need no
 # core-domain branch to onboard.
-MCP_CLIENT_PROFILES: dict[str, dict[str, str]] = {
+MCP_CLIENT_PROFILES: dict[str, dict[str, Any]] = {
     "workbuddy": {
         "label": "WorkBuddy",
         "vendor": "Tencent",
         "format": "json",
         "config_path_hint": "~/.workbuddy/mcp.json",
         "project_instruction_path_hint": ".workbuddy/memory/MEMORY.md",
+        "local_config": {
+            "candidates": [
+                {
+                    "root": "home",
+                    "parts": [".workbuddy", "mcp.json"],
+                    "label": "WorkBuddy",
+                }
+            ],
+            "reload_instruction": (
+                "配置写入后重启 WorkBuddy 或新开会话；配置内容变化时，连接器可能需要重新审批。"
+            ),
+        },
     },
     "grok_build": {
         "label": "Grok Build",
@@ -47,7 +59,26 @@ MCP_CLIENT_PROFILES: dict[str, dict[str, str]] = {
         "label": "Trae",
         "vendor": "ByteDance",
         "format": "json",
-        "config_path_hint": "使用 Trae 当前实际读取的 MCP JSON 配置文件",
+        "config_path_hint": (
+            "%APPDATA%/TRAE SOLO CN/User/mcp.json；仅在实际文件存在时检测其他 Trae 配置"
+        ),
+        "local_config": {
+            "candidates": [
+                {
+                    "root": "appdata",
+                    "parts": ["TRAE SOLO CN", "User", "mcp.json"],
+                    "label": "TRAE SOLO CN",
+                },
+                {
+                    "root": "appdata",
+                    "parts": ["Trae CN", "User", "mcp.json"],
+                    "label": "Trae CN",
+                },
+            ],
+            "reload_instruction": (
+                "配置写入后重启 Trae 或重新加载 MCP，并新开会话等待当前 Room 出现连接 Presence。"
+            ),
+        },
     },
     "generic": {
         "label": "通用（标准 MCP）",
@@ -125,100 +156,26 @@ def _build_streamable_http_toml(
 
 
 def build_onboarding_prompt(
-    project: Mapping[str, Any],
     *,
     profile_id: str,
     profile: Mapping[str, Any],
     transport: str,
     config_text: str,
-    project_instructions_text: str,
 ) -> str:
-    """Build one complete prompt for one client profile and transport."""
-    project_name = str(project.get("name", "")).strip() or "Project"
-    root_path = str(project.get("root_path", "")).strip() or "<本机项目路径>"
+    """Build a concise handoff containing only the generated MCP connection facts."""
     client_label = str(profile.get("label", profile_id)).strip() or profile_id
-    config_path_hint = str(profile.get("config_path_hint", "")).strip()
-    project_instruction_path_hint = str(
-        profile.get("project_instruction_path_hint", "")
-    ).strip()
-    transport_details = {
-        "local": {
-            "label": "本机 stdio",
-            "scope": "Agent 与 AgentChatRoom 中心运行在同一台电脑。",
-            "project_path": root_path,
-            "credential_note": "配置中的本机路径是当前运行环境值，不要改成远程地址。",
-        },
-        "http": {
-            "label": "直接 HTTP MCP",
-            "scope": "Agent 通过中心的 Streamable HTTP MCP 连接。",
-            "project_path": "<当前 Agent 电脑上的项目路径>",
-            "credential_note": (
-                "把配置中的 <paste-issued-agent-token> 替换为该 Project 签发的 Agent Token；"
-                "不要把 Token 写入项目文件或 Room 消息。"
-            ),
-        },
-        "remote": {
-            "label": "远程 Bridge",
-            "scope": "Agent 电脑运行本地 stdio Bridge，再连接 AgentChatRoom 中心。",
-            "project_path": "<当前 Agent 电脑上的项目路径>",
-            "credential_note": (
-                "把配置中的 <paste-issued-agent-token> 替换为该 Project 签发的 Agent Token；"
-                "不要把 Token 写入项目文件或 Room 消息。"
-            ),
-        },
+    transport_label = {
+        "local": "本机 stdio",
+        "http": "直接 HTTP MCP",
+        "remote": "远程 Bridge",
     }[transport]
-    instruction_target = (
-        f"建议项目规则文件：{project_instruction_path_hint}。"
-        if project_instruction_path_hint
-        else "把项目规则写入该客户端实际会读取的项目级指令或记忆文件；不要创建客户端不会读取的文件。"
-    )
-    join_intro = (
-        "本机 stdio MCP 加载完整软件身份和 checkout 路径配置后会自动建立连接 Presence；"
-        "Agent 开始工作前仍调用 room_join 获取本次运行凭据："
-        if transport == "local"
-        else "工具加载后调用 room_join："
-    )
 
-    return f"""请直接为当前工作空间完成 AgentChatRoom 接入，不要只解释步骤。
+    return f"""请为 {client_label} 接入名为 `{MCP_SERVER_NAME}` 的 MCP Server。
 
-目标
-- Project：{project_name}
-- 目标客户端：{client_label}
-- 连接方式：{transport_details['label']}
-- 说明：{transport_details['scope']}
+连接方式：{transport_label}
+请根据当前客户端和运行环境自行完成接入。连接配置：
 
-一、配置 MCP
-1. 检查当前客户端已有的 MCP 配置，保留其他 MCP Server，只新增或更新名为 agentchatroom 的配置。
-2. 建议配置位置：{config_path_hint or '请使用当前客户端实际支持的 MCP 配置文件'}。
-3. 写入下面的配置：
-
-{config_text.rstrip()}
-
-4. {transport_details['credential_note']}
-5. 如果客户端需要刷新 MCP、重启或新开对话才能加载工具，请明确告诉用户需要执行的动作；工具加载后继续完成下面步骤。
-
-二、写入当前项目的协作规则
-{instruction_target}
-
-{project_instructions_text.rstrip() or '当前项目尚未生成协作规则，先停止并告知用户。'}
-
-三、加入并同步 Room
-{join_intro}
-- project_path：{transport_details['project_path']}
-- 软件身份：由 MCP 配置中的 {SOFTWARE_KEY_ENV_VAR}、{SOFTWARE_NAME_ENV_VAR} 和 {SOFTWARE_CLIENT_ENV_VAR} 注入；不要在任务、审核或运行检查中改名或创建新身份
-- model：使用当前界面显示的模型标签；完全不可见时填 unknown
-- role：只是本次 Session 的任务角色，例如 executor、reviewer 或 coordinator，不是新的 Agent 身份
-
-不要另建 Room，也不要提交或推断 project_key。本机 stdio 会读取并校验 `.agentchatroom/project.json`，Project key 只由后端生成。只有当前规范化项目作用域在数据库和本地登记中都为空时，首个 Agent 才允许请求后端创建 Room。
-
-room_join 成功后立即调用 room_sync。开始项目检查、修改或评审前都必须先同步；Task 状态由认领、工作报告和审核事件推进，不要手工声称实时 working/idle。
-
-四、执行协作约定
-- 发布 Agent 消息时填写本次回复真实的 model_display_name。
-- 认领任务使用 task_claim；编辑文件前使用 lease_acquire，结束后释放租约。
-- 完成工作使用 work_report 提交修改文件和测试证据；执行完成不等于独立验证通过。
-- project_id、session_id、Session Token 和 cursor 只保存在当前运行时，不得写入项目文件。
-- 本次工作结束后提交 Work Report；连接状态由 MCP 进程自动维护。"""
+{config_text.rstrip()}"""
 
 
 def _profile_identity_environment(
@@ -392,34 +349,28 @@ def build_mcp_integration(
         if project:
             profiles[profile_id]["onboarding_prompts"] = {
                 "local": build_onboarding_prompt(
-                    project,
                     profile_id=profile_id,
                     profile=profile,
                     transport="local",
                     config_text=config_text,
-                    project_instructions_text=project_instructions_text,
                 ),
                 "http": build_onboarding_prompt(
-                    project,
                     profile_id=profile_id,
                     profile=profile,
                     transport="http",
                     config_text=http_config_text,
-                    project_instructions_text=project_instructions_text,
                 ),
                 "remote": build_onboarding_prompt(
-                    project,
                     profile_id=profile_id,
                     profile=profile,
                     transport="remote",
                     config_text=remote_config_text,
-                    project_instructions_text=project_instructions_text,
                 ),
             }
         if profile_id == "workbuddy":
             profiles[profile_id]["project_memory_text"] = project_instructions_text
     return {
-        "schema_version": 3,
+        "schema_version": 4,
         "transport": "stdio",
         "server_name": MCP_SERVER_NAME,
         "command": command,

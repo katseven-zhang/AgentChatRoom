@@ -2,7 +2,7 @@
 
 AgentChatRoom 是一个面向异构 AI 编程 Agent 的项目级实时协作中心。它让 Codex、WorkBuddy、Grok Build、Trae 以及其他支持标准 MCP 的客户端，在同一 Project/Room 中交换消息、领取任务、声明文件占用、提交工作证据，并由独立 Agent 完成验证和最终集成。
 
-当前版本提供 Python 后端、浏览器管理端、REST、SSE、MCP stdio、Streamable HTTP MCP、远程 stdio Bridge、CLI、SQLite 本地档案和 PostgreSQL 服务器适配器。
+当前一期提供 Python 后端、浏览器管理端、REST、SSE、本机 MCP stdio、CLI 和 SQLite 本地档案。Streamable HTTP MCP、远程 stdio Bridge、PostgreSQL 和服务器部署适配器保留为后续阶段基础，不作为当前单机产品能力展示。
 
 ## 2026-08-30 修复更新
 
@@ -18,6 +18,7 @@ AgentChatRoom 是一个面向异构 AI 编程 Agent 的项目级实时协作中�
 - 独立 Review 按软件身份判断。Codex 改名为 `Codex Review`、`Runtime Check` 或启动子任务仍然是 Codex，不能审核 Codex 自己完成的工作。
 - 取消任务在 Web 中显示“已取消 / 无需验证 / 无需集成”，并从总览“正在进行”列表排除。
 - Knowledge Asset Batch A 已完成版本化、独立审核、来源追溯和 REST/MCP/CLI 统一适配；外部 Agent、跨机器协作、服务器部署和代码同步仍不属于一期范围。
+- Web 端 Room 动态与审计面板会按分页追平到最新事件游标后渲染，不再停留在历史首屏；SSE 从已加载的最大事件 ID 起订阅，刷新页面即可看到最新消息、任务与审计记录。
 
 本次更新已通过完整测试、Python/JavaScript 语法检查、公开发布审计、差异检查和本地浏览器回归；运行时数据、凭据和本地 `docs/` 资料不纳入版本提交。
 
@@ -72,9 +73,9 @@ GitHub Actions 当前持续验证 Windows 与 Ubuntu；macOS 的命令路径已�
 1. 下载或克隆仓库。
 2. 双击 `启动 AgentChatRoom.cmd`。
 3. 首次启动会在当前仓库创建 `.venv`、安装依赖、启动后端并打开浏览器。
-4. CMD 窗口持续显示后端日志；关闭窗口会停止前台服务。
+4. CMD 窗口以前台方式持续运行并显示启动、停止和错误日志；关闭这个启动窗口会连同前台服务一起停止，不会转入后台常驻。
 
-需要清理异常退出后残留的后台进程时，双击 `关闭 AgentChatRoom.cmd`。
+需要清理异常退出后残留的后台进程时，双击 `关闭 AgentChatRoom.cmd`。清理脚本不会创建虚拟环境或安装依赖；它会先请求后台服务正常停止，再结束 `server.pid` 对应的整个进程树，最后按实际配置端口清理仍在监听的残留进程树。
 
 默认地址：
 
@@ -83,6 +84,24 @@ http://127.0.0.1:8765
 ```
 
 启动脚本通过自身位置推导仓库根目录，所以仓库可以放在任意盘符、任意父目录，也可以改名。
+
+## Windows GUI 控制台
+
+双击 `AgentChatRoom 控制台.cmd` 打开本机图形控制台。它面向只想点按钮、不想看 CMD 窗口的 Windows 单机使用场景，不提供远程或服务器管理能力。
+
+- **端口**：输入框默认读取当前有效配置（含环境变量与配置文件优先级）；仅接受 1-65535 的整数端口，输入不合法会提示且不会启动。端口与配置不同时会写回本地配置文件，下次启动直接生效。
+- **启动服务**：按钮在服务已运行或上一个动作未完成时禁用，避免重复启动；端口被占用、启动失败会在日志区给出原因。启动成功后状态栏显示实际监听地址与进程号。
+- **停止服务**：复用与 CLI `stop` 相同的后台服务生命周期，包括 Windows 进程树清理；停止完成或超时都会在日志区反馈，超时会提示改用 `关闭 AgentChatRoom.cmd` 清理残留。
+- **日志区**：滚动显示启动、运行错误与停止日志，日志中的令牌、密钥等敏感值会被遮蔽，不回显明文。
+- **关闭窗口**：服务仍在运行时询问三种选择——结束服务并关闭、保留服务运行仅关窗口、取消关闭；服务未运行时直接关闭，不弹确认。选择保留时服务以分离方式继续运行，可随时重新打开控制台或用关闭脚本停止。
+
+GUI 与两个 CMD 启停入口使用同一套配置和服务生命周期实现；GUI 异常退出后，仍可双击 `关闭 AgentChatRoom.cmd` 完整清理残留进程。GUI 需要系统 Python 附带的 tkinter 模块（python.org 官方安装器默认包含）；缺失时会给出明确的修复提示，而不是静默失败。
+
+命令行也可以直接启动控制台：
+
+```powershell
+.venv\Scripts\agentchatroom.exe gui
+```
 
 ## 手动安装与启动
 
@@ -144,11 +163,12 @@ Linux 或 macOS：
 ## 浏览器基本使用
 
 1. 打开 Web 管理端并创建 Project。
-2. Project 根目录填写需要协作的代码工作区；这是运行数据库中的本机数据，不会写入仓库配置。
-3. 点击“接入 Agent”，选择客户端和连接方式。
-4. 复制页面生成的一段接入提示词，粘贴给对应 Agent。
-5. 本机 stdio MCP 进程加载完整软件身份和 checkout 路径配置后，会自动加入已登记 Room 并出现在左侧；Agent 开始工作前仍调用 `room_join` 和 `room_sync` 获取本次运行凭据并同步事实。
-6. 在 Room 动态中查看消息、模型标签、任务进展、文件占用、验证结果和事件顺序。
+2. 本机部署可点击“选择文件夹”打开系统目录选择器，也可手工填写需要协作的项目文件夹；取消选择不会修改原输入。该路径只保存在运行数据库和 checkout 本地登记中，不会写入公开仓库配置。
+3. 点击“配置本机 Agent”并选择客户端；一期 Web 固定使用本机 stdio，不显示 HTTP 或远程连接选项。
+4. 本机 WorkBuddy 或 Trae 可先使用页面的 MCP 配置助手检测现有配置；确认预览后再应用。也可以把页面生成的 MCP 接入信息交给 Agent：内容只包含目标客户端、连接方式和当前环境动态生成的 `agentchatroom` 配置，配置位置、写入方式和异常处理由 Agent 自行判断并向用户反馈。
+5. 按页面提示重启客户端、重新加载 MCP 或新开会话。配置文件已写入不等于已经连接，必须等左侧显示该软件在当前 Room“已连接”。
+6. Agent 开始工作前仍调用 `room_join` 和 `room_sync` 获取本次运行凭据并同步事实。
+7. 在 Room 动态中查看消息、模型标签、任务进展、文件占用、验证结果和事件顺序。
 
 一个本机 Agent 软件安装在一个 Project 中只对应一个持久软件身份。Codex、Trae、WorkBuddy、Grok Build 等客户端的本机 stdio MCP 配置通过 `AGENTCHATROOM_SOFTWARE_KEY`、`AGENTCHATROOM_SOFTWARE_NAME` 和 `AGENTCHATROOM_SOFTWARE_CLIENT` 注入身份，并通过 `AGENTCHATROOM_PROJECT_PATH` 指向当前 checkout。四项配置完整且 checkout 已登记时，MCP 进程启动即自动建立 Presence；缺少配置时不会根据模型参数猜测身份，也不会自动创建 Room。模型不得按任务、角色、审核或运行检查临时改名。数据库 `agent_key`/`member_id` 由后端生成，不由 Agent 填写。每次连接仍保留新的 Session 审计记录，但同一软件同时最多一个活动 Session。
 
@@ -162,9 +182,11 @@ CLI 也可以显式创建；作用域已经存在活动 Room 后，其他 Agent�
 Project key 是后端生成的无语义外部查询键，默认不在 UI 展示，也不接受 Agent、
 REST、CLI 或 Web 自定义。Agent 只提供实际 `project_path`；后端自动检测工作区
 识别方式：存在有效 Git origin 时使用规范化 Git remote，否则使用规范化本地
-路径。Agent 的 `room_join` 不接受 `logical_path`，不能通过改写作用域参数另建
-Room。用户划分单仓库子项目时，应把实际子目录作为 `project_path`/`root_path`
-交给 Web、REST 或 CLI；后端根据它相对 Git 根目录的位置生成 `logical_path`。
+路径。Agent 的 `room_join` 不接受 `logical_path`，Web 也不要求用户填写该内部派生
+值，不能通过改写作用域参数另建 Room。用户划分单仓库子项目时，应直接选择或
+填写实际子目录作为 `project_path`/`root_path`；后端根据它相对 Git 根目录的
+位置生成 `logical_path`。LAN 或服务器部署不会尝试打开服务器桌面选择器，仍使用
+手工绝对路径输入。
 任何显式传入值只能与后端派生结果一致，不能使用绝对路径、`..` 或虚构目录
 改写 Project 身份。
 
@@ -190,13 +212,31 @@ Room。`room_join` 会从忽略的 `.agentchatroom/project.json` 读取后端登
 .venv\Scripts\agentchatroom.exe mcp-config --format codex-toml --transport local-stdio
 ```
 
-支持的连接方式：
+连接方式与一期范围：
 
 - `local-stdio`：Agent 与中心在同一台电脑，共享同一个 `.agentchatroom/runtime`。
-- `streamable-http`：客户端直接连接中心 `/mcp`，需要 Agent Token。
-- `remote-bridge`：客户端只支持 stdio 时，由本机 Bridge 转发到远程中心。
+- `streamable-http`：后续阶段客户端直接连接中心 `/mcp` 的基础适配，当前不在 Web 展示。
+- `remote-bridge`：后续阶段由本机 Bridge 转发到远程中心的基础适配，当前不在 Web 展示。
 
-远程 Token 只放在客户端安全配置或环境变量中，不写入 README、项目规则、日志、消息正文或 Git。
+一期 Web 只提供 `local-stdio` 配置流程。远程能力完成独立设计、代码同步边界和端到端验收前，不应通过隐藏入口或手工参数将其视为已支持产品能力。未来使用的远程 Token 只允许放在客户端安全配置或环境变量中，不写入 README、项目规则、日志、消息正文或 Git。
+
+### 本机 MCP 配置助手
+
+`deployment_profile=local` 时，Web“配置本机 Agent”可为已验证的 JSON 客户端执行
+`检测 -> 预览 -> 用户确认 -> 备份 -> 原子写入 -> 再次校验`：
+
+- WorkBuddy 检测当前用户的 `~/.workbuddy/mcp.json`。
+- Trae 优先检测 `%APPDATA%/TRAE SOLO CN/User/mcp.json`；只有其他候选配置文件实际存在时才使用，不创建猜测路径。
+- 只新增或替换 `mcpServers.agentchatroom`，保留其他 MCP Server 和客户端设置。
+- 预览返回当前文件 SHA-256；应用时哈希不一致会拒绝覆盖，要求重新检测。
+- 写入前在同一目录创建带 UTC 时间戳的备份，并通过同目录临时文件和原子替换更新原文件。
+- 配置缺失、JSON 无效、不可读、不可写时降级为辅助或手动配置；不会静默覆盖、自动提权或修改未知文件。
+- “让 Agent 配置 MCP”只发送目标客户端、连接方式和当前环境动态生成的配置，不混入项目协作规则、配置文件路径假设、权限处理或任务流程；具体接入方式由 Agent 根据实际客户端自行判断。
+- LAN/服务器部署只生成配置和人工指引，绝不尝试修改 Agent 电脑上的文件。
+
+WorkBuddy 配置变化可能触发新的连接器审批；Trae/WorkBuddy 都可能需要重启、
+重新加载 MCP 或新开会话。页面分别显示“配置文件状态”“是否需要重载”和
+“当前 Room Presence”，不会把复制配置、写入配置或启动进程误报为已连接。
 
 ## 标准协作流程
 

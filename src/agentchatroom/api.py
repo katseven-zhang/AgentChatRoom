@@ -10,7 +10,7 @@ import secrets
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Callable, Literal
 
 from fastapi import FastAPI, Query, Request
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
@@ -21,8 +21,10 @@ from starlette.datastructures import MutableHeaders
 from . import __version__
 from .config import Settings, load_settings
 from .database import create_database
+from .desktop import DirectoryPickerUnavailable, pick_directory
 from .errors import DomainError
 from .integrations import build_mcp_integration
+from .local_mcp import LocalMcpConfigurator
 from .mcp_server import create_mcp
 from .project_registration import (
     register_checkout_project,
@@ -171,6 +173,14 @@ class ProjectCreate(StrictModel):
     name: str | None = None
     logical_path: str = ""
     settings: dict[str, Any] = Field(default_factory=dict)
+
+
+class LocalFolderPickRequest(StrictModel):
+    initial_path: str = Field(default="", max_length=4096)
+
+
+class LocalMcpApplyRequest(StrictModel):
+    expected_current_sha256: str = Field(min_length=64, max_length=64)
 
 
 class ProjectUpdate(StrictModel):
@@ -407,8 +417,17 @@ class KnowledgeAssetAction(StrictModel):
     reason: str = ""
 
 
-def create_app(settings: Settings | None = None) -> FastAPI:
+def create_app(
+    settings: Settings | None = None,
+    *,
+    directory_picker: Callable[[str], str | None] | None = None,
+    local_mcp_configurator: LocalMcpConfigurator | None = None,
+) -> FastAPI:
     resolved = settings or load_settings()
+    resolved_directory_picker = directory_picker or pick_directory
+    resolved_local_mcp_configurator = (
+        local_mcp_configurator or LocalMcpConfigurator()
+    )
     service = AgentChatRoomService(create_database(resolved), resolved)
     service.initialize()
     management_token = os.getenv(resolved.management_token_env, "")
@@ -455,6 +474,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.settings = resolved
     app.state.service = service
     app.state.mcp_server = mcp_server
+    app.state.directory_picker = resolved_directory_picker
+    app.state.local_mcp_configurator = resolved_local_mcp_configurator
 
     def management_authenticated(request: Request) -> bool:
         if not resolved.management_auth_required:
@@ -618,6 +639,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "presence_refresh_interval_seconds": resolved.presence_refresh_interval_seconds,
             "capabilities": {
                 "mcp": True,
+                "local_folder_picker": resolved.deployment_profile == "local",
+                "local_mcp_config_assistant": (
+                    resolved.deployment_profile == "local"
+                ),
                 "streamable_http_mcp": resolved.mcp_http_enabled,
                 "streamable_http_mcp_path": resolved.mcp_http_path,
                 "streamable_http_mcp_json_response": resolved.mcp_http_json_response,
@@ -674,6 +699,42 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             project=service.get_project(project_id),
         )
 
+    def local_mcp_profile(
+        project_id: str, profile_id: str
+    ) -> tuple[dict[str, Any], dict[str, Any] | None]:
+        integration = build_mcp_integration(
+            resolved,
+            project=service.get_project(project_id),
+        )
+        return integration, integration["profiles"].get(profile_id)
+
+    @app.get(
+        "/api/v1/projects/{project_id}/integrations/mcp/local/{profile_id}/plan"
+    )
+    def local_mcp_plan(project_id: str, profile_id: str) -> dict[str, Any]:
+        _integration, profile = local_mcp_profile(project_id, profile_id)
+        return resolved_local_mcp_configurator.plan(
+            deployment_profile=resolved.deployment_profile,
+            profile_id=profile_id,
+            profile=profile,
+        )
+
+    @app.post(
+        "/api/v1/projects/{project_id}/integrations/mcp/local/{profile_id}/apply"
+    )
+    def apply_local_mcp_config(
+        project_id: str,
+        profile_id: str,
+        body: LocalMcpApplyRequest,
+    ) -> dict[str, Any]:
+        _integration, profile = local_mcp_profile(project_id, profile_id)
+        return resolved_local_mcp_configurator.apply(
+            deployment_profile=resolved.deployment_profile,
+            profile_id=profile_id,
+            profile=profile,
+            expected_current_sha256=body.expected_current_sha256,
+        )
+
     @app.get("/api/v1/admin/runtime")
     def admin_runtime(lines: int = Query(80, ge=0, le=500)) -> dict[str, Any]:
         """Expose safe operational state for the authenticated management UI."""
@@ -712,6 +773,33 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @app.get("/api/v1/projects")
     def list_projects() -> dict[str, Any]:
         return {"projects": service.list_projects()}
+
+    @app.post("/api/v1/local/folders/pick")
+    def pick_local_folder(body: LocalFolderPickRequest) -> dict[str, Any]:
+        if resolved.deployment_profile != "local":
+            raise DomainError(
+                "local_folder_picker_unavailable",
+                "The system folder picker is available only in local deployments",
+                status_code=409,
+            )
+        try:
+            selected = resolved_directory_picker(body.initial_path)
+        except DirectoryPickerUnavailable as error:
+            raise DomainError(
+                "local_folder_picker_unavailable",
+                "The system folder picker is unavailable; enter the project path manually",
+                status_code=503,
+            ) from error
+        if selected is None:
+            return {"cancelled": True, "path": ""}
+        selected_path = Path(selected).expanduser().resolve()
+        if not selected_path.is_dir():
+            raise DomainError(
+                "local_folder_picker_invalid_selection",
+                "The selected project folder does not exist",
+                status_code=500,
+            )
+        return {"cancelled": False, "path": str(selected_path)}
 
     @app.post("/api/v1/projects", status_code=201)
     def create_project(body: ProjectCreate) -> dict[str, Any]:

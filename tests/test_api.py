@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import json
 from dataclasses import replace
 
 import pytest
 from fastapi.testclient import TestClient
 
 from agentchatroom.api import create_app
+from agentchatroom.desktop import DirectoryPickerUnavailable
+from agentchatroom.local_mcp import LocalMcpConfigurator, LocalMcpEnvironment
 
 
 def test_health_and_project_room_flow(settings, project_dir):
@@ -26,6 +29,8 @@ def test_health_and_project_room_flow(settings, project_dir):
         public_config = client.get("/api/v1/config/public")
         assert public_config.status_code == 200
         assert public_config.json()["deployment_profile"] == settings.deployment_profile
+        assert public_config.json()["capabilities"]["local_folder_picker"] is True
+        assert public_config.json()["capabilities"]["local_mcp_config_assistant"] is True
         assert public_config.json()["domain"]["schema_version"] == 5
         assert public_config.json()["domain"]["agent_connection_statuses"] == [
             "connected",
@@ -53,10 +58,9 @@ def test_health_and_project_room_flow(settings, project_dir):
             "trusted_headers": settings.trusted_proxy_headers,
             "trusted_ips_configured": bool(settings.trusted_proxy_ips),
         }
-
         integration = client.get("/api/v1/integrations/mcp")
         assert integration.status_code == 200
-        assert integration.json()["schema_version"] == 3
+        assert integration.json()["schema_version"] == 4
         assert integration.json()["transport"] == "stdio"
         assert integration.json()["generic_json"]["mcpServers"]["agentchatroom"][
             "env"
@@ -185,6 +189,177 @@ def test_health_and_project_room_flow(settings, project_dir):
         assert exported.status_code == 200
         assert exported.headers["content-disposition"].startswith("attachment;")
         assert exported.json()["project"]["id"] == project["id"]
+
+
+def test_api_picks_and_cancels_a_local_project_folder(settings, tmp_path):
+    selected = tmp_path / "selected"
+    selected.mkdir()
+    responses = iter((str(selected), None))
+    initial_paths = []
+
+    def directory_picker(initial_path):
+        initial_paths.append(initial_path)
+        return next(responses)
+
+    with TestClient(create_app(settings, directory_picker=directory_picker)) as client:
+        picked = client.post(
+            "/api/v1/local/folders/pick",
+            json={"initial_path": str(tmp_path)},
+        )
+        cancelled = client.post(
+            "/api/v1/local/folders/pick",
+            json={"initial_path": str(selected)},
+        )
+
+    assert picked.status_code == 200
+    assert picked.json() == {"cancelled": False, "path": str(selected.resolve())}
+    assert cancelled.status_code == 200
+    assert cancelled.json() == {"cancelled": True, "path": ""}
+    assert initial_paths == [str(tmp_path), str(selected)]
+
+
+def test_api_folder_picker_is_local_only_and_has_a_manual_fallback(
+    settings, tmp_path
+):
+    unavailable = replace(settings, deployment_profile="lan")
+    called = False
+
+    def directory_picker(_initial_path):
+        nonlocal called
+        called = True
+        return str(tmp_path)
+
+    with TestClient(create_app(unavailable, directory_picker=directory_picker)) as client:
+        public_config = client.get("/api/v1/config/public")
+        response = client.post("/api/v1/local/folders/pick", json={})
+
+    assert public_config.json()["capabilities"]["local_folder_picker"] is False
+    assert response.status_code == 409
+    assert response.json()["error"]["code"] == "local_folder_picker_unavailable"
+    assert called is False
+
+
+def test_api_folder_picker_sanitizes_desktop_failures(settings):
+    def directory_picker(_initial_path):
+        raise DirectoryPickerUnavailable("sensitive desktop failure")
+
+    with TestClient(create_app(settings, directory_picker=directory_picker)) as client:
+        response = client.post("/api/v1/local/folders/pick", json={})
+
+    assert response.status_code == 503
+    assert response.json()["error"] == {
+        "code": "local_folder_picker_unavailable",
+        "message": (
+            "The system folder picker is unavailable; enter the project path manually"
+        ),
+        "details": {},
+    }
+    assert "sensitive" not in response.text
+
+
+def test_api_plans_and_applies_verified_local_mcp_configuration(
+    settings, project_dir, tmp_path
+):
+    home_dir = tmp_path / "home"
+    appdata_dir = tmp_path / "appdata"
+    workbuddy_path = home_dir / ".workbuddy" / "mcp.json"
+    workbuddy_path.parent.mkdir(parents=True)
+    workbuddy_path.write_text(
+        json.dumps({"mcpServers": {"existing": {"command": "keep-me"}}}),
+        encoding="utf-8",
+    )
+    trae_path = appdata_dir / "TRAE SOLO CN" / "User" / "mcp.json"
+    trae_path.parent.mkdir(parents=True)
+    trae_path.write_text('{"mcpServers": {}}\n', encoding="utf-8")
+    configurator = LocalMcpConfigurator(
+        LocalMcpEnvironment(home_dir=home_dir, appdata_dir=appdata_dir)
+    )
+
+    with TestClient(
+        create_app(settings, local_mcp_configurator=configurator)
+    ) as client:
+        project = client.post(
+            "/api/v1/projects",
+            json={"root_path": str(project_dir), "name": "Local MCP"},
+        ).json()
+        workbuddy_plan = client.get(
+            f"/api/v1/projects/{project['id']}/integrations/mcp/local/workbuddy/plan"
+        )
+        trae_plan = client.get(
+            f"/api/v1/projects/{project['id']}/integrations/mcp/local/trae/plan"
+        )
+        applied = client.post(
+            f"/api/v1/projects/{project['id']}/integrations/mcp/local/workbuddy/apply",
+            json={
+                "expected_current_sha256": workbuddy_plan.json()[
+                    "current_sha256"
+                ]
+            },
+        )
+        unknown = client.get(
+            f"/api/v1/projects/{project['id']}/integrations/mcp/local/unknown/plan"
+        )
+
+    assert workbuddy_plan.status_code == 200
+    assert workbuddy_plan.json()["state"] == "unconfigured"
+    assert trae_plan.status_code == 200
+    assert trae_plan.json()["detected_profile"] == "TRAE SOLO CN"
+    assert applied.status_code == 200
+    assert applied.json()["plan"]["state"] == "current"
+    updated = json.loads(workbuddy_path.read_text(encoding="utf-8"))
+    assert updated["mcpServers"]["existing"] == {"command": "keep-me"}
+    assert "agentchatroom" in updated["mcpServers"]
+    assert unknown.status_code == 404
+    assert unknown.json()["error"]["code"] == "local_mcp_profile_unknown"
+
+
+def test_api_local_mcp_apply_rejects_stale_hash_and_non_local_deployment(
+    settings, project_dir, tmp_path
+):
+    home_dir = tmp_path / "home"
+    config_path = home_dir / ".workbuddy" / "mcp.json"
+    config_path.parent.mkdir(parents=True)
+    config_path.write_text('{"mcpServers": {}}\n', encoding="utf-8")
+    configurator = LocalMcpConfigurator(
+        LocalMcpEnvironment(home_dir=home_dir, appdata_dir=tmp_path / "appdata")
+    )
+
+    with TestClient(
+        create_app(settings, local_mcp_configurator=configurator)
+    ) as client:
+        project = client.post(
+            "/api/v1/projects", json={"root_path": str(project_dir)}
+        ).json()
+        stale = client.post(
+            f"/api/v1/projects/{project['id']}/integrations/mcp/local/workbuddy/apply",
+            json={"expected_current_sha256": "0" * 64},
+        )
+    assert stale.status_code == 409
+    assert stale.json()["error"]["code"] == "local_mcp_config_changed"
+
+    remote_settings = replace(
+        settings,
+        data_dir=tmp_path / "remote-runtime",
+        deployment_profile="lan",
+    )
+    with TestClient(
+        create_app(remote_settings, local_mcp_configurator=configurator)
+    ) as client:
+        project = client.post(
+            "/api/v1/projects", json={"root_path": str(project_dir)}
+        ).json()
+        plan = client.get(
+            f"/api/v1/projects/{project['id']}/integrations/mcp/local/workbuddy/plan"
+        )
+        apply = client.post(
+            f"/api/v1/projects/{project['id']}/integrations/mcp/local/workbuddy/apply",
+            json={"expected_current_sha256": "0" * 64},
+        )
+
+    assert plan.status_code == 200
+    assert plan.json()["state"] == "unavailable"
+    assert apply.status_code == 409
+    assert apply.json()["error"]["code"] == "local_mcp_apply_unavailable"
 
 
 def test_api_project_member_management_and_token_link(settings, project_dir):

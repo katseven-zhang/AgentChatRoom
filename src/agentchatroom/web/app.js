@@ -3,6 +3,9 @@ const state = {
   integration: null,
   integrationFormat: "workbuddy",
   integrationTransport: "local",
+  integrationLocalPlan: null,
+  integrationLocalApplyResult: null,
+  integrationLocalRequest: 0,
   authRequired: false,
   authenticated: false,
   projects: [],
@@ -40,7 +43,7 @@ const elements = Object.fromEntries(
     "message-form", "message-input", "message-kind", "message-channel", "message-task", "message-priority",
     "message-requires-ack", "send-message-button", "onboarding", "new-message-notice",
     "project-dialog", "project-form", "project-name-input", "project-path-input",
-    "project-logical-path-input",
+    "project-folder-picker-button",
     "task-dialog", "task-form", "task-title-input", "task-description-input",
     "task-criteria-input", "task-priority-input", "task-dependency-options",
     "task-edit-dialog", "task-edit-form", "task-edit-id", "task-edit-title",
@@ -53,6 +56,10 @@ const elements = Object.fromEntries(
     "integration-dialog", "integration-data-dir", "integration-log-path",
     "integration-config-path", "integration-config-code", "integration-join-code", "integration-cli-code",
     "integration-project-rules-path", "integration-project-rules-code", "integration-onboarding-prompt", "toast-region",
+    "integration-local-assistant", "integration-local-state", "integration-local-mode",
+    "integration-local-path", "integration-local-message", "integration-local-changes",
+    "integration-local-reload", "integration-local-presence", "integration-local-backup",
+    "integration-local-refresh", "integration-local-apply",
     "create-member-button", "member-list", "refresh-audit-button", "audit-event-filter",
     "create-token-button", "register-workspace-button", "token-list", "workspace-list", "audit-list",
     "refresh-runtime-button", "runtime-status", "runtime-config", "runtime-log",
@@ -556,6 +563,40 @@ async function loadProjects() {
   }
 }
 
+const EVENT_WINDOW_SIZE = 500;
+const AUDIT_WINDOW_SIZE = 100;
+
+async function loadEventWindow(buildPage, windowSize, { tailJump = true, maxPages = 40 } = {}) {
+  let after = 0;
+  let collected = [];
+  let latest = 0;
+  for (let page = 0; page < maxPages; page += 1) {
+    const result = await api(buildPage(after, windowSize));
+    collected = collected.concat(result.events);
+    latest = result.latest_cursor;
+    if (result.events.length) after = result.events[result.events.length - 1].id;
+    if (result.events.length < windowSize || after >= latest) break;
+    if (tailJump && latest - after > windowSize) after = latest - windowSize;
+  }
+  return { events: collected, cursor: after };
+}
+
+async function loadRecentEvents(projectId) {
+  return loadEventWindow(
+    (after, limit) => `/api/v1/projects/${projectId}/events?after=${after}&limit=${limit}`,
+    EVENT_WINDOW_SIZE,
+  );
+}
+
+async function loadRecentAuditEvents(projectId, eventType) {
+  const filter = eventType ? `&event_type=${encodeURIComponent(eventType)}` : "";
+  return loadEventWindow(
+    (after, limit) => `/api/v1/projects/${projectId}/audit?after=${after}&limit=${limit}${filter}`,
+    AUDIT_WINDOW_SIZE,
+    { tailJump: !eventType },
+  );
+}
+
 async function selectProject(projectId) {
   state.projectId = projectId;
   localStorage.setItem("agentchatroom.projectId", projectId);
@@ -565,22 +606,22 @@ async function selectProject(projectId) {
   closeEventSource();
   const [snapshot, eventPage, members, credentials, workspaces, audit, runtime] = await Promise.all([
     api(`/api/v1/projects/${projectId}/snapshot`),
-    api(`/api/v1/projects/${projectId}/events?after=0&limit=500`),
+    loadRecentEvents(projectId),
     api(`/api/v1/projects/${projectId}/members`),
     api(`/api/v1/projects/${projectId}/agent-tokens`),
     api(`/api/v1/projects/${projectId}/workspaces`),
-    api(`/api/v1/projects/${projectId}/audit?after=0&limit=100`),
+    loadRecentAuditEvents(projectId),
     api("/api/v1/admin/runtime?lines=80"),
   ]);
   state.snapshot = snapshot;
   state.members = members.members;
   state.credentials = credentials.credentials;
   state.workspaces = workspaces.workspaces;
-  state.auditEvents = audit.events;
+  state.auditEvents = audit.events.slice(-AUDIT_WINDOW_SIZE);
   state.runtime = runtime;
   mergeEvents(eventPage.events);
   renderAll();
-  connectEvents(snapshot.cursor);
+  connectEvents(eventPage.cursor);
   startPresenceRefresh();
 }
 
@@ -711,7 +752,7 @@ function renderEmptyRoom() {
     "message-requires-ack", "send-message-button"]
     .forEach((id) => { elements[id].disabled = true; });
   elements["agent-count"].textContent = "0";
-  elements["agent-list"].innerHTML = '<div class="empty-state">Agent 通过「接入 Agent」里的配置加入后，会显示在这里</div>';
+  elements["agent-list"].innerHTML = '<div class="empty-state">Agent 完成「配置本机 Agent」并连接当前 Room 后，会显示在这里</div>';
   elements["chat-stream"].innerHTML = '<div class="empty-state">Room 动态会实时显示在这里：Agent 加入、任务进展和消息按时间排列</div>';
   elements["task-table"].innerHTML = '<div class="empty-state">还没有任务。任务是把工作交给 Agent 的最小单元：点右上角「+ 新建任务」，写清要做什么和验收条件。</div>';
   elements["token-list"].innerHTML = '<div class="empty-state">选择项目后管理 Agent Token</div>';
@@ -1006,13 +1047,13 @@ async function refreshManagement() {
     api(`/api/v1/projects/${state.projectId}/members`),
     api(`/api/v1/projects/${state.projectId}/agent-tokens`),
     api(`/api/v1/projects/${state.projectId}/workspaces`),
-    api(`/api/v1/projects/${state.projectId}/audit?after=0&limit=100${eventType ? `&event_type=${encodeURIComponent(eventType)}` : ""}`),
+    loadRecentAuditEvents(state.projectId, eventType),
     api("/api/v1/admin/runtime?lines=80"),
   ]);
   state.members = members.members;
   state.credentials = credentials.credentials;
   state.workspaces = workspaces.workspaces;
-  state.auditEvents = audit.events;
+  state.auditEvents = audit.events.slice(-AUDIT_WINDOW_SIZE);
   state.runtime = runtime;
   renderManagement();
 }
@@ -1083,6 +1124,31 @@ function renderEvents(agents, tasks) {
 }
 
 document.getElementById("add-project-button").addEventListener("click", () => elements["project-dialog"].showModal());
+elements["project-folder-picker-button"].addEventListener("click", async () => {
+  const button = elements["project-folder-picker-button"];
+  const input = elements["project-path-input"];
+  button.disabled = true;
+  button.textContent = "正在选择...";
+  try {
+    const result = await api("/api/v1/local/folders/pick", {
+      method: "POST",
+      body: JSON.stringify({ initial_path: input.value.trim() }),
+    });
+    if (!result.cancelled && result.path) {
+      input.value = result.path;
+      input.focus();
+    }
+  } catch (error) {
+    if (error.code === "local_folder_picker_unavailable") {
+      showToast("无法打开系统文件夹选择器，请手动输入项目路径", "error");
+    } else {
+      handleError(error);
+    }
+  } finally {
+    button.textContent = "选择文件夹";
+    button.disabled = !state.config?.capabilities?.local_folder_picker;
+  }
+});
 document.getElementById("create-task-button").addEventListener("click", () => {
   renderDependencyOptions();
   elements["task-dialog"].showModal();
@@ -1165,18 +1231,18 @@ document.querySelector(".integration-tabs").addEventListener("click", (event) =>
   renderIntegrationConfig();
   renderProjectInstructions();
   renderOnboardingPrompt();
+  state.integrationLocalPlan = null;
+  state.integrationLocalApplyResult = null;
+  renderLocalMcpPlan();
+  void refreshLocalMcpPlan();
 });
 
-document.querySelector(".integration-transport-tabs").addEventListener("click", (event) => {
-  const button = event.target.closest("[data-integration-transport]");
-  if (!button) return;
-  state.integrationTransport = button.dataset.integrationTransport;
-  document.querySelectorAll("[data-integration-transport]").forEach((item) => {
-    item.classList.toggle("is-active", item === button);
-  });
-  renderIntegrationConfig();
-  renderIntegrationJoin();
-  renderOnboardingPrompt();
+elements["integration-local-refresh"].addEventListener("click", () => {
+  void refreshLocalMcpPlan(true);
+});
+
+elements["integration-local-apply"].addEventListener("click", () => {
+  void applyLocalMcpPlan();
 });
 
 document.querySelectorAll("[data-copy-target]").forEach((button) => {
@@ -1347,7 +1413,6 @@ elements["project-form"].addEventListener("submit", async (event) => {
       body: JSON.stringify({
         name: elements["project-name-input"].value.trim() || null,
         root_path: elements["project-path-input"].value.trim(),
-        logical_path: elements["project-logical-path-input"].value.trim(),
       }),
     });
     elements["project-dialog"].close();
@@ -1898,29 +1963,157 @@ function renderIntegrationTabs() {
     <button type="button" ${profileId === state.integrationFormat ? 'class="is-active" ' : ""}data-integration-format="${escapeHtml(profileId)}">${escapeHtml(state.integration.profiles[profileId].label || profileId)}</button>`).join("");
 }
 
+function localMcpAssistantSupported() {
+  const profile = state.integration?.profiles?.[state.integrationFormat];
+  return state.integrationTransport === "local" && Boolean(profile?.local_config);
+}
+
+function localMcpPresence() {
+  const softwareKey = state.integrationFormat.replaceAll("_", "-");
+  const identity = (state.snapshot?.agent_identities || []).find(
+    (agent) => agent.software_key === softwareKey
+  );
+  return identity?.connection_status === "connected";
+}
+
+function renderLocalMcpPlan() {
+  const section = elements["integration-local-assistant"];
+  const supported = localMcpAssistantSupported();
+  section.hidden = !supported;
+  if (!supported) return;
+
+  const profile = state.integration.profiles[state.integrationFormat];
+  const plan = state.integrationLocalPlan;
+  const connected = localMcpPresence();
+  elements["integration-local-presence"].textContent = connected
+    ? "当前 Room 已连接：客户端 MCP Presence 正常"
+    : "当前 Room 尚未连接：写入配置后仍需重启或新开会话并等待 Presence";
+  elements["integration-local-presence"].dataset.connected = connected ? "true" : "false";
+  elements["integration-local-backup"].textContent = state.integrationLocalApplyResult?.backup_path
+    ? `本次备份：${state.integrationLocalApplyResult.backup_path}`
+    : "";
+  elements["integration-local-refresh"].disabled = !plan;
+  elements["integration-local-apply"].disabled = true;
+
+  if (!plan) {
+    elements["integration-local-state"].textContent = "正在检测";
+    elements["integration-local-state"].dataset.state = "loading";
+    elements["integration-local-mode"].textContent = "读取客户端现有 MCP 配置";
+    elements["integration-local-path"].textContent = profile.config_path_hint || "";
+    elements["integration-local-message"].textContent = "只检测，不会在打开页面时自动写入。";
+    elements["integration-local-changes"].textContent = "";
+    elements["integration-local-reload"].textContent = "";
+    return;
+  }
+
+  const stateLabels = {
+    current: "配置已是最新",
+    unconfigured: "可以添加配置",
+    outdated: "可以更新配置",
+    missing: "未发现配置文件",
+    invalid: "配置文件 JSON 无效",
+    unreadable: "配置文件不可读取",
+    unwritable: "配置文件不可写",
+    unavailable: "当前部署不可代写",
+  };
+  const modeLabels = {
+    managed_write: "一键配置",
+    assisted: "辅助配置",
+    manual: "手动配置",
+  };
+  const messages = {
+    current: "agentchatroom 配置内容已匹配。配置存在不代表客户端当前已经连接。",
+    unconfigured: "检测到有效配置文件，可在确认后只新增 agentchatroom Server。",
+    outdated: "检测到旧的 agentchatroom 配置，可在确认后只更新这一项。",
+    missing: "没有找到经过验证且实际存在的配置文件，请在客户端 MCP 界面手动添加。",
+    invalid: "现有文件不是有效 JSON，为避免破坏客户端配置，已停止自动处理。",
+    unreadable: "服务无法读取该文件，请检查权限后重试或在客户端内手动配置。",
+    unwritable: "服务不会自动提权，请在客户端内手动配置或修复文件权限。",
+    unavailable: "LAN/服务器部署不能修改 Agent 电脑上的配置，请复制下方配置手动添加。",
+  };
+  elements["integration-local-state"].textContent = stateLabels[plan.state] || plan.state;
+  elements["integration-local-state"].dataset.state = plan.state;
+  elements["integration-local-mode"].textContent = `${modeLabels[plan.mode] || plan.mode}${plan.detected_profile ? ` · ${plan.detected_profile}` : ""}`;
+  elements["integration-local-path"].textContent = plan.config_path
+    || plan.candidate_paths?.[0]
+    || profile.config_path_hint
+    || "未检测到配置路径";
+  elements["integration-local-message"].textContent = messages[plan.state] || plan.message;
+  elements["integration-local-changes"].textContent = plan.changed_fields?.length
+    ? `将变更：${plan.changed_fields.join("、")}`
+    : "不会改动其他 MCP Server。";
+  elements["integration-local-reload"].textContent = plan.reload_instruction || "";
+  elements["integration-local-refresh"].disabled = false;
+  elements["integration-local-apply"].disabled = !plan.managed_apply_available;
+}
+
+async function refreshLocalMcpPlan(announce = false) {
+  if (!state.snapshot || !localMcpAssistantSupported()) {
+    state.integrationLocalPlan = null;
+    renderLocalMcpPlan();
+    return;
+  }
+  const projectId = state.snapshot.project.id;
+  const profileId = state.integrationFormat;
+  const requestId = ++state.integrationLocalRequest;
+  state.integrationLocalPlan = null;
+  renderLocalMcpPlan();
+  try {
+    const plan = await api(`/api/v1/projects/${projectId}/integrations/mcp/local/${encodeURIComponent(profileId)}/plan`);
+    if (requestId !== state.integrationLocalRequest || profileId !== state.integrationFormat || state.integrationTransport !== "local") return;
+    state.integrationLocalPlan = plan;
+    renderLocalMcpPlan();
+    if (announce) showToast("已重新检测客户端 MCP 配置");
+  } catch (error) {
+    if (requestId !== state.integrationLocalRequest) return;
+    elements["integration-local-state"].textContent = "检测失败";
+    elements["integration-local-state"].dataset.state = "invalid";
+    elements["integration-local-message"].textContent = "未修改任何客户端配置；可重新检测或使用下方手动配置。";
+    elements["integration-local-refresh"].disabled = false;
+    handleError(error);
+  }
+}
+
+async function applyLocalMcpPlan() {
+  const plan = state.integrationLocalPlan;
+  if (!state.snapshot || !plan?.managed_apply_available) return;
+  const confirmed = window.confirm(
+    `将先备份 ${plan.config_path}，然后只新增或更新 mcpServers.agentchatroom。是否继续？`
+  );
+  if (!confirmed) return;
+  const button = elements["integration-local-apply"];
+  button.disabled = true;
+  button.textContent = "正在应用...";
+  try {
+    const projectId = state.snapshot.project.id;
+    const profileId = state.integrationFormat;
+    const result = await api(
+      `/api/v1/projects/${projectId}/integrations/mcp/local/${encodeURIComponent(profileId)}/apply`,
+      {
+        method: "POST",
+        body: JSON.stringify({ expected_current_sha256: plan.current_sha256 }),
+      }
+    );
+    state.integrationLocalApplyResult = result;
+    state.integrationLocalPlan = result.plan;
+    renderLocalMcpPlan();
+    showToast("配置已备份并写入；请重启或新开会话，等待当前 Room 显示已连接");
+  } catch (error) {
+    handleError(error);
+    await refreshLocalMcpPlan();
+  } finally {
+    button.textContent = "应用配置";
+    button.disabled = !state.integrationLocalPlan?.managed_apply_available;
+  }
+}
+
 async function openIntegrationDialog() {
   if (!state.snapshot) return;
   const project = state.snapshot.project;
   state.integration = await api(`/api/v1/projects/${project.id}/integrations/mcp`);
+  state.integrationTransport = "local";
   elements["integration-data-dir"].textContent = state.integration.runtime.data_dir;
   elements["integration-log-path"].textContent = state.integration.runtime.log_path;
-  const bridgeEnabled = Boolean(state.integration.transports?.remote_stdio_bridge?.enabled);
-  const httpEnabled = Boolean(state.integration.transports?.streamable_http?.enabled);
-  const remoteButton = document.querySelector('[data-integration-transport="remote"]');
-  const httpButton = document.querySelector('[data-integration-transport="http"]');
-  remoteButton.disabled = !bridgeEnabled;
-  remoteButton.title = bridgeEnabled ? "通过本地 stdio Bridge 连接中心服务" : "服务端未启用 HTTP MCP";
-  httpButton.disabled = !httpEnabled;
-  httpButton.title = httpEnabled ? "客户端直接连接中心 Streamable HTTP MCP" : "服务端未启用 HTTP MCP";
-  if (!bridgeEnabled && state.integrationTransport === "remote") {
-    state.integrationTransport = "local";
-  }
-  if (!httpEnabled && state.integrationTransport === "http") {
-    state.integrationTransport = "local";
-  }
-  document.querySelectorAll("[data-integration-transport]").forEach((item) => {
-    item.classList.toggle("is-active", item.dataset.integrationTransport === state.integrationTransport);
-  });
   elements["integration-cli-code"].textContent = [
     "agentchatroom",
     "--url", JSON.stringify(window.location.origin),
@@ -1935,13 +2128,17 @@ async function openIntegrationDialog() {
   renderIntegrationConfig();
   renderIntegrationJoin();
   renderProjectInstructions();
+  state.integrationLocalPlan = null;
+  state.integrationLocalApplyResult = null;
+  renderLocalMcpPlan();
   elements["integration-dialog"].showModal();
+  void refreshLocalMcpPlan();
 }
 
 function renderOnboardingPrompt() {
   if (!state.integration) return;
   const profile = state.integration.profiles?.[state.integrationFormat];
-  elements["integration-onboarding-prompt"].textContent = profile?.onboarding_prompts?.[state.integrationTransport]
+  elements["integration-onboarding-prompt"].textContent = profile?.onboarding_prompts?.local
     || state.integration.onboarding_prompt
     || "当前接入配置尚未生成。";
 }
@@ -1949,29 +2146,13 @@ function renderOnboardingPrompt() {
 function renderIntegrationConfig() {
   if (!state.integration) return;
   const profile = state.integration.profiles?.[state.integrationFormat];
-  const remoteBridge = state.integrationTransport === "remote";
-  const streamableHttp = state.integrationTransport === "http";
-  const configKey = remoteBridge
-    ? "remote_bridge_config_text"
-    : streamableHttp
-      ? "streamable_http_config_text"
-      : "local_config_text";
-  elements["integration-config-code"].textContent = profile?.[configKey]
-    || (remoteBridge
-      ? state.integration.remote_bridge_json_text
-      : streamableHttp
-        ? state.integration.streamable_http_json_text
-        : state.integration.generic_json_text);
+  elements["integration-config-code"].textContent = profile?.local_config_text
+    || state.integration.generic_json_text;
   if (elements["integration-config-path"]) {
     const target = profile?.config_path_hint
       ? `建议配置文件：${profile.config_path_hint}`
       : "标准 MCP 配置片段";
-    const transport = remoteBridge
-      ? `远程 Bridge · ${state.integration.runtime.mcp_http_url}`
-      : streamableHttp
-        ? `直接 Streamable HTTP · ${state.integration.runtime.mcp_http_url}`
-        : "本机 stdio · 直接读写本机数据库（仅限这台电脑，含本机数据目录路径；跨机器请切到远程 Bridge / HTTP）";
-    elements["integration-config-path"].textContent = `${target} · ${transport}`;
+    elements["integration-config-path"].textContent = `${target} · 本机 stdio`;
   }
 }
 
@@ -1990,22 +2171,13 @@ function renderProjectInstructions() {
 function renderIntegrationJoin() {
   if (!state.integration || !state.snapshot) return;
   const project = state.snapshot.project;
-  const remote = state.integrationTransport !== "local";
-  const workspacePath = remote ? "<path-to-project-on-this-computer>" : project.root_path;
   const payload = {
-    project_path: workspacePath,
+    project_path: project.root_path,
     model: "<actual model or unknown>",
     role: "executor",
     branch: "<git branch>",
-    worktree: workspacePath,
+    worktree: project.root_path,
   };
-  if (remote) {
-    payload.agent_name = "<Software name>";
-    payload.client = "<software-client-code>";
-    payload.host_key = "<stable-host-key>";
-    payload.host_name = "<computer-name>";
-    payload.git_remote = "<git-remote-url>";
-  }
   elements["integration-join-code"].textContent = JSON.stringify(payload, null, 2);
 }
 
@@ -2052,6 +2224,11 @@ function applyPublicConfig() {
   populateDomainOptions();
   elements["product-name"].textContent = state.config.product_name;
   document.title = state.config.product_name;
+  const folderPickerEnabled = Boolean(state.config.capabilities?.local_folder_picker);
+  elements["project-folder-picker-button"].disabled = !folderPickerEnabled;
+  elements["project-folder-picker-button"].title = folderPickerEnabled
+    ? "打开系统文件夹选择器"
+    : "当前部署模式请手动输入服务器上的项目路径";
 }
 
 async function loadAuthenticatedApp() {

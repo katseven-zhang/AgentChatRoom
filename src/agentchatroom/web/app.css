@@ -1792,6 +1792,23 @@ dialog::backdrop {
   font-weight: 650;
 }
 
+.path-picker-control {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 8px;
+  align-items: stretch;
+}
+
+.path-picker-control input {
+  min-width: 0;
+}
+
+.path-picker-control .secondary-button {
+  min-height: 38px;
+  padding-inline: 12px;
+  white-space: nowrap;
+}
+
 .dependency-fieldset {
   margin: 14px 0 0;
   padding: 10px;
@@ -1890,6 +1907,82 @@ dialog::backdrop {
   margin-top: 18px;
 }
 
+.local-mcp-assistant {
+  display: grid;
+  gap: 8px;
+  padding: 14px 0;
+  border-top: 1px solid var(--border);
+  border-bottom: 1px solid var(--border);
+}
+
+.local-mcp-assistant[hidden] {
+  display: none;
+}
+
+.local-mcp-assistant p {
+  margin: 0;
+}
+
+.local-mcp-state {
+  flex: 0 0 auto;
+  padding: 4px 8px;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  background: var(--surface-muted);
+  color: var(--text-muted);
+  font-size: 11px;
+  font-weight: 750;
+}
+
+.local-mcp-state[data-state="current"] {
+  border-color: var(--primary);
+  color: var(--primary);
+}
+
+.local-mcp-state[data-state="unconfigured"],
+.local-mcp-state[data-state="outdated"] {
+  border-color: var(--blue);
+  color: var(--blue);
+}
+
+.local-mcp-state[data-state="invalid"],
+.local-mcp-state[data-state="unreadable"],
+.local-mcp-state[data-state="unwritable"] {
+  border-color: var(--danger);
+  color: var(--danger);
+}
+
+.local-mcp-path {
+  min-width: 0;
+  padding: 8px 10px;
+  border-left: 3px solid var(--border-strong);
+  background: var(--surface-muted);
+  color: var(--text);
+  overflow-wrap: anywhere;
+}
+
+.local-mcp-message,
+.local-mcp-presence {
+  color: var(--text-muted);
+  line-height: 1.6;
+}
+
+.local-mcp-presence[data-connected="true"] {
+  color: var(--primary);
+  font-weight: 700;
+}
+
+.local-mcp-backup {
+  overflow-wrap: anywhere;
+}
+
+.local-mcp-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 2px;
+}
+
 .integration-chooser {
   display: grid;
   grid-template-columns: 1fr;
@@ -1929,14 +2022,11 @@ dialog::backdrop {
 
 .integration-tabs {
   width: 100%;
+  min-width: 0;
+  box-sizing: border-box;
 }
 
-.integration-transport-tabs {
-  width: 100%;
-}
-
-.integration-tabs button,
-.integration-transport-tabs button {
+.integration-tabs button {
   min-width: 0;
   flex: 1 1 0;
 }
@@ -2191,6 +2281,28 @@ dialog::backdrop {
 
   .integration-chooser {
     grid-template-columns: 1fr;
+  }
+
+  .integration-chooser > div {
+    min-width: 0;
+  }
+
+  .integration-tabs {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    overflow: visible;
+  }
+
+  .integration-tabs button {
+    width: 100%;
+    height: auto;
+    min-height: 34px;
+    padding: 4px 6px;
+    white-space: normal;
+  }
+
+  .integration-tabs button:last-child {
+    grid-column: 1 / -1;
   }
 
   .scope-status {

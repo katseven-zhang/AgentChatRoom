@@ -25,10 +25,20 @@ def test_mcp_integration_uses_explicit_runtime_configuration(tmp_path):
     assert result["runtime"]["log_path"] == str(settings.data_dir / "server.log")
     assert result["profiles"]["workbuddy"]["vendor"] == "Tencent"
     assert result["profiles"]["workbuddy"]["format"] == "json"
+    assert result["profiles"]["workbuddy"]["local_config"]["candidates"] == [
+        {
+            "root": "home",
+            "parts": [".workbuddy", "mcp.json"],
+            "label": "WorkBuddy",
+        }
+    ]
     assert '"mcpServers"' in result["profiles"]["workbuddy"]["config_text"]
     assert "[mcp_servers.agentchatroom]" in result["profiles"]["grok_build"]["config_text"]
     assert "[mcp_servers.agentchatroom]" in result["profiles"]["codex"]["config_text"]
     assert result["profiles"]["trae"]["vendor"] == "ByteDance"
+    assert result["profiles"]["trae"]["local_config"]["candidates"][0][
+        "parts"
+    ] == ["TRAE SOLO CN", "User", "mcp.json"]
     assert '"AGENTCHATROOM_SOFTWARE_KEY": "trae"' in result["profiles"]["trae"][
         "config_text"
     ]
@@ -98,7 +108,7 @@ def test_project_integration_builds_stable_workbuddy_memory_without_live_state(t
     result = build_mcp_integration(settings, project=project)
     memory = result["profiles"]["workbuddy"]["project_memory_text"]
 
-    assert result["schema_version"] == 3
+    assert result["schema_version"] == 4
     assert result["project"] == {"name": "AgentChatRoom"}
     assert "sample-project" not in memory
     assert "`OFF`" in memory and "`OBSERVE`" in memory and "`COORDINATE`" in memory
@@ -110,21 +120,31 @@ def test_project_integration_builds_stable_workbuddy_memory_without_live_state(t
     assert "must not edit it, supply a key" in memory
 
     prompt = result["onboarding_prompt"]
-    assert "完成 AgentChatRoom 接入" in prompt
+    assert "接入名为 `agentchatroom` 的 MCP Server" in prompt
+    assert "请根据当前客户端和运行环境自行完成接入" in prompt
     assert "project_key：sample-project" not in prompt
-    assert "不要提交或推断 project_key" in prompt
-    assert "room_join" in prompt
-    assert "model_display_name" in prompt
-    assert "不要另建 Room" in prompt
-    assert ".agentchatroom/project.json" in prompt
+    assert "room_join" not in prompt
+    assert "model_display_name" not in prompt
+    assert "协作规则" not in prompt
+    assert ".agentchatroom/project.json" not in prompt
+    assert "Task" not in prompt
+    assert "Lease" not in prompt
+    assert "Work Report" not in prompt
     assert "AGENTCHATROOM_SOFTWARE_KEY" in prompt
     assert '"mcpServers"' in prompt
+    assert "无法自动配置时" not in prompt
+    assert "不要提权" not in prompt
+    assert "配置文件：" not in prompt
+    assert "操作要求" not in prompt
+    assert "重启" not in prompt
+    assert "。。" not in prompt
     assert "project_runtime_only" not in memory
     assert "Session Token" in memory
 
     workbuddy_prompts = result["profiles"]["workbuddy"]["onboarding_prompts"]
     assert set(workbuddy_prompts) == {"local", "http", "remote"}
-    assert "目标客户端：WorkBuddy" in workbuddy_prompts["local"]
+    assert "请为 WorkBuddy 接入名为 `agentchatroom`" in workbuddy_prompts["local"]
+    assert "~/.workbuddy/mcp.json" not in workbuddy_prompts["local"]
     assert "AGENTCHATROOM_SOFTWARE_KEY" in workbuddy_prompts["local"]
     assert '"AGENTCHATROOM_SOFTWARE_KEY": "workbuddy"' in workbuddy_prompts["local"]
     assert '"mcpServers"' in workbuddy_prompts["local"]
@@ -134,13 +154,14 @@ def test_project_integration_builds_stable_workbuddy_memory_without_live_state(t
     assert "agentchatroom.mcp_bridge" in workbuddy_prompts["remote"]
 
     codex_prompts = result["profiles"]["codex"]["onboarding_prompts"]
-    assert "目标客户端：Codex" in codex_prompts["local"]
+    assert "请为 Codex 接入名为 `agentchatroom`" in codex_prompts["local"]
     assert "AGENTCHATROOM_SOFTWARE_KEY" in codex_prompts["local"]
     assert 'AGENTCHATROOM_SOFTWARE_KEY = "codex"' in codex_prompts["local"]
     assert (
         f"AGENTCHATROOM_PROJECT_PATH = {json.dumps(str(tmp_path))}"
         in codex_prompts["local"]
     )
-    assert "会自动建立连接 Presence" in codex_prompts["local"]
+    assert "room_join" not in codex_prompts["local"]
+    assert "无法自动配置时" not in codex_prompts["local"]
     assert "[mcp_servers.agentchatroom]" in codex_prompts["local"]
     assert "bearer_token_env_var" in codex_prompts["http"]

@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import replace
 import os
 import socket
+import subprocess
+import time
 
 import pytest
 
@@ -22,6 +24,21 @@ def available_port() -> int:
     with socket.socket() as listener:
         listener.bind(("127.0.0.1", 0))
         return int(listener.getsockname()[1])
+
+
+def port_is_listening(port: int) -> bool:
+    with socket.socket() as client:
+        client.settimeout(0.1)
+        return client.connect_ex(("127.0.0.1", port)) == 0
+
+
+def wait_for_port_to_close(port: int) -> bool:
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        if not port_is_listening(port):
+            return True
+        time.sleep(0.05)
+    return not port_is_listening(port)
 
 
 def test_parse_test_evidence_preserves_commands_with_colons():
@@ -83,7 +100,25 @@ def test_detached_server_starts_and_stops(settings):
         stopped = stop_detached_server(settings)
     assert stopped == {"stopped": True, "pid": pid}
     assert not process_is_running(pid)
+    assert wait_for_port_to_close(port)
     assert not (settings.data_dir / "server.pid").exists()
+
+
+def test_windows_server_stop_uses_taskkill_for_the_process_tree(monkeypatch):
+    captured = {}
+
+    def fake_run(command, **kwargs):
+        captured["command"] = command
+        captured["kwargs"] = kwargs
+        return subprocess.CompletedProcess(command, 0)
+
+    monkeypatch.setattr(cli, "_WINDOWS", True)
+    monkeypatch.setattr(cli.subprocess, "run", fake_run)
+
+    cli._terminate_server_process(4321)
+
+    assert captured["command"] == ["taskkill", "/PID", "4321", "/T", "/F"]
+    assert captured["kwargs"]["check"] is False
 
 
 def test_stop_removes_stale_pid_file(settings):

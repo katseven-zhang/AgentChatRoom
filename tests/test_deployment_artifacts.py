@@ -91,20 +91,34 @@ def test_windows_launcher_generator_is_portable_and_config_driven(tmp_path) -> N
         text=True,
     )
     assert result.returncode == 0, result.stderr
-    assert result.stdout.count("generated:") == 2
+    assert result.stdout.count("generated:") == 3
 
     start_bytes = (tmp_path / "启动 AgentChatRoom.cmd").read_bytes()
     stop_bytes = (tmp_path / "关闭 AgentChatRoom.cmd").read_bytes()
+    gui_bytes = (tmp_path / "AgentChatRoom 控制台.cmd").read_bytes()
     start = start_bytes.decode("gbk")
     stop = stop_bytes.decode("gbk")
+    gui = gui_bytes.decode("gbk")
 
     assert b"\r\n" in start_bytes
     assert b"\n" not in start_bytes.replace(b"\r\n", b"")
     assert b"\r\n" in stop_bytes
     assert b"\n" not in stop_bytes.replace(b"\r\n", b"")
+    assert b"\r\n" in gui_bytes
+    assert b"\n" not in gui_bytes.replace(b"\r\n", b"")
     assert "serve --open-browser" in start
+    assert "serve --detach" not in start
+    assert "日志实时显示在本窗口" in start
     assert "load_settings().port" in stop
     assert ":8765" not in stop
+    assert "bootstrap.cmd" not in stop
+    assert "taskkill /T /F /PID" in stop
+    assert "没有发现占用 %AGENTCHATROOM_PORT% 端口" in stop
+    assert "没有发现占用 8765 端口" not in stop
+    assert "bootstrap.cmd" in gui
+    assert "-m agentchatroom gui" in gui
+    assert "AGENTCHATROOM_ACCESS_LOG" in gui
+    assert "8765" not in gui
 
 
 def test_ci_uses_node_24_action_runtimes() -> None:

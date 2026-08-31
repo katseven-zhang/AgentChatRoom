@@ -6,7 +6,7 @@
     <meta name="color-scheme" content="light">
     <title>AgentChatRoom</title>
     <link rel="icon" href="/assets/favicon.svg?v=1.0.0-central1" type="image/svg+xml">
-    <link rel="stylesheet" href="/assets/app.css?v=1.0.0-central17">
+    <link rel="stylesheet" href="/assets/app.css?v=1.0.0-central22">
   </head>
   <body>
     <div class="app-shell" id="app-shell">
@@ -69,7 +69,7 @@
             <p class="room-path" id="room-path">添加本地项目后即可开始协作</p>
           </div>
           <div class="workspace-actions">
-            <button class="secondary-button" id="connect-agent-button" type="button" disabled>接入 Agent</button>
+            <button class="secondary-button" id="connect-agent-button" type="button" disabled>配置本机 Agent</button>
             <button class="icon-button" id="project-settings-button" type="button" title="项目设置" aria-label="项目设置" disabled>⚙</button>
             <button class="secondary-button" id="export-project-button" type="button" disabled>导出</button>
             <button class="danger-button" id="archive-project-button" type="button" disabled>归档项目</button>
@@ -90,7 +90,7 @@
             <h3>三步开始多 Agent 协作</h3>
             <ol class="onboarding-steps">
               <li><strong>1. 添加项目</strong><span>把本地工作目录注册为协作 Room（右上角「+ 添加项目」）</span></li>
-              <li><strong>2. 接入 Agent</strong><span>打开「接入 Agent」，复制 MCP 配置给 WorkBuddy、Codex 或 Grok，让它加入这个 Room</span></li>
+              <li><strong>2. 配置本机 Agent</strong><span>选择客户端并完成本机 MCP 配置，重载后等待它连接当前 Room</span></li>
               <li><strong>3. 派发第一件工作</strong><span>「新建任务」写清要做什么和验收条件，Agent 认领后在这里跟踪进展、消息和验证结论</span></li>
             </ol>
           </section>
@@ -321,9 +321,13 @@
           <button type="button" class="icon-button dialog-close" title="关闭" aria-label="关闭">×</button>
         </div>
         <label>项目名称 <input id="project-name-input" name="name" autocomplete="off" placeholder="可选，默认使用文件夹名"></label>
-        <label>项目文件夹 <input id="project-path-input" name="root_path" autocomplete="off" required placeholder="粘贴需要协作的项目目录"></label>
-        <label>逻辑子目录 <input id="project-logical-path-input" name="logical_path" autocomplete="off" placeholder="可选，例如 packages/api"></label>
-        <p class="form-hint">工作区类型由后端自动检测为 Git 仓库或本地目录；Project key 由后端生成。服务不上传源码。</p>
+        <label>项目文件夹
+          <span class="path-picker-control">
+            <input id="project-path-input" name="root_path" autocomplete="off" required placeholder="输入路径或点击选择文件夹">
+            <button id="project-folder-picker-button" type="button" class="secondary-button" disabled>选择文件夹</button>
+          </span>
+        </label>
+        <p class="form-hint">Git 仓库内的子文件夹会自动登记为该仓库的独立项目范围；普通目录按本地路径登记。</p>
         <div class="dialog-actions">
           <button type="button" class="secondary-button dialog-close">取消</button>
           <button type="submit" class="primary-button">添加项目</button>
@@ -555,34 +559,46 @@
       <div class="dialog-form">
         <div class="dialog-header">
           <div>
-            <p class="context-label">Agent 连接</p>
-            <h2>接入当前 Room</h2>
+            <p class="context-label">当前 Room</p>
+            <h2>配置本机 Agent</h2>
           </div>
           <button type="button" class="icon-button dialog-close" title="关闭" aria-label="关闭">×</button>
         </div>
 
         <section class="integration-section integration-chooser">
           <div>
-            <p class="integration-choice-label">目标 Agent</p>
+            <p class="integration-choice-label">Agent 客户端</p>
             <div class="segmented-control integration-tabs" id="integration-format-tabs" aria-label="目标 Agent"></div>
           </div>
-          <div>
-            <p class="integration-choice-label">连接方式</p>
-            <div class="segmented-control integration-transport-tabs" aria-label="MCP 连接方式">
-              <button type="button" class="is-active" data-integration-transport="local">本机 stdio</button>
-              <button type="button" data-integration-transport="http">直接 HTTP MCP</button>
-              <button type="button" data-integration-transport="remote">远程 Bridge</button>
+        </section>
+
+        <section id="integration-local-assistant" class="integration-section local-mcp-assistant" hidden>
+          <div class="integration-heading">
+            <div>
+              <h3>本机 MCP 配置</h3>
+              <p id="integration-local-mode" class="secondary-text">读取客户端现有 MCP 配置</p>
             </div>
+            <span id="integration-local-state" class="local-mcp-state" data-state="loading">正在检测</span>
+          </div>
+          <p class="local-mcp-path"><code id="integration-local-path"></code></p>
+          <p id="integration-local-message" class="local-mcp-message">只检测，不会在打开页面时自动写入。</p>
+          <p id="integration-local-changes" class="secondary-text"></p>
+          <p id="integration-local-reload" class="secondary-text"></p>
+          <p id="integration-local-presence" class="local-mcp-presence" data-connected="false"></p>
+          <p id="integration-local-backup" class="secondary-text local-mcp-backup"></p>
+          <div class="local-mcp-actions">
+            <button id="integration-local-refresh" type="button" class="secondary-button" disabled>重新检测</button>
+            <button id="integration-local-apply" type="button" class="primary-button" disabled>应用配置</button>
           </div>
         </section>
 
         <section class="integration-section onboarding-section">
           <div class="integration-heading">
             <div>
-              <h3>复制给 Agent</h3>
-              <p class="secondary-text">这段提示词包含当前项目、MCP 配置、加入 Room 和协作规则</p>
+              <h3>让 Agent 配置 MCP</h3>
+              <p class="secondary-text">复制当前环境的 MCP 连接参数，由 Agent 自行完成接入</p>
             </div>
-            <button class="primary-button copy-button" type="button" data-copy-target="integration-onboarding-prompt">复制提示词</button>
+            <button class="primary-button copy-button" type="button" data-copy-target="integration-onboarding-prompt">复制配置指令</button>
           </div>
           <pre id="integration-onboarding-prompt" class="code-block onboarding-prompt"></pre>
         </section>
@@ -764,6 +780,6 @@
     </dialog>
 
     <div class="toast-region" id="toast-region" aria-live="assertive"></div>
-    <script src="/assets/app.js?v=1.0.0-central17" defer></script>
+    <script src="/assets/app.js?v=1.0.0-central22" defer></script>
   </body>
 </html>

@@ -32,6 +32,7 @@ from .integrations import build_mcp_integration
 
 
 MUTATING_HTTP_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
+_WINDOWS = os.name == "nt"
 
 
 def request_json(
@@ -356,7 +357,7 @@ def stop_detached_server(settings) -> dict[str, Any]:
         pid_path.unlink(missing_ok=True)
         return {"stopped": False, "reason": "not_running", "pid": pid}
     try:
-        os.kill(pid, signal.SIGTERM)
+        _terminate_server_process(pid)
     except OSError as error:
         if not process_is_running(pid):
             pid_path.unlink(missing_ok=True)
@@ -371,6 +372,20 @@ def stop_detached_server(settings) -> dict[str, Any]:
         return {"stopped": False, "reason": "timeout", "pid": pid}
     pid_path.unlink(missing_ok=True)
     return {"stopped": True, "pid": pid}
+
+
+def _terminate_server_process(pid: int) -> None:
+    if not _WINDOWS:
+        os.kill(pid, signal.SIGTERM)
+        return
+    result = subprocess.run(
+        ["taskkill", "/PID", str(pid), "/T", "/F"],
+        check=False,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    if result.returncode and process_is_running(pid):
+        raise OSError(f"taskkill failed with exit code {result.returncode}")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -406,6 +421,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     stop = commands.add_parser("stop", help="Stop a detached local service")
     stop.add_argument("--config")
+
+    gui = commands.add_parser("gui", help="Open the local GUI controller")
+    gui.add_argument("--config")
 
     logs = commands.add_parser("logs", help="Show the detached service log")
     logs.add_argument("--config")
@@ -797,6 +815,11 @@ def main(argv: list[str] | None = None) -> None:
         return
     if args.command == "stop":
         print_result(stop_detached_server(load_settings(args.config)), args.json)
+        return
+    if args.command == "gui":
+        from .gui import run_gui
+
+        run_gui(args.config)
         return
     if args.command == "logs":
         if args.lines < 1:
