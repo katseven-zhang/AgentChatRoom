@@ -152,6 +152,55 @@ def test_software_identity_reconnect_replaces_the_previous_session(service, proj
     assert disconnected["status"] == "registered"
 
 
+def test_revoked_member_is_kept_in_history_but_removed_from_current_roster(
+    service, project
+):
+    online = service.join_room(
+        project["id"],
+        agent_key="online-main",
+        name="Online Agent",
+        client="codex",
+        model="unknown",
+    )
+    offline = service.join_room(
+        project["id"],
+        agent_key="offline-main",
+        name="Offline Agent",
+        client="trae",
+        model="unknown",
+    )
+    revoked = service.join_room(
+        project["id"],
+        agent_key="revoked-main",
+        name="Revoked Agent",
+        client="qoder",
+        model="unknown",
+    )
+    service.leave_session(project["id"], offline["agent"]["id"], offline["token"])
+    service.leave_session(project["id"], revoked["agent"]["id"], revoked["token"])
+    service.revoke_project_member(project["id"], revoked["agent"]["member_id"])
+
+    snapshot = service.snapshot(project["id"])
+    identities = {item["member_id"]: item for item in snapshot["agent_identities"]}
+    assert len(snapshot["agents"]) == 3
+    assert set(identities) == {
+        online["agent"]["member_id"],
+        offline["agent"]["member_id"],
+    }
+    assert identities[online["agent"]["member_id"]]["connection_status"] == "connected"
+    assert identities[offline["agent"]["member_id"]]["connection_status"] == "disconnected"
+    assert all(item["member_status"] != "revoked" for item in identities.values())
+
+    members = service.list_project_members(project["id"])
+    revoked_member = next(
+        item for item in members if item["id"] == revoked["agent"]["member_id"]
+    )
+    assert revoked_member["status"] == "revoked"
+    assert revoked_member["session_count"] == 1
+    targets = service.list_task_intake_targets(project["id"])
+    assert [item["member_id"] for item in targets] == [online["agent"]["member_id"]]
+
+
 def test_agent_key_aliases_cannot_create_another_software_identity(service, project):
     first = service.join_room(
         project["id"],

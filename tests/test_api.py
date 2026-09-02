@@ -412,6 +412,80 @@ def test_api_project_member_management_and_token_link(settings, project_dir):
         assert revoked.json()["member"]["status"] == "revoked"
 
 
+def test_api_snapshot_roster_excludes_revoked_but_preserves_history(
+    settings, project_dir
+):
+    with TestClient(create_app(settings)) as client:
+        project = client.post(
+            "/api/v1/projects",
+            json={"root_path": str(project_dir), "name": "Roster API"},
+        ).json()
+        joined = {}
+        for key, name, client_name in (
+            ("online-main", "Online Agent", "codex"),
+            ("offline-main", "Offline Agent", "trae"),
+            ("revoked-main", "Revoked Agent", "qoder"),
+        ):
+            response = client.post(
+                f"/api/v1/projects/{project['id']}/agents/join",
+                json={
+                    "agent_key": key,
+                    "name": name,
+                    "client": client_name,
+                    "model": "test-model",
+                },
+            )
+            assert response.status_code == 201
+            joined[key] = response.json()
+
+        for key in ("offline-main", "revoked-main"):
+            left = client.post(
+                f"/api/v1/projects/{project['id']}/agents/{joined[key]['agent']['id']}/leave",
+                json={"token": joined[key]["token"]},
+            )
+            assert left.status_code == 200
+
+        revoked_member_id = joined["revoked-main"]["agent"]["member_id"]
+        revoked = client.delete(
+            f"/api/v1/projects/{project['id']}/members/{revoked_member_id}"
+        )
+        assert revoked.status_code == 200
+        assert revoked.json()["member"]["status"] == "revoked"
+
+        snapshot = client.get(f"/api/v1/projects/{project['id']}/snapshot")
+        assert snapshot.status_code == 200
+        payload = snapshot.json()
+        assert len(payload["agents"]) == 3
+        assert {item["member_id"] for item in payload["agent_identities"]} == {
+            joined["online-main"]["agent"]["member_id"],
+            joined["offline-main"]["agent"]["member_id"],
+        }
+        assert len(payload["members"]) == 3
+        assert next(
+            member for member in payload["members"] if member["id"] == revoked_member_id
+        )["status"] == "revoked"
+
+        targets = client.get(
+            f"/api/v1/projects/{project['id']}/task-intakes/targets"
+        )
+        assert targets.status_code == 200
+        assert [item["member_id"] for item in targets.json()["targets"]] == [
+            joined["online-main"]["agent"]["member_id"]
+        ]
+
+        members = client.get(f"/api/v1/projects/{project['id']}/members")
+        assert members.status_code == 200
+        assert len(members.json()["members"]) == 3
+        active_only = client.get(
+            f"/api/v1/projects/{project['id']}/members?include_revoked=false"
+        )
+        assert active_only.status_code == 200
+        assert all(
+            member["status"] != "revoked"
+            for member in active_only.json()["members"]
+        )
+
+
 def test_health_ready_hides_database_failures(settings, monkeypatch):
     app = create_app(settings)
 

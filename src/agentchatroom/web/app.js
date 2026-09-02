@@ -330,8 +330,13 @@ function projectSource(project) {
   return project.git_remote ? "Git" : "本地路径";
 }
 
+function currentAgentRoster(agentIdentities) {
+  return (agentIdentities || []).filter((agent) => agent.member_status !== "revoked");
+}
+
 function connectedAgentCount(agentIdentities) {
-  return agentIdentities.filter((agent) => agent.connection_status === "connected").length;
+  return currentAgentRoster(agentIdentities)
+    .filter((agent) => agent.connection_status === "connected").length;
 }
 
 function taskStatus(status) {
@@ -663,7 +668,7 @@ async function refreshPresence() {
     if (snapshot.project.id !== state.projectId) return;
     state.snapshot = snapshot;
     state.members = snapshot.members || state.members;
-    const agentIdentities = snapshot.agent_identities || [];
+    const agentIdentities = currentAgentRoster(snapshot.agent_identities);
     renderAgents(agentIdentities);
     renderMetrics(agentIdentities, snapshot.tasks, snapshot.leases);
     renderLeases(snapshot.leases, snapshot.agents);
@@ -766,7 +771,7 @@ function renderEmptyRoom() {
 function renderAll() {
   if (!state.snapshot) return renderEmptyRoom();
   const { project, agents, tasks, leases } = state.snapshot;
-  const agentIdentities = state.snapshot.agent_identities || [];
+  const agentIdentities = currentAgentRoster(state.snapshot.agent_identities);
   state.members = state.snapshot.members || state.members;
   state.projects = state.projects.map((item) => item.id === project.id ? project : item);
   renderProjects();
@@ -791,8 +796,9 @@ function renderAll() {
 }
 
 function renderAgents(agents) {
-  elements["agent-count"].textContent = agents.length;
-  const ordered = [...agents].sort((left, right) => {
+  const roster = currentAgentRoster(agents);
+  elements["agent-count"].textContent = roster.length;
+  const ordered = [...roster].sort((left, right) => {
     const leftDisconnected = left.connection_status === "disconnected" ? 1 : 0;
     const rightDisconnected = right.connection_status === "disconnected" ? 1 : 0;
     return leftDisconnected - rightDisconnected;
@@ -827,7 +833,8 @@ function renderAgents(agents) {
 }
 
 function renderMetrics(agents, tasks, leases) {
-  elements["metric-agents"].textContent = agents.length;
+  const roster = currentAgentRoster(agents);
+  elements["metric-agents"].textContent = roster.length;
   elements["metric-active"].textContent = tasks.filter((task) => ["claimed", "in_progress", "blocked"].includes(task.status)).length;
   elements["metric-leases"].textContent = leases.length;
   elements["metric-reviews"].textContent = tasks.filter((task) => task.status === "awaiting_review").length;

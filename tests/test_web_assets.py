@@ -55,6 +55,9 @@ def test_web_bootstrap_and_phase_one_local_agent_hooks_are_complete():
     assert "agent.model" not in javascript
     assert "上报模型" not in javascript
     assert ".model-badge" in (WEB_DIR / "app.css").read_text(encoding="utf-8")
+    assert "function currentAgentRoster(agentIdentities)" in javascript
+    assert "agent.member_status !== \"revoked\"" in javascript
+    assert "currentAgentRoster(snapshot.agent_identities)" in javascript
     assert "function connectedAgentCount(agentIdentities)" in javascript
 
 

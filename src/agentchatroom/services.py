@@ -594,12 +594,18 @@ class AgentChatRoomService:
                 if session.get("last_activity_at")
             ]
             member = member_by_id.get(member_id, {})
+            # Project members are the source of truth for the current roster.
+            # Keep every historical session in ``agents`` below, but do not
+            # promote a revoked member into the current identity projection.
+            if member and str(member.get("status") or "") == "revoked":
+                continue
             member_metadata = member.get("metadata") or {}
             identities.append(
                 {
                     "schema_version": DOMAIN_SCHEMA_VERSION,
                     "id": member_id,
                     "member_id": member_id,
+                    "member_status": str(member.get("status") or "active"),
                     "agent_key": member_id,
                     "software_key": str(member_metadata.get("software_key") or ""),
                     "managed_identity": bool(
