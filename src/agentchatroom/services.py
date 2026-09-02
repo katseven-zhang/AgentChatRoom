@@ -36,6 +36,8 @@ from .contracts import (
     PROJECT_MEMBER_STATUSES,
     TASK_EXECUTION_STATUSES,
     TASK_INTEGRATION_STATUSES,
+    TASK_INTAKE_STATUSES,
+    TASK_INTAKE_TRANSITIONS,
     TASK_VERIFICATION_STATUSES,
     task_contract,
     task_state_for_legacy_status,
@@ -392,6 +394,35 @@ class AgentChatRoomService:
             raise DomainError("task_not_found", "Task does not exist", status_code=404)
         return row
 
+    def _next_task_number(self, connection: Any, project_id: str) -> int:
+        """Allocate the next Project-scoped number inside the caller's write transaction."""
+        row = connection.execute(
+            "SELECT COALESCE(MAX(task_number), 0) + 1 AS task_number "
+            "FROM tasks WHERE project_id = ?",
+            (project_id,),
+        ).fetchone()
+        return int(row["task_number"])
+
+    def _require_task_by_number(
+        self, connection: Any, project_id: str, task_number: int
+    ) -> Mapping[str, Any]:
+        if task_number < 1:
+            raise DomainError(
+                "invalid_task_number", "Task number must be a positive integer"
+            )
+        row = connection.execute(
+            "SELECT * FROM tasks WHERE project_id = ? AND task_number = ?",
+            (project_id, task_number),
+        ).fetchone()
+        if row is None:
+            raise DomainError(
+                "task_not_found",
+                "Task number does not exist in this Project",
+                status_code=404,
+                details={"task_number": task_number},
+            )
+        return row
+
     def _authenticate(
         self,
         connection: Any,
@@ -437,6 +468,14 @@ class AgentChatRoomService:
         task_id: str | None = None,
         payload: dict[str, Any] | None = None,
     ) -> int:
+        event_payload = dict(payload or {})
+        if task_id and "task_number" not in event_payload:
+            task = connection.execute(
+                "SELECT task_number FROM tasks WHERE id = ? AND project_id = ?",
+                (task_id, project_id),
+            ).fetchone()
+            if task is not None and task["task_number"] is not None:
+                event_payload["task_number"] = int(task["task_number"])
         row = connection.execute(
             """
             INSERT INTO events(project_id, event_type, actor_session_id, task_id, payload_json, created_at)
@@ -448,7 +487,7 @@ class AgentChatRoomService:
                 event_type,
                 actor_session_id,
                 task_id,
-                json_dump(payload or {}),
+                json_dump(event_payload),
                 iso_now(),
             ),
         ).fetchone()
@@ -456,9 +495,17 @@ class AgentChatRoomService:
             raise RuntimeError("Event insert did not return an id")
         return int(row["id"])
 
-    def _event_dict(self, row: Mapping[str, Any]) -> dict[str, Any]:
+    def _event_dict(
+        self, row: Mapping[str, Any], connection: Any | None = None
+    ) -> dict[str, Any]:
         data = dict(row)
         data["payload"] = json_load(data.pop("payload_json"), {})
+        if connection is not None and data.get("task_id"):
+            task = connection.execute(
+                "SELECT task_number FROM tasks WHERE id = ?",
+                (data["task_id"],),
+            ).fetchone()
+            data["task_number"] = int(task["task_number"]) if task else None
         if data["event_type"].startswith("review."):
             default_channel = "review"
         elif data["task_id"]:
@@ -828,8 +875,72 @@ class AgentChatRoomService:
         data["metadata"] = json_load(data.pop("metadata_json"), {})
         return data
 
+    def _task_intake_dict(self, row: Mapping[str, Any]) -> dict[str, Any]:
+        data = dict(row)
+        data["schema_version"] = DOMAIN_SCHEMA_VERSION
+        return data
+
+    def _require_task_intake(
+        self, connection: Any, project_id: str, intake_id: str
+    ) -> Mapping[str, Any]:
+        row = connection.execute(
+            "SELECT * FROM task_intakes WHERE id = ? AND project_id = ?",
+            (intake_id, project_id),
+        ).fetchone()
+        if row is None:
+            raise DomainError(
+                "task_intake_not_found", "Task intake does not exist", status_code=404
+            )
+        return row
+
+    def _require_intake_target(
+        self,
+        connection: Any,
+        project_id: str,
+        member_id: str,
+        session_id: str | None,
+    ) -> Mapping[str, Any]:
+        member = self._require_member(connection, project_id, member_id)
+        if member["status"] != "active":
+            raise DomainError(
+                "task_intake_target_unavailable",
+                "The target Agent member is not active",
+                status_code=409,
+            )
+        if session_id:
+            target = connection.execute(
+                "SELECT * FROM agent_sessions WHERE id = ? AND project_id = ? AND member_id = ?",
+                (session_id, project_id, member_id),
+            ).fetchone()
+            if target is None:
+                raise DomainError(
+                    "task_intake_target_not_found",
+                    "The target Agent session does not belong to the selected member",
+                    status_code=404,
+                )
+            if self._agent_dict(target)["status"] == "offline":
+                raise DomainError(
+                    "task_intake_target_unavailable",
+                    "The selected Agent session is not connected",
+                    status_code=409,
+                )
+        return member
+
+    def _transition_task_intake(
+        self, connection: Any, current: Mapping[str, Any], next_status: str
+    ) -> None:
+        if next_status not in TASK_INTAKE_STATUSES:
+            raise DomainError("invalid_task_intake_status", "Unsupported intake status")
+        if next_status not in TASK_INTAKE_TRANSITIONS[current["status"]]:
+            raise DomainError(
+                "invalid_task_intake_transition",
+                f"Task intake cannot move from {current['status']} to {next_status}",
+                status_code=409,
+            )
+
     def _task_dict(self, row: Mapping[str, Any]) -> dict[str, Any]:
         data = dict(row)
+        data["task_number"] = int(data["task_number"])
         data["acceptance_criteria"] = json_load(
             data.pop("acceptance_criteria_json"), []
         )
@@ -899,12 +1010,23 @@ class AgentChatRoomService:
         self, connection: Any, row: Mapping[str, Any]
     ) -> dict[str, Any]:
         data = self._task_dict(row)
-        data["depends_on"] = [
-            dependency["depends_on_task_id"]
-            for dependency in connection.execute(
-                "SELECT depends_on_task_id FROM task_dependencies WHERE task_id = ? ORDER BY created_at",
-                (row["id"],),
-            ).fetchall()
+        dependencies = connection.execute(
+            """
+            SELECT t.id, t.task_number, t.title, t.status, t.execution_status,
+                   t.verification_status, t.integration_status
+            FROM task_dependencies d
+            JOIN tasks t ON t.id = d.depends_on_task_id
+            WHERE d.task_id = ? ORDER BY d.created_at
+            """,
+            (row["id"],),
+        ).fetchall()
+        data["depends_on"] = [dependency["id"] for dependency in dependencies]
+        data["dependency_details"] = [
+            {
+                **dict(dependency),
+                "task_number": int(dependency["task_number"]),
+            }
+            for dependency in dependencies
         ]
         data["assignments"] = [
             dict(assignment)
@@ -2305,7 +2427,7 @@ class AgentChatRoomService:
                 """,
                 (project_id, after, limit),
             ).fetchall()
-            events = [self._event_dict(row) for row in rows]
+            events = [self._event_dict(row, connection) for row in rows]
             cursor = events[-1]["id"] if events else after
             latest = connection.execute(
                 "SELECT COALESCE(MAX(id), 0) AS cursor FROM events WHERE project_id = ?",
@@ -2346,7 +2468,7 @@ class AgentChatRoomService:
                 """,
                 parameters,
             ).fetchall()
-            events = [self._event_dict(row) for row in rows]
+            events = [self._event_dict(row, connection) for row in rows]
             cursor = events[-1]["id"] if events else after
             latest = self.latest_cursor(connection, project_id)
             return {
@@ -2527,6 +2649,400 @@ class AgentChatRoomService:
                 "cursor": cursor,
             }
 
+    def list_task_intake_targets(self, project_id: str) -> list[dict[str, Any]]:
+        with self.database.connect() as connection:
+            self._require_project(connection, project_id)
+            rows = connection.execute(
+                """
+                SELECT a.*, (
+                    SELECT MAX(e.created_at)
+                    FROM events e
+                    WHERE e.project_id = a.project_id
+                      AND e.actor_session_id = a.id
+                ) AS last_activity_at
+                FROM agent_sessions a
+                WHERE a.project_id = ?
+                ORDER BY a.created_at
+                """,
+                (project_id,),
+            ).fetchall()
+            agents = [self._agent_dict(row) for row in rows]
+            members = [
+                self._member_dict(row)
+                for row in connection.execute(
+                    "SELECT * FROM project_members WHERE project_id = ?",
+                    (project_id,),
+                ).fetchall()
+            ]
+            active_member_ids = {
+                str(member["id"])
+                for member in members
+                if member["status"] == "active"
+            }
+            targets = self._agent_identities(agents, members=members)
+            return [
+                target
+                for target in targets
+                if target["member_id"] in active_member_ids
+                and target["connection_status"] == "connected"
+                and target["active_session_count"] > 0
+            ]
+
+    @idempotent_write("task.intake.submit")
+    def submit_task_intake(
+        self,
+        project_id: str,
+        *,
+        raw_description: str,
+        target_member_id: str,
+        target_session_id: str | None = None,
+        created_by_session_id: str | None = None,
+        token: str | None = None,
+    ) -> dict[str, Any]:
+        clean_description = raw_description.strip()
+        clean_member_id = target_member_id.strip()
+        clean_session_id = target_session_id.strip() if target_session_id else None
+        if not clean_description:
+            raise DomainError(
+                "invalid_task_intake", "A raw task description is required"
+            )
+        if not clean_member_id:
+            raise DomainError(
+                "task_intake_target_required", "An Agent target is required"
+            )
+        intake_id = new_id("intake")
+        now = iso_now()
+        with self.database.connect(write=True) as connection:
+            self._require_project(connection, project_id)
+            if created_by_session_id:
+                self._authenticate(
+                    connection, project_id, created_by_session_id, token or ""
+                )
+            member = self._require_intake_target(
+                connection, project_id, clean_member_id, clean_session_id
+            )
+            if clean_session_id is None:
+                candidates = connection.execute(
+                    """
+                    SELECT * FROM agent_sessions
+                    WHERE project_id = ? AND member_id = ? AND left_at IS NULL
+                    ORDER BY last_heartbeat DESC, created_at DESC
+                    """,
+                    (project_id, clean_member_id),
+                ).fetchall()
+                for candidate in candidates:
+                    if self._agent_dict(candidate)["status"] != "offline":
+                        clean_session_id = str(candidate["id"])
+                        break
+                if clean_session_id is None:
+                    raise DomainError(
+                        "task_intake_target_unavailable",
+                        "The selected Agent has no connected session",
+                        status_code=409,
+                    )
+            connection.execute(
+                """
+                INSERT INTO task_intakes(
+                    id, project_id, raw_description, target_member_id,
+                    target_session_id, created_by_session_id, status, formal_task_id,
+                    note, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, 'pending', NULL, '', ?, ?)
+                """,
+                (
+                    intake_id,
+                    project_id,
+                    clean_description,
+                    member["id"],
+                    clean_session_id,
+                    created_by_session_id,
+                    now,
+                    now,
+                ),
+            )
+            event_id = self._emit(
+                connection,
+                project_id,
+                "task.intake_submitted",
+                actor_session_id=created_by_session_id,
+                payload={
+                    "intake_id": intake_id,
+                    "raw_description": clean_description,
+                    "target_member_id": member["id"],
+                    "target_session_id": clean_session_id,
+                    "requires_agent_acceptance": True,
+                },
+            )
+            row = self._require_task_intake(connection, project_id, intake_id)
+            return {
+                "intake": self._task_intake_dict(row),
+                "event_id": event_id,
+                "cursor": event_id,
+            }
+
+    def list_task_intakes(
+        self, project_id: str, status: str | None = None
+    ) -> list[dict[str, Any]]:
+        with self.database.connect() as connection:
+            self._require_project(connection, project_id)
+            if status is not None and status not in TASK_INTAKE_STATUSES:
+                raise DomainError(
+                    "invalid_task_intake_status", "Unsupported intake status"
+                )
+            clause = "project_id = ?"
+            parameters: list[Any] = [project_id]
+            if status:
+                clause += " AND status = ?"
+                parameters.append(status)
+            rows = connection.execute(
+                f"SELECT * FROM task_intakes WHERE {clause} ORDER BY created_at ASC, id ASC",
+                parameters,
+            ).fetchall()
+            return [self._task_intake_dict(row) for row in rows]
+
+    def get_task_intake(self, project_id: str, intake_id: str) -> dict[str, Any]:
+        with self.database.connect() as connection:
+            return self._task_intake_dict(
+                self._require_task_intake(connection, project_id, intake_id)
+            )
+
+    @idempotent_write("task.intake.reassign")
+    def reassign_task_intake(
+        self,
+        project_id: str,
+        intake_id: str,
+        *,
+        target_member_id: str,
+        target_session_id: str | None = None,
+        note: str = "",
+    ) -> dict[str, Any]:
+        clean_member_id = target_member_id.strip()
+        clean_session_id = target_session_id.strip() if target_session_id else None
+        if not clean_member_id:
+            raise DomainError(
+                "task_intake_target_required", "An Agent target is required"
+            )
+        with self.database.connect(write=True) as connection:
+            intake = self._require_task_intake(connection, project_id, intake_id)
+            if intake["status"] == "defined":
+                raise DomainError(
+                    "task_intake_already_defined",
+                    "A defined intake must be reassigned through its formal task",
+                    status_code=409,
+                )
+            if intake["status"] == "cancelled":
+                raise DomainError(
+                    "task_intake_cancelled", "A cancelled intake cannot be reassigned", status_code=409
+                )
+            member = self._require_intake_target(
+                connection, project_id, clean_member_id, clean_session_id
+            )
+            if clean_session_id is None:
+                candidates = connection.execute(
+                    """
+                    SELECT * FROM agent_sessions
+                    WHERE project_id = ? AND member_id = ? AND left_at IS NULL
+                    ORDER BY last_heartbeat DESC, created_at DESC
+                    """,
+                    (project_id, clean_member_id),
+                ).fetchall()
+                for candidate in candidates:
+                    if self._agent_dict(candidate)["status"] != "offline":
+                        clean_session_id = str(candidate["id"])
+                        break
+                if clean_session_id is None:
+                    raise DomainError(
+                        "task_intake_target_unavailable",
+                        "The selected Agent has no connected session",
+                        status_code=409,
+                    )
+            now = iso_now()
+            connection.execute(
+                """
+                UPDATE task_intakes
+                SET target_member_id = ?, target_session_id = ?, status = 'pending',
+                    note = ?, updated_at = ?
+                WHERE id = ? AND project_id = ?
+                """,
+                (
+                    member["id"],
+                    clean_session_id,
+                    note.strip(),
+                    now,
+                    intake_id,
+                    project_id,
+                ),
+            )
+            event_id = self._emit(
+                connection,
+                project_id,
+                "task.intake_reassigned",
+                payload={
+                    "intake_id": intake_id,
+                    "target_member_id": member["id"],
+                    "target_session_id": clean_session_id,
+                    "note": note.strip(),
+                },
+            )
+            updated = self._require_task_intake(connection, project_id, intake_id)
+            return {
+                "intake": self._task_intake_dict(updated),
+                "event_id": event_id,
+                "cursor": event_id,
+            }
+
+    @idempotent_write("task.intake.acknowledge")
+    def acknowledge_task_intake(
+        self,
+        project_id: str,
+        intake_id: str,
+        *,
+        session_id: str,
+        token: str,
+        response: str = "accepted",
+        note: str = "",
+    ) -> dict[str, Any]:
+        if response not in {"accepted", "declined", "blocked"}:
+            raise DomainError(
+                "invalid_task_intake_response",
+                "Intake response must be accepted, declined, or blocked",
+            )
+        if response != "accepted" and not note.strip():
+            raise DomainError(
+                "intake_response_note_required",
+                "Declined or blocked intake responses require a note",
+            )
+        with self.database.connect(write=True) as connection:
+            agent = self._authenticate(connection, project_id, session_id, token)
+            intake = self._require_task_intake(connection, project_id, intake_id)
+            if intake["target_member_id"] != agent["member_id"]:
+                raise DomainError(
+                    "task_intake_not_for_agent",
+                    "This Agent is not the selected intake target",
+                    status_code=403,
+                )
+            if intake["status"] != "pending":
+                if (
+                    intake["status"] == response
+                    and intake["target_session_id"] == session_id
+                ):
+                    return {
+                        "intake": self._task_intake_dict(intake),
+                        "event_id": None,
+                        "cursor": self.latest_cursor(connection, project_id),
+                    }
+                raise DomainError(
+                    "task_intake_already_acknowledged",
+                    "Task intake already has a response",
+                    status_code=409,
+                )
+            next_status = response
+            now = iso_now()
+            connection.execute(
+                """
+                UPDATE task_intakes
+                SET target_session_id = ?, status = ?, note = ?, updated_at = ?
+                WHERE id = ? AND project_id = ? AND status = 'pending'
+                """,
+                (session_id, next_status, note.strip(), now, intake_id, project_id),
+            )
+            event_id = self._emit(
+                connection,
+                project_id,
+                "task.intake_acknowledged",
+                actor_session_id=session_id,
+                payload={
+                    "intake_id": intake_id,
+                    "response": response,
+                    "note": note.strip(),
+                    "target_session_id": session_id,
+                },
+            )
+            updated = self._require_task_intake(connection, project_id, intake_id)
+            return {
+                "intake": self._task_intake_dict(updated),
+                "event_id": event_id,
+                "cursor": event_id,
+            }
+
+    @idempotent_write("task.intake.define")
+    def define_task_from_intake(
+        self,
+        project_id: str,
+        intake_id: str,
+        *,
+        session_id: str,
+        token: str,
+        title: str,
+        description: str = "",
+        acceptance_criteria: list[str] | None = None,
+        depends_on: list[str] | None = None,
+        priority: int = 2,
+        note: str = "",
+    ) -> dict[str, Any]:
+        with self.database.connect(write=True) as connection:
+            agent = self._authenticate(connection, project_id, session_id, token)
+            intake = self._require_task_intake(connection, project_id, intake_id)
+            if intake["target_member_id"] != agent["member_id"]:
+                raise DomainError(
+                    "task_intake_not_for_agent",
+                    "Only the selected Agent can define this intake",
+                    status_code=403,
+                )
+            if intake["status"] != "accepted":
+                raise DomainError(
+                    "task_intake_not_accepted",
+                    "The intake must be accepted before its formal task can be defined",
+                    status_code=409,
+                )
+            created = self.create_task(
+                project_id,
+                title=title,
+                description=description,
+                acceptance_criteria=acceptance_criteria,
+                depends_on=depends_on,
+                priority=priority,
+                actor_session_id=session_id,
+                token=token,
+            )
+            task = created["task"]
+            now = iso_now()
+            connection.execute(
+                """
+                UPDATE task_intakes
+                SET status = 'defined', formal_task_id = ?, note = ?, updated_at = ?
+                WHERE id = ? AND project_id = ? AND status = 'accepted'
+                """,
+                (task["id"], note.strip(), now, intake_id, project_id),
+            )
+            defined_event_id = self._emit(
+                connection,
+                project_id,
+                "task.intake_defined",
+                actor_session_id=session_id,
+                task_id=task["id"],
+                payload={
+                    "intake_id": intake_id,
+                    "task_number": task["task_number"],
+                    "note": note.strip(),
+                },
+            )
+            assignment = self.assign_task(
+                project_id,
+                task["id"],
+                assigned_by_session_id=session_id,
+                token=token,
+                assigned_to_session_id=session_id,
+                note="Agent-defined task is ready for execution",
+            )
+            updated = self._require_task_intake(connection, project_id, intake_id)
+            return {
+                "intake": self._task_intake_dict(updated),
+                "task": self.get_task(project_id, task["id"]),
+                "assignment": assignment["assignment"],
+                "event_id": defined_event_id,
+                "cursor": defined_event_id,
+            }
+
     @idempotent_write("task.create")
     def create_task(
         self,
@@ -2559,18 +3075,21 @@ class AgentChatRoomService:
                 self._authenticate(connection, project_id, actor_session_id, token or "")
             for dependency_id in dependencies:
                 self._require_task(connection, project_id, dependency_id)
+            task_number = self._next_task_number(connection, project_id)
             connection.execute(
                 """
                 INSERT INTO tasks(
-                    id, project_id, title, description, acceptance_criteria_json,
-                    priority, status, execution_status, verification_status,
-                    integration_status, created_by_session_id, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, 'todo', 'todo', 'not_required',
+                    id, project_id, task_number, title, description,
+                    acceptance_criteria_json, priority, status, execution_status,
+                    verification_status, integration_status, created_by_session_id,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, 'todo', 'todo', 'not_required',
                           'pending', ?, ?, ?)
                 """,
                 (
                     task_id,
                     project_id,
+                    task_number,
                     title.strip(),
                     description.strip(),
                     json_dump(criteria),
@@ -2595,6 +3114,7 @@ class AgentChatRoomService:
                 actor_session_id=actor_session_id,
                 task_id=task_id,
                 payload={
+                    "task_number": task_number,
                     "title": title.strip(),
                     "priority": priority,
                     "depends_on": dependencies,
@@ -2634,6 +3154,13 @@ class AgentChatRoomService:
         with self.database.connect() as connection:
             self._require_project(connection, project_id)
             task = self._require_task(connection, project_id, task_id)
+            return self._task_with_dependencies(connection, task)
+
+    def get_task_by_number(self, project_id: str, task_number: int) -> dict[str, Any]:
+        """Resolve a human-readable Project task number to the full task."""
+        with self.database.connect() as connection:
+            self._require_project(connection, project_id)
+            task = self._require_task_by_number(connection, project_id, task_number)
             return self._task_with_dependencies(connection, task)
 
     @idempotent_write("task.claim")

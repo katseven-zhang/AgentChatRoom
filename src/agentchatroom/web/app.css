@@ -1301,6 +1301,245 @@ body.is-resizing-panels {
   white-space: nowrap;
 }
 
+.task-number {
+  color: var(--primary);
+  font: 750 11px/1.2 Consolas, "Cascadia Code", monospace;
+  white-space: nowrap;
+}
+
+.task-intake-list {
+  display: grid;
+  gap: 8px;
+  margin-top: 18px;
+}
+
+.task-intake-heading {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+  padding-top: 16px;
+  border-top: 1px solid var(--border);
+}
+
+.task-intake-heading h3 {
+  margin: 0;
+  font-size: 14px;
+}
+
+.task-intake-item {
+  min-width: 0;
+  padding: 12px;
+  border: 1px solid color-mix(in srgb, var(--amber) 24%, var(--border));
+  border-left: 3px solid var(--amber);
+  border-radius: var(--radius);
+  background: var(--amber-soft);
+}
+
+.task-intake-meta {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.task-intake-item p,
+.task-intake-item small {
+  display: block;
+  margin: 8px 0 0;
+  line-height: 1.6;
+  overflow-wrap: anywhere;
+}
+
+.task-intake-item small {
+  color: var(--text-muted);
+  font-size: 11px;
+}
+
+.task-detail-dialog {
+  width: min(760px, calc(100vw - 24px));
+}
+
+.task-contract {
+  min-width: 0;
+  padding: 14px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  background: var(--surface-muted);
+}
+
+.task-contract-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  padding-bottom: 12px;
+  border-bottom: 1px solid var(--border);
+}
+
+.task-contract-header > div:first-child {
+  min-width: 0;
+  display: grid;
+  gap: 5px;
+}
+
+.task-contract-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0 18px;
+  margin: 0;
+}
+
+.task-contract-grid > div {
+  min-width: 0;
+  padding: 11px 0;
+  border-bottom: 1px solid var(--border);
+}
+
+.task-contract-grid .task-contract-wide {
+  grid-column: 1 / -1;
+}
+
+.task-contract-grid dt {
+  color: var(--text-muted);
+  font-size: 10px;
+  font-weight: 750;
+}
+
+.task-contract-grid dd {
+  margin: 5px 0 0;
+  line-height: 1.55;
+  overflow-wrap: anywhere;
+}
+
+.task-contract-description {
+  white-space: pre-wrap;
+}
+
+.readonly-list {
+  display: grid;
+  gap: 6px;
+  margin: 0;
+  padding-left: 18px;
+}
+
+.readonly-list li {
+  min-width: 0;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+
+.task-dependencies .readonly-list {
+  padding-left: 0;
+  list-style: none;
+}
+
+.task-dependencies .readonly-list li {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 7px 8px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+}
+
+.task-dependencies .readonly-list li > span {
+  min-width: 0;
+}
+
+.link-button {
+  flex: 0 0 auto;
+  min-height: 26px;
+  padding: 0 8px;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+  color: var(--blue);
+  font-size: 11px;
+}
+
+.link-button:hover {
+  border-color: var(--blue);
+  background: var(--blue-soft);
+}
+
+.task-timeline {
+  min-width: 0;
+}
+
+.timeline-list {
+  position: relative;
+  display: grid;
+  gap: 0;
+  margin: 0;
+  padding: 3px 0 3px 22px;
+  list-style: none;
+}
+
+.timeline-list::before {
+  content: "";
+  position: absolute;
+  top: 12px;
+  bottom: 12px;
+  left: 6px;
+  width: 1px;
+  background: var(--border-strong);
+}
+
+.timeline-item {
+  position: relative;
+  min-width: 0;
+  padding: 9px 0 9px 12px;
+}
+
+.timeline-marker {
+  position: absolute;
+  top: 16px;
+  left: -19px;
+  width: 9px;
+  height: 9px;
+  border: 2px solid var(--surface);
+  border-radius: 50%;
+  background: var(--primary);
+  box-shadow: 0 0 0 1px var(--primary-border);
+}
+
+.timeline-content {
+  min-width: 0;
+  padding: 9px 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface-muted);
+}
+
+.timeline-heading {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.timeline-heading strong {
+  font-size: 12px;
+}
+
+.timeline-content p {
+  margin: 5px 0 0;
+  color: var(--text-muted);
+  font-size: 11px;
+  line-height: 1.55;
+  overflow-wrap: anywhere;
+}
+
+.timeline-content small {
+  display: block;
+  margin-top: 6px;
+}
+
 .task-meta,
 .lease-meta,
 .event-meta {
@@ -2265,6 +2504,23 @@ dialog::backdrop {
 
   .task-row {
     grid-template-columns: 44px minmax(0, 1fr);
+  }
+
+  .task-contract-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .task-contract-grid .task-contract-wide {
+    grid-column: auto;
+  }
+
+  .task-contract-header {
+    flex-direction: column;
+  }
+
+  .task-dependencies .readonly-list li {
+    align-items: flex-start;
+    flex-direction: column;
   }
 
   .task-row > .task-meta {

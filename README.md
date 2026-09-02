@@ -4,23 +4,20 @@ AgentChatRoom 是一个面向异构 AI 编程 Agent 的项目级实时协作中�
 
 当前一期提供 Python 后端、浏览器管理端、REST、SSE、本机 MCP stdio、CLI 和 SQLite 本地档案。Streamable HTTP MCP、远程 stdio Bridge、PostgreSQL 和服务器部署适配器保留为后续阶段基础，不作为当前单机产品能力展示。
 
-## 2026-08-30 修复更新
+## 2026-09-02 修复更新
 
-本次修复版包版本为 `0.2.2`，重点收口 Project/Room 生命周期、软件身份和单机协作的事实来源：
+本次修复版重点收口用户任务入口、Agent 受理和 Project 级稳定任务序号：
 
-- Project key 改由后端从 `project_id` 派生；Agent、REST、CLI 和 Web 不再自定义或猜测 key。
-- Git 或本地路径来源由后端依据实际 checkout 自动检测；同一规范化作用域只允许一个活动 Project/Room。
-- `.agentchatroom/project.json` 由后端维护并作为 checkout 注册；永久删除后的孤儿登记不会复活旧 Project。
-- 归档保留 `archived_at` 和追加式历史；永久删除物理清除 Project 及级联 Room 数据，不保留 tombstone。
-- Presence 只表示连接存活；任务认领、Work Report、独立 Review 和 Integration 才是工作进展事实，Work Report 会释放本任务 Lease。
-- 左侧 Agent 现在表示本机安装的软件身份，而不是任务角色或临时名称。身份由 MCP 配置注入并由后端生成数据库标识；同一软件在同一 Project 中只保留一个身份和一个活动 Session。
-- 同一软件重连会关闭旧 Session，并把未完成任务、有效 Lease、待响应指派和待处理 Handoff 原子转给新 Session；`executor`、`reviewer`、`coordinator` 只是 Session/Task 角色。
-- 独立 Review 按软件身份判断。Codex 改名为 `Codex Review`、`Runtime Check` 或启动子任务仍然是 Codex，不能审核 Codex 自己完成的工作。
-- 取消任务在 Web 中显示“已取消 / 无需验证 / 无需集成”，并从总览“正在进行”列表排除。
-- Knowledge Asset Batch A 已完成版本化、独立审核、来源追溯和 REST/MCP/CLI 统一适配；外部 Agent、跨机器协作、服务器部署和代码同步仍不属于一期范围。
-- Web 端 Room 动态与审计面板会按分页追平到最新事件游标后渲染，不再停留在历史首屏；SSE 从已加载的最大事件 ID 起订阅，刷新页面即可看到最新消息、任务与审计记录。
+- 用户任务入口拆分为两阶段：先提交原始任务说明 + 目标 Agent，受理后由 Agent 补全正式任务合同并自动派发。
+- 用户不再填写正式标题、验收条件、优先级、依赖或内部状态；用户唯一保留的控制是指定 / 改派 Agent。
+- 依赖继续由 Agent 判断并写入共享领域服务，用户侧只读展示。
+- 待受理、待定义阶段不能被普通 Agent 认领、提交 Work Report、独立 Review 或最终集成。
+- Project / Room 级新增稳定、唯一、后端生成的人类可读 `task_number`（从 1 开始，事务性生成，不能由前端传入；取消、改派、交接、验证和集成后保持不变）。
+- 历史任务按 `created_at, id` 回填 `task_number`；内部 `task_<随机码>` ID 仍然保留。
+- REST、MCP、CLI、Web 共享同一领域服务和状态机；公开 Schema 版本升到 `6`。
+- Web 任务 Tab 文案改为「协作视图」并新增 Intake 列表、时间线、依赖只读、只读详情视图与时间线样式。
+- 用户侧移除了保存任务、依赖编辑、依赖勾选、交接和集成提交入口。
 
-本次更新已通过完整测试、Python/JavaScript 语法检查、公开发布审计、差异检查和本地浏览器回归；运行时数据、凭据和本地 `docs/` 资料不纳入版本提交。
 
 ## 核心原则
 

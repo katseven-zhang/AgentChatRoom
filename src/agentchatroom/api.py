@@ -42,6 +42,8 @@ from .contracts import (
     PROJECT_MEMBER_STATUSES,
     TASK_EXECUTION_STATUSES,
     TASK_INTEGRATION_STATUSES,
+    TASK_INTAKE_STATUSES,
+    TASK_INTAKE_TRANSITIONS,
     TASK_VERIFICATION_STATUSES,
     knowledge_contract,
 )
@@ -285,6 +287,38 @@ class TaskCreate(StrictModel):
     priority: int = 2
     actor_session_id: str | None = None
     token: str | None = None
+
+
+class TaskIntakeCreate(StrictModel):
+    raw_description: str
+    target_member_id: str
+    target_session_id: str | None = None
+    created_by_session_id: str | None = None
+    token: str | None = None
+
+
+class TaskIntakeAcknowledge(StrictModel):
+    session_id: str
+    token: str
+    response: Literal["accepted", "declined", "blocked"] = "accepted"
+    note: str = ""
+
+
+class TaskIntakeReassign(StrictModel):
+    target_member_id: str
+    target_session_id: str | None = None
+    note: str = ""
+
+
+class TaskIntakeDefine(StrictModel):
+    session_id: str
+    token: str
+    title: str
+    description: str = ""
+    acceptance_criteria: list[str] = Field(default_factory=list)
+    depends_on: list[str] = Field(default_factory=list)
+    priority: int = Field(default=2, ge=0, le=4)
+    note: str = ""
 
 
 class TaskClaim(StrictModel):
@@ -669,6 +703,11 @@ def create_app(
                 "task_execution_statuses": sorted(TASK_EXECUTION_STATUSES),
                 "task_verification_statuses": sorted(TASK_VERIFICATION_STATUSES),
                 "task_integration_statuses": sorted(TASK_INTEGRATION_STATUSES),
+                "task_intake_statuses": sorted(TASK_INTAKE_STATUSES),
+                "task_intake_transitions": {
+                    status: sorted(next_states)
+                    for status, next_states in TASK_INTAKE_TRANSITIONS.items()
+                },
                 "assignment_statuses": sorted(ASSIGNMENT_STATUSES),
                 "assignment_responses": sorted(ASSIGNMENT_RESPONSES),
                 "handoff_statuses": sorted(HANDOFF_STATUSES),
@@ -1086,9 +1125,77 @@ def create_app(
     def list_tasks(project_id: str, status: str | None = None) -> dict[str, Any]:
         return {"tasks": service.list_tasks(project_id, status=status)}
 
+    @app.get("/api/v1/projects/{project_id}/tasks/by-number/{task_number}")
+    def get_task_by_number(project_id: str, task_number: int) -> dict[str, Any]:
+        return {"task": service.get_task_by_number(project_id, task_number)}
+
     @app.get("/api/v1/projects/{project_id}/tasks/{task_id}")
     def get_task(project_id: str, task_id: str) -> dict[str, Any]:
         return {"task": service.get_task(project_id, task_id)}
+
+    @app.get("/api/v1/projects/{project_id}/task-intakes/targets")
+    def list_task_intake_targets(project_id: str) -> dict[str, Any]:
+        return {"targets": service.list_task_intake_targets(project_id)}
+
+    @app.get("/api/v1/projects/{project_id}/task-intakes")
+    def list_task_intakes(project_id: str, status: str | None = None) -> dict[str, Any]:
+        return {"intakes": service.list_task_intakes(project_id, status=status)}
+
+    @app.get("/api/v1/projects/{project_id}/task-intakes/{intake_id}")
+    def get_task_intake(project_id: str, intake_id: str) -> dict[str, Any]:
+        return {"intake": service.get_task_intake(project_id, intake_id)}
+
+    @app.post("/api/v1/projects/{project_id}/task-intakes", status_code=201)
+    def submit_task_intake(
+        request: Request, project_id: str, body: TaskIntakeCreate
+    ) -> dict[str, Any]:
+        return service.submit_task_intake(
+            project_id,
+            **body.model_dump(),
+            request_id=request.state.request_id,
+        )
+
+    @app.post("/api/v1/projects/{project_id}/task-intakes/{intake_id}/acknowledge")
+    def acknowledge_task_intake(
+        request: Request,
+        project_id: str,
+        intake_id: str,
+        body: TaskIntakeAcknowledge,
+    ) -> dict[str, Any]:
+        return service.acknowledge_task_intake(
+            project_id,
+            intake_id,
+            **body.model_dump(),
+            request_id=request.state.request_id,
+        )
+
+    @app.post("/api/v1/projects/{project_id}/task-intakes/{intake_id}/reassign")
+    def reassign_task_intake(
+        request: Request,
+        project_id: str,
+        intake_id: str,
+        body: TaskIntakeReassign,
+    ) -> dict[str, Any]:
+        return service.reassign_task_intake(
+            project_id,
+            intake_id,
+            **body.model_dump(),
+            request_id=request.state.request_id,
+        )
+
+    @app.post("/api/v1/projects/{project_id}/task-intakes/{intake_id}/define", status_code=201)
+    def define_task_from_intake(
+        request: Request,
+        project_id: str,
+        intake_id: str,
+        body: TaskIntakeDefine,
+    ) -> dict[str, Any]:
+        return service.define_task_from_intake(
+            project_id,
+            intake_id,
+            **body.model_dump(),
+            request_id=request.state.request_id,
+        )
 
     @app.post("/api/v1/projects/{project_id}/tasks", status_code=201)
     def create_task(

@@ -485,6 +485,164 @@ def task_get(project_id: str, task_id: str) -> dict[str, Any]:
 
 
 @mcp.tool()
+def task_get_by_number(project_id: str, task_number: int) -> dict[str, Any]:
+    """Return one complete task by its stable human-readable Project number."""
+    try:
+        _authorize_remote(project_id, "room:read")
+    except DomainError as error:
+        return {"ok": False, **error.as_dict()}
+    return _tool_result(get_service().get_task_by_number, project_id, task_number)
+
+
+@mcp.tool()
+def task_intake_targets(project_id: str) -> dict[str, Any]:
+    """List currently connected Agents that can receive a user task intake."""
+    try:
+        _authorize_remote(project_id, "room:read")
+    except DomainError as error:
+        return {"ok": False, **error.as_dict()}
+    return _tool_result(get_service().list_task_intake_targets, project_id)
+
+
+@mcp.tool()
+def task_intake_submit(
+    project_id: str,
+    raw_description: str,
+    target_member_id: str,
+    target_session_id: str = "",
+    created_by_session_id: str = "",
+    token: str = "",
+    request_id: str = "",
+) -> dict[str, Any]:
+    """Submit raw user intent for a selected Agent to accept and define."""
+    try:
+        _authorize_remote(project_id, "task:write")
+    except DomainError as error:
+        return {"ok": False, **error.as_dict()}
+    return _tool_result(
+        get_service().submit_task_intake,
+        project_id,
+        raw_description=raw_description,
+        target_member_id=target_member_id,
+        target_session_id=target_session_id or None,
+        created_by_session_id=created_by_session_id or None,
+        token=token or None,
+        request_id=_mcp_request_id(request_id),
+    )
+
+
+@mcp.tool()
+def task_intake_list(project_id: str, status: str = "") -> dict[str, Any]:
+    """List user task intakes, optionally filtered by lifecycle status."""
+    try:
+        _authorize_remote(project_id, "room:read")
+    except DomainError as error:
+        return {"ok": False, **error.as_dict()}
+    return _tool_result(
+        get_service().list_task_intakes,
+        project_id,
+        status=status or None,
+    )
+
+
+@mcp.tool()
+def task_intake_get(project_id: str, intake_id: str) -> dict[str, Any]:
+    """Return one user task intake and its current formal-task link."""
+    try:
+        _authorize_remote(project_id, "room:read")
+    except DomainError as error:
+        return {"ok": False, **error.as_dict()}
+    return _tool_result(get_service().get_task_intake, project_id, intake_id)
+
+
+@mcp.tool()
+def task_intake_acknowledge(
+    project_id: str,
+    intake_id: str,
+    session_id: str,
+    token: str,
+    response: str = "accepted",
+    note: str = "",
+    request_id: str = "",
+) -> dict[str, Any]:
+    """Accept, decline, or block a user task intake as its selected Agent."""
+    try:
+        _authorize_remote(project_id, "task:write")
+    except DomainError as error:
+        return {"ok": False, **error.as_dict()}
+    return _tool_result(
+        get_service().acknowledge_task_intake,
+        project_id,
+        intake_id,
+        session_id=session_id,
+        token=token,
+        response=response,
+        note=note,
+        request_id=_mcp_request_id(request_id),
+    )
+
+
+@mcp.tool()
+def task_intake_reassign(
+    project_id: str,
+    intake_id: str,
+    target_member_id: str,
+    target_session_id: str = "",
+    note: str = "",
+    request_id: str = "",
+) -> dict[str, Any]:
+    """Redirect an undefined user task intake to another available Agent."""
+    try:
+        _authorize_remote(project_id, "task:write")
+    except DomainError as error:
+        return {"ok": False, **error.as_dict()}
+    return _tool_result(
+        get_service().reassign_task_intake,
+        project_id,
+        intake_id,
+        target_member_id=target_member_id,
+        target_session_id=target_session_id or None,
+        note=note,
+        request_id=_mcp_request_id(request_id),
+    )
+
+
+@mcp.tool()
+def task_define_from_intake(
+    project_id: str,
+    intake_id: str,
+    session_id: str,
+    token: str,
+    title: str,
+    acceptance_criteria: list[str],
+    description: str = "",
+    depends_on: list[str] | None = None,
+    priority: int = 2,
+    note: str = "",
+    request_id: str = "",
+) -> dict[str, Any]:
+    """Define and dispatch the formal task contract after intake acceptance."""
+    try:
+        _authorize_remote(project_id, "task:write")
+    except DomainError as error:
+        return {"ok": False, **error.as_dict()}
+    return _tool_result(
+        get_service().define_task_from_intake,
+        project_id,
+        intake_id,
+        session_id=session_id,
+        token=token,
+        title=title,
+        description=description,
+        acceptance_criteria=acceptance_criteria,
+        depends_on=depends_on,
+        priority=priority,
+        note=note,
+        request_id=_mcp_request_id(request_id),
+    )
+
+
+@mcp.tool()
 def audit_query(
     project_id: str,
     after: int = 0,

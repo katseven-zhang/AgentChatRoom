@@ -629,12 +629,12 @@ def test_task_contract_exposes_versioned_state(service, project):
         acceptance_criteria=["State contract is exposed"],
     )["task"]
 
-    assert task["schema_version"] == 5
+    assert task["schema_version"] == 6
     assert task["execution_status"] == "todo"
     assert task["verification_status"] == "not_required"
     assert task["integration_status"] == "pending"
     assert task["state"] == {
-        "schema_version": 5,
+        "schema_version": 6,
         "execution_status": "todo",
         "verification_status": "not_required",
         "integration_status": "pending",
@@ -661,7 +661,7 @@ def test_get_task_returns_one_complete_task(service, project):
     assert fetched["id"] == created["id"]
     assert fetched["title"] == "Read one task"
     assert fetched["acceptance_criteria"] == ["The exact task is returned"]
-    assert fetched["state"]["schema_version"] == 5
+    assert fetched["state"]["schema_version"] == 6
     assert fetched["assignments"] == []
     assert fetched["handoffs"] == []
     assert fetched["integrations"] == []

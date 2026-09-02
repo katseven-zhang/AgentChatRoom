@@ -18,7 +18,10 @@ const state = {
   presenceRefreshInFlight: false,
   taskFilter: "",
   eventFilter: "all",
+  taskIntakeTargets: [],
+  taskIntakes: [],
   editingTaskId: null,
+  editingIntakeId: null,
   editingMemberId: null,
   members: [],
   credentials: [],
@@ -38,18 +41,17 @@ const elements = Object.fromEntries(
     "create-task-button", "archive-project-button", "project-settings-button", "export-project-button",
     "connect-agent-button", "logout-button",
     "metric-agents", "metric-active", "metric-leases",
-    "metric-reviews", "active-task-list", "recent-event-list", "task-table",
+    "metric-reviews", "active-task-list", "recent-event-list",
     "lease-list", "review-list", "chat-subtitle", "chat-stream", "event-filter",
     "message-form", "message-input", "message-kind", "message-channel", "message-task", "message-priority",
     "message-requires-ack", "send-message-button", "onboarding", "new-message-notice",
     "project-dialog", "project-form", "project-name-input", "project-path-input",
     "project-folder-picker-button",
-    "task-dialog", "task-form", "task-title-input", "task-description-input",
-    "task-criteria-input", "task-priority-input", "task-dependency-options",
-    "task-edit-dialog", "task-edit-form", "task-edit-id", "task-edit-title",
-    "task-edit-description", "task-edit-criteria", "task-edit-dependencies",
-    "task-edit-status", "task-edit-priority", "task-edit-progress",
-    "task-edit-current-step", "task-edit-blocker", "task-edit-next-step", "task-edit-owner",
+    "task-dialog", "task-form", "task-raw-description-input", "task-target-agent-input",
+    "task-target-agent-empty", "task-intake-submit", "task-intake-list", "task-table",
+    "task-edit-dialog", "task-detail-heading", "task-detail-contract", "task-timeline",
+    "task-assign-button", "task-assignment-list", "task-assign-dialog", "task-assign-form",
+    "task-assign-title", "task-assign-agent", "task-assign-agent-empty", "task-assign-note", "task-assign-submit",
     "settings-dialog", "settings-form", "settings-project-name", "settings-lease-policy", "settings-roles",
     "archive-dialog", "archive-form", "archive-project-name", "permanent-delete-input",
     "remove-project-hint", "remove-project-submit",
@@ -70,14 +72,6 @@ const elements = Object.fromEntries(
     "token-secret-dialog", "token-secret-value", "token-secret-close",
     "workspace-dialog", "workspace-form", "workspace-host-name", "workspace-host-key",
     "workspace-local-path", "workspace-branch", "workspace-worktree", "workspace-git-remote",
-    "task-assign-button", "task-assignment-list", "task-assign-dialog", "task-assign-form",
-    "task-assign-title", "task-assign-agent", "task-assign-role", "task-assign-capability", "task-assign-note",
-    "task-handoff-button", "task-handoff-list", "task-handoff-dialog", "task-handoff-form",
-    "task-handoff-title", "task-handoff-agent", "task-handoff-summary", "task-handoff-completed",
-    "task-handoff-pending", "task-handoff-files", "task-handoff-risks", "task-handoff-next-step",
-    "task-integration-button", "task-integration-list", "task-integration-dialog", "task-integration-form",
-    "task-integration-title", "task-integration-result", "task-integration-summary",
-    "task-integration-files", "task-integration-commit", "task-integration-tests",
   ].map((id) => [id, document.getElementById(id)])
 );
 
@@ -406,6 +400,8 @@ function eventLabel(type) {
     "task.handoff_requested": "请求了任务交接", "task.handoff_acknowledged": "回应了任务交接",
     "task.completed": "声明执行完成",
     "task.updated": "更新了任务", "task.blocked": "阻塞了任务",
+    "task.intake_submitted": "提交了任务意图", "task.intake_acknowledged": "受理了任务意图",
+    "task.intake_reassigned": "改派了任务意图", "task.intake_defined": "正式定义了任务",
     "task.unblocked": "解除了任务阻塞", "task.released": "释放了任务",
     "task.cancelled": "取消了任务", "lease.acquired": "占用了文件范围",
     "lease.released": "释放了文件范围", "lease.conflict": "检测到文件冲突",
@@ -604,7 +600,7 @@ async function selectProject(projectId) {
   state.eventIds = new Set();
   renderProjects();
   closeEventSource();
-  const [snapshot, eventPage, members, credentials, workspaces, audit, runtime] = await Promise.all([
+  const [snapshot, eventPage, members, credentials, workspaces, audit, runtime, intakeTargets, intakes] = await Promise.all([
     api(`/api/v1/projects/${projectId}/snapshot`),
     loadRecentEvents(projectId),
     api(`/api/v1/projects/${projectId}/members`),
@@ -612,11 +608,15 @@ async function selectProject(projectId) {
     api(`/api/v1/projects/${projectId}/workspaces`),
     loadRecentAuditEvents(projectId),
     api("/api/v1/admin/runtime?lines=80"),
+    api(`/api/v1/projects/${projectId}/task-intakes/targets`),
+    api(`/api/v1/projects/${projectId}/task-intakes`),
   ]);
   state.snapshot = snapshot;
   state.members = members.members;
   state.credentials = credentials.credentials;
   state.workspaces = workspaces.workspaces;
+  state.taskIntakeTargets = intakeTargets.targets || [];
+  state.taskIntakes = intakes.intakes || [];
   state.auditEvents = audit.events.slice(-AUDIT_WINDOW_SIZE);
   state.runtime = runtime;
   mergeEvents(eventPage.events);
@@ -741,6 +741,8 @@ function renderEmptyRoom() {
   state.members = [];
   state.credentials = [];
   state.workspaces = [];
+  state.taskIntakeTargets = [];
+  state.taskIntakes = [];
   state.auditEvents = [];
   elements["room-name"].textContent = "尚未添加项目";
   elements["room-path"].textContent = "添加本地项目后即可开始协作";
@@ -754,7 +756,7 @@ function renderEmptyRoom() {
   elements["agent-count"].textContent = "0";
   elements["agent-list"].innerHTML = '<div class="empty-state">Agent 完成「配置本机 Agent」并连接当前 Room 后，会显示在这里</div>';
   elements["chat-stream"].innerHTML = '<div class="empty-state">Room 动态会实时显示在这里：Agent 加入、任务进展和消息按时间排列</div>';
-  elements["task-table"].innerHTML = '<div class="empty-state">还没有任务。任务是把工作交给 Agent 的最小单元：点右上角「+ 新建任务」，写清要做什么和验收条件。</div>';
+  elements["task-table"].innerHTML = '<div class="empty-state">还没有正式任务。点右上角「+ 新建任务」提交原始任务意图，等待 Agent 受理和定义。</div>';
   elements["token-list"].innerHTML = '<div class="empty-state">选择项目后管理 Agent Token</div>';
   elements["member-list"].innerHTML = '<div class="empty-state">选择项目后管理项目成员</div>';
   elements["workspace-list"].innerHTML = '<div class="empty-state">选择项目后查看 Workspace</div>';
@@ -780,6 +782,7 @@ function renderAll() {
   renderAgents(agentIdentities);
   renderMetrics(agentIdentities, tasks, leases);
   renderTasks(tasks);
+  renderTaskIntakes();
   renderLeases(leases, agents);
   renderReviews(tasks, agents);
   renderEvents(agents, tasks);
@@ -833,10 +836,10 @@ function renderMetrics(agents, tasks, leases) {
   elements["active-task-list"].innerHTML = active.length
     ? active.map((task) => `
       <div class="compact-item">
-        <div class="task-meta"><span class="priority p${task.priority}">P${task.priority}</span><span class="status-badge ${escapeHtml(task.status)}">${escapeHtml(taskStatus(task.status))}</span></div>
+        <div class="task-meta"><span class="task-number">任务 #${task.task_number}</span><span class="priority p${task.priority}">P${task.priority}</span><span class="status-badge ${escapeHtml(task.status)}">${escapeHtml(taskStatus(task.status))}</span></div>
         <p><strong>${escapeHtml(task.title)}</strong></p>
       </div>`).join("")
-    : '<div class="empty-state">当前没有进行中的工作。点「+ 新建任务」把第一件事派出去，Agent 的进展会显示在这里。</div>';
+    : '<div class="empty-state">当前没有进行中的工作。点「+ 新建任务」把第一件事交给受理 Agent。</div>';
 
   const recent = state.events.slice(-6).reverse();
   elements["recent-event-list"].innerHTML = recent.length
@@ -861,19 +864,43 @@ function renderTasks(tasks) {
   elements["task-table"].innerHTML = filtered.length
     ? filtered.map((task) => `
       <button class="task-row" type="button" data-task-id="${escapeHtml(task.id)}">
-        <span class="priority p${task.priority}">P${task.priority}</span>
+        <span class="task-number">#${task.task_number}</span>
         <div>
           <h3>${escapeHtml(task.title)}</h3>
-          <p>${escapeHtml(task.description || task.acceptance_criteria.join(" · ") || "尚未填写说明")}${task.current_step ? ` · 当前：${escapeHtml(task.current_step)}` : ""}${task.blocker_reason ? ` · 阻塞：${escapeHtml(task.blocker_reason)}` : ""}</p>
+          <p>${escapeHtml(task.description || task.acceptance_criteria.join(" · ") || "尚未填写正式说明")}${task.current_step ? ` · 当前：${escapeHtml(task.current_step)}` : ""}${task.blocker_reason ? ` · 阻塞：${escapeHtml(task.blocker_reason)}` : ""}</p>
         </div>
         <div class="task-meta">
+          <span class="status-badge ${escapeHtml(task.status)}">${escapeHtml(taskStatus(task.status))}</span>
           <span class="status-badge ${escapeHtml(task.execution_status)}">${escapeHtml(executionStatus(task.execution_status))}</span>
           <span class="status-badge ${escapeHtml(task.verification_status)}">${escapeHtml(verificationStatus(task.verification_status))}</span>
-          <span class="status-badge ${escapeHtml(taskIntegrationStatusClass(task))}">${escapeHtml(taskIntegrationStatus(task))}</span>
-          <span class="secondary-text">${task.progress_percent}%${task.owner_session_id ? ` · ${escapeHtml(names[task.owner_session_id] || shortId(task.owner_session_id))}` : ""}${task.depends_on?.length ? ` · 依赖 ${task.depends_on.length} 项` : ""}</span>
+          <span class="secondary-text">${task.progress_percent}%${task.owner_session_id ? ` · ${escapeHtml(names[task.owner_session_id] || shortId(task.owner_session_id))}` : " · 尚未指定 Agent"}${task.depends_on?.length ? ` · 依赖 ${task.depends_on.length} 项` : ""}</span>
         </div>
       </button>`).join("")
-    : '<div class="empty-state">当前筛选下没有任务。点「+ 新建任务」写清要做什么和验收条件，Agent 可以认领或等派发。</div>';
+    : '<div class="empty-state">当前筛选下没有正式任务。新提交的原始意图会显示在下方，等待 Agent 受理和定义。</div>';
+}
+
+function intakeTargetName(intake) {
+  const target = state.taskIntakeTargets.find((item) => item.member_id === intake.target_member_id);
+  return target?.name || intake.target_member_id || "未指定 Agent";
+}
+
+function taskIntakeStatus(status) {
+  return {
+    pending: "待 Agent 受理", accepted: "已受理待定义", defined: "已正式定义",
+    declined: "Agent 已拒绝", blocked: "受理受阻", cancelled: "已取消",
+  }[status] || status;
+}
+
+function renderTaskIntakes() {
+  const active = state.taskIntakes.filter((intake) => intake.status !== "defined");
+  elements["task-intake-list"].innerHTML = active.length
+    ? `<div class="task-intake-heading"><h3>待受理任务意图</h3><span class="secondary-text">正式标题、优先级、验收条件和依赖由 Agent 定义</span></div>${active.map((intake) => `
+      <article class="task-intake-item">
+        <div class="task-intake-meta"><span class="status-badge ${escapeHtml(intake.status)}">${escapeHtml(taskIntakeStatus(intake.status))}</span><span class="secondary-text">受理 Agent：${escapeHtml(intakeTargetName(intake))}</span></div>
+        <p>${escapeHtml(intake.raw_description)}</p>
+        ${intake.note ? `<small>${escapeHtml(intake.note)}</small>` : ""}
+      </article>`).join("")}`
+    : "";
 }
 
 function renderLeases(leases, agents) {
@@ -1149,8 +1176,9 @@ elements["project-folder-picker-button"].addEventListener("click", async () => {
     button.disabled = !state.config?.capabilities?.local_folder_picker;
   }
 });
-document.getElementById("create-task-button").addEventListener("click", () => {
-  renderDependencyOptions();
+document.getElementById("create-task-button").addEventListener("click", async () => {
+  if (!state.projectId) return;
+  await refreshTaskIntakeTargets();
   elements["task-dialog"].showModal();
 });
 document.getElementById("archive-project-button").addEventListener("click", () => {
@@ -1209,9 +1237,7 @@ elements["register-workspace-button"].addEventListener("click", () => {
 elements["refresh-audit-button"].addEventListener("click", () => refreshManagement().catch(handleError));
 elements["audit-event-filter"].addEventListener("change", () => refreshManagement().catch(handleError));
 elements["refresh-runtime-button"].addEventListener("click", () => refreshManagement().catch(handleError));
-elements["task-assign-button"].addEventListener("click", openTaskAssignmentDialog);
-elements["task-handoff-button"].addEventListener("click", openTaskHandoffDialog);
-elements["task-integration-button"].addEventListener("click", openTaskIntegrationDialog);
+elements["task-assign-button"].addEventListener("click", () => openTaskAssignmentDialog().catch(handleError));
 elements["token-secret-close"].addEventListener("click", () => {
   elements["token-secret-value"].textContent = "";
   elements["token-secret-dialog"].close();
@@ -1318,7 +1344,12 @@ document.querySelectorAll("dialog").forEach((dialog) => {
 
 elements["task-table"].addEventListener("click", (event) => {
   const button = event.target.closest("[data-task-id]");
-  if (button) openTaskEditor(button.dataset.taskId);
+  if (button) openTaskDetails(button.dataset.taskId).catch(handleError);
+});
+
+elements["task-detail-contract"].addEventListener("click", (event) => {
+  const button = event.target.closest("[data-related-task-id]");
+  if (button) openTaskDetails(button.dataset.relatedTaskId).catch(handleError);
 });
 
 elements["token-list"].addEventListener("click", async (event) => {
@@ -1425,40 +1456,6 @@ elements["project-form"].addEventListener("submit", async (event) => {
   }
 });
 
-elements["task-edit-status"].addEventListener("change", () => {
-  elements["task-edit-blocker"].required = elements["task-edit-status"].value === "blocked";
-});
-
-elements["task-edit-form"].addEventListener("submit", async (event) => {
-  event.preventDefault();
-  const task = state.snapshot?.tasks.find((item) => item.id === state.editingTaskId);
-  if (!task) return;
-  const contractLocked = ["awaiting_review", "verified", "done"].includes(task.status);
-  const body = {
-    status: elements["task-edit-status"].value,
-    description: elements["task-edit-description"].value.trim(),
-    priority: Number(elements["task-edit-priority"].value),
-    progress_percent: Number(elements["task-edit-progress"].value),
-    current_step: elements["task-edit-current-step"].value.trim(),
-    blocker_reason: elements["task-edit-blocker"].value.trim(),
-    next_step: elements["task-edit-next-step"].value.trim(),
-  };
-  if (!contractLocked) {
-    body.title = elements["task-edit-title"].value.trim();
-    body.acceptance_criteria = elements["task-edit-criteria"].value.split("\n").map((item) => item.trim()).filter(Boolean);
-    body.depends_on = [...elements["task-edit-dependencies"].querySelectorAll("input:checked")].map((input) => input.value);
-  }
-  try {
-    await api(`/api/v1/projects/${state.projectId}/tasks/${task.id}`, {
-      method: "PATCH",
-      body: JSON.stringify(body),
-    });
-    elements["task-edit-dialog"].close();
-    showToast("任务已更新");
-  } catch (error) {
-    handleError(error);
-  }
-});
 
 elements["settings-form"].addEventListener("submit", async (event) => {
   event.preventDefault();
@@ -1484,22 +1481,27 @@ elements["settings-form"].addEventListener("submit", async (event) => {
 
 elements["task-form"].addEventListener("submit", async (event) => {
   event.preventDefault();
+  if (!state.projectId) return;
+  const rawDescription = elements["task-raw-description-input"].value.trim();
+  const targetMemberId = elements["task-target-agent-input"].value;
+  if (!rawDescription || !targetMemberId) {
+    showToast("请填写原始任务说明并选择受理 Agent", "error");
+    return;
+  }
+  elements["task-intake-submit"].disabled = true;
   try {
-    await api(`/api/v1/projects/${state.projectId}/tasks`, {
+    await api(`/api/v1/projects/${state.projectId}/task-intakes`, {
       method: "POST",
-      body: JSON.stringify({
-        title: elements["task-title-input"].value.trim(),
-        description: elements["task-description-input"].value.trim(),
-        acceptance_criteria: elements["task-criteria-input"].value.split("\n").map((item) => item.trim()).filter(Boolean),
-        depends_on: [...elements["task-dependency-options"].querySelectorAll("input:checked")].map((input) => input.value),
-        priority: Number(elements["task-priority-input"].value),
-      }),
+      body: JSON.stringify({ raw_description: rawDescription, target_member_id: targetMemberId }),
     });
     elements["task-dialog"].close();
     elements["task-form"].reset();
-    showToast("任务已创建");
+    await refreshTaskIntakeData();
+    showToast("任务意图已提交，等待 Agent 受理");
   } catch (error) {
     handleError(error);
+  } finally {
+    elements["task-intake-submit"].disabled = !state.taskIntakeTargets.length;
   }
 });
 
@@ -1664,91 +1666,37 @@ elements["workspace-form"].addEventListener("submit", async (event) => {
 elements["task-assign-form"].addEventListener("submit", async (event) => {
   event.preventDefault();
   const task = state.snapshot?.tasks.find((item) => item.id === state.editingTaskId);
-  if (!task) return;
+  if (!task || !state.projectId) return;
   const assignedTo = elements["task-assign-agent"].value;
-  const targetRole = elements["task-assign-role"].value.trim();
-  const capability = elements["task-assign-capability"].value.trim();
-  if (!assignedTo && !targetRole && !capability) {
-    showToast("请指定 Agent、角色或能力", "error");
+  if (!assignedTo) {
+    showToast("请选择目标 Agent", "error");
     return;
   }
+  elements["task-assign-submit"].disabled = true;
   try {
     await api(`/api/v1/projects/${state.projectId}/tasks/${task.id}/assignments`, {
       method: "POST",
       body: JSON.stringify({
-        assigned_to_session_id: assignedTo || null,
-        target_role: targetRole,
-        required_capability: capability,
+        assigned_to_session_id: assignedTo,
+        target_role: "",
+        required_capability: "",
         note: elements["task-assign-note"].value.trim(),
       }),
     });
     elements["task-assign-dialog"].close();
-    state.snapshot = await api(`/api/v1/projects/${state.projectId}/snapshot`);
-    renderAll();
-    const updated = state.snapshot.tasks.find((item) => item.id === task.id);
-    if (updated) renderTaskAssignments(updated);
-    showToast("任务已派发");
+    await refreshTaskIntakeData();
+    const updatedTask = state.snapshot?.tasks.find((item) => item.id === task.id) || task;
+    renderTaskContract(updatedTask);
+    renderTaskAssignments(updatedTask);
+    renderTaskTimeline(updatedTask);
+    showToast(`任务 #${task.task_number} 已指定给 Agent`);
   } catch (error) {
     handleError(error);
+  } finally {
+    elements["task-assign-submit"].disabled = false;
   }
 });
 
-elements["task-handoff-form"].addEventListener("submit", async (event) => {
-  event.preventDefault();
-  const task = state.snapshot?.tasks.find((item) => item.id === state.editingTaskId);
-  if (!task) return;
-  try {
-    await api(`/api/v1/projects/${state.projectId}/tasks/${task.id}/handoffs`, {
-      method: "POST",
-      body: JSON.stringify({
-        to_session_id: elements["task-handoff-agent"].value,
-        summary: elements["task-handoff-summary"].value.trim(),
-        completed_items: textLines(elements["task-handoff-completed"].value),
-        pending_items: textLines(elements["task-handoff-pending"].value),
-        files: textLines(elements["task-handoff-files"].value),
-        risks: textLines(elements["task-handoff-risks"].value),
-        next_step: elements["task-handoff-next-step"].value.trim(),
-      }),
-    });
-    elements["task-handoff-dialog"].close();
-    state.snapshot = await api(`/api/v1/projects/${state.projectId}/snapshot`);
-    renderAll();
-    const updated = state.snapshot.tasks.find((item) => item.id === task.id);
-    if (updated) {
-      renderTaskHandoffs(updated);
-      elements["task-handoff-button"].disabled = true;
-    }
-    showToast("交接请求已发送");
-  } catch (error) {
-    handleError(error);
-  }
-});
-
-elements["task-integration-form"].addEventListener("submit", async (event) => {
-  event.preventDefault();
-  const task = state.snapshot?.tasks.find((item) => item.id === state.editingTaskId);
-  if (!task) return;
-  try {
-    const tests = parseTestLines(elements["task-integration-tests"].value);
-    await api(`/api/v1/projects/${state.projectId}/tasks/${task.id}/integrations`, {
-      method: "POST",
-      body: JSON.stringify({
-        result: elements["task-integration-result"].value,
-        summary: elements["task-integration-summary"].value.trim(),
-        files: textLines(elements["task-integration-files"].value),
-        tests,
-        commit_hash: elements["task-integration-commit"].value.trim(),
-      }),
-    });
-    elements["task-integration-dialog"].close();
-    elements["task-edit-dialog"].close();
-    state.snapshot = await api(`/api/v1/projects/${state.projectId}/snapshot`);
-    renderAll();
-    showToast("集成结果已记录");
-  } catch (error) {
-    handleError(error);
-  }
-});
 
 function showTokenSecret(token) {
   elements["token-secret-value"].textContent = token;
@@ -1761,46 +1709,69 @@ function handleError(error) {
   showToast(error.message || "发生未知错误", "error");
 }
 
-function renderDependencyOptions() {
-  const candidates = (state.snapshot?.tasks || []).filter((task) => !["done", "cancelled"].includes(task.status));
-  elements["task-dependency-options"].innerHTML = candidates.length
-    ? candidates.map((task) => `
-      <label class="check-control">
-        <input type="checkbox" value="${escapeHtml(task.id)}">
-        <span>${escapeHtml(task.title)} <span class="secondary-text">${escapeHtml(taskStatus(task.status))}</span></span>
-      </label>`).join("")
-    : '<span class="secondary-text">当前没有可选择的依赖任务</span>';
-}
-
 function renderMessageTaskOptions(tasks) {
   const selected = elements["message-task"].value;
   const candidates = tasks.filter((task) => !["done", "cancelled"].includes(task.status));
   elements["message-task"].innerHTML = [
     '<option value="">不关联任务</option>',
-    ...candidates.map((task) => `<option value="${escapeHtml(task.id)}">${escapeHtml(task.title)}</option>`),
+    ...candidates.map((task) => `<option value="${escapeHtml(task.id)}">任务 #${task.task_number} · ${escapeHtml(task.title)}</option>`),
   ].join("");
   if (candidates.some((task) => task.id === selected)) elements["message-task"].value = selected;
 }
 
-function renderTaskEditDependencies(task, disabled) {
-  const candidates = (state.snapshot?.tasks || []).filter((item) => item.id !== task.id && item.status !== "cancelled");
-  elements["task-edit-dependencies"].innerHTML = candidates.length
-    ? candidates.map((candidate) => `
-      <label class="check-control">
-        <input type="checkbox" value="${escapeHtml(candidate.id)}" ${task.depends_on.includes(candidate.id) ? "checked" : ""} ${disabled ? "disabled" : ""}>
-        <span>${escapeHtml(candidate.title)} <span class="secondary-text">${escapeHtml(taskStatus(candidate.status))}</span></span>
-      </label>`).join("")
-    : '<span class="secondary-text">当前没有可选择的依赖任务</span>';
+async function loadTaskEvents(projectId, taskId) {
+  return loadEventWindow(
+    (after, limit) => `/api/v1/projects/${projectId}/audit?after=${after}&limit=${limit}&task_id=${encodeURIComponent(taskId)}`,
+    AUDIT_WINDOW_SIZE,
+    { tailJump: false },
+  );
+}
+
+async function refreshTaskIntakeTargets() {
+  if (!state.projectId) return;
+  const result = await api(`/api/v1/projects/${state.projectId}/task-intakes/targets`);
+  state.taskIntakeTargets = result.targets || [];
+  const options = state.taskIntakeTargets
+    .filter((target) => target.connection_status === "connected" && target.active_session_count > 0)
+    .map((target) => `<option value="${escapeHtml(target.member_id)}">${escapeHtml(target.name)} · ${escapeHtml(target.client || target.software_key || "Agent")}</option>`);
+  elements["task-target-agent-input"].innerHTML = options.length
+    ? '<option value="">请选择受理 Agent</option>' + options.join("")
+    : '<option value="">暂无可受理 Agent</option>';
+  elements["task-target-agent-input"].disabled = !options.length;
+  elements["task-target-agent-empty"].classList.toggle("is-hidden", Boolean(options.length));
+  elements["task-intake-submit"].disabled = !options.length;
+  return options.length > 0;
+}
+
+async function refreshTaskIntakeData() {
+  if (!state.projectId) return;
+  const [targets, intakes, tasks] = await Promise.all([
+    api(`/api/v1/projects/${state.projectId}/task-intakes/targets`),
+    api(`/api/v1/projects/${state.projectId}/task-intakes`),
+    api(`/api/v1/projects/${state.projectId}/tasks`),
+  ]);
+  state.taskIntakeTargets = targets.targets || [];
+  state.taskIntakes = intakes.intakes || [];
+  if (state.snapshot) state.snapshot.tasks = tasks.tasks || [];
+  renderTaskIntakes();
+  if (state.snapshot) {
+    renderTasks(state.snapshot.tasks);
+    renderMessageTaskOptions(state.snapshot.tasks);
+  }
+}
+
+function sessionName(sessionId) {
+  if (!sessionId) return "系统";
+  const session = (state.snapshot?.agents || []).find((agent) => agent.id === sessionId);
+  return session?.name || shortId(sessionId);
 }
 
 function renderTaskAssignments(task) {
-  const agents = Object.fromEntries(
-    (state.snapshot?.agents || []).map((agent) => [agent.id, agent.name])
-  );
-  elements["task-assignment-list"].innerHTML = task.assignments?.length
-    ? task.assignments.slice().reverse().map((assignment) => {
+  const assignments = task.assignments || [];
+  elements["task-assignment-list"].innerHTML = assignments.length
+    ? assignments.slice().reverse().map((assignment) => {
       const target = assignment.assigned_to_session_id
-        ? agents[assignment.assigned_to_session_id] || shortId(assignment.assigned_to_session_id)
+        ? sessionName(assignment.assigned_to_session_id)
         : assignment.target_role
           ? `角色 ${assignment.target_role}`
           : `能力 ${assignment.required_capability}`;
@@ -1815,125 +1786,98 @@ function renderTaskAssignments(task) {
     : '<div class="empty-state">尚未派发</div>';
 }
 
-function renderTaskHandoffs(task) {
-  const agents = Object.fromEntries(
-    (state.snapshot?.agents || []).map((agent) => [agent.id, agent.name])
+function taskTimelineEvents(task) {
+  const intakeIds = new Set(
+    state.taskIntakes.filter((intake) => intake.formal_task_id === task.id).map((intake) => intake.id)
   );
-  elements["task-handoff-list"].innerHTML = task.handoffs?.length
-    ? task.handoffs.slice().reverse().map((handoff) => `
-      <article class="management-item">
-        <div>
-          <h4>${escapeHtml(agents[handoff.from_session_id] || shortId(handoff.from_session_id))} → ${escapeHtml(agents[handoff.to_session_id] || shortId(handoff.to_session_id))} <span class="status-badge ${escapeHtml(handoff.status)}">${escapeHtml(assignmentStatus(handoff.status))}</span></h4>
-          <p>${escapeHtml(handoff.summary)} · 下一步：${escapeHtml(handoff.next_step)}${handoff.response_note ? ` · 回复：${escapeHtml(handoff.response_note)}` : ""}</p>
-          ${handoff.pending_items?.length ? `<p class="secondary-text">待完成：${escapeHtml(handoff.pending_items.join("、"))}</p>` : ""}
-          ${handoff.files?.length ? `<p class="secondary-text">文件：${escapeHtml(handoff.files.join("、"))}</p>` : ""}
-          ${handoff.risks?.length ? `<p class="secondary-text">风险：${escapeHtml(handoff.risks.join("、"))}</p>` : ""}
-        </div>
-        <span class="secondary-text">${escapeHtml(formatTime(handoff.created_at))}</span>
-      </article>`).join("")
-    : '<div class="empty-state">尚无交接记录</div>';
+  return state.events
+    .filter((event) => event.task_id === task.id || intakeIds.has(event.payload?.intake_id))
+    .sort((left, right) => left.id - right.id);
 }
 
-function renderTaskIntegrations(task) {
-  const agents = Object.fromEntries(
-    (state.snapshot?.agents || []).map((agent) => [agent.id, agent.name])
-  );
-  elements["task-integration-list"].innerHTML = task.integrations?.length
-    ? task.integrations.slice().reverse().map((integration) => `
-      <article class="management-item">
-        <div>
-          <h4>${escapeHtml(integrationResult(integration.result))} <span class="status-badge ${escapeHtml(integration.result)}">${escapeHtml(integrationStatus(integration.result))}</span></h4>
-          <p>${escapeHtml(integration.summary)} · ${escapeHtml(agents[integration.integrator_session_id] || (integration.integrator_session_id ? shortId(integration.integrator_session_id) : "管理端"))}</p>
-          ${integration.tests?.length ? `<p class="secondary-text">测试：${escapeHtml(integration.tests.map((item) => `${item.exit_code === 0 ? "通过" : "失败"} · ${item.command}`).join("；"))}</p>` : ""}
-          ${integration.commit_hash ? `<p class="secondary-text">Commit：${escapeHtml(shortId(integration.commit_hash))}</p>` : ""}
-        </div>
-        <span class="secondary-text">${escapeHtml(formatTime(integration.created_at))}</span>
-      </article>`).join("")
-    : '<div class="empty-state">尚无集成记录</div>';
+function timelineDetails(event) {
+  const payload = event.payload || {};
+  const details = [];
+  if (payload.response) details.push(`结果：${payload.response}`);
+  if (payload.note) details.push(payload.note);
+  if (payload.summary) details.push(payload.summary);
+  if (payload.raw_description && event.event_type !== "task.intake_submitted") details.push(payload.raw_description);
+  if (payload.files?.length) details.push(`文件：${payload.files.join("、")}`);
+  if (payload.tests?.length) details.push(`测试：${payload.tests.map((test) => `${test.exit_code === 0 ? "通过" : "失败"} · ${test.command}`).join("；")}`);
+  if (payload.commit_hash) details.push(`Commit：${shortId(payload.commit_hash)}`);
+  return details.join(" · ");
 }
 
-function openTaskEditor(taskId) {
+function renderTaskTimeline(task) {
+  const events = taskTimelineEvents(task);
+  elements["task-timeline"].innerHTML = events.length
+    ? `<ol class="timeline-list">${events.map((event) => `
+      <li class="timeline-item">
+        <span class="timeline-marker" aria-hidden="true"></span>
+        <div class="timeline-content">
+          <div class="timeline-heading"><strong>${escapeHtml(eventLabel(event.event_type))}</strong><span class="secondary-text">${escapeHtml(sessionName(event.actor_session_id))} · ${escapeHtml(formatTime(event.created_at))}</span></div>
+          ${timelineDetails(event) ? `<p>${escapeHtml(timelineDetails(event))}</p>` : ""}
+          <small class="secondary-text">${eventIdBadge(event.id)}${event.task_number ? ` · 任务 #${escapeHtml(event.task_number)}` : ""}</small>
+        </div>
+      </li>`).join("")}</ol>`
+    : '<div class="empty-state">尚无协作事件</div>';
+}
+
+function renderTaskContract(task) {
+  const dependencies = task.dependency_details || [];
+  const criteria = task.acceptance_criteria || [];
+  const statusSummary = `${taskStatus(task.status)} · ${executionStatus(task.execution_status)} · ${verificationStatus(task.verification_status)} · ${taskIntegrationStatus(task)}`;
+  elements["task-detail-heading"].textContent = `任务 #${task.task_number} · ${task.title}`;
+  elements["task-detail-contract"].innerHTML = `
+    <div class="task-contract-header">
+      <div><span class="task-number">任务 #${task.task_number}</span><span class="secondary-text">内部 ID：${escapeHtml(task.id)}</span></div>
+      <div class="task-meta"><span class="priority p${task.priority}">P${task.priority}</span><span class="status-badge ${escapeHtml(task.status)}">${escapeHtml(taskStatus(task.status))}</span></div>
+    </div>
+    <dl class="task-contract-grid">
+      <div><dt>执行状态</dt><dd>${escapeHtml(statusSummary)}</dd></div>
+      <div><dt>完成度</dt><dd>${escapeHtml(`${task.progress_percent}%`)}</dd></div>
+      <div><dt>当前步骤</dt><dd>${escapeHtml(task.current_step || "暂无")}</dd></div>
+      <div><dt>下一步</dt><dd>${escapeHtml(task.next_step || "暂无")}</dd></div>
+      ${task.blocker_reason ? `<div class="task-contract-wide"><dt>阻塞原因</dt><dd>${escapeHtml(task.blocker_reason)}</dd></div>` : ""}
+      <div class="task-contract-wide"><dt>正式说明</dt><dd class="task-contract-description">${escapeHtml(task.description || "暂无正式说明")}</dd></div>
+      <div class="task-contract-wide"><dt>验收条件</dt><dd>${criteria.length ? `<ul class="readonly-list">${criteria.map((criterion) => `<li>${escapeHtml(criterion)}</li>`).join("")}</ul>` : "暂无验收条件"}</dd></div>
+      ${dependencies.length ? `<div class="task-contract-wide task-dependencies"><dt>前置依赖</dt><dd><ul class="readonly-list">${dependencies.map((dependency) => `<li><span><strong>任务 #${dependency.task_number}</strong> · ${escapeHtml(dependency.title)} · ${escapeHtml(taskStatus(dependency.status))}</span><button type="button" class="link-button" data-related-task-id="${escapeHtml(dependency.id)}">查看</button></li>`).join("")}</ul></dd></div>` : ""}
+    </dl>`;
+}
+
+async function openTaskDetails(taskId) {
   const task = state.snapshot?.tasks.find((item) => item.id === taskId);
-  if (!task) return;
+  if (!task || !state.projectId) return;
   state.editingTaskId = taskId;
-  const contractLocked = ["awaiting_review", "verified", "done"].includes(task.status);
-  const transitions = (state.config?.domain?.task_transitions?.[task.status] || [task.status])
-    .filter((status) => status === task.status || !["awaiting_review", "verified", "done"].includes(status));
-  elements["task-edit-id"].value = task.id;
-  elements["task-edit-title"].value = task.title;
-  elements["task-edit-description"].value = task.description;
-  elements["task-edit-criteria"].value = task.acceptance_criteria.join("\n");
-  elements["task-edit-status"].innerHTML = transitions.map((status) => `<option value="${escapeHtml(status)}">${escapeHtml(taskStatus(status))}</option>`).join("");
-  elements["task-edit-status"].value = task.status;
-  elements["task-edit-priority"].value = String(task.priority);
-  elements["task-edit-progress"].value = String(task.progress_percent);
-  elements["task-edit-current-step"].value = task.current_step;
-  elements["task-edit-blocker"].value = task.blocker_reason;
-  elements["task-edit-next-step"].value = task.next_step;
-  elements["task-edit-blocker"].required = task.status === "blocked";
-  ["task-edit-title", "task-edit-criteria"].forEach((id) => { elements[id].disabled = contractLocked; });
-  renderTaskEditDependencies(task, contractLocked);
-  const owner = state.snapshot.agents.find((agent) => agent.id === task.owner_session_id);
-  elements["task-edit-owner"].textContent = `任务 ${shortId(task.id)} · ${owner ? `负责人 ${owner.name}` : "尚未分配"} · ${executionStatus(task.execution_status)} · ${verificationStatus(task.verification_status)} · ${integrationStatus(task.integration_status)}${contractLocked ? " · 验收契约已锁定" : ""}`;
+  renderTaskContract(task);
   renderTaskAssignments(task);
-  renderTaskHandoffs(task);
-  renderTaskIntegrations(task);
-  const handoffAvailable = Boolean(task.owner_session_id)
-    && !["completed", "cancelled"].includes(task.execution_status)
-    && !(task.handoffs || []).some((handoff) => handoff.status === "pending")
-    && (state.snapshot?.agents || []).some((agent) => agent.id !== task.owner_session_id);
-  elements["task-handoff-button"].disabled = !handoffAvailable;
-  elements["task-integration-button"].disabled = !(
-    task.execution_status === "completed"
-    && task.verification_status === "approved"
-    && task.integration_status !== "done"
-  );
+  renderTaskTimeline(task);
+  elements["task-assign-button"].disabled = ["cancelled", "done"].includes(task.status);
   elements["task-edit-dialog"].showModal();
+  try {
+    const page = await loadTaskEvents(state.projectId, taskId);
+    mergeEvents(page.events);
+    const currentTask = state.snapshot?.tasks.find((item) => item.id === taskId) || task;
+    renderTaskTimeline(currentTask);
+  } catch (error) {
+    showToast("任务历史暂时无法加载，已显示当前缓存", "error");
+  }
 }
 
-function openTaskAssignmentDialog() {
+async function openTaskAssignmentDialog() {
   const task = state.snapshot?.tasks.find((item) => item.id === state.editingTaskId);
-  if (!task) return;
-  elements["task-assign-title"].textContent = `派发：${task.title}`;
-  elements["task-assign-agent"].innerHTML = [
-    '<option value="">不指定 Agent</option>',
-    ...(state.snapshot?.agents || []).map((agent) => `<option value="${escapeHtml(agent.id)}">${escapeHtml(agent.name)} · ${escapeHtml(agent.role)}</option>`),
-  ].join("");
-  elements["task-assign-role"].value = "";
-  elements["task-assign-capability"].value = "";
+  if (!task || !state.projectId) return;
+  await refreshTaskIntakeTargets();
+  const options = state.taskIntakeTargets
+    .filter((target) => target.connection_status === "connected" && target.active_session_count > 0)
+    .flatMap((target) => (target.active_session_ids || []).map((sessionId) => `<option value="${escapeHtml(sessionId)}">${escapeHtml(target.name)} · ${escapeHtml(target.client || target.software_key || "Agent")}</option>`));
+  elements["task-assign-title"].textContent = `指定/改派：任务 #${task.task_number}`;
+  elements["task-assign-agent"].innerHTML = options.length ? '<option value="">请选择目标 Agent</option>' + options.join("") : '<option value="">暂无在线 Agent</option>';
+  elements["task-assign-agent"].disabled = !options.length;
+  elements["task-assign-agent-empty"].textContent = options.length ? "只显示当前 Project 中在线且可受理任务的 Agent。" : "当前没有在线且可受理任务的 Agent。";
+  elements["task-assign-submit"].disabled = !options.length;
   elements["task-assign-note"].value = "";
   elements["task-assign-dialog"].showModal();
-}
-
-function openTaskHandoffDialog() {
-  const task = state.snapshot?.tasks.find((item) => item.id === state.editingTaskId);
-  if (!task) return;
-  const candidates = (state.snapshot?.agents || []).filter(
-    (agent) => agent.id !== task.owner_session_id
-  );
-  elements["task-handoff-title"].textContent = `交接：${task.title}`;
-  elements["task-handoff-agent"].innerHTML = candidates.map(
-    (agent) => `<option value="${escapeHtml(agent.id)}">${escapeHtml(agent.name)} · ${escapeHtml(agent.role)}</option>`
-  ).join("");
-  elements["task-handoff-summary"].value = task.current_step || "";
-  elements["task-handoff-completed"].value = "";
-  elements["task-handoff-pending"].value = task.next_step || "";
-  elements["task-handoff-files"].value = "";
-  elements["task-handoff-risks"].value = task.blocker_reason || "";
-  elements["task-handoff-next-step"].value = task.next_step || "";
-  elements["task-handoff-dialog"].showModal();
-}
-
-function openTaskIntegrationDialog() {
-  const task = state.snapshot?.tasks.find((item) => item.id === state.editingTaskId);
-  if (!task) return;
-  elements["task-integration-title"].textContent = `集成：${task.title}`;
-  elements["task-integration-result"].value = "done";
-  elements["task-integration-summary"].value = "";
-  elements["task-integration-files"].value = "";
-  elements["task-integration-commit"].value = "";
-  elements["task-integration-tests"].value = "";
-  elements["task-integration-dialog"].showModal();
 }
 
 async function downloadProjectExport() {

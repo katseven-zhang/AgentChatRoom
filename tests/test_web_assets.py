@@ -131,8 +131,9 @@ def test_web_supports_human_reading_and_guided_interactions():
     assert "function eventIdBadge(eventId)" in javascript
     assert "eventIdBadge(event.id)" in javascript
     assert javascript.count("eventIdBadge(event.id)") >= 4
-    assert markup.count('class="tab-status">未闭环</span>') == 4
-    assert markup.count('class="scope-status"><span>未闭环</span>') == 4
+    assert markup.count('class="tab-status">未闭环</span>') == 3
+    assert 'class="tab-status">协作视图</span>' in markup
+    assert markup.count('class="scope-status"><span>未闭环</span>') == 3
     assert ".event-id" in stylesheet
     assert ".scope-status" in stylesheet
     assert ".integration-chooser {\n  display: grid;\n  grid-template-columns: 1fr;" in stylesheet

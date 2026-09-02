@@ -5,7 +5,7 @@ from typing import Any
 from typing_extensions import NotRequired, TypedDict
 
 
-DOMAIN_SCHEMA_VERSION = 5
+DOMAIN_SCHEMA_VERSION = 6
 PROJECT_MEMBER_SCHEMA_VERSION = 1
 KNOWLEDGE_SCHEMA_VERSION = 1
 MODEL_DISPLAY_NAME_MAX_LENGTH = 160
@@ -49,6 +49,22 @@ TASK_VERIFICATION_STATUSES = {
     "approved",
 }
 TASK_INTEGRATION_STATUSES = {"pending", "done", "failed"}
+TASK_INTAKE_STATUSES = {
+    "pending",
+    "accepted",
+    "defined",
+    "declined",
+    "blocked",
+    "cancelled",
+}
+TASK_INTAKE_TRANSITIONS = {
+    "pending": {"pending", "accepted", "declined", "blocked", "cancelled"},
+    "accepted": {"accepted", "defined", "blocked", "cancelled"},
+    "defined": {"defined"},
+    "declined": {"declined", "pending", "cancelled"},
+    "blocked": {"blocked", "pending", "cancelled"},
+    "cancelled": {"cancelled"},
+}
 
 ASSIGNMENT_STATUSES = {"pending", "accepted", "declined", "blocked", "cancelled"}
 ASSIGNMENT_RESPONSES = {"accepted", "declined", "blocked"}

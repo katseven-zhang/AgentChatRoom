@@ -123,6 +123,7 @@ def _schema_without_task_state_dimensions() -> str:
             "    credential_id TEXT REFERENCES agent_credentials(id),\n", ""
         )
         .replace("    no_code_change_reason TEXT NOT NULL DEFAULT '',\n", "")
+        .replace("    task_number INTEGER NOT NULL,\n", "")
     )
 
 
@@ -500,3 +501,67 @@ def test_database_migrates_v15_project_keys_to_backend_generated_form(settings):
         "project_1234567890abcdef1234": "prj_1234567890abcdef1234",
         "project_abcdef1234567890abcd": "prj_abcdef1234567890abcd",
     }
+
+
+def test_database_migrates_v16_to_v17_intake_and_task_number(settings):
+    """Schema v17 introduces task_intakes and backfills task_number from v16."""
+    legacy_schema = SCHEMA.replace(
+        "    task_number INTEGER NOT NULL,\n", ""
+    )
+    settings.data_dir.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(settings.database_path) as connection:
+        connection.executescript(legacy_schema)
+        connection.execute(
+            """
+            INSERT INTO projects(
+                id, project_key, name, root_path, git_remote, logical_path,
+                settings_json, archived_at, created_at, updated_at
+            ) VALUES (
+                'project_legacy00000000000000', 'prj_legacy00000000000000',
+                'Legacy', 'C:/legacy', NULL, '', '{}', NULL,
+                '2026-08-30T00:00:00Z', '2026-08-30T00:00:00Z'
+            )
+            """
+        )
+        connection.executemany(
+            """
+            INSERT INTO tasks(
+                id, project_id, title, acceptance_criteria_json, priority,
+                status, created_at, updated_at
+            ) VALUES (?, 'project_legacy00000000000000', ?, '["pass"]', 2, 'todo', ?, ?)
+            """,
+            [
+                ("task_alpha", "Alpha", "2026-08-30T00:00:01Z", "2026-08-30T00:00:01Z"),
+                ("task_beta", "Beta", "2026-08-30T00:00:02Z", "2026-08-30T00:00:02Z"),
+                ("task_gamma", "Gamma", "2026-08-30T00:00:03Z", "2026-08-30T00:00:03Z"),
+            ],
+        )
+        connection.execute("INSERT INTO schema_meta(version) VALUES (16)")
+
+    Database(settings.database_path).initialize()
+
+    with sqlite3.connect(settings.database_path) as connection:
+        version = connection.execute("SELECT version FROM schema_meta").fetchone()[0]
+        tables = {
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            )
+        }
+        indexes = {
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'index'"
+            )
+        }
+        numbers = dict(
+            connection.execute(
+                "SELECT id, task_number FROM tasks ORDER BY task_number"
+            ).fetchall()
+        )
+
+    assert version == SCHEMA_VERSION
+    assert "task_intakes" in tables
+    assert "idx_tasks_project_task_number" in indexes
+    assert "idx_task_intakes_project_status" in indexes
+    assert numbers == {"task_alpha": 1, "task_beta": 2, "task_gamma": 3}

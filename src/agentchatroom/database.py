@@ -11,7 +11,7 @@ if TYPE_CHECKING:
     from .config import Settings
 
 
-SCHEMA_VERSION = 16
+SCHEMA_VERSION = 17
 
 
 class DatabaseBackend(Protocol):
@@ -134,6 +134,7 @@ ON agent_sessions(project_id, last_heartbeat DESC);
 CREATE TABLE IF NOT EXISTS tasks (
     id TEXT PRIMARY KEY,
     project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    task_number INTEGER NOT NULL,
     title TEXT NOT NULL,
     description TEXT NOT NULL DEFAULT '',
     acceptance_criteria_json TEXT NOT NULL DEFAULT '[]',
@@ -154,6 +155,23 @@ CREATE TABLE IF NOT EXISTS tasks (
 
 CREATE INDEX IF NOT EXISTS idx_tasks_project_status
 ON tasks(project_id, status, priority, created_at);
+
+CREATE TABLE IF NOT EXISTS task_intakes (
+    id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    raw_description TEXT NOT NULL,
+    target_member_id TEXT NOT NULL REFERENCES project_members(id),
+    target_session_id TEXT REFERENCES agent_sessions(id),
+    created_by_session_id TEXT REFERENCES agent_sessions(id),
+    status TEXT NOT NULL DEFAULT 'pending',
+    formal_task_id TEXT REFERENCES tasks(id),
+    note TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_task_intakes_project_status
+ON task_intakes(project_id, status, created_at);
 
 CREATE TABLE IF NOT EXISTS task_dependencies (
     task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
@@ -635,6 +653,34 @@ MIGRATIONS = {
         SET project_key = 'prj_' || substr(id, 9)
         WHERE project_key <> 'prj_' || substr(id, 9);
     """,
+    17: """
+        CREATE TABLE IF NOT EXISTS task_intakes (
+            id TEXT PRIMARY KEY,
+            project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+            raw_description TEXT NOT NULL,
+            target_member_id TEXT NOT NULL REFERENCES project_members(id),
+            target_session_id TEXT REFERENCES agent_sessions(id),
+            created_by_session_id TEXT REFERENCES agent_sessions(id),
+            status TEXT NOT NULL DEFAULT 'pending',
+            formal_task_id TEXT REFERENCES tasks(id),
+            note TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_task_intakes_project_status
+        ON task_intakes(project_id, status, created_at);
+        UPDATE tasks
+        SET task_number = (
+            SELECT COUNT(*)
+            FROM tasks earlier
+            WHERE earlier.project_id = tasks.project_id
+              AND (earlier.created_at < tasks.created_at
+                   OR (earlier.created_at = tasks.created_at AND earlier.id <= tasks.id))
+        )
+        WHERE task_number IS NULL;
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_tasks_project_task_number
+        ON tasks(project_id, task_number);
+    """,
 }
 
 
@@ -668,6 +714,47 @@ def ensure_project_member_columns(connection: Any, *, postgres: bool = False) ->
     for key, statement in definitions.items():
         if key not in existing:
             connection.execute(statement)
+
+
+def ensure_task_number_schema(connection: Any, *, postgres: bool = False) -> None:
+    """Add the Project-scoped task number column/index to legacy databases."""
+    if postgres:
+        row = connection.execute(
+            """
+            SELECT 1
+            FROM information_schema.columns
+            WHERE table_schema = current_schema()
+              AND table_name = 'tasks'
+              AND column_name = 'task_number'
+            """
+        ).fetchone()
+        exists = row is not None
+    else:
+        exists = any(
+            row["name"] == "task_number"
+            for row in connection.execute("PRAGMA table_info(tasks)").fetchall()
+        )
+    if not exists:
+        connection.execute("ALTER TABLE tasks ADD COLUMN task_number INTEGER")
+        connection.execute(
+            """
+            UPDATE tasks
+            SET task_number = (
+                SELECT COUNT(*)
+                FROM tasks earlier
+                WHERE earlier.project_id = tasks.project_id
+                  AND (earlier.created_at < tasks.created_at
+                       OR (earlier.created_at = tasks.created_at AND earlier.id <= tasks.id))
+            )
+            WHERE task_number IS NULL
+            """
+        )
+    connection.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_tasks_project_task_number
+        ON tasks(project_id, task_number)
+        """
+    )
 
 
 def ensure_agent_identity_columns(connection: Any, *, postgres: bool = False) -> None:
@@ -715,6 +802,7 @@ class Database:
             connection.executescript(SCHEMA)
             ensure_project_member_columns(connection)
             ensure_agent_identity_columns(connection)
+            ensure_task_number_schema(connection)
             row = connection.execute("SELECT version FROM schema_meta LIMIT 1").fetchone()
             if row is None:
                 connection.execute(

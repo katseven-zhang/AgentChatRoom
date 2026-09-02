@@ -31,7 +31,7 @@ def test_health_and_project_room_flow(settings, project_dir):
         assert public_config.json()["deployment_profile"] == settings.deployment_profile
         assert public_config.json()["capabilities"]["local_folder_picker"] is True
         assert public_config.json()["capabilities"]["local_mcp_config_assistant"] is True
-        assert public_config.json()["domain"]["schema_version"] == 5
+        assert public_config.json()["domain"]["schema_version"] == 6
         assert public_config.json()["domain"]["agent_connection_statuses"] == [
             "connected",
             "disconnected",

@@ -597,6 +597,56 @@ def build_parser() -> argparse.ArgumentParser:
     task_get.add_argument("project_id")
     task_get.add_argument("task_id")
 
+    task_number = commands.add_parser("task-get-by-number", help="Get a task by number")
+    task_number.add_argument("project_id")
+    task_number.add_argument("task_number", type=int)
+
+    intake_targets = commands.add_parser("task-intake-targets", help="List intake targets")
+    intake_targets.add_argument("project_id")
+
+    intake_submit = commands.add_parser("task-intake-submit", help="Submit raw task intent")
+    intake_submit.add_argument("project_id")
+    intake_submit.add_argument("raw_description")
+    intake_submit.add_argument("--target-member-id", required=True)
+    intake_submit.add_argument("--target-session-id")
+    intake_submit.add_argument("--created-by-session-id")
+    intake_submit.add_argument("--token")
+
+    intake_list = commands.add_parser("task-intake-list", help="List task intakes")
+    intake_list.add_argument("project_id")
+    intake_list.add_argument("--status")
+
+    intake_get = commands.add_parser("task-intake-get", help="Get one task intake")
+    intake_get.add_argument("project_id")
+    intake_get.add_argument("intake_id")
+
+    intake_ack = commands.add_parser("task-intake-acknowledge", help="Acknowledge a task intake")
+    intake_ack.add_argument("project_id")
+    intake_ack.add_argument("intake_id")
+    intake_ack.add_argument("--session-id", required=True)
+    intake_ack.add_argument("--token", required=True)
+    intake_ack.add_argument("--response", choices=["accepted", "declined", "blocked"], default="accepted")
+    intake_ack.add_argument("--note", default="")
+
+    intake_reassign = commands.add_parser("task-intake-reassign", help="Reassign a task intake")
+    intake_reassign.add_argument("project_id")
+    intake_reassign.add_argument("intake_id")
+    intake_reassign.add_argument("--target-member-id", required=True)
+    intake_reassign.add_argument("--target-session-id")
+    intake_reassign.add_argument("--note", default="")
+
+    intake_define = commands.add_parser("task-define-from-intake", help="Define a formal task from intake")
+    intake_define.add_argument("project_id")
+    intake_define.add_argument("intake_id")
+    intake_define.add_argument("title")
+    intake_define.add_argument("--session-id", required=True)
+    intake_define.add_argument("--token", required=True)
+    intake_define.add_argument("--description", default="")
+    intake_define.add_argument("--accept", action="append", required=True)
+    intake_define.add_argument("--depends-on", action="append", default=[])
+    intake_define.add_argument("--priority", type=int, default=2)
+    intake_define.add_argument("--note", default="")
+
     claim = commands.add_parser("task-claim", help="Claim a task")
     claim.add_argument("project_id")
     claim.add_argument("task_id")
@@ -1062,6 +1112,72 @@ def main(argv: list[str] | None = None) -> None:
         result = call_api(
             "GET",
             f"/api/v1/projects/{args.project_id}/tasks/{args.task_id}",
+        )
+    elif args.command == "task-get-by-number":
+        result = call_api(
+            "GET",
+            f"/api/v1/projects/{args.project_id}/tasks/by-number/{args.task_number}",
+        )
+    elif args.command == "task-intake-targets":
+        result = call_api(
+            "GET",
+            f"/api/v1/projects/{args.project_id}/task-intakes/targets",
+        )
+    elif args.command == "task-intake-submit":
+        result = call_api(
+            "POST",
+            f"/api/v1/projects/{args.project_id}/task-intakes",
+            {
+                "raw_description": args.raw_description,
+                "target_member_id": args.target_member_id,
+                "target_session_id": args.target_session_id,
+                "created_by_session_id": args.created_by_session_id,
+                "token": args.token,
+            },
+        )
+    elif args.command == "task-intake-list":
+        query = f"?{urllib.parse.urlencode({'status': args.status})}" if args.status else ""
+        result = call_api("GET", f"/api/v1/projects/{args.project_id}/task-intakes{query}")
+    elif args.command == "task-intake-get":
+        result = call_api(
+            "GET",
+            f"/api/v1/projects/{args.project_id}/task-intakes/{args.intake_id}",
+        )
+    elif args.command == "task-intake-acknowledge":
+        result = call_api(
+            "POST",
+            f"/api/v1/projects/{args.project_id}/task-intakes/{args.intake_id}/acknowledge",
+            {
+                "session_id": args.session_id,
+                "token": args.token,
+                "response": args.response,
+                "note": args.note,
+            },
+        )
+    elif args.command == "task-intake-reassign":
+        result = call_api(
+            "POST",
+            f"/api/v1/projects/{args.project_id}/task-intakes/{args.intake_id}/reassign",
+            {
+                "target_member_id": args.target_member_id,
+                "target_session_id": args.target_session_id,
+                "note": args.note,
+            },
+        )
+    elif args.command == "task-define-from-intake":
+        result = call_api(
+            "POST",
+            f"/api/v1/projects/{args.project_id}/task-intakes/{args.intake_id}/define",
+            {
+                "session_id": args.session_id,
+                "token": args.token,
+                "title": args.title,
+                "description": args.description,
+                "acceptance_criteria": args.accept,
+                "depends_on": args.depends_on,
+                "priority": args.priority,
+                "note": args.note,
+            },
         )
     elif args.command == "task-claim":
         result = call_api(
