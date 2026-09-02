@@ -496,7 +496,11 @@ def task_get_by_number(project_id: str, task_number: int) -> dict[str, Any]:
 
 @mcp.tool()
 def task_intake_targets(project_id: str) -> dict[str, Any]:
-    """List currently connected Agents that can receive a user task intake."""
+    """List all non-revoked Agent identities that can receive a user task intake.
+
+    The result includes previously connected but currently offline identities;
+    their connection status is exposed so clients can explain deferred intake.
+    """
     try:
         _authorize_remote(project_id, "room:read")
     except DomainError as error:

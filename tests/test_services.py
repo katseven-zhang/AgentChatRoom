@@ -198,7 +198,10 @@ def test_revoked_member_is_kept_in_history_but_removed_from_current_roster(
     assert revoked_member["status"] == "revoked"
     assert revoked_member["session_count"] == 1
     targets = service.list_task_intake_targets(project["id"])
-    assert [item["member_id"] for item in targets] == [online["agent"]["member_id"]]
+    assert [item["member_id"] for item in targets] == [
+        online["agent"]["member_id"],
+        offline["agent"]["member_id"],
+    ]
 
 
 def test_agent_key_aliases_cannot_create_another_software_identity(service, project):

@@ -196,6 +196,82 @@ def test_mcp_project_member_tools_share_the_domain_service(
     assert revoked["result"]["member"]["status"] == "revoked"
 
 
+def test_mcp_task_intake_supports_offline_targets_and_rejects_revoked(
+    monkeypatch, service, project
+):
+    monkeypatch.setattr(mcp_server, "service", service)
+    creator = service.join_room(
+        project["id"],
+        agent_key="mcp-intake-creator",
+        name="MCP Creator",
+        client="codex",
+        model="test-model",
+    )
+    offline = service.join_room(
+        project["id"],
+        agent_key="mcp-intake-offline",
+        name="MCP Offline",
+        client="trae",
+        model="test-model",
+    )
+    revoked = service.join_room(
+        project["id"],
+        agent_key="mcp-intake-revoked",
+        name="MCP Revoked",
+        client="qoder",
+        model="test-model",
+    )
+    service.leave_session(project["id"], offline["agent"]["id"], offline["token"])
+    service.leave_session(project["id"], revoked["agent"]["id"], revoked["token"])
+    service.revoke_project_member(project["id"], revoked["agent"]["member_id"])
+
+    targets = mcp_server.task_intake_targets(project["id"])
+    assert targets["ok"] is True
+    target_ids = {item["member_id"] for item in targets["result"]}
+    assert offline["agent"]["member_id"] in target_ids
+    assert revoked["agent"]["member_id"] not in target_ids
+    offline_target = next(
+        item for item in targets["result"]
+        if item["member_id"] == offline["agent"]["member_id"]
+    )
+    assert offline_target["connection_status"] == "disconnected"
+
+    submitted = mcp_server.task_intake_submit(
+        project["id"],
+        "Queue MCP work until reconnect",
+        offline["agent"]["member_id"],
+        created_by_session_id=creator["agent"]["id"],
+        token=creator["token"],
+    )
+    assert submitted["ok"] is True
+    assert submitted["result"]["intake"]["target_session_id"] is None
+
+    reassigned = mcp_server.task_intake_reassign(
+        project["id"],
+        submitted["result"]["intake"]["id"],
+        creator["agent"]["member_id"],
+    )
+    assert reassigned["ok"] is True
+    assert reassigned["result"]["intake"]["target_session_id"] == creator["agent"]["id"]
+
+    explicit_offline = mcp_server.task_intake_submit(
+        project["id"],
+        "Reject stale MCP session",
+        offline["agent"]["member_id"],
+        target_session_id=offline["agent"]["id"],
+    )
+    assert explicit_offline["ok"] is False
+    assert explicit_offline["error"]["code"] == "task_intake_target_unavailable"
+
+    revoked_submit = mcp_server.task_intake_submit(
+        project["id"],
+        "Reject revoked MCP target",
+        revoked["agent"]["member_id"],
+    )
+    assert revoked_submit["ok"] is False
+    assert revoked_submit["error"]["code"] == "task_intake_target_unavailable"
+
+
 def test_mcp_compatibility_unwraps_single_item_array_wrapper():
     schema = {"type": "array", "items": {"type": "object"}}
 

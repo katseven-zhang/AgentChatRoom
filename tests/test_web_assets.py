@@ -58,6 +58,9 @@ def test_web_bootstrap_and_phase_one_local_agent_hooks_are_complete():
     assert "function currentAgentRoster(agentIdentities)" in javascript
     assert "agent.member_status !== \"revoked\"" in javascript
     assert "currentAgentRoster(snapshot.agent_identities)" in javascript
+    assert "可选择所有已接入且未吊销的 Agent" in javascript
+    assert "当前未连接的 Agent 会在重新接入后受理任务" in javascript
+    assert "target.connection_status === \"connected\" ? \"已连接\" : \"未连接\"" in javascript
     assert "function connectedAgentCount(agentIdentities)" in javascript
 
 

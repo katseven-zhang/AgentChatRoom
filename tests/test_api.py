@@ -469,9 +469,64 @@ def test_api_snapshot_roster_excludes_revoked_but_preserves_history(
             f"/api/v1/projects/{project['id']}/task-intakes/targets"
         )
         assert targets.status_code == 200
-        assert [item["member_id"] for item in targets.json()["targets"]] == [
-            joined["online-main"]["agent"]["member_id"]
-        ]
+        assert {
+            item["member_id"] for item in targets.json()["targets"]
+        } == {
+            joined["online-main"]["agent"]["member_id"],
+            joined["offline-main"]["agent"]["member_id"],
+        }
+        assert next(
+            item
+            for item in targets.json()["targets"]
+            if item["member_id"] == joined["offline-main"]["agent"]["member_id"]
+        )["connection_status"] == "disconnected"
+
+        submitted = client.post(
+            f"/api/v1/projects/{project['id']}/task-intakes",
+            json={
+                "raw_description": "Queue work for the offline Agent",
+                "target_member_id": joined["offline-main"]["agent"]["member_id"],
+                "created_by_session_id": joined["online-main"]["agent"]["id"],
+                "token": joined["online-main"]["token"],
+            },
+        )
+        assert submitted.status_code == 201
+        intake = submitted.json()["intake"]
+        assert intake["target_member_id"] == joined["offline-main"]["agent"]["member_id"]
+        assert intake["target_session_id"] is None
+
+        reassigned = client.post(
+            f"/api/v1/projects/{project['id']}/task-intakes/{intake['id']}/reassign",
+            json={"target_member_id": joined["online-main"]["agent"]["member_id"]},
+        )
+        assert reassigned.status_code == 200
+        reassigned_back = client.post(
+            f"/api/v1/projects/{project['id']}/task-intakes/{intake['id']}/reassign",
+            json={"target_member_id": joined["offline-main"]["agent"]["member_id"]},
+        )
+        assert reassigned_back.status_code == 200
+        assert reassigned_back.json()["intake"]["target_session_id"] is None
+
+        explicit_offline = client.post(
+            f"/api/v1/projects/{project['id']}/task-intakes",
+            json={
+                "raw_description": "Reject stale offline session routing",
+                "target_member_id": joined["offline-main"]["agent"]["member_id"],
+                "target_session_id": joined["offline-main"]["agent"]["id"],
+            },
+        )
+        assert explicit_offline.status_code == 409
+        assert explicit_offline.json()["error"]["code"] == "task_intake_target_unavailable"
+
+        revoked_target = client.post(
+            f"/api/v1/projects/{project['id']}/task-intakes",
+            json={
+                "raw_description": "Reject revoked Agent routing",
+                "target_member_id": revoked_member_id,
+            },
+        )
+        assert revoked_target.status_code == 409
+        assert revoked_target.json()["error"]["code"] == "task_intake_target_unavailable"
 
         members = client.get(f"/api/v1/projects/{project['id']}/members")
         assert members.status_code == 200

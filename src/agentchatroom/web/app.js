@@ -1739,13 +1739,18 @@ async function refreshTaskIntakeTargets() {
   const result = await api(`/api/v1/projects/${state.projectId}/task-intakes/targets`);
   state.taskIntakeTargets = result.targets || [];
   const options = state.taskIntakeTargets
-    .filter((target) => target.connection_status === "connected" && target.active_session_count > 0)
-    .map((target) => `<option value="${escapeHtml(target.member_id)}">${escapeHtml(target.name)} · ${escapeHtml(target.client || target.software_key || "Agent")}</option>`);
+    .map((target) => {
+      const connection = target.connection_status === "connected" ? "已连接" : "未连接";
+      return `<option value="${escapeHtml(target.member_id)}">${escapeHtml(target.name)} · ${escapeHtml(target.client || target.software_key || "Agent")} · ${connection}</option>`;
+    });
   elements["task-target-agent-input"].innerHTML = options.length
     ? '<option value="">请选择受理 Agent</option>' + options.join("")
-    : '<option value="">暂无可受理 Agent</option>';
+    : '<option value="">暂无已接入且未吊销的 Agent</option>';
   elements["task-target-agent-input"].disabled = !options.length;
-  elements["task-target-agent-empty"].classList.toggle("is-hidden", Boolean(options.length));
+  elements["task-target-agent-empty"].textContent = options.length
+    ? "可选择所有已接入且未吊销的 Agent；当前未连接的 Agent 会在重新接入后受理任务。"
+    : "当前没有已接入且未吊销的 Agent。";
+  elements["task-target-agent-empty"].classList.toggle("is-hidden", false);
   elements["task-intake-submit"].disabled = !options.length;
   return options.length > 0;
 }
@@ -1876,12 +1881,11 @@ async function openTaskAssignmentDialog() {
   if (!task || !state.projectId) return;
   await refreshTaskIntakeTargets();
   const options = state.taskIntakeTargets
-    .filter((target) => target.connection_status === "connected" && target.active_session_count > 0)
-    .flatMap((target) => (target.active_session_ids || []).map((sessionId) => `<option value="${escapeHtml(sessionId)}">${escapeHtml(target.name)} · ${escapeHtml(target.client || target.software_key || "Agent")}</option>`));
+    .flatMap((target) => (target.active_session_ids || []).map((sessionId) => `<option value="${escapeHtml(sessionId)}">${escapeHtml(target.name)} · ${escapeHtml(target.client || target.software_key || "Agent")} · 已连接</option>`));
   elements["task-assign-title"].textContent = `指定/改派：任务 #${task.task_number}`;
   elements["task-assign-agent"].innerHTML = options.length ? '<option value="">请选择目标 Agent</option>' + options.join("") : '<option value="">暂无在线 Agent</option>';
   elements["task-assign-agent"].disabled = !options.length;
-  elements["task-assign-agent-empty"].textContent = options.length ? "只显示当前 Project 中在线且可受理任务的 Agent。" : "当前没有在线且可受理任务的 Agent。";
+  elements["task-assign-agent-empty"].textContent = options.length ? "正式任务派发需要目标 Agent 当前在线并持有活动 Session。" : "当前没有在线 Agent；离线 Agent 可在新建任务时作为受理 Agent。";
   elements["task-assign-submit"].disabled = !options.length;
   elements["task-assign-note"].value = "";
   elements["task-assign-dialog"].showModal();

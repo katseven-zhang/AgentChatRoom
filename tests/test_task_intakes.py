@@ -30,23 +30,87 @@ def _join_ordered(service, project):
     return creator, target
 
 
-def test_task_intake_targets_exclude_suspended_and_disconnected(service, project):
-    target = _join(service, project, agent_key="intake-target", name="Target")
-    other = _join(service, project, agent_key="intake-other", name="Other")
-    service.update_project_member(
-        project["id"],
-        target["agent"]["member_id"],
-        status="suspended",
-        actor_session_id=other["agent"]["id"],
-        token=other["token"],
-    )
+def test_task_intake_targets_include_active_offline_and_exclude_revoked(
+    service, project
+):
+    online = _join(service, project, agent_key="intake-online", name="Online")
+    offline = _join(service, project, agent_key="intake-offline", name="Offline")
+    revoked = _join(service, project, agent_key="intake-revoked", name="Revoked")
+    suspended = _join(service, project, agent_key="intake-suspended", name="Suspended")
+    service.leave_session(project["id"], offline["agent"]["id"], offline["token"])
+    service.leave_session(project["id"], revoked["agent"]["id"], revoked["token"])
+    service.leave_session(project["id"], suspended["agent"]["id"], suspended["token"])
+    service.revoke_project_member(project["id"], revoked["agent"]["member_id"])
+    service.update_project_member(project["id"], suspended["agent"]["member_id"], status="suspended")
+
     targets = service.list_task_intake_targets(project["id"])
-    member_ids = {item["member_id"] for item in targets}
-    assert target["agent"]["member_id"] not in member_ids
-    assert other["agent"]["member_id"] in member_ids
+    by_id = {item["member_id"]: item for item in targets}
+    assert set(by_id) == {
+        online["agent"]["member_id"],
+        offline["agent"]["member_id"],
+        suspended["agent"]["member_id"],
+    }
+    assert by_id[online["agent"]["member_id"]]["connection_status"] == "connected"
+    assert by_id[offline["agent"]["member_id"]]["connection_status"] == "disconnected"
+    assert by_id[suspended["agent"]["member_id"]]["connection_status"] == "disconnected"
 
 
-def test_submit_task_intake_requires_target_session_when_explicit_session_offline(
+def test_reassign_task_intake_allows_active_offline_target_without_session(
+    service, project
+):
+    creator = _join(service, project, agent_key="intake-creator", name="Creator")
+    first_target = _join(service, project, agent_key="intake-first", name="First")
+    second_target = _join(service, project, agent_key="intake-second", name="Second")
+    service.leave_session(project["id"], second_target["agent"]["id"], second_target["token"])
+    intake = service.submit_task_intake(
+        project["id"],
+        raw_description="Reassign when the second Agent reconnects",
+        target_member_id=first_target["agent"]["member_id"],
+        created_by_session_id=creator["agent"]["id"],
+        token=creator["token"],
+    )["intake"]
+
+    reassigned = service.reassign_task_intake(
+        project["id"],
+        intake["id"],
+        target_member_id=second_target["agent"]["member_id"],
+    )["intake"]
+    assert reassigned["target_member_id"] == second_target["agent"]["member_id"]
+    assert reassigned["target_session_id"] is None
+
+
+def test_submit_task_intake_allows_active_offline_target_without_session(
+    service, project
+):
+    creator = _join(service, project, agent_key="intake-creator", name="Creator")
+    target = _join(service, project, agent_key="intake-offline", name="Offline")
+    service.leave_session(project["id"], target["agent"]["id"], target["token"])
+
+    intake = service.submit_task_intake(
+        project["id"],
+        raw_description="Fix the auth flow when the target reconnects",
+        target_member_id=target["agent"]["member_id"],
+        created_by_session_id=creator["agent"]["id"],
+        token=creator["token"],
+    )["intake"]
+    assert intake["status"] == "pending"
+    assert intake["target_member_id"] == target["agent"]["member_id"]
+    assert intake["target_session_id"] is None
+
+
+def test_submit_task_intake_rejects_revoked_member(service, project):
+    target = _join(service, project, agent_key="intake-revoked", name="Revoked")
+    service.revoke_project_member(project["id"], target["agent"]["member_id"])
+    with pytest.raises(DomainError) as failure:
+        service.submit_task_intake(
+            project["id"],
+            raw_description="Do not route to revoked Agent",
+            target_member_id=target["agent"]["member_id"],
+        )
+    assert failure.value.code == "task_intake_target_unavailable"
+
+
+def test_submit_task_intake_still_rejects_explicit_offline_session(
     service, project
 ):
     target = _join(service, project, agent_key="intake-target", name="Target")

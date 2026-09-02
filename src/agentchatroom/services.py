@@ -907,10 +907,10 @@ class AgentChatRoomService:
         session_id: str | None,
     ) -> Mapping[str, Any]:
         member = self._require_member(connection, project_id, member_id)
-        if member["status"] != "active":
+        if member["status"] == "revoked":
             raise DomainError(
                 "task_intake_target_unavailable",
-                "The target Agent member is not active",
+                "The target Agent member has been revoked",
                 status_code=409,
             )
         if session_id:
@@ -2680,18 +2680,19 @@ class AgentChatRoomService:
                     (project_id,),
                 ).fetchall()
             ]
-            active_member_ids = {
+            eligible_member_ids = {
                 str(member["id"])
                 for member in members
-                if member["status"] == "active"
+                if member["status"] != "revoked"
             }
             targets = self._agent_identities(agents, members=members)
+            # A task intake targets an Agent identity, not a live connection.
+            # Keep every non-revoked member with historical sessions selectable
+            # so users can queue work for an Agent that is currently offline.
             return [
                 target
                 for target in targets
-                if target["member_id"] in active_member_ids
-                and target["connection_status"] == "connected"
-                and target["active_session_count"] > 0
+                if target["member_id"] in eligible_member_ids
             ]
 
     @idempotent_write("task.intake.submit")
@@ -2740,12 +2741,8 @@ class AgentChatRoomService:
                     if self._agent_dict(candidate)["status"] != "offline":
                         clean_session_id = str(candidate["id"])
                         break
-                if clean_session_id is None:
-                    raise DomainError(
-                        "task_intake_target_unavailable",
-                        "The selected Agent has no connected session",
-                        status_code=409,
-                    )
+            # An offline member remains a valid target; in that case the
+            # identity is stored without a session until it reconnects.
             connection.execute(
                 """
                 INSERT INTO task_intakes(
@@ -2855,12 +2852,8 @@ class AgentChatRoomService:
                     if self._agent_dict(candidate)["status"] != "offline":
                         clean_session_id = str(candidate["id"])
                         break
-                if clean_session_id is None:
-                    raise DomainError(
-                        "task_intake_target_unavailable",
-                        "The selected Agent has no connected session",
-                        status_code=409,
-                    )
+            # An offline member remains a valid target; in that case the
+            # identity is stored without a session until it reconnects.
             now = iso_now()
             connection.execute(
                 """
