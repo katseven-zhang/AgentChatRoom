@@ -318,3 +318,160 @@ def test_bootstrap_redaction_shares_the_same_text_policy():
     sample = {"body": "Authorization: Bearer supersecret value tail"}
     assert bootstrap_redact(sample) == history_redact(sample)
     assert "supersecret" not in str(bootstrap_redact(sample))
+
+
+def test_task_history_cursor_pagination_walks_the_whole_chain_without_overlap(
+    service, project, joined_agents
+):
+    executor, _ = joined_agents
+    task = service.create_task(
+        project["id"],
+        title="Cursor pagination",
+        acceptance_criteria=["Every event reachable via cursor"],
+    )["task"]
+    service.claim_task(
+        project["id"], task["id"], executor["agent"]["id"], executor["token"]
+    )
+    service.update_task(
+        project["id"],
+        task["id"],
+        status="in_progress",
+        session_id=executor["agent"]["id"],
+        token=executor["token"],
+    )
+    service.update_task(
+        project["id"],
+        task["id"],
+        progress_percent=40,
+        current_step="Halfway",
+        session_id=executor["agent"]["id"],
+        token=executor["token"],
+    )
+    service.update_task(
+        project["id"],
+        task["id"],
+        progress_percent=80,
+        current_step="Almost",
+        session_id=executor["agent"]["id"],
+        token=executor["token"],
+    )
+    service.submit_work_report(
+        project["id"],
+        task["id"],
+        session_id=executor["agent"]["id"],
+        token=executor["token"],
+        summary="Progress done",
+        files=["src/step4.py"],
+        tests=[{"command": "pytest", "exit_code": 0}],
+    )
+
+    # Backwards from the newest page via before-cursor...
+    seen: list[int] = []
+    page = service.list_task_history(project["id"], task["id"], limit=2)
+    assert page["total"] >= 5
+    seen.extend(item["event_id"] for item in page["items"])
+    while page["has_more_before"]:
+        page = service.list_task_history(
+            project["id"], task["id"], before=page["next_before"], limit=2
+        )
+        seen.extend(item["event_id"] for item in page["items"])
+    # The before-walk must cover every event exactly once.
+    assert len(seen) == len(set(seen)) == page["total"]
+    # ...then forward from the oldest event via cursor, covering the same
+    # chain without overlap or gaps.
+    oldest = min(seen)
+    forward: list[int] = []
+    page = service.list_task_history(
+        project["id"], task["id"], cursor=oldest - 1, limit=2
+    )
+    forward.extend(item["event_id"] for item in page["items"])
+    while page["has_more_after"]:
+        page = service.list_task_history(
+            project["id"], task["id"], cursor=page["cursor"], limit=2
+        )
+        forward.extend(item["event_id"] for item in page["items"])
+    # The forward cursor walk yields the exact same chain, oldest first.
+    assert forward == sorted(seen)
+
+    # cursor is an alias of after: equal values are accepted, conflicting
+    # ones are rejected with a structured error instead of being ignored.
+    boundary = forward[-1]
+    aliased = service.list_task_history(
+        project["id"], task["id"], after=boundary, cursor=boundary
+    )
+    assert aliased["after"] == boundary
+    from agentchatroom.services import DomainError
+
+    import pytest
+
+    with pytest.raises(DomainError) as conflict:
+        service.list_task_history(
+            project["id"], task["id"], after=1, cursor=2
+        )
+    assert conflict.value.code == "conflicting_history_cursor"
+
+
+def test_task_history_has_more_after_ignores_unrelated_room_events(
+    service, project, joined_agents
+):
+    executor, other = joined_agents
+    task = service.create_task(
+        project["id"],
+        title="Bounded forward pagination",
+        acceptance_criteria=["has_more_after reflects this task only"],
+    )["task"]
+    service.claim_task(
+        project["id"], task["id"], executor["agent"]["id"], executor["token"]
+    )
+    service.submit_work_report(
+        project["id"],
+        task["id"],
+        session_id=executor["agent"]["id"],
+        token=executor["token"],
+        summary="Only report",
+        files=["src/only.py"],
+        tests=[{"command": "pytest", "exit_code": 0}],
+    )
+    # Unrelated events move the Room-wide cursor far beyond this task.
+    noise = service.create_task(
+        project["id"],
+        title="Unrelated noise",
+        acceptance_criteria=["noise"],
+    )["task"]
+    service.claim_task(
+        project["id"], noise["id"], other["agent"]["id"], other["token"]
+    )
+
+    history = service.list_task_history(project["id"], task["id"], limit=50)
+    assert history["total"] >= 2
+    assert len(history["items"]) == history["total"]
+    assert history["latest_cursor"] > history["next_after"]
+    assert history["has_more_after"] is False
+    assert history["has_more_before"] is False
+
+
+def test_task_history_shows_claim_state_transition_from_payload(
+    service, project, joined_agents
+):
+    executor, _ = joined_agents
+    task = service.create_task(
+        project["id"],
+        title="Claim trail",
+        acceptance_criteria=["Claim shows before and after"],
+    )["task"]
+    service.claim_task(
+        project["id"], task["id"], executor["agent"]["id"], executor["token"]
+    )
+    history = service.list_task_history(
+        project["id"], task["id"], event_type="task.claimed"
+    )
+    claimed = next(
+        item for item in history["items"] if item["event_type"] == "task.claimed"
+    )
+    fields = {change["field"]: change for change in claimed["state_changes"]}
+    assert fields["status"]["before"] == "todo"
+    assert fields["status"]["after"] == "claimed"
+    assert fields["execution_status"]["before"] == "todo"
+    assert fields["execution_status"]["after"] == "claimed"
+    assert claimed["payload"]["owner_session_id"] == executor["agent"]["id"]
+    assert claimed["task_number"] == task["task_number"]

@@ -626,6 +626,7 @@ def build_parser() -> argparse.ArgumentParser:
     task_history.add_argument("task_id")
     task_history.add_argument("--after", type=int, default=0)
     task_history.add_argument("--before", type=int, default=0)
+    task_history.add_argument("--cursor", type=int, default=0)
     task_history.add_argument("--limit", type=int, default=50)
     task_history.add_argument("--event-type", default="")
 
@@ -1205,6 +1206,7 @@ def main(argv: list[str] | None = None) -> None:
             {
                 "after": args.after,
                 "before": args.before,
+                "cursor": args.cursor,
                 "limit": args.limit,
                 **({"event_type": args.event_type} if args.event_type else {}),
             }

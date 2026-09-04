@@ -721,6 +721,7 @@ def task_history(
     task_id: str = "",
     after: int = 0,
     before: int = 0,
+    cursor: int = 0,
     limit: int = 50,
     event_type: str = "",
 ) -> dict[str, Any]:
@@ -735,6 +736,7 @@ def task_history(
         task_id,
         after=after,
         before=before,
+        cursor=cursor,
         limit=limit,
         event_type=event_type,
     )

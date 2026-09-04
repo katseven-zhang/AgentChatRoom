@@ -2776,12 +2776,24 @@ class AgentChatRoomService:
         *,
         after: int = 0,
         before: int = 0,
+        cursor: int = 0,
         limit: int = 50,
         event_type: str = "",
     ) -> dict[str, Any]:
         limit = max(1, min(int(limit or 50), TASK_HISTORY_LIMIT_MAX))
         after = max(0, int(after or 0))
         before = max(0, int(before or 0))
+        cursor = max(0, int(cursor or 0))
+        if cursor and after and cursor != after:
+            raise DomainError(
+                "conflicting_history_cursor",
+                "Provide either cursor or after for forward pagination, not both",
+                status_code=422,
+            )
+        if cursor and not after:
+            # ``cursor`` is the forward-pagination alias of ``after``; both
+            # mean "return events with event_id strictly greater than this".
+            after = cursor
         wanted_type = str(event_type or "").strip()
         with self.database.connect() as connection:
             self._require_project(connection, project_id)
@@ -2844,6 +2856,14 @@ class AgentChatRoomService:
             items = self._project_task_history_items(connection, events)
             next_after = items[-1]["event_id"] if items else after
             next_before = items[0]["event_id"] if items else before
+            # The Room-wide cursor moves with unrelated tasks, so forward
+            # pagination bounds must be computed from THIS task's events:
+            # only an event of this task after ``next_after`` means more.
+            task_latest_sql = (
+                f"SELECT MAX(id) AS max_id FROM events WHERE {' AND '.join(clauses)}"
+            )
+            task_latest_row = connection.execute(task_latest_sql, parameters).fetchone()
+            task_latest = int(task_latest_row["max_id"] or 0)
             latest = self.latest_cursor(connection, project_id)
             return {
                 "schema_version": TASK_HISTORY_SCHEMA_VERSION,
@@ -2854,9 +2874,10 @@ class AgentChatRoomService:
                 "limit": limit,
                 "after": after,
                 "before": before,
+                "cursor": next_after,
                 "next_after": next_after,
                 "next_before": next_before,
-                "has_more_after": bool(items) and next_after < latest,
+                "has_more_after": bool(items) and next_after < task_latest,
                 "has_more_before": bool(items) and next_before > 1 and total > len(items),
                 "latest_cursor": latest,
                 "event_type": wanted_type,
@@ -3805,7 +3826,19 @@ class AgentChatRoomService:
                 "task.claimed",
                 actor_session_id=session_id,
                 task_id=task_id,
-                payload={},
+                payload={
+                    "task_number": task["task_number"],
+                    "previous_owner_session_id": None,
+                    "owner_session_id": session_id,
+                    "from_status": task["status"],
+                    "status": "claimed",
+                    "from_execution_status": task["execution_status"],
+                    "execution_status": "claimed",
+                    "from_verification_status": task["verification_status"],
+                    "verification_status": task["verification_status"],
+                    "from_integration_status": task["integration_status"],
+                    "integration_status": task["integration_status"],
+                },
             )
             row = connection.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
             return {

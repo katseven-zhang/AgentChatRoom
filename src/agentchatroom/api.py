@@ -1510,6 +1510,7 @@ def create_app(
         task_id: str,
         after: int = Query(0, ge=0),
         before: int = Query(0, ge=0),
+        cursor: int = Query(0, ge=0),
         limit: int = Query(50, ge=1, le=200),
         event_type: str | None = None,
     ) -> dict[str, Any]:
@@ -1518,6 +1519,7 @@ def create_app(
             task_id,
             after=after,
             before=before,
+            cursor=cursor,
             limit=limit,
             event_type=event_type or "",
         )
