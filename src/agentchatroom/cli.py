@@ -384,7 +384,16 @@ def _terminate_server_process(pid: int) -> None:
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
-    if result.returncode and process_is_running(pid):
+    if result.returncode == 0 or not process_is_running(pid):
+        return
+    # taskkill can be rejected by sandbox policy or fail on the process tree
+    # while the direct child itself is still terminable; fall back to
+    # TerminateProcess on the serve process before reporting failure.
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except OSError:
+        pass
+    if process_is_running(pid):
         raise OSError(f"taskkill failed with exit code {result.returncode}")
 
 

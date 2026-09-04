@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import replace
 import json
 import os
+import signal
 import socket
 import subprocess
 import time
@@ -120,6 +121,32 @@ def test_windows_server_stop_uses_taskkill_for_the_process_tree(monkeypatch):
 
     assert captured["command"] == ["taskkill", "/PID", "4321", "/T", "/F"]
     assert captured["kwargs"]["check"] is False
+
+
+def test_windows_server_stop_falls_back_when_taskkill_is_rejected(monkeypatch):
+    """taskkill can be blocked by sandbox policy; the direct child must still
+    be terminable via TerminateProcess (os.kill on Windows)."""
+    calls = {"kill": []}
+    states = iter([True, False])  # alive after taskkill, dead after fallback
+
+    def fake_run(command, **kwargs):
+        assert command == ["taskkill", "/PID", "4321", "/T", "/F"]
+        return subprocess.CompletedProcess(command, 1)
+
+    def fake_is_running(pid):
+        return next(states)
+
+    def fake_kill(pid, sig):
+        calls["kill"].append((pid, sig))
+
+    monkeypatch.setattr(cli, "_WINDOWS", True)
+    monkeypatch.setattr(cli.subprocess, "run", fake_run)
+    monkeypatch.setattr(cli, "process_is_running", fake_is_running)
+    monkeypatch.setattr(cli.os, "kill", fake_kill)
+
+    cli._terminate_server_process(4321)
+
+    assert calls["kill"] == [(4321, signal.SIGTERM)]
 
 
 def test_stop_removes_stale_pid_file(settings):

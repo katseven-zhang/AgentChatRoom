@@ -346,6 +346,9 @@ def test_web_task_view_harness_covers_state_triple_samples(tmp_path):
     # Pure navigation/filter/sort logic used by the tasks panel.
     start_b = javascript.index("function taskNavigationEntries(tasks)")
     end_b = javascript.index("function renderTaskNavigation(tasks)")
+    # Expert filter rendering (exact-state options must carry counts).
+    start_c = javascript.index("function renderTaskExpertFilters(tasks)")
+    end_c = javascript.index("function renderTasks(tasks)")
 
     config = {
         "schema_version": 2,
@@ -418,14 +421,20 @@ def test_web_task_view_harness_covers_state_triple_samples(tmp_path):
     harness.write_text(
         "const state = { config: { domain: { task_view: "
         + json.dumps(config, ensure_ascii=False)
-        + " } } };\n"
+        + " } }, taskExpert: { execution: '', verification: '', integration: '', priority: '', owner: '', number: '', phase: '' }, snapshot: { agents: [] } };\n"
         "function escapeHtml(value) { return String(value ?? ''); }\n"
+        "function shortId(value) { return String(value); }\n"
+        "const captured = { expert: '' };\n"
+        "const document = { getElementById: (id) => ({ set innerHTML(value) { captured[id === 'task-expert-filters' ? 'expert' : id] = value; }, get innerHTML() { return captured[id] || ''; } }) };\n"
         + javascript[start_a:end_a]
         + "\n"
         + javascript[start_b:end_b]
+        + "\n"
+        + javascript[start_c:end_c]
         + "\nconst samples = "
         + json.dumps(samples, ensure_ascii=False)
         + ";\n"
+        "renderTaskExpertFilters(samples);\n"
         "const mapping = Object.fromEntries(samples.map((sample) => {\n"
         "  const view = taskView(sample);\n"
         "  return [sample.name, { phase: view.phase, group: view.group, label: viewLabel(view.phase), needs_attention: view.needs_attention }];\n"
@@ -436,7 +445,7 @@ def test_web_task_view_harness_covers_state_triple_samples(tmp_path):
         "const attentionTasks = samples.filter((sample) => matchesEntry(sample, attentionEntry));\n"
         "const activeOrder = sortForEntry(samples.filter((sample) => matchesEntry(sample, activeEntry)), activeEntry)\n"
         "  .map((sample) => taskView(sample).phase);\n"
-        "console.log(JSON.stringify({ mapping, attentionCount: attentionEntry.count, attentionPhases: attentionTasks.map((sample) => taskView(sample).phase), activeOrder }));\n",
+        "console.log(JSON.stringify({ mapping, attentionCount: attentionEntry.count, attentionPhases: attentionTasks.map((sample) => taskView(sample).phase), activeOrder, expertHtml: captured.expert }));\n",
         encoding="utf-8",
     )
     output = subprocess.check_output(
@@ -459,3 +468,32 @@ def test_web_task_view_harness_covers_state_triple_samples(tmp_path):
         "in_progress",
         "claimed",
     ]
+    # Event #2780: every exact-state option is selectable and shows its count.
+    expert_html = result["expertHtml"]
+    expected_counts = {
+        "todo": 1,
+        "claimed": 1,
+        "in_progress": 1,
+        "blocked": 1,
+        "awaiting_review": 1,
+        "changes_requested": 2,  # returned + released_returned
+        "pending_integration": 2,  # P7 + P11
+        "integration_failed": 1,
+        "done": 1,
+        "cancelled": 1,
+        "unclassified": 1,
+    }
+    for phase, count in expected_counts.items():
+        label = config["phase_labels"][phase]
+        # Chinese labels contain no HTML-special characters, so the rendered
+        # option text appears verbatim inside the expert filter markup.
+        assert f">{label} ({count})<" in expert_html, (
+            f"exact-state option for {phase} must show count {count}"
+        )
+    # The ten states required by event #2780 are all present.
+    for phase in (
+        "todo", "claimed", "in_progress", "blocked", "awaiting_review",
+        "changes_requested", "pending_integration", "integration_failed",
+        "done", "cancelled",
+    ):
+        assert f'value="{phase}"' in expert_html

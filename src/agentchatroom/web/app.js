@@ -1152,8 +1152,19 @@ function renderTaskExpertFilters(tasks) {
   const owners = [...new Set(tasks.map((task) => task.owner_session_id).filter(Boolean))]
     .map((id) => `<option value="${escapeHtml(id)}" ${expert.owner === id ? "selected" : ""}>${escapeHtml(names[id] || shortId(id))}</option>`)
     .join("");
+  // Exact-phase options carry the same projection-derived counts as the
+  // navigation entries (event #2780: every one of the 10 states must be
+  // individually selectable AND show its count).
+  const phaseCounts = {};
+  for (const task of tasks) {
+    const phase = taskView(task).phase;
+    phaseCounts[phase] = (phaseCounts[phase] || 0) + 1;
+  }
   const options = (kind, codes) => codes
     .map((code) => `<option value="${escapeHtml(code)}" ${expert[kind] === code ? "selected" : ""}>${escapeHtml(kind === "phase" ? viewLabel(code) : viewFaceLabel(kind, code))}</option>`)
+    .join("");
+  const phaseOptions = (codes) => codes
+    .map((code) => `<option value="${escapeHtml(code)}" ${expert.phase === code ? "selected" : ""}>${escapeHtml(viewLabel(code))} (${phaseCounts[code] || 0})</option>`)
     .join("");
   const phases = taskViewConfig()?.phases || [];
   const executionCodes = taskViewConfig()?.phases
@@ -1166,7 +1177,7 @@ function renderTaskExpertFilters(tasks) {
     <label>优先级<select data-expert="priority"><option value="">全部</option>${[0, 1, 2, 3, 4].map((value) => `<option value="${value}" ${expert.priority !== "" && String(expert.priority) === String(value) ? "selected" : ""}>P${value}</option>`).join("")}</select></label>
     <label>负责人<select data-expert="owner"><option value="">全部</option>${owners}</select></label>
     <label>任务号<input type="search" inputmode="numeric" placeholder="#号" data-expert="number" value="${escapeHtml(expert.number)}"></label>
-    ${phases.length ? `<label>精确状态<select data-expert="phase"><option value="">全部</option>${options("phase", phases)}</select></label>` : ""}`;
+    ${phases.length ? `<label>精确状态<select data-expert="phase"><option value="">全部</option>${phaseOptions(phases)}</select></label>` : ""}`;
 }
 
 function renderTasks(tasks) {
