@@ -269,6 +269,10 @@
             <h2>Room 动态</h2>
             <p id="chat-subtitle">等待选择项目</p>
           </div>
+          <label class="event-system-toggle" title="勾选时只显示普通消息、决策、阻塞三类动态；取消勾选可查看加入/离开、连接状态、任务、租约等全部系统事件。仅影响此面板的展示，不影响事件记录。">
+            <input type="checkbox" id="event-hide-system" checked />
+            只看消息动态
+          </label>
           <select id="event-filter" aria-label="筛选动态" disabled>
             <option value="all">全部动态</option>
             <option value="messages">只看消息</option>

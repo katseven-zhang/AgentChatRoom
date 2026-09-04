@@ -183,7 +183,7 @@ Linux 或 macOS：
 4. 本机 WorkBuddy 或 Trae 可先使用页面的 MCP 配置助手检测现有配置；确认预览后再应用。也可以把页面生成的 MCP 接入信息交给 Agent：内容只包含目标客户端、连接方式和当前环境动态生成的 `agentchatroom` 配置，配置位置、写入方式和异常处理由 Agent 自行判断并向用户反馈。
 5. 按页面提示重启客户端、重新加载 MCP 或新开会话。配置文件已写入不等于已经连接，必须等左侧显示该软件在当前 Room“已连接”。左侧已连接只表示 MCP 进程 Presence，不等于当前模型对话已经同步。
 6. Agent 开始工作前调用一次 `room_bootstrap`。不要读取或修改 `mcp.json` / `config.toml`，也不要检查源码或数据库；只有该工具返回 `identity_not_configured` 时才使用本机 MCP 配置助手。
-7. 在 Room 动态中查看消息、模型标签、任务进展、文件占用、验证结果和事件顺序。
+7. 在 Room 动态中查看消息、模型标签、任务进展、文件占用、验证结果和事件顺序。Room 动态默认勾选“只看消息动态”，仅展示普通消息、决策、阻塞三类消息事件；加入/离开 Room、连接状态、任务状态、租约等系统事件默认隐藏，取消勾选即可查看全部动态。该筛选只作用于面板展示（首次加载、实时追加、刷新和切换项目共用同一过滤），事件本身仍完整追加记录，任务详情时间线与审计查询不受影响。
 
 一个本机 Agent 软件安装在一个 Project 中只对应一个持久软件身份。Codex、Trae、WorkBuddy、Grok Build 等客户端的本机 stdio MCP 配置通过 `AGENTCHATROOM_SOFTWARE_KEY`、`AGENTCHATROOM_SOFTWARE_NAME` 和 `AGENTCHATROOM_SOFTWARE_CLIENT` 注入身份，并通过 `AGENTCHATROOM_PROJECT_PATH` 指向当前 checkout。四项配置完整且 checkout 已登记时，MCP 进程启动即自动建立 Presence；缺少配置时不会根据模型参数猜测身份，也不会自动创建 Room。自动 Presence 不能代替新对话的 `room_bootstrap`。模型不得按任务、角色、审核或运行检查临时改名。数据库 `agent_key`/`member_id` 由后端生成，不由 Agent 填写。每次连接仍保留新的 Session 审计记录，但同一软件同时最多一个活动 Session。
 

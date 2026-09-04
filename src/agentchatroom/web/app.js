@@ -23,6 +23,7 @@ const state = {
   taskEntry: "",
   taskExpert: { execution: "", verification: "", integration: "", priority: "", owner: "", number: "" },
   eventFilter: "all",
+  hideSystemFeedEvents: true,
   taskIntakeTargets: [],
   taskIntakes: [],
   editingTaskId: null,
@@ -48,7 +49,7 @@ const elements = Object.fromEntries(
     "connect-agent-button", "logout-button",
     "metric-agents", "metric-active", "metric-leases",
     "metric-reviews", "active-task-list", "recent-event-list",
-    "lease-list", "review-list", "chat-subtitle", "chat-stream", "event-filter",
+    "lease-list", "review-list", "chat-subtitle", "chat-stream", "event-filter", "event-hide-system",
     "message-form", "message-input", "message-kind", "message-channel", "message-task", "message-priority",
     "message-requires-ack", "send-message-button", "onboarding", "new-message-notice",
     "project-dialog", "project-form", "project-name-input", "project-path-input",
@@ -1444,12 +1445,23 @@ function renderReportEvidence(taskId) {
   </details>`;
 }
 
+function visibleFeedEvents(events) {
+  // Room 动态唯一的展示层过滤入口：首屏、实时追加、手动刷新与项目切换
+  // 都经由 renderEvents 走这里。只影响展示，不触碰 append-only 事件历史。
+  let filtered = events;
+  if (state.hideSystemFeedEvents) {
+    filtered = filtered.filter((event) =>
+      ["message.message", "message.decision", "message.blocker"].includes(event.event_type));
+  }
+  if (state.eventFilter === "messages") filtered = filtered.filter((event) => event.event_type.startsWith("message.") && event.payload?.body !== undefined);
+  if (state.eventFilter === "decisions") filtered = filtered.filter((event) => ["message.decision", "message.blocker"].includes(event.event_type));
+  return filtered;
+}
+
 function renderEvents(agents, tasks) {
   const agentMap = Object.fromEntries(agents.map((agent) => [agent.id, agent]));
   const taskMap = Object.fromEntries(tasks.map((task) => [task.id, task]));
-  let events = [...state.events];
-  if (state.eventFilter === "messages") events = events.filter((event) => event.event_type.startsWith("message.") && event.payload?.body !== undefined);
-  if (state.eventFilter === "decisions") events = events.filter((event) => ["message.decision", "message.blocker"].includes(event.event_type));
+  let events = visibleFeedEvents([...state.events]);
   events = events.slice(-120);
   const stream = elements["chat-stream"];
   const streamVisible = stream.offsetParent !== null && stream.clientHeight > 0;
@@ -1882,6 +1894,11 @@ window.addEventListener("hashchange", () => {
 
 elements["event-filter"].addEventListener("change", () => {
   state.eventFilter = elements["event-filter"].value;
+  if (state.snapshot) renderEvents(state.snapshot.agents, state.snapshot.tasks);
+});
+
+elements["event-hide-system"].addEventListener("change", () => {
+  state.hideSystemFeedEvents = elements["event-hide-system"].checked;
   if (state.snapshot) renderEvents(state.snapshot.agents, state.snapshot.tasks);
 });
 

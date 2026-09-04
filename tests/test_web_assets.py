@@ -572,3 +572,96 @@ def test_web_every_dialog_close_listener_uses_scoped_cleanup():
         )
     ]
     assert "clearDialogDrafts(dialog)" in listener
+
+
+def test_web_room_feed_hides_system_events_by_default_with_single_filter():
+    """Regression for task #45: the Room feed checkbox defaults to checked
+    and one shared filter function decides what is visible on first load,
+    live appends, manual refresh and project switches (all of them render
+    through renderEvents -> visibleFeedEvents)."""
+    javascript = (WEB_DIR / "app.js").read_text(encoding="utf-8")
+    markup = (WEB_DIR / "index.html").read_text(encoding="utf-8")
+
+    # The checkbox exists, defaults to checked, and sits in the feed header.
+    assert 'id="event-hide-system" checked' in markup
+    assert "只看消息动态" in markup
+    assert "hideSystemFeedEvents: true" in javascript
+    # Rendering goes through the single shared filter entry point.
+    assert "function visibleFeedEvents(events)" in javascript
+    assert "let events = visibleFeedEvents([...state.events]);" in javascript
+    # The old inline filter chain must be gone (single source of truth).
+    assert 'if (state.eventFilter === "messages") events = events.filter' not in javascript
+    # The checkbox wiring rerenders the feed from the current snapshot.
+    listener = javascript[
+        javascript.index('elements["event-hide-system"].addEventListener') : javascript.index(
+            "});",
+            javascript.index('elements["event-hide-system"].addEventListener'),
+        )
+    ]
+    assert "state.hideSystemFeedEvents = elements[\"event-hide-system\"].checked" in listener
+    assert "renderEvents(state.snapshot.agents, state.snapshot.tasks)" in listener
+    # Display-layer only: no backend contract strings inside the filter.
+    assert "api(" not in javascript[javascript.index("function visibleFeedEvents(events)"):javascript.index("function renderEvents(")]
+
+    start = javascript.index("function visibleFeedEvents(events)")
+    end = javascript.index("function renderEvents(")
+    harness = tmp_path_feed_harness(javascript, start, end)
+    output = subprocess.check_output(["node", str(harness)], text=True, encoding="utf-8")
+    outcomes = json.loads(output)
+    assert outcomes == {
+        "defaultCheckedHidesSystemEvents": True,
+        "messageKindsSurvive": True,
+        "uncheckShowsEverything": True,
+        "recheckRestoresImmediately": True,
+        "filterCombinesWithDropdown": True,
+    }
+
+
+def tmp_path_feed_harness(javascript, start, end):
+    import tempfile
+
+    harness = Path(tempfile.mkstemp(suffix=".js")[1])
+    harness.write_text(
+        "const state = { hideSystemFeedEvents: true, eventFilter: 'all' };\n"
+        + javascript[start:end].replace("function renderEvents(agents, tasks) {", "function renderEventsUnused() {", 1)
+        # renderEvents body references DOM elements; only visibleFeedEvents is exercised.
+        .split("function renderEventsUnused() {")[0]
+        + r"""
+const samples = [
+  { id: 1, event_type: 'message.message' },
+  { id: 2, event_type: 'message.decision' },
+  { id: 3, event_type: 'message.blocker' },
+  { id: 4, event_type: 'message.system' },
+  { id: 5, event_type: 'message.acknowledged' },
+  { id: 6, event_type: 'agent.joined' },
+  { id: 7, event_type: 'task.claimed' },
+  { id: 8, event_type: 'lease.acquired' },
+  { id: 9, event_type: 'work.reported' },
+  { id: 10, event_type: 'credential.issued' },
+];
+const kinds = (events) => events.map((event) => event.id);
+const outcomes = {};
+// Default (checked): only ordinary messages, decisions and blockers survive.
+outcomes.defaultCheckedHidesSystemEvents =
+  JSON.stringify(kinds(visibleFeedEvents(samples))) === JSON.stringify([1, 2, 3]);
+// The three allowed kinds are exactly the message.message/decision/blocker trio.
+outcomes.messageKindsSurvive = visibleFeedEvents(samples).every((event) =>
+  ['message.message', 'message.decision', 'message.blocker'].includes(event.event_type));
+// Unchecking shows the full append-only feed, including joins and leases.
+state.hideSystemFeedEvents = false;
+outcomes.uncheckShowsEverything = kinds(visibleFeedEvents(samples)).length === samples.length;
+// Rechecking filters again immediately, without any reload.
+state.hideSystemFeedEvents = true;
+outcomes.recheckRestoresImmediately =
+  JSON.stringify(kinds(visibleFeedEvents(samples))) === JSON.stringify([1, 2, 3]);
+// The dropdown filter composes with the checkbox instead of being replaced.
+state.eventFilter = 'decisions';
+const decisionsOnly = kinds(visibleFeedEvents(samples));
+state.eventFilter = 'all';
+outcomes.filterCombinesWithDropdown =
+  JSON.stringify(decisionsOnly) === JSON.stringify([2, 3]);
+console.log(JSON.stringify(outcomes));
+""",
+        encoding="utf-8",
+    )
+    return harness
