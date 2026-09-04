@@ -4278,6 +4278,43 @@ class AgentChatRoomService:
                     "event_id": None,
                     "cursor": self.latest_cursor(connection, project_id),
                 }
+            # 原子重派：同一任务先失效既有 pending 指派（目标不同才失效，
+            # 同目标重复指派已在上方幂等返回），再创建唯一的新 pending。
+            stale = connection.execute(
+                """
+                SELECT id, assigned_to_session_id FROM task_assignments
+                WHERE project_id = ? AND task_id = ? AND status = 'pending'
+                  AND COALESCE(assigned_to_session_id, '') <> COALESCE(?, '')
+                ORDER BY created_at
+                """,
+                (project_id, task_id, assigned_to_session_id or ""),
+            ).fetchall()
+            now_reassign = iso_now()
+            for row in stale:
+                connection.execute(
+                    """
+                    UPDATE task_assignments
+                    SET status = 'cancelled', responded_by_session_id = ?,
+                        response_note = 'superseded by reassignment', responded_at = ?
+                    WHERE id = ?
+                    """,
+                    (assigned_by_session_id, now_reassign, row["id"]),
+                )
+                self._emit(
+                    connection,
+                    project_id,
+                    "task.assignment_cancelled",
+                    actor_session_id=assigned_by_session_id,
+                    task_id=task_id,
+                    payload={
+                        "assignment_id": str(row["id"]),
+                        "by": "reassign",
+                        "previous_target_session_id": str(
+                            row["assigned_to_session_id"] or ""
+                        ),
+                        "task_number": task["task_number"],
+                    },
+                )
             assignment_id = new_id("assignment")
             now = iso_now()
             connection.execute(

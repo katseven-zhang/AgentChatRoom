@@ -3178,3 +3178,92 @@ def test_release_and_claim_race_admits_exactly_one_successor(
             first_successor["agent"]["id"],
             second_successor["agent"]["id"],
         }
+
+
+def test_reassignment_supersedes_stale_pending_assignment_atomically(
+    service, project, joined_agents
+):
+    """Regression for task #56: re-assigning a task supersedes the stale
+    pending assignment in the same write transaction, leaving exactly one
+    pending assignment for the new target and a structured rejection (not
+    a silent takeover) if the stale target still tries to acknowledge."""
+    manager_a, first_target = joined_agents
+    second_target = service.join_room(
+        project["id"],
+        agent_key="reassign-target-main",
+        name="Reassign Target",
+        client="trae",
+        model="test-model",
+        role="executor",
+    )
+    task = service.create_task(
+        project["id"],
+        title="Atomic reassignment",
+        acceptance_criteria=["One pending assignment at a time"],
+    )["task"]
+
+    first = service.assign_task(
+        project["id"],
+        task["id"],
+        assigned_by_session_id=manager_a["agent"]["id"],
+        token=manager_a["token"],
+        assigned_to_session_id=first_target["agent"]["id"],
+        note="please handle",
+    )
+    assert first["assignment"]["status"] == "pending"
+
+    second = service.assign_task(
+        project["id"],
+        task["id"],
+        assigned_by_session_id=manager_a["agent"]["id"],
+        token=manager_a["token"],
+        assigned_to_member_id=first_target["agent"]["member_id"],
+        note="reassigned to the same scope via identity",
+    )
+    # 同目标重复指派幂等，不产生第二条 pending。
+    assert second["assignment"]["id"] == first["assignment"]["id"]
+
+    third = service.assign_task(
+        project["id"],
+        task["id"],
+        assigned_by_session_id=manager_a["agent"]["id"],
+        token=manager_a["token"],
+        assigned_to_session_id=second_target["agent"]["id"],
+        note="switching targets",
+    )
+    assert third["assignment"]["status"] == "pending"
+
+    assignments = [
+        row
+        for row in service.list_events(project["id"], after=0)["events"]
+        if row["event_type"] == "task.assignment_cancelled"
+    ]
+    superseded = next(
+        event
+        for event in assignments
+        if event["payload"].get("by") == "reassign"
+    )
+    assert superseded["payload"]["assignment_id"] == first["assignment"]["id"]
+
+    # 旧目标失效后再确认被结构化拒绝，不能重新夺回任务。
+    with pytest.raises(DomainError) as stale_ack:
+        service.acknowledge_task_assignment(
+            project["id"],
+            task["id"],
+            first["assignment"]["id"],
+            session_id=first_target["agent"]["id"],
+            token=first_target["token"],
+            response="accepted",
+        )
+    assert stale_ack.value.code == "assignment_already_acknowledged"
+
+    accepted = service.acknowledge_task_assignment(
+        project["id"],
+        task["id"],
+        third["assignment"]["id"],
+        session_id=second_target["agent"]["id"],
+        token=second_target["token"],
+        response="accepted",
+    )
+    assert accepted["assignment"]["status"] == "accepted"
+    assert accepted["task"]["owner_session_id"] == second_target["agent"]["id"]

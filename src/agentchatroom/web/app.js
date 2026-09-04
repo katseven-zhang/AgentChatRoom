@@ -421,10 +421,18 @@ function taskNeedsIntegration(task) {
   return taskView(task).execution_status !== "cancelled";
 }
 
-function assignmentStatus(status) {
-  return {
-    pending: "待确认", accepted: "已接受", declined: "已拒绝", blocked: "受阻", cancelled: "已取消",
-  }[status] || status;
+function assignmentStatus(assignment) {
+  if (typeof assignment === "string") {
+    return { pending: "待确认", accepted: "已接受", declined: "已拒绝", blocked: "受阻", cancelled: "已取消" }[assignment] || assignment;
+  }
+  // 指派生命周期与任务生命周期分离：cancelled 需要区分
+  // 「因释放/改派失效」与「目标明确取消受理」，不能都显示成已取消。
+  const note = String(assignment.response_note || "");
+  if (assignment.status === "cancelled") {
+    if (note.includes("task release")) return "因任务释放失效";
+    if (note.includes("superseded by reassignment")) return "因改派失效";
+  }
+  return assignmentStatus(assignment.status);
 }
 
 function integrationResult(result) {
@@ -2414,8 +2422,9 @@ function renderTaskAssignments(task) {
         : "";
       return `<article class="management-item">
         <div>
-          <h4>${escapeHtml(target)} <span class="status-badge ${escapeHtml(assignment.status)}">${escapeHtml(assignmentStatus(assignment.status))}</span></h4>
-          <p>${escapeHtml(assignment.note || "无附加说明")}${assignment.response_note ? ` · 回复：${escapeHtml(assignment.response_note)}` : ""}</p>
+          <h4>${escapeHtml(target)} <span class="status-badge ${escapeHtml(assignment.status)}">${escapeHtml(assignmentStatus(assignment))}</span></h4>
+          <p>${assignment.note ? escapeHtml(assignment.note) : "未填写说明"}${assignment.response_note ? ` · 回复：${escapeHtml(assignment.response_note)}` : ""}</p>
+          ${assignment.status === "pending" ? '<p class="secondary-text">等待目标 Agent 确认；确认后才会产生任务认领事实。</p>' : ""}
           ${delayedNotice}
         </div>
         <span class="secondary-text">${escapeHtml(formatTime(assignment.created_at))}</span>

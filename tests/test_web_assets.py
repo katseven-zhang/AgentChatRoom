@@ -905,3 +905,50 @@ def test_web_markup_has_no_duplicate_element_ids():
     assert ids.count("task-release-button") == 1
     javascript = (WEB_DIR / "app.js").read_text(encoding="utf-8")
     assert 'elements["task-release-button"].addEventListener' in javascript
+
+
+def test_web_assignment_labels_distinguish_release_from_reassignment(tmp_path):
+    """Regression for task #56: cancelled assignments must show WHY they
+    ended (released vs superseded) instead of a bare 已取消, empty notes
+    read 未填写说明, and pending carries the awaiting-acknowledgement
+    hint — the lifecycle is separate from the task lifecycle."""
+    javascript = (WEB_DIR / "app.js").read_text(encoding="utf-8")
+    start = javascript.index("function assignmentStatus(assignment)")
+    end = javascript.index("\n}", start) + len("\n}")
+
+    harness = tmp_path / "assignment_label_harness.js"
+    harness.write_text(
+        "function escapeHtml(value) { return String(value ?? ''); }\n"
+        + javascript[start:end]
+        + "\n"
+        + r"""
+const outcomes = {};
+outcomes.releaseInvalidated = assignmentStatus({
+  status: 'cancelled',
+  response_note: 'cancelled by task release (other)',
+}) === '因任务释放失效';
+outcomes.reassignInvalidated = assignmentStatus({
+  status: 'cancelled',
+  response_note: 'superseded by reassignment',
+}) === '因改派失效';
+outcomes.plainCancelStillWorks = assignmentStatus({
+  status: 'cancelled',
+  response_note: 'agent declined after offline return',
+}) === '已取消';
+outcomes.plainStatusFallback = assignmentStatus('pending') === '待确认';
+console.log(JSON.stringify(outcomes));
+""",
+        encoding="utf-8",
+    )
+    output = subprocess.check_output(["node", str(harness)], text=True, encoding="utf-8")
+    outcomes = json.loads(output)
+    assert outcomes == {
+        "releaseInvalidated": True,
+        "reassignInvalidated": True,
+        "plainCancelStillWorks": True,
+        "plainStatusFallback": True,
+    }
+    # 指派卡片：空说明显示「未填写说明」，pending 带待确认提示。
+    assert '"未填写说明"' in javascript
+    assert "等待目标 Agent 确认" in javascript
+    assert 'assignmentStatus(assignment)' in javascript
