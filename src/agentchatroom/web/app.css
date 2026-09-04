@@ -2876,3 +2876,40 @@ dialog::backdrop {
   border: 1px dashed var(--amber, #c78a1d);
   color: var(--amber, #c78a1d);
 }
+
+/* #51 结构化渲染：安全 Markdown 子集 */
+.msg-h {
+  font-weight: 600;
+  margin: 6px 0 2px;
+}
+.msg-h1 { font-size: 14px; }
+.msg-h2 { font-size: 13px; }
+.msg-h3 { font-size: 12px; }
+.msg-list {
+  margin: 3px 0 3px 18px;
+  padding: 0;
+}
+.msg-list li { margin: 1px 0; }
+.msg-quote {
+  margin: 4px 0;
+  padding: 4px 8px;
+  border-left: 3px solid var(--border);
+  background: var(--surface);
+}
+.msg-code {
+  margin: 4px 0;
+  padding: 6px 8px;
+  background: var(--surface);
+  border-radius: 4px;
+  overflow-x: auto;
+  font-size: 11px;
+  line-height: 1.45;
+  white-space: pre;
+}
+.event-body code {
+  font-family: var(--mono, monospace);
+  font-size: 11px;
+  background: var(--surface);
+  padding: 0 3px;
+  border-radius: 3px;
+}

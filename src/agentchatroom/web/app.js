@@ -518,40 +518,121 @@ function avatarColorClass(seed) {
 const MESSAGE_COLLAPSE_LINES = 12;
 const MESSAGE_PREVIEW_LINES = 8;
 
-function renderMessageLines(lines) {
-  return lines.map((line) => {
+function renderInlineCode(escapedLine) {
+  // 输入已整体转义；此处仅把成对反引号内的片段包成 <code>。
+  return escapedLine.replace(/`([^`]+)`/g, "<code>$1</code>");
+}
+
+function renderMessageLine(line) {
+  const trimmed = line.trim();
+  const escaped = escapeHtml(line);
+  const heading = trimmed.match(/^【(.+)】/);
+  if (heading) {
+    return `<div class="msg-heading">${escapeHtml(trimmed)}</div>`;
+  }
+  if (/^(✓|✔|✅)/.test(trimmed)) {
+    return `<div class="msg-line msg-pass">${renderInlineCode(escaped)}</div>`;
+  }
+  if (/^(✗|✘|❌)/.test(trimmed)) {
+    return `<div class="msg-line msg-fail">${renderInlineCode(escaped)}</div>`;
+  }
+  const keyValue = trimmed.match(/^([A-Z][A-Z_]{2,}|[\u4e00-\u9fa5A-Za-z]{2,12})(\s*[:：]\s*)(\S.*)$/);
+  if (keyValue && !trimmed.startsWith("http")) {
+    return `<div class="msg-line"><span class="msg-key">${escapeHtml(keyValue[1])}${escapeHtml(keyValue[2])}</span>${renderInlineCode(escapeHtml(keyValue[3]))}</div>`;
+  }
+  return `<div class="msg-line">${renderInlineCode(escaped)}</div>`;
+}
+
+// 安全 Markdown 子集渲染契约：围栏代码块、# 标题、-/*/数字 列表、> 引用、
+// 普通段落与行内 `code`。所有源文本先整体转义，结构标签由渲染器生成，
+// 输入中的 HTML/脚本/事件属性永远以字面文本呈现。
+function renderStructuredBody(body) {
+  const lines = String(body || "").split("\n");
+  const blocks = [];
+  let index = 0;
+  while (index < lines.length) {
+    const line = lines[index];
     const trimmed = line.trim();
-    const heading = trimmed.match(/^【(.+)】/);
+    if (trimmed.startsWith("```")) {
+      const codeLines = [];
+      index += 1;
+      while (index < lines.length && !lines[index].trim().startsWith("```")) {
+        codeLines.push(lines[index]);
+        index += 1;
+      }
+      index += 1; // 跳过闭合围栏（缺失时也安全结束）
+      blocks.push(`<pre class="msg-code"><code>${escapeHtml(codeLines.join("\n"))}</code></pre>`);
+      continue;
+    }
+    if (!trimmed) {
+      index += 1;
+      continue;
+    }
+    const heading = trimmed.match(/^(#{1,3})\s+(.*)$/);
     if (heading) {
-      return `<div class="msg-heading">${escapeHtml(trimmed)}</div>`;
+      blocks.push(`<div class="msg-h msg-h${heading[1].length}">${renderInlineCode(escapeHtml(heading[2]))}</div>`);
+      index += 1;
+      continue;
     }
-    if (/^(✓|✔|✅)/.test(trimmed)) {
-      return `<div class="msg-line msg-pass">${escapeHtml(line)}</div>`;
+    if (/^>\s?/.test(trimmed)) {
+      const quoteLines = [];
+      while (index < lines.length && /^>\s?/.test(lines[index].trim())) {
+        quoteLines.push(lines[index].trim().replace(/^>\s?/, ""));
+        index += 1;
+      }
+      blocks.push(`<blockquote class="msg-quote">${quoteLines.map((item) => renderMessageLine(item)).join("")}</blockquote>`);
+      continue;
     }
-    if (/^(✗|✘|❌)/.test(trimmed)) {
-      return `<div class="msg-line msg-fail">${escapeHtml(line)}</div>`;
+    if (/^(-|\*|•|·)\s+/.test(trimmed) || /^\d+[.)]\s+/.test(trimmed)) {
+      const ordered = /^\d+[.)]\s+/.test(trimmed);
+      const items = [];
+      while (index < lines.length) {
+        const candidate = lines[index].trim();
+        if (ordered && /^\d+[.)]\s+/.test(candidate)) {
+          items.push(candidate.replace(/^\d+[.)]\s+/, ""));
+        } else if (!ordered && /^(-|\*|•|·)\s+/.test(candidate)) {
+          items.push(candidate.replace(/^(-|\*|•|·)\s+/, ""));
+        } else {
+          break;
+        }
+        index += 1;
+      }
+      const tag = ordered ? "ol" : "ul";
+      blocks.push(`<${tag} class="msg-list">${items.map((item) => `<li>${renderInlineCode(escapeHtml(item))}</li>`).join("")}</${tag}>`);
+      continue;
     }
-    if (/^[-•·]\s+/.test(trimmed)) {
-      return `<div class="msg-line msg-list-item">${escapeHtml(line)}</div>`;
-    }
-    const keyValue = trimmed.match(/^([A-Z][A-Z_]{2,}|[\u4e00-\u9fa5A-Za-z]{2,12})(\s*[:：]\s*)(\S.*)$/);
-    if (keyValue && !trimmed.startsWith("http")) {
-      return `<div class="msg-line"><span class="msg-key">${escapeHtml(keyValue[1])}${escapeHtml(keyValue[2])}</span>${escapeHtml(keyValue[3])}</div>`;
-    }
-    return `<div class="msg-line">${escapeHtml(line)}</div>`;
-  }).join("");
+    blocks.push(renderMessageLine(line));
+    index += 1;
+  }
+  return blocks.join("");
+}
+
+function renderMessageLines(lines) {
+  return lines.map((line) => renderMessageLine(line)).join("");
+}
+
+// 降级契约：结构化渲染抛错时只隔离当前事件，退回整段转义纯文本，
+// 不阻塞动态流、历史分页或实时追加。
+function renderMessageBodySafely(eventId, body) {
+  try {
+    return renderMessageBody(eventId, body);
+  } catch (error) {
+    console.warn("Ignored malformed event body", eventId, error);
+    return `<div class="event-body"><div class="msg-line">${escapeHtml(String(body || ""))}</div></div>`;
+  }
 }
 
 function renderMessageBody(eventId, body) {
-  const lines = String(body || "").split("\n");
+  const text = String(body || "");
+  const lines = text.split("\n");
   const expanded = state.expandedEvents.has(eventId);
   if (lines.length <= MESSAGE_COLLAPSE_LINES || expanded) {
     const toggle = lines.length > MESSAGE_COLLAPSE_LINES
       ? `<button class="expand-toggle" type="button" data-collapse-event="${eventId}">收起</button>`
       : "";
-    return `<div class="event-body">${renderMessageLines(lines)}</div>${toggle}`;
+    return `<div class="event-body">${renderStructuredBody(text)}</div>${toggle}`;
   }
-  return `<div class="event-body is-collapsed">${renderMessageLines(lines.slice(0, MESSAGE_PREVIEW_LINES))}</div>
+  return `<div class="event-body is-collapsed">${renderStructuredBody(lines.slice(0, MESSAGE_PREVIEW_LINES).join("\n"))}</div>
     <button class="expand-toggle" type="button" data-expand-event="${eventId}">展开全部（共 ${lines.length} 行）</button>`;
 }
 
@@ -1493,7 +1574,7 @@ function renderEvents(agents, tasks) {
           <span class="event-avatar ${avatarColorClass(event.actor_session_id || agent?.name)}">${escapeHtml(initials(agent?.name || "用户"))}</span>
           <div class="event-content">
             <div class="event-meta"><span class="event-author"><strong>${escapeHtml(agent?.name || "用户")}</strong>${messageModelBadge(event)}${kind !== "message" ? ` <span class="type-badge ${escapeHtml(kind)}">${escapeHtml(messageKind(kind))}</span>` : ""}${event.payload?.priority <= 1 ? ` <span class="type-badge urgent">${event.payload.priority === 0 ? "紧急" : "高优先级"}</span>` : ""}</span><span class="event-stamp">${eventIdBadge(event.id)}<time title="${escapeHtml(event.created_at)}">${escapeHtml(formatTime(event.created_at))}</time></span></div>
-            ${renderMessageBody(event.id, event.payload?.body || "")}
+            ${renderMessageBodySafely(event.id, event.payload?.body || "")}
             <p class="secondary-text">${escapeHtml(messageChannel(event.channel))}频道${event.payload?.requires_ack ? ` · 需要确认 · 已确认 ${ackCount}` : ""}${event.payload?.mentions?.length ? ` · @${escapeHtml(event.payload.mentions.join("、"))}` : ""}</p>
             ${event.payload?.files?.length ? `<p class="secondary-text">关联文件：${escapeHtml(event.payload.files.join("、"))}</p>` : ""}
             ${task ? `<p class="secondary-text">关联任务：${escapeHtml(task.title)}</p>` : ""}

@@ -665,3 +665,108 @@ console.log(JSON.stringify(outcomes));
         encoding="utf-8",
     )
     return harness
+
+
+def test_web_structured_renderer_renders_safe_markdown_and_blocks_attacks(tmp_path):
+    """Regression for task #51: the structured body renderer turns the safe
+    Markdown subset (fenced code, headings, lists, quotes, inline code)
+    into readable blocks while every attacker payload stays inert escaped
+    text, and a renderer crash degrades to escaped plain text for that
+    event only."""
+    javascript = (WEB_DIR / "app.js").read_text(encoding="utf-8")
+
+    def extract(name, end_name):
+        start = javascript.index(f"function {name}")
+        end = javascript.index(f"function {end_name}", start)
+        return javascript[start:end]
+
+    parts = [
+        extract("renderInlineCode", "renderMessageLine"),
+        extract("renderMessageLine", "renderStructuredBody"),
+        extract("renderStructuredBody", "renderMessageLines"),
+        extract("renderMessageLines", "renderMessageBodySafely"),
+        extract("renderMessageBodySafely", "showToast"),
+    ]
+
+    harness = tmp_path / "structured_renderer_harness.js"
+    harness.write_text(
+        "const state = { expandedEvents: new Set() };\n"
+        "const MESSAGE_COLLAPSE_LINES = 40;\n"
+        "const MESSAGE_PREVIEW_LINES = 12;\n"
+        "function escapeHtml(value) { return String(value ?? '')\n"
+        "  .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')\n"
+        "  .replace(/\"/g, '&quot;').replace(/'/g, '&#39;'); }\n"
+        "const consoleWarn = [];\n"
+        "const __realConsole = globalThis.console;\n"
+        "const console = { warn: (...args) => consoleWarn.push(args), log: (...args) => __realConsole.log(...args) };\n"
+        + "\n".join(parts)
+        + "\n"
+        + r"""
+const outcomes = {};
+// Safe markdown subset becomes readable blocks.
+const sample = [
+  '## 修复说明',
+  '',
+  '根因是分页边界：',
+  '- 命中了全局游标',
+  '* 未按任务过滤',
+  '',
+  '> 复现命令如下',
+  '```bash',
+  'pytest --basetemp=<tmp>',
+  '```',
+  '见 `task_history.py`',
+].join('\n');
+const html = renderStructuredBody(sample);
+outcomes.heading = html.includes('msg-h2') && html.includes('修复说明');
+outcomes.listItems = (html.match(/<li>/g) || []).length === 2;
+outcomes.quote = html.includes('msg-quote') && html.includes('复现命令如下');
+outcomes.fencedCode = html.includes('msg-code') && html.includes('pytest --basetemp=&lt;tmp&gt;');
+outcomes.inlineCode = html.includes('<code>task_history.py</code>');
+// Attack payloads stay inert: no raw tags, no attribute breakout, no javascript: href.
+const attacks = [
+  '<script>alert(1)</script>',
+  '<img src=x onerror=alert(1)>',
+  '"><a href="javascript:alert(1)">x</a>',
+  '```</code><script>alert(1)</script>```',
+];
+const attackHtml = attacks.map((a) => renderStructuredBody(a)).join('');
+outcomes.noScriptTag = !attackHtml.includes('<script>');
+outcomes.noOnerror = !attackHtml.includes('<img');
+outcomes.noRawHref = !attackHtml.includes('<a href');
+outcomes.escapedVisible = attackHtml.includes('&lt;script&gt;');
+// A renderer crash isolates the single event and degrades to escaped text.
+const original = renderMessageBody;
+renderMessageBody = () => { throw new Error('boom'); };
+const degraded = renderMessageBodySafely(42, '<img src=x>');
+outcomes.degradesToEscapedText = degraded.includes('&lt;img src=x&gt;');
+outcomes.warnedOnce = consoleWarn.length === 1;
+renderMessageBody = original;
+outcomes.recoversAfterCrash = renderMessageBodySafely(43, 'ok').includes('ok');
+console.log(JSON.stringify(outcomes));
+""",
+        encoding="utf-8",
+    )
+    output = subprocess.check_output(["node", str(harness)], text=True, encoding="utf-8")
+    outcomes = json.loads(output)
+    assert outcomes == {
+        "heading": True,
+        "listItems": True,
+        "quote": True,
+        "fencedCode": True,
+        "inlineCode": True,
+        "noScriptTag": True,
+        "noOnerror": True,
+        "noRawHref": True,
+        "escapedVisible": True,
+        "degradesToEscapedText": True,
+        "warnedOnce": True,
+        "recoversAfterCrash": True,
+    }
+
+
+def test_web_feed_uses_safe_structured_renderer():
+    javascript = (WEB_DIR / "app.js").read_text(encoding="utf-8")
+    # The Room feed must go through the fallback wrapper, never the raw renderer.
+    assert "renderMessageBodySafely(event.id, event.payload?.body || \"\")" in javascript
+    assert 'renderMessageBody(event.id, event.payload?.body' not in javascript
