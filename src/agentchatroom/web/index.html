@@ -290,26 +290,26 @@
             <details class="composer-advanced" id="composer-advanced">
               <summary>高级选项</summary>
               <div class="composer-options">
-                <select id="message-kind" aria-label="消息类型" disabled>
+                <select id="message-kind" aria-label="消息类型" title="普通消息=日常沟通；决策=需要留痕的结论；阻塞=报告当前障碍。类型决定动态与任务时间线里的徽章。" disabled>
                   <option value="message">普通消息</option>
                   <option value="decision">决策</option>
                   <option value="blocker">阻塞</option>
                 </select>
-                <select id="message-channel" aria-label="消息频道" disabled>
+                <select id="message-channel" aria-label="消息频道" title="公共=全员可见；评审=验收上下文；系统=运维广播。关联任务时自动切换为任务频道。" disabled>
                   <option value="public">公共频道</option>
                   <option value="review">评审频道</option>
                   <option value="system">系统频道</option>
                 </select>
-                <select id="message-task" aria-label="关联任务" disabled>
+                <select id="message-task" aria-label="关联任务" title="把这条消息挂到任务时间线，方便按任务回溯上下文。" disabled>
                   <option value="">不关联任务</option>
                 </select>
-                <select id="message-priority" aria-label="消息优先级" disabled>
+                <select id="message-priority" aria-label="消息优先级" title="紧急/高优先级的消息在动态里带醒目标签。" disabled>
                   <option value="0">紧急</option>
                   <option value="1">高</option>
                   <option value="2" selected>普通</option>
                   <option value="3">低</option>
                 </select>
-                <label class="check-control"><input id="message-requires-ack" type="checkbox" disabled> 需要确认</label>
+                <label class="check-control" title="勾选后接收者需要显式确认，动态与任务时间线会显示确认人数。"><input id="message-requires-ack" type="checkbox" disabled> 需要确认</label>
               </div>
             </details>
             <button class="primary-button" id="send-message-button" type="submit" disabled>发送</button>
