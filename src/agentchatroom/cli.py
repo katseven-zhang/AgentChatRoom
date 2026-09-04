@@ -600,6 +600,11 @@ def build_parser() -> argparse.ArgumentParser:
     tasks = commands.add_parser("task-list", help="List tasks")
     tasks.add_argument("project_id")
     tasks.add_argument("--status")
+    tasks.add_argument(
+        "--phase",
+        help="Filter by shared task view phase code, or 'attention' for the "
+        "deduplicated needs-attention inbox",
+    )
 
     task_get = commands.add_parser("task-get", help="Get one task")
     task_get.add_argument("project_id")
@@ -670,6 +675,26 @@ def build_parser() -> argparse.ArgumentParser:
     claim.add_argument("task_id")
     claim.add_argument("--session-id", required=True)
     claim.add_argument("--token", required=True)
+
+    task_release = commands.add_parser(
+        "task-release", help="Release an owned task back to the claimable pool"
+    )
+    task_release.add_argument("project_id")
+    task_release.add_argument("task_id")
+    task_release.add_argument(
+        "--reason-code",
+        choices=[
+            "quota_exhausted",
+            "agent_unavailable",
+            "user_requested",
+            "reassignment_needed",
+            "other",
+        ],
+        default="other",
+    )
+    task_release.add_argument("--reason", default="")
+    task_release.add_argument("--session-id")
+    task_release.add_argument("--token")
 
     task_update = commands.add_parser("task-update", help="Update a task")
     task_update.add_argument("project_id")
@@ -1154,8 +1179,13 @@ def main(argv: list[str] | None = None) -> None:
             },
         )
     elif args.command == "task-list":
-        query = f"?{urllib.parse.urlencode({'status': args.status})}" if args.status else ""
-        result = call_api("GET", f"/api/v1/projects/{args.project_id}/tasks{query}")
+        query = urllib.parse.urlencode(
+            {key: value for key, value in (("status", args.status), ("phase", getattr(args, "phase", None))) if value}
+        )
+        result = call_api(
+            "GET",
+            f"/api/v1/projects/{args.project_id}/tasks{('?' + query) if query else ''}",
+        )
     elif args.command == "task-get":
         result = call_api(
             "GET",
@@ -1245,6 +1275,17 @@ def main(argv: list[str] | None = None) -> None:
             "POST",
             f"/api/v1/projects/{args.project_id}/tasks/{args.task_id}/claim",
             {"session_id": args.session_id, "token": args.token},
+        )
+    elif args.command == "task-release":
+        result = call_api(
+            "POST",
+            f"/api/v1/projects/{args.project_id}/tasks/{args.task_id}/release",
+            {
+                "reason_code": args.reason_code,
+                "reason": args.reason,
+                "session_id": args.session_id,
+                "token": args.token,
+            },
         )
     elif args.command == "task-update":
         result = call_api(

@@ -43,9 +43,16 @@ from .contracts import (
     TASK_INTEGRATION_STATUSES,
     TASK_INTAKE_STATUSES,
     TASK_INTAKE_TRANSITIONS,
+    TASK_RELEASE_COMPAT_REASON_CODE,
+    TASK_RELEASE_EXECUTION_STATUSES,
+    TASK_RELEASE_REASON_CODES,
     TASK_VERIFICATION_STATUSES,
+    TASK_VIEW_ATTENTION_PHASES,
+    TASK_VIEW_SCHEMA_VERSION,
+    TASK_VIEW_UNCLASSIFIED_PHASE,
     task_contract,
     task_state_for_legacy_status,
+    task_view,
 )
 from .database import DatabaseBackend
 from .errors import DomainError
@@ -99,6 +106,29 @@ SENSITIVE_REQUEST_FIELDS = {
     "api_key",
 }
 logger = logging.getLogger(__name__)
+
+_UNCLASSIFIED_TASK_VIEW_WARNED: set[str] = set()
+
+
+def _warn_unclassified_task_view(task: Mapping[str, Any]) -> None:
+    """Alert once per task when the (E,V,I) triple maps to unclassified.
+
+    Plan D requires legacy residue or unknown combinations to surface
+    explicitly instead of being disguised as a normal phase.
+    """
+    task_id = str(task.get("id") or "")
+    if task_id in _UNCLASSIFIED_TASK_VIEW_WARNED:
+        return
+    _UNCLASSIFIED_TASK_VIEW_WARNED.add(task_id)
+    logger.warning(
+        "task %s (#%s) has unclassified state view: execution=%r verification=%r "
+        "integration=%r; extend TASK_VIEW projection in contracts.py",
+        task_id,
+        task.get("task_number"),
+        task.get("execution_status"),
+        task.get("verification_status"),
+        task.get("integration_status"),
+    )
 
 
 def _is_unique_constraint_error(error: BaseException) -> bool:
@@ -1129,7 +1159,14 @@ class AgentChatRoomService:
             integration_status=data["integration_status"],
             legacy_status=data["status"],
         )
-        data["phase"] = data["state"]["phase"]
+        data["state_view"] = task_view(
+            execution_status=data["execution_status"],
+            verification_status=data["verification_status"],
+            integration_status=data["integration_status"],
+        )
+        data["phase"] = data["state_view"]["phase"]
+        if data["phase"] == TASK_VIEW_UNCLASSIFIED_PHASE:
+            _warn_unclassified_task_view(data)
         return data
 
     def _handoff_dict(self, row: Mapping[str, Any]) -> dict[str, Any]:
@@ -3638,10 +3675,30 @@ class AgentChatRoomService:
                 "cursor": event_id,
             }
 
-    def list_tasks(self, project_id: str, status: str | None = None) -> list[dict[str, Any]]:
+    def list_tasks(
+        self,
+        project_id: str,
+        status: str | None = None,
+        phase: str | None = None,
+    ) -> list[dict[str, Any]]:
         with self.database.connect() as connection:
             self._require_project(connection, project_id)
-            return self._list_tasks(connection, project_id, status=status)
+            tasks = self._list_tasks(connection, project_id, status=status)
+        if phase:
+            wanted = str(phase).strip()
+            if wanted == "attention":
+                tasks = [
+                    task
+                    for task in tasks
+                    if task["state_view"]["needs_attention"]
+                ]
+            else:
+                tasks = [
+                    task
+                    for task in tasks
+                    if task["state_view"]["phase"] == wanted
+                ]
+        return tasks
 
     def _list_tasks(
         self,
@@ -3756,6 +3813,300 @@ class AgentChatRoomService:
                 "event_id": event_id,
                 "cursor": event_id,
             }
+
+    def _release_task_locked(
+        self,
+        connection: Any,
+        project_id: str,
+        task: Mapping[str, Any],
+        *,
+        reason_code: str,
+        reason: str,
+        initiator: str,
+        actor_session_id: str | None,
+    ) -> dict[str, Any]:
+        """Shared release core; runs inside an open write transaction.
+
+        Release moves an owned claimed / in_progress / blocked task back to the
+        claimable pool without touching task contracts, progress, evidence, or
+        append-only history. Cancellation is a different, terminal action.
+        """
+        clean_reason_code = str(reason_code or "").strip()
+        clean_reason = str(reason or "").strip()
+        if clean_reason_code not in TASK_RELEASE_REASON_CODES:
+            raise DomainError(
+                "invalid_release_reason_code",
+                "Release reason code must be one of: "
+                + ", ".join(sorted(TASK_RELEASE_REASON_CODES)),
+                status_code=422,
+                details={"allowed": sorted(TASK_RELEASE_REASON_CODES)},
+            )
+        previous_owner = task["owner_session_id"]
+        if previous_owner is None and task["execution_status"] == "todo":
+            return {
+                "task": self._task_with_dependencies(connection, task),
+                "released": False,
+                "already_released": True,
+                "reason_code": clean_reason_code,
+                "reason": clean_reason,
+                "released_lease_ids": [],
+                "invalidated_assignment_ids": [],
+                "invalidated_handoff_ids": [],
+                "event_id": None,
+                "cursor": self.latest_cursor(connection, project_id),
+            }
+        if task["execution_status"] not in TASK_RELEASE_EXECUTION_STATUSES:
+            raise DomainError(
+                "task_not_releasable",
+                "Only claimed, in_progress, or blocked tasks can be released",
+                status_code=409,
+                details={
+                    "execution_status": task["execution_status"],
+                    "verification_status": task["verification_status"],
+                    "integration_status": task["integration_status"],
+                    "legacy_status": task["status"],
+                },
+            )
+        if previous_owner is None:
+            raise DomainError(
+                "task_not_releasable",
+                "Task has no owner to release",
+                status_code=409,
+                details={"execution_status": task["execution_status"]},
+            )
+        (
+            next_execution_status,
+            next_verification_status,
+            next_integration_status,
+        ) = task_state_for_legacy_status(
+            "todo", previous_verification=task["verification_status"]
+        )
+        now = iso_now()
+        active_leases = connection.execute(
+            """
+            SELECT id FROM file_leases
+            WHERE project_id = ? AND task_id = ? AND session_id = ?
+              AND released_at IS NULL
+            """,
+            (project_id, task["id"], previous_owner),
+        ).fetchall()
+        released_lease_ids = [row["id"] for row in active_leases]
+        if released_lease_ids:
+            connection.execute(
+                """
+                UPDATE file_leases SET released_at = ?
+                WHERE project_id = ? AND task_id = ? AND session_id = ?
+                  AND released_at IS NULL
+                """,
+                (now, project_id, task["id"], previous_owner),
+            )
+        pending_assignments = connection.execute(
+            """
+            SELECT id FROM task_assignments
+            WHERE project_id = ? AND task_id = ? AND status = 'pending'
+            ORDER BY created_at
+            """,
+            (project_id, task["id"]),
+        ).fetchall()
+        invalidated_assignment_ids = [row["id"] for row in pending_assignments]
+        if invalidated_assignment_ids:
+            placeholders = _sql_placeholders(len(invalidated_assignment_ids))
+            connection.execute(
+                f"""
+                UPDATE task_assignments
+                SET status = 'cancelled', responded_by_session_id = ?,
+                    response_note = ?, responded_at = ?
+                WHERE project_id = ? AND task_id = ?
+                  AND status = 'pending' AND id IN ({placeholders})
+                """,
+                (
+                    actor_session_id,
+                    f"cancelled by task release ({clean_reason_code})",
+                    now,
+                    project_id,
+                    task["id"],
+                    *invalidated_assignment_ids,
+                ),
+            )
+        pending_handoffs = connection.execute(
+            """
+            SELECT id FROM task_handoffs
+            WHERE project_id = ? AND task_id = ? AND status = 'pending'
+            ORDER BY created_at
+            """,
+            (project_id, task["id"]),
+        ).fetchall()
+        invalidated_handoff_ids = [row["id"] for row in pending_handoffs]
+        if invalidated_handoff_ids:
+            placeholders = _sql_placeholders(len(invalidated_handoff_ids))
+            connection.execute(
+                f"""
+                UPDATE task_handoffs
+                SET status = 'cancelled', responded_by_session_id = ?,
+                    response_note = ?, responded_at = ?
+                WHERE project_id = ? AND task_id = ?
+                  AND status = 'pending' AND id IN ({placeholders})
+                """,
+                (
+                    actor_session_id,
+                    f"cancelled by task release ({clean_reason_code})",
+                    now,
+                    project_id,
+                    task["id"],
+                    *invalidated_handoff_ids,
+                ),
+            )
+        next_blocker_reason = (
+            "" if task["status"] == "blocked" else task["blocker_reason"]
+        )
+        updated = connection.execute(
+            """
+            UPDATE tasks
+            SET owner_session_id = NULL, status = 'todo',
+                execution_status = 'todo', verification_status = ?,
+                integration_status = ?, blocker_reason = ?, updated_at = ?
+            WHERE id = ? AND project_id = ? AND owner_session_id = ?
+              AND execution_status IN ('claimed', 'in_progress', 'blocked')
+            """,
+            (
+                next_verification_status,
+                next_integration_status,
+                next_blocker_reason,
+                now,
+                task["id"],
+                project_id,
+                previous_owner,
+            ),
+        )
+        if updated.rowcount != 1:
+            raise DomainError(
+                "task_release_conflict",
+                "Task ownership changed concurrently; reload the task and retry",
+                status_code=409,
+            )
+        event_id = self._emit(
+            connection,
+            project_id,
+            "task.released",
+            actor_session_id=actor_session_id,
+            task_id=task["id"],
+            payload={
+                "initiator": initiator,
+                "initiator_session_id": actor_session_id or "",
+                "previous_owner_session_id": previous_owner,
+                "reason_code": clean_reason_code,
+                "reason": clean_reason,
+                "from_status": task["status"],
+                "status": "todo",
+                "from_execution_status": task["execution_status"],
+                "execution_status": next_execution_status,
+                "from_verification_status": task["verification_status"],
+                "verification_status": next_verification_status,
+                "from_integration_status": task["integration_status"],
+                "integration_status": next_integration_status,
+                "progress_percent": task["progress_percent"],
+                "current_step": task["current_step"],
+                "next_step": task["next_step"],
+                "cleared_blocker_reason": (
+                    task["blocker_reason"]
+                    if next_blocker_reason != task["blocker_reason"]
+                    else ""
+                ),
+                "released_lease_ids": released_lease_ids,
+                "invalidated_assignment_ids": invalidated_assignment_ids,
+                "invalidated_handoff_ids": invalidated_handoff_ids,
+            },
+        )
+        for assignment_id in invalidated_assignment_ids:
+            self._emit(
+                connection,
+                project_id,
+                "task.assignment_cancelled",
+                actor_session_id=actor_session_id,
+                task_id=task["id"],
+                payload={
+                    "assignment_id": assignment_id,
+                    "by": "task_release",
+                    "reason_code": clean_reason_code,
+                    "previous_owner_session_id": previous_owner,
+                },
+            )
+        for handoff_id in invalidated_handoff_ids:
+            self._emit(
+                connection,
+                project_id,
+                "task.handoff_cancelled",
+                actor_session_id=actor_session_id,
+                task_id=task["id"],
+                payload={
+                    "handoff_id": handoff_id,
+                    "by": "task_release",
+                    "reason_code": clean_reason_code,
+                    "previous_owner_session_id": previous_owner,
+                },
+            )
+        row = connection.execute(
+            "SELECT * FROM tasks WHERE id = ?", (task["id"],)
+        ).fetchone()
+        return {
+            "task": self._task_with_dependencies(connection, row),
+            "released": True,
+            "already_released": False,
+            "reason_code": clean_reason_code,
+            "reason": clean_reason,
+            "released_lease_ids": released_lease_ids,
+            "invalidated_assignment_ids": invalidated_assignment_ids,
+            "invalidated_handoff_ids": invalidated_handoff_ids,
+            "event_id": event_id,
+            "cursor": event_id,
+        }
+
+    @idempotent_write("task.release")
+    def release_task(
+        self,
+        project_id: str,
+        task_id: str,
+        *,
+        reason_code: str,
+        reason: str = "",
+        session_id: str | None = None,
+        token: str | None = None,
+    ) -> dict[str, Any]:
+        """Release an owned task back to the claimable pool.
+
+        The current owner may release its own task; management may release on
+        behalf of an owner that is offline, unreachable, or out of quota. The
+        task returns to todo with its contract, progress, and history intact.
+        """
+        with self.database.connect(write=True) as connection:
+            task = self._require_task(connection, project_id, task_id)
+            actor_session_id: str | None = None
+            initiator = "management"
+            if session_id:
+                if not token:
+                    raise DomainError(
+                        "invalid_session_token",
+                        "session_id and token must be supplied together",
+                        status_code=401,
+                    )
+                self._authenticate(connection, project_id, session_id, token)
+                if task["owner_session_id"] != session_id:
+                    raise DomainError(
+                        "not_task_owner",
+                        "Only the task owner or management can release this task",
+                        status_code=403,
+                    )
+                initiator = "owner"
+                actor_session_id = session_id
+            return self._release_task_locked(
+                connection,
+                project_id,
+                task,
+                reason_code=reason_code,
+                reason=reason,
+                initiator=initiator,
+                actor_session_id=actor_session_id,
+            )
 
     @idempotent_write("task.assign")
     def assign_task(
@@ -4384,6 +4735,39 @@ class AgentChatRoomService:
                     f"Task cannot move from {task['status']} to {next_status}",
                     status_code=409,
                 )
+            if (
+                status == "todo"
+                and task["owner_session_id"] is not None
+                and task["execution_status"] in TASK_RELEASE_EXECUTION_STATUSES
+            ):
+                release_result = self._release_task_locked(
+                    connection,
+                    project_id,
+                    task,
+                    reason_code=TASK_RELEASE_COMPAT_REASON_CODE,
+                    reason="released through task_update(status=todo); "
+                    "prefer task_release for an explicit reason code",
+                    initiator="owner" if session_id else "management",
+                    actor_session_id=session_id,
+                )
+                task = connection.execute(
+                    "SELECT * FROM tasks WHERE id = ?", (task_id,)
+                ).fetchone()
+                if all(
+                    value is None
+                    for value in (
+                        title,
+                        description,
+                        acceptance_criteria,
+                        depends_on,
+                        priority,
+                        progress_percent,
+                        current_step,
+                        blocker_reason,
+                        next_step,
+                    )
+                ):
+                    return release_result
             (
                 next_execution_status,
                 next_verification_status,

@@ -89,41 +89,56 @@ def test_web_renders_explicit_no_code_work_evidence():
     assert "无代码变更" in javascript
 
 
-def test_web_treats_cancelled_tasks_as_not_requiring_integration():
+def test_web_renders_state_view_from_server_config_without_hardcoded_buckets():
     javascript = (WEB_DIR / "app.js").read_text(encoding="utf-8")
-
-    assert 'task.execution_status === "cancelled" ? "无需集成"' in javascript
-    assert 'task.execution_status === "cancelled" ? "not_required"' in javascript
-    assert "taskIntegrationStatus(task)" in javascript
-    assert "taskIntegrationStatusClass(task)" in javascript
-    assert "function bucketOf(task)" in javascript
-    assert "function taskPhaseLabel(task)" in javascript
-    assert "function taskDisplayLabel(task)" in javascript
-    assert "legacy_status" not in javascript
     markup = (WEB_DIR / "index.html").read_text(encoding="utf-8")
-    assert 'data-filter="">全部' in markup
-    assert 'data-filter="todo">待认领' in markup
-    assert 'data-filter="claimed">已认领' in markup
-    assert 'data-filter="in_progress">执行中' in markup
-    assert 'data-filter="blocked">阻塞' in markup
-    assert 'data-filter="awaiting_review">已提交' in markup
-    assert 'data-filter="verified">待验收' in markup
-    assert 'data-filter="done">已完成' in markup
-    assert 'data-filter="cancelled">已取消' in markup
+    stylesheet = (WEB_DIR / "app.css").read_text(encoding="utf-8")
+
+    # The shared projection is the single source of truth in the front end.
+    assert "function taskView(task)" in javascript
+    assert "function taskNotFinished(task)" in javascript
+    assert "task?.state_view" in javascript
+    # The retired hard-coded bucket/status helpers must be gone.
+    for retired in (
+        "function bucketOf(",
+        "function bucketLabel(",
+        "function taskStatus(",
+        "function taskDisplayLabel(",
+        "function executionStatus(",
+        "function verificationStatus(",
+        "function integrationStatus(",
+    ):
+        assert retired not in javascript
+    assert "legacy_status" not in javascript
+    # Navigation entries and expert filters are rendered from server config.
+    assert 'id="task-navigation"' in markup
+    assert 'id="task-expert-filters"' in markup
+    assert "data-filter" not in markup
+    assert 'data-task-entry="${escapeHtml(entry.key)}"' in javascript
+    assert "state.config?.domain?.task_view" in javascript
+    # Cards show task number and priority side by side, plus view badges.
     assert "P${task.priority}" in javascript
-    assert 'aria-label="任务阶段筛选"' in markup
+    assert "#${task.task_number}" in javascript
+    assert "function taskViewBadgeHtml(view)" in javascript
+    assert 'class="status-badge aux' in javascript
+    # Terminal cancelled tasks are never treated as integration candidates.
+    assert '["done", "cancelled"].includes(group)' in javascript
+    # The three anomaly phases carry visible emphasis styles.
+    for phase in ("changes_requested", "integration_failed", "unclassified"):
+        assert f".status-badge.{phase}" in stylesheet
 
 
 def test_web_task_list_renders_task_number_and_priority_together():
     javascript = (WEB_DIR / "app.js").read_text(encoding="utf-8")
-    render_tasks = javascript[
-        javascript.index("function renderTasks(tasks)") : javascript.index(
-            "function intakeTargetName", javascript.index("function renderTasks(tasks)")
+    render_table = javascript[
+        javascript.index("function renderTaskTable(tasks)") : javascript.index(
+            "function intakeTargetName",
+            javascript.index("function renderTaskTable(tasks)"),
         )
     ]
 
-    assert '<span class="task-number">#${task.task_number}</span>' in render_tasks
-    assert '<span class="priority p${task.priority}">P${task.priority}</span>' in render_tasks
+    assert '<span class="task-number">#${task.task_number}</span>' in render_table
+    assert '<span class="priority p${task.priority}">P${task.priority}</span>' in render_table
 
 
 def test_web_supports_human_reading_and_guided_interactions():
@@ -149,8 +164,8 @@ def test_web_supports_human_reading_and_guided_interactions():
     assert "snapshot.agent_identities" in javascript
     assert "当前连接" in javascript
     assert "累计" in javascript and "次接入" in javascript
-    assert 'app.css?v=1.0.0-central26' in markup
-    assert 'app.js?v=1.0.0-central26' in markup
+    assert 'app.css?v=1.0.0-central27' in markup
+    assert 'app.js?v=1.0.0-central27' in markup
     assert 'id="task-history-filter"' in markup
     assert "function loadTaskHistory(" in javascript
     assert "function renderHistoryEvidence(" in javascript
@@ -311,30 +326,117 @@ def test_web_sse_and_project_switch_guard_stale_snapshots():
     assert "rememberExpandedEvent" in javascript
 
 
-def test_web_task_filter_buckets_cover_legacy_status_samples(tmp_path):
+def test_web_task_view_harness_covers_state_triple_samples(tmp_path):
+    """Node harness proving the browser renders the shared state.view codes.
+
+    The front end never re-derives phases: samples carry the exact
+    ``state_view`` payload produced by the Python projection, so this test
+    locks the server projection -> server config labels -> Web rendering
+    chain end to end. It runs with an explicit UTF-8 decoding contract for
+    the child process so the default Windows GBK locale cannot break the
+    regression.
+    """
+    from agentchatroom.contracts import task_view
+
     javascript = (WEB_DIR / "app.js").read_text(encoding="utf-8")
-    start = javascript.index("function bucketOf(task)")
-    end = javascript.index("function taskStatus(status)")
-    harness = tmp_path / "task_buckets.js"
+    # Rendering helper functions that read the projection and server config.
+    start_a = javascript.index("function taskViewConfig()")
+    end_marker_a = "function taskNeedsIntegration(task) {\n  return taskView(task).execution_status !== \"cancelled\";\n}\n"
+    end_a = javascript.index(end_marker_a) + len(end_marker_a)
+    # Pure navigation/filter/sort logic used by the tasks panel.
+    start_b = javascript.index("function taskNavigationEntries(tasks)")
+    end_b = javascript.index("function renderTaskNavigation(tasks)")
+
+    config = {
+        "schema_version": 2,
+        "phases": [
+            "todo", "claimed", "in_progress", "blocked", "awaiting_review",
+            "changes_requested", "pending_integration", "integration_failed",
+            "done", "cancelled", "unclassified",
+        ],
+        "phase_labels": {
+            "todo": "待认领", "claimed": "已认领", "in_progress": "执行中",
+            "blocked": "阻塞", "awaiting_review": "待验收",
+            "changes_requested": "已退回", "pending_integration": "待集成",
+            "integration_failed": "集成失败", "done": "已完成",
+            "cancelled": "已取消", "unclassified": "未归类",
+        },
+        "group_labels": {
+            "claimable": "待认领", "active": "进行中", "review": "待验收",
+            "integration": "待集成", "done": "已完成", "cancelled": "已取消",
+            "unclassified": "未归类",
+        },
+        "attention_phases": ["blocked", "changes_requested", "integration_failed"],
+        "attention_label": "需要处理",
+        "active_subgroup_order": ["changes_requested", "blocked", "in_progress", "claimed"],
+    }
+
+    sample_triples = [
+        ("todo", "todo", "not_required", "pending"),
+        ("claimed", "claimed", "not_required", "pending"),
+        ("in_progress", "in_progress", "not_required", "pending"),
+        ("blocked", "blocked", "not_required", "pending"),
+        ("awaiting_review", "completed", "pending", "pending"),
+        ("returned", "in_progress", "changes_requested", "pending"),
+        ("pending_integration", "completed", "approved", "pending"),
+        ("integration_failed", "completed", "approved", "failed"),
+        ("done", "completed", "approved", "done"),
+        ("cancelled", "cancelled", "not_required", "pending"),
+        ("released_returned", "todo", "changes_requested", "pending"),
+        ("verified_without_review", "completed", "not_required", "pending"),
+        ("residue", "todo", "approved", "pending"),
+    ]
+    # Each sample embeds the exact projection payload the server would send.
+    samples = []
+    expected_mapping = {}
+    for name, execution, verification, integration in sample_triples:
+        view = task_view(
+            execution_status=execution,
+            verification_status=verification,
+            integration_status=integration,
+        )
+        samples.append(
+            {
+                "name": name,
+                "id": f"task-{len(samples) + 1:04d}",
+                "task_number": len(samples) + 1,
+                "priority": 1,
+                "execution_status": execution,
+                "verification_status": verification,
+                "integration_status": integration,
+                "state_view": view,
+            }
+        )
+        expected_mapping[name] = {
+            "phase": view["phase"],
+            "group": view["group"],
+            "label": config["phase_labels"][view["phase"]],
+            "needs_attention": view["needs_attention"],
+        }
+
+    harness = tmp_path / "task_view_harness.js"
     harness.write_text(
-        javascript[start:end]
-        + """
-const samples = [
-  {legacy: "todo", status: "todo", execution_status: "todo", verification_status: "not_required", integration_status: "pending"},
-  {legacy: "claimed", status: "claimed", execution_status: "claimed", verification_status: "not_required", integration_status: "pending"},
-  {legacy: "in_progress", status: "in_progress", execution_status: "in_progress", verification_status: "not_required", integration_status: "pending"},
-  {legacy: "blocked", status: "blocked", execution_status: "blocked", verification_status: "not_required", integration_status: "pending"},
-  {legacy: "awaiting_review", status: "awaiting_review", execution_status: "completed", verification_status: "pending", integration_status: "pending"},
-  {legacy: "verified", status: "verified", execution_status: "completed", verification_status: "approved", integration_status: "pending"},
-  {legacy: "done", status: "done", execution_status: "completed", verification_status: "approved", integration_status: "done"},
-  {legacy: "cancelled", status: "cancelled", execution_status: "cancelled", verification_status: "not_required", integration_status: "pending"}
-];
-const mapping = Object.fromEntries(samples.map((sample) => [sample.legacy, {
-  bucket: bucketOf(sample),
-  label: bucketLabel(bucketOf(sample))
-}]));
-console.log(JSON.stringify(mapping));
-""",
+        "const state = { config: { domain: { task_view: "
+        + json.dumps(config, ensure_ascii=False)
+        + " } } };\n"
+        "function escapeHtml(value) { return String(value ?? ''); }\n"
+        + javascript[start_a:end_a]
+        + "\n"
+        + javascript[start_b:end_b]
+        + "\nconst samples = "
+        + json.dumps(samples, ensure_ascii=False)
+        + ";\n"
+        "const mapping = Object.fromEntries(samples.map((sample) => {\n"
+        "  const view = taskView(sample);\n"
+        "  return [sample.name, { phase: view.phase, group: view.group, label: viewLabel(view.phase), needs_attention: view.needs_attention }];\n"
+        "}));\n"
+        "const entries = taskNavigationEntries(samples);\n"
+        "const attentionEntry = entries.find((entry) => entry.key === 'attention');\n"
+        "const activeEntry = entries.find((entry) => entry.key === 'active');\n"
+        "const attentionTasks = samples.filter((sample) => matchesEntry(sample, attentionEntry));\n"
+        "const activeOrder = sortForEntry(samples.filter((sample) => matchesEntry(sample, activeEntry)), activeEntry)\n"
+        "  .map((sample) => taskView(sample).phase);\n"
+        "console.log(JSON.stringify({ mapping, attentionCount: attentionEntry.count, attentionPhases: attentionTasks.map((sample) => taskView(sample).phase), activeOrder }));\n",
         encoding="utf-8",
     )
     output = subprocess.check_output(
@@ -342,14 +444,18 @@ console.log(JSON.stringify(mapping));
         text=True,
         encoding="utf-8",
     )
-    mapping = json.loads(output)
-    assert mapping == {
-        "todo": {"bucket": "todo", "label": "待认领"},
-        "claimed": {"bucket": "claimed", "label": "已认领"},
-        "in_progress": {"bucket": "in_progress", "label": "执行中"},
-        "blocked": {"bucket": "blocked", "label": "阻塞"},
-        "awaiting_review": {"bucket": "awaiting_review", "label": "已提交"},
-        "verified": {"bucket": "verified", "label": "待验收"},
-        "done": {"bucket": "done", "label": "已完成"},
-        "cancelled": {"bucket": "cancelled", "label": "已取消"},
-    }
+    result = json.loads(output)
+    assert result["mapping"] == expected_mapping
+    # Inbox dedup: 4 anomalous tasks, one blocked+returned overlap counted once.
+    assert result["attentionCount"] == 4
+    assert sorted(result["attentionPhases"]) == sorted(
+        ["blocked", "changes_requested", "integration_failed", "changes_requested"]
+    )
+    # Active sub-group ordering: returned first, then blocked, then execution.
+    assert result["activeOrder"] == [
+        "changes_requested",
+        "changes_requested",
+        "blocked",
+        "in_progress",
+        "claimed",
+    ]

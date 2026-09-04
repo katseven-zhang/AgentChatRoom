@@ -51,7 +51,10 @@ from .contracts import (
     TASK_INTAKE_TRANSITIONS,
     TASK_PHASES,
     TASK_PHASE_COMMANDS,
-    TASK_PHASE_LABELS,
+    TASK_VIEW_ALL_PHASES,
+    TASK_VIEW_ATTENTION_PHASES,
+    TASK_VIEW_GROUP_CODES,
+    TASK_VIEW_SCHEMA_VERSION,
     TASK_VERIFICATION_STATUSES,
     knowledge_contract,
 )
@@ -68,6 +71,91 @@ from .services import (
     REQUEST_ID_PATTERN,
     new_id,
 )
+
+# ---------------------------------------------------------------------------
+# Server-side versioned presentation metadata for the task view projection
+# (Plan D, event #2788/#2795). The domain layer emits stable codes only;
+# localized labels, group ordering, and attention semantics are served here
+# as versioned config so REST / MCP / CLI / Web stay aligned by schema
+# version instead of by hard-coded front-end maps.
+# ---------------------------------------------------------------------------
+TASK_VIEW_LABELS = {
+    "todo": "待认领",
+    "claimed": "已认领",
+    "in_progress": "执行中",
+    "blocked": "阻塞",
+    "awaiting_review": "待验收",
+    "changes_requested": "已退回",
+    "pending_integration": "待集成",
+    "integration_failed": "集成失败",
+    "done": "已完成",
+    "cancelled": "已取消",
+    "unclassified": "未归类",
+}
+TASK_VIEW_GROUP_LABELS = {
+    "claimable": "待认领",
+    "active": "进行中",
+    "review": "待验收",
+    "integration": "待集成",
+    "done": "已完成",
+    "cancelled": "已取消",
+    "unclassified": "未归类",
+}
+# Active sub-group ordering: 修改中(red) → 阻塞(orange) → 执行中 → 已认领.
+TASK_VIEW_ACTIVE_SUBGROUP_ORDER = (
+    "changes_requested",
+    "blocked",
+    "in_progress",
+    "claimed",
+)
+TASK_VIEW_ATTENTION_LABEL = "需要处理"
+# Legacy status wording kept for compatible outputs (event #2795 correction 5).
+TASK_VIEW_LEGACY_STATUS_LABELS = {
+    "todo": "待认领",
+    "claimed": "已认领",
+    "in_progress": "执行中",
+    "blocked": "阻塞",
+    "awaiting_review": "已提交",
+    "verified": "已通过",
+    "done": "已完成",
+    "cancelled": "已取消",
+}
+TASK_VIEW_EXECUTION_LABELS = {
+    "todo": "待开始",
+    "claimed": "已认领",
+    "in_progress": "执行中",
+    "blocked": "阻塞",
+    "completed": "执行完成",
+    "cancelled": "已取消",
+}
+TASK_VIEW_VERIFICATION_LABELS = {
+    "not_required": "无需验证",
+    "pending": "待验证",
+    "changes_requested": "需修改",
+    "approved": "已通过",
+}
+TASK_VIEW_INTEGRATION_LABELS = {
+    "pending": "待集成",
+    "done": "已集成",
+    "failed": "集成失败",
+}
+
+
+def task_view_presentation_config() -> dict[str, Any]:
+    return {
+        "schema_version": TASK_VIEW_SCHEMA_VERSION,
+        "phases": list(TASK_VIEW_ALL_PHASES),
+        "phase_labels": dict(TASK_VIEW_LABELS),
+        "groups": list(TASK_VIEW_GROUP_CODES),
+        "group_labels": dict(TASK_VIEW_GROUP_LABELS),
+        "active_subgroup_order": list(TASK_VIEW_ACTIVE_SUBGROUP_ORDER),
+        "attention_phases": sorted(TASK_VIEW_ATTENTION_PHASES),
+        "attention_label": TASK_VIEW_ATTENTION_LABEL,
+        "execution_labels": dict(TASK_VIEW_EXECUTION_LABELS),
+        "verification_labels": dict(TASK_VIEW_VERIFICATION_LABELS),
+        "integration_labels": dict(TASK_VIEW_INTEGRATION_LABELS),
+        "status_labels": dict(TASK_VIEW_LEGACY_STATUS_LABELS),
+    }
 
 
 def trusted_proxy_peer(peer_host: str, trusted_proxy_ips: str) -> bool:
@@ -432,6 +520,19 @@ class TaskIntakeDefine(StrictModel):
 class TaskClaim(StrictModel):
     session_id: str
     token: str
+
+
+class TaskRelease(StrictModel):
+    reason_code: Literal[
+        "quota_exhausted",
+        "agent_unavailable",
+        "user_requested",
+        "reassignment_needed",
+        "other",
+    ]
+    reason: str = ""
+    session_id: str | None = None
+    token: str | None = None
 
 
 class TaskAssign(StrictModel):
@@ -951,8 +1052,8 @@ def create_app(
                 "task_verification_statuses": sorted(TASK_VERIFICATION_STATUSES),
                 "task_integration_statuses": sorted(TASK_INTEGRATION_STATUSES),
                 "task_phases": list(TASK_PHASES),
-                "task_phase_labels": dict(TASK_PHASE_LABELS),
                 "task_phase_commands": dict(TASK_PHASE_COMMANDS),
+                "task_view": task_view_presentation_config(),
                 "task_history_schema_version": TASK_HISTORY_SCHEMA_VERSION,
                 "task_intake_statuses": sorted(TASK_INTAKE_STATUSES),
                 "bootstrap_schema_version": BOOTSTRAP_SCHEMA_VERSION,
@@ -1385,8 +1486,14 @@ def create_app(
         )
 
     @app.get("/api/v1/projects/{project_id}/tasks")
-    def list_tasks(project_id: str, status: str | None = None) -> dict[str, Any]:
-        return {"tasks": service.list_tasks(project_id, status=status)}
+    def list_tasks(
+        project_id: str,
+        status: str | None = None,
+        phase: str | None = None,
+    ) -> dict[str, Any]:
+        return {
+            "tasks": service.list_tasks(project_id, status=status, phase=phase)
+        }
 
     @app.get("/api/v1/projects/{project_id}/tasks/by-number/{task_number}")
     def get_task_by_number(project_id: str, task_number: int) -> dict[str, Any]:
@@ -1500,6 +1607,21 @@ def create_app(
             task_id,
             body.session_id,
             body.token,
+            request_id=request.state.request_id,
+        )
+
+    @app.post("/api/v1/projects/{project_id}/tasks/{task_id}/release")
+    def release_task(
+        request: Request,
+        project_id: str,
+        task_id: str,
+        body: TaskRelease,
+    ) -> dict[str, Any]:
+        _reject_credentials_in_query(request)
+        return service.release_task(
+            project_id,
+            task_id,
+            **body.model_dump(),
             request_id=request.state.request_id,
         )
 

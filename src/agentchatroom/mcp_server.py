@@ -682,13 +682,27 @@ def message_acknowledge(
 
 
 @mcp.tool()
-def task_list(project_id: str = "", status: str = "") -> dict[str, Any]:
-    """List project tasks, optionally filtered by status."""
+def task_list(
+    project_id: str = "",
+    status: str = "",
+    phase: str = "",
+) -> dict[str, Any]:
+    """List project tasks, optionally filtered by legacy status or view phase.
+
+    phase accepts a versioned phase code from the shared task view projection
+    (e.g. pending_integration, changes_requested) or "attention" for the
+    deduplicated needs-attention inbox.
+    """
     try:
         _authorize_remote(project_id, "room:read")
     except DomainError as error:
         return {"ok": False, **error.as_dict()}
-    return _tool_result(get_service().list_tasks, project_id, status=status or None)
+    return _tool_result(
+        get_service().list_tasks,
+        project_id,
+        status=status or None,
+        phase=phase or None,
+    )
 
 
 @mcp.tool()
@@ -1066,6 +1080,39 @@ def task_claim(
         task_id,
         session_id,
         token,
+        request_id=_mcp_request_id(request_id),
+    )
+
+
+@mcp.tool()
+def task_release(
+    project_id: str = "",
+    task_id: str = "",
+    reason_code: str = "",
+    reason: str = "",
+    session_id: str = "",
+    token: str = "",
+    request_id: str = "",
+) -> dict[str, Any]:
+    """Release an owned task back to the claimable pool without cancelling it.
+
+    reason_code must be one of: quota_exhausted, agent_unavailable,
+    user_requested, reassignment_needed, other. The task returns to todo with
+    its contract, progress, and history intact; active file leases are released
+    and pending assignments/handoffs are cancelled.
+    """
+    try:
+        _authorize_remote(project_id, "task:write")
+    except DomainError as error:
+        return {"ok": False, **error.as_dict()}
+    return _tool_result(
+        get_service().release_task,
+        project_id,
+        task_id,
+        reason_code=reason_code,
+        reason=reason,
+        session_id=session_id or None,
+        token=token or None,
         request_id=_mcp_request_id(request_id),
     )
 

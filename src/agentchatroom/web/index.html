@@ -6,7 +6,8 @@
     <meta name="color-scheme" content="light">
     <title>AgentChatRoom</title>
     <link rel="icon" href="/assets/favicon.svg?v=1.0.0-central1" type="image/svg+xml">
-    <link rel="stylesheet" href="/assets/app.css?v=1.0.0-central26">
+    <link rel="stylesheet" href="/assets/app.css?v=1.0.0-central27">
+    <script src="/assets/app.js?v=1.0.0-central27" defer></script>
   </head>
   <body>
     <div class="app-shell" id="app-shell">
@@ -119,20 +120,14 @@
         </section>
 
         <section class="tab-panel" id="panel-tasks" role="tabpanel" aria-labelledby="tab-tasks">
-          <div class="scope-status"><span>协作视图</span><p>提交原始任务说明后，由目标 Agent 受理并补全正式任务合同；执行、验证和集成过程在详情中只读呈现。</p></div>
+          <div class="scope-status"><span>协作视图</span><p>提交原始任务说明后，由目标 Agent 受理并补全正式任务合同；执行、验证和集成过程在详情中只读呈现。导航入口与状态标签由服务端版本化投影统一提供，「需要处理」收件箱汇总退回、阻塞与集成失败三类异常。</p></div>
           <div class="panel-toolbar">
-            <div class="segmented-control" id="task-filter" aria-label="任务阶段筛选">
-              <button type="button" class="is-active" data-filter="">全部</button>
-              <button type="button" data-filter="todo">待认领</button>
-              <button type="button" data-filter="claimed">已认领</button>
-              <button type="button" data-filter="in_progress">执行中</button>
-              <button type="button" data-filter="blocked">阻塞</button>
-              <button type="button" data-filter="awaiting_review">已提交</button>
-              <button type="button" data-filter="verified">待验收</button>
-              <button type="button" data-filter="done">已完成</button>
-              <button type="button" data-filter="cancelled">已取消</button>
-            </div>
+            <nav class="task-navigation" id="task-navigation" aria-label="任务阶段入口"></nav>
           </div>
+          <details class="task-expert" id="task-expert">
+            <summary>精确筛选（执行 / 验收 / 集成 / 优先级 / 负责人 / 任务号 / 精确状态）</summary>
+            <div class="task-expert-filters" id="task-expert-filters"></div>
+          </details>
           <div id="task-table" class="task-table"></div>
           <div id="task-intake-list" class="task-intake-list" aria-live="polite"></div>
         </section>
@@ -387,6 +382,15 @@
           </div>
           <div id="task-assignment-list" class="management-list compact-management-list"></div>
         </section>
+        <section class="dialog-subsection" id="task-release-section" style="display:none">
+          <div class="section-heading">
+            <div>
+              <h3>任务释放</h3>
+              <p class="secondary-text">将任务退回待认领池，保留进度记录。</p>
+            </div>
+            <button type="button" class="warning-button" id="task-release-button">释放任务</button>
+          </div>
+        </section>
         <section class="dialog-subsection">
           <div class="section-heading">
             <div>
@@ -435,6 +439,34 @@
         <div class="dialog-actions">
           <button type="button" class="secondary-button dialog-close">取消</button>
           <button type="submit" class="primary-button" id="task-assign-submit">确认指定</button>
+        </div>
+      </form>
+    </dialog>
+
+    <dialog id="task-release-dialog">
+      <form method="dialog" class="dialog-form">
+        <div class="dialog-header">
+          <div>
+            <p class="context-label">任务释放</p>
+            <h2 id="task-release-title">释放任务 #?</h2>
+          </div>
+          <button type="button" class="icon-button dialog-close" title="关闭" aria-label="关闭">×</button>
+        </div>
+        <p class="form-hint">释放将把任务退回待认领池，保留进度和证据，但清除当前所有权和活跃文件租约。</p>
+        <label>释放原因
+          <select id="task-release-reason" required>
+            <option value="">选择原因…</option>
+            <option value="quota_exhausted">Grok 额度耗尽</option>
+            <option value="agent_unavailable">Agent 不可用</option>
+            <option value="user_requested">用户请求</option>
+            <option value="reassignment_needed">需要改派</option>
+            <option value="other">其他</option>
+          </select>
+        </label>
+        <label>详细说明 <textarea id="task-release-reason-text" rows="2" placeholder="可选，说明情况"></textarea></label>
+        <div class="dialog-actions">
+          <button type="button" class="secondary-button dialog-close">取消</button>
+          <button type="submit" class="warning-button" id="task-release-submit">确认释放</button>
         </div>
       </form>
     </dialog>
@@ -708,6 +740,6 @@
     </dialog>
 
     <div class="toast-region" id="toast-region" aria-live="polite"></div>
-    <script src="/assets/app.js?v=1.0.0-central26" defer></script>
+    <script src="/assets/app.js?v=1.0.0-central27" defer></script>
   </body>
 </html>

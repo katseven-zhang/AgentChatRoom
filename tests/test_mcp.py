@@ -67,6 +67,7 @@ def test_mcp_exposes_standard_tool_set():
         "member_revoke",
         "task_create",
         "task_claim",
+        "task_release",
         "task_assign",
         "task_acknowledge",
         "task_handoff",

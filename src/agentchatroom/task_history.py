@@ -229,6 +229,13 @@ def history_summary(event_type: str, payload: Mapping[str, Any]) -> str:
         return f"review {payload.get('verdict') or 'submitted'}"
     if event_type == "work.reported":
         return str(payload.get("summary") or "work reported")
+    if event_type == "task.released":
+        reason_code = str(payload.get("reason_code") or "other")
+        reason = str(payload.get("reason") or "").strip()
+        summary = f"released ({reason_code})"
+        if reason:
+            summary = f"{summary}: {reason}"
+        return summary
     if event_type.startswith("message."):
         body = str(payload.get("body") or "").strip().splitlines()
         return body[0][:180] if body else event_type

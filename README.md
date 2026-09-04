@@ -9,7 +9,7 @@ AgentChatRoom 是一个面向异构 AI 编程 Agent 的项目级实时协作中�
 - 已配置且已登记的本机 Agent 新开对话时，调用一次零参数 `room_bootstrap` 即可解析当前 checkout、恢复或替换同一软件身份的 Session，并完成本次对话的首次同步。
 - Session Token 只保存在本机 MCP 进程内存中，不出现在工具结果、日志、URL、Room 消息或 checkout 登记里；后续 MCP 工具从当前绑定注入 `project_id` / `session_id` / `token`。
 - MCP 启动后的自动 Presence 仍然只表示进程在线，不等于当前模型对话已同步。
-- Web 任务筛选改为 待认领 / 已认领 / 执行中 / 阻塞 / 已提交 / 待验收，并保留全部、已完成、已取消。`phase` 由共享领域合同派生；已提交 Work Report 显示为「已提交」，已验证待集成显示为「待验收」。
+- Web 任务展示改为方案 D 投影：导航 7 入口（需要处理 / 待认领 / 进行中 / 待验收 / 待集成 / 已完成 / 已取消）+ 全部任务重置；`state_view.phase` 由共享领域合同派生，已提交 Work Report 显示「待验收」，已验证待集成显示「待集成」，被退回显示「已退回」，集成失败有独立入口。
 
 ## 2026-09-03 审查修复
 
@@ -32,7 +32,7 @@ AgentChatRoom 是一个面向异构 AI 编程 Agent 的项目级实时协作中�
 - 待受理、待定义阶段不能被普通 Agent 认领、提交 Work Report、独立 Review 或最终集成。
 - Project / Room 级新增稳定、唯一、后端生成的人类可读 `task_number`（从 1 开始，在写事务内通过 `task_number_sequences` 计数器分配，不能由前端传入；取消、改派、交接、验证和集成后保持不变，已分配号码不会被复用）。
 - 历史任务按 `created_at, id` 回填 `task_number`；内部 `task_<随机码>` ID 仍然保留。
-- REST、MCP、CLI、Web 共享同一领域服务和状态机；公开 Schema 版本升到 `6`。
+- REST、MCP、CLI、Web 共享同一领域服务和状态机；公开 Schema 版本升到 `7`。
 - Web 任务 Tab 文案改为「协作视图」并新增 Intake 列表、时间线、依赖只读、只读详情视图与时间线样式。
 - 用户侧移除了保存任务、依赖编辑、依赖勾选、交接和集成提交入口。
 
@@ -300,22 +300,30 @@ room_bootstrap
 
 Web「配置本机 Agent」把四件事实分开显示：软件配置、进程连接（MCP Presence）、Room Session、当前对话同步。浏览器无法观察某个模型对话是否已同步，因此不会把左侧「已连接」画成「当前对话已同步」。CLI `room-bootstrap` 复用同一领域服务，成功结果也不打印 Session Token。
 
-### Web 任务阶段筛选
+### Web 任务状态投影（方案 D v1）
 
-后端仍使用执行 / 验证 / 集成三面状态机；REST、MCP、CLI、持久化和 Web 共用派生字段 `phase`。Agent 不得自造阶段名。公开筛选阶段是：
+后端使用执行 / 验证 / 集成三面状态机（append-only，不因展示改动）；REST、MCP、CLI、持久化和 Web 共用 contracts.py 的版本化投影 `state_view`（`TASK_VIEW_PROJECTION` / `task_view_contract()`，schema version 2；公开 Schema 版本升到 `7`）。投影是确定性纯函数：输入仅 `(execution_status, verification_status, integration_status)`，输出 `phase`（唯一）、`group`、`needs_attention`、`primary_badge`、`auxiliary_badges`。核心只输出稳定语义代码，中文文案、分组与计数口径由 REST `/api/v1/config/public` 的 `domain.task_view` 版本化配置提供，四端按同一 schema version 消费；任何非法三元组或历史残留组合显式投影为 `unclassified` 并在服务端告警，不会被宽泛优先级伪装成正常阶段。`legacy_status` 仅作为只读兼容输出，新筛选与展示不得依赖它。
 
-| 阶段 | 含义 | Agent 提交入口 |
-| --- | --- | --- |
-| 待认领 `todo` | 正式任务尚未被认领 | `task_create` / intake define |
-| 已认领 `claimed` | 已指定执行者，尚未开始 | `task_claim` |
-| 执行中 `in_progress` | 正在执行 | `task_update status=in_progress` |
-| 阻塞 `blocked` | 执行受阻 | `task_update status=blocked` |
-| 已提交 `awaiting_review` | Work Report 已提交，待独立验证 | `work_report` |
-| 待验收 `verified` | 独立验证通过，待集成 | `review_submit verdict=approved` |
-| 已完成 `done` | 验证通过且集成完成 | `integration_submit result=done` |
-| 已取消 `cancelled` | 已取消，不再进入验证或集成 | `task_update status=cancelled` |
+11 个有效相位（P7 与 P11 共享 `pending_integration` 代码与「待集成」分组）：
 
-Web 任务列表按上述阶段分别筛选，并保留「全部」。任务卡片同时显示 `#<task_number>` 与 `P<priority>`，二者互不替代。公开语义上「已完成 = 验证通过 + 集成完成」。
+| 相位代码 | 展示 | 三元组 (E, V, I) | Agent 提交入口 |
+| --- | --- | --- | --- |
+| `todo` | 待认领 | (todo, not_required, pending) | `task_create` / intake define |
+| `claimed` | 已认领 | (claimed, not_required, pending) | `task_claim` |
+| `in_progress` | 执行中 | (in_progress, not_required, pending) | `task_update status=in_progress` |
+| `blocked` | 阻塞 | (blocked, not_required, pending) | `task_update status=blocked` |
+| `awaiting_review` | 待验收 | (completed, pending, pending) | `work_report` |
+| `changes_requested` | 已退回 | (todo/claimed/in_progress/blocked, changes_requested, pending) | `review_submit verdict=changes_requested` |
+| `pending_integration` | 待集成 | (completed, approved 或 not_required, pending) | `review_submit verdict=approved` |
+| `integration_failed` | 集成失败 | (completed, approved 或 not_required, failed) | `integration_submit result=failed` |
+| `done` | 已完成 | (completed, approved 或 not_required, done) | `integration_submit result=done` |
+| `cancelled` | 已取消 | (cancelled, *残留 V*, pending) | `task_update status=cancelled` |
+
+主徽章优先级（首条命中生效，且被验收退回的任务即使 execution 重新打开也显示「已退回」，不显示普通「执行中」）：集成失败 > 验收退回 > 阻塞 > 已取消 > 待认领 > 已认领 > 执行中 > 待验收 > 待集成 > 已完成 > 未归类；退回与阻塞并发时主徽章为「已退回」、辅徽章为「阻塞」。终态保护：`cancelled` 不被残留的验证/集成注意力字段覆盖。「已提交」只是 Work Report 提交事件（时间线可追溯），永不作为徽章或筛选出现；「已完成」仅指验证 + 集成均通过的终态。
+
+Web 任务模块导航是 7 个常驻入口 + 「全部任务」重置入口：需要处理（收件箱）/ 待认领 / 进行中 / 待验收 / 待集成 / 已完成 / 已取消。「需要处理」是查询而非状态：`changes_requested`、`blocked`、`integration_failed` 三类任务 ID 的去重并集（退回且阻塞只计一次），不含待认领；异常任务同时出现在收件箱与所属阶段组（双入口）。进行中组内子分组排序：修改中（红）→ 阻塞（橙）→ 执行中 → 已认领。列表头部提供精确筛选（执行 / 验收 / 集成 / 优先级 / 负责人 / 任务号 / 精确状态，任意组合）。任务卡片同时显示 `#<task_number>` 与 `P<priority>`，二者互不替代；详情页分别展示执行、验收、集成三维原值。
+
+REST `GET /api/v1/projects/{project_id}/tasks?phase=`、MCP `task_list(phase=…)`、CLI `task-list --phase=` 复用同一投影过滤：`phase` 接受任一相位代码或 `attention`（收件箱去重视图）。
 
 ### 任务证据链与分页历史
 

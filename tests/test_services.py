@@ -681,13 +681,13 @@ def test_task_contract_exposes_versioned_state(service, project):
         acceptance_criteria=["State contract is exposed"],
     )["task"]
 
-    assert task["schema_version"] == 6
+    assert task["schema_version"] == 7
     assert task["execution_status"] == "todo"
     assert task["verification_status"] == "not_required"
     assert task["integration_status"] == "pending"
     assert task["phase"] == "todo"
     assert task["state"] == {
-        "schema_version": 6,
+        "schema_version": 7,
         "execution_status": "todo",
         "verification_status": "not_required",
         "integration_status": "pending",
@@ -696,6 +696,17 @@ def test_task_contract_exposes_versioned_state(service, project):
         "completed": False,
         "verified": False,
         "integrated": False,
+    }
+    assert task["state_view"] == {
+        "schema_version": 2,
+        "phase": "todo",
+        "group": "claimable",
+        "needs_attention": False,
+        "primary_badge": "todo",
+        "auxiliary_badges": [],
+        "execution_status": "todo",
+        "verification_status": "not_required",
+        "integration_status": "pending",
     }
     assert task["assignments"] == []
     assert task["handoffs"] == []
@@ -715,7 +726,7 @@ def test_get_task_returns_one_complete_task(service, project):
     assert fetched["id"] == created["id"]
     assert fetched["title"] == "Read one task"
     assert fetched["acceptance_criteria"] == ["The exact task is returned"]
-    assert fetched["state"]["schema_version"] == 6
+    assert fetched["state"]["schema_version"] == 7
     assert fetched["assignments"] == []
     assert fetched["handoffs"] == []
     assert fetched["integrations"] == []

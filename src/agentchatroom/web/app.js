@@ -20,7 +20,8 @@ const state = {
   selectGeneration: 0,
   streamHadError: false,
   busyCount: 0,
-  taskFilter: "",
+  taskEntry: "",
+  taskExpert: { execution: "", verification: "", integration: "", priority: "", owner: "", number: "" },
   eventFilter: "all",
   taskIntakeTargets: [],
   taskIntakes: [],
@@ -346,87 +347,76 @@ function connectedAgentCount(agentIdentities) {
     .filter((agent) => agent.connection_status === "connected").length;
 }
 
-function bucketOf(task) {
-  if (task?.phase) return task.phase;
-  const execution = task?.execution_status || "";
-  const verification = task?.verification_status || "";
-  const integration = task?.integration_status || "";
-  if (execution === "cancelled" || task?.status === "cancelled") return "cancelled";
-  if (execution === "completed" && verification === "approved" && integration === "done") {
-    return "done";
-  }
-  if (verification === "approved" && integration !== "done") return "verified";
-  if (execution === "completed") return "awaiting_review";
-  if (execution === "blocked") return "blocked";
-  if (execution === "claimed") return "claimed";
-  if (execution === "in_progress") return "in_progress";
-  return "todo";
+function taskViewConfig() {
+  return state.config?.domain?.task_view || null;
 }
 
-function bucketLabel(bucket) {
+function taskView(task) {
+  const view = task?.state_view;
+  if (view) return view;
+  // Snapshot data always carries state_view; treat anything else as
+  // unclassified so unknown shapes surface instead of being guessed.
   return {
-    todo: "待认领",
-    claimed: "已认领",
-    in_progress: "执行中",
-    blocked: "阻塞",
-    awaiting_review: "已提交",
-    verified: "待验收",
-    pending_integration: "待验收",
-    done: "已完成",
-    cancelled: "已取消",
-  }[bucket] || bucket;
+    schema_version: 0,
+    phase: "unclassified",
+    group: "unclassified",
+    needs_attention: false,
+    primary_badge: "unclassified",
+    auxiliary_badges: [],
+    execution_status: task?.execution_status || "",
+    verification_status: task?.verification_status || "",
+    integration_status: task?.integration_status || "",
+  };
 }
 
-function taskStatus(status) {
-  return {
-    todo: "待认领", claimed: "已认领", in_progress: "进行中", blocked: "阻塞",
-    awaiting_review: "已提交", verified: "待验收", done: "已完成", cancelled: "已取消",
-  }[status] || status;
+function viewLabel(code) {
+  const labels = taskViewConfig()?.phase_labels || {};
+  return labels[code] || code;
 }
 
-function executionStatus(status, task) {
-  if (status === "completed" && task && bucketOf(task) === "awaiting_review") {
-    return "执行完成（已提交）";
-  }
-  if (status === "completed" && task && bucketOf(task) === "verified") {
-    return "执行完成（待验收）";
-  }
-  return {
-    todo: "待开始", claimed: "已认领", in_progress: "执行中", blocked: "阻塞",
-    completed: "执行完成", cancelled: "已取消",
-  }[status] || status;
+function viewGroupLabel(code) {
+  const labels = taskViewConfig()?.group_labels || {};
+  return labels[code] || code;
 }
 
-function verificationStatus(status) {
-  return {
-    not_required: "无需验证", pending: "待验证", changes_requested: "需修改", approved: "已通过",
-  }[status] || status;
+function viewFaceLabel(kind, code) {
+  const labels = taskViewConfig()?.[`${kind}_labels`] || {};
+  return labels[code] || code;
 }
 
 function taskPhaseLabel(task) {
-  return bucketLabel(bucketOf(task));
+  return viewLabel(taskView(task).phase);
 }
 
 function taskPhaseClass(task) {
-  return bucketOf(task);
+  return taskView(task).phase;
 }
 
-function taskDisplayLabel(task) {
-  const phase = taskPhaseLabel(task);
-  const status = taskStatus(task.status);
-  return status && status !== phase ? `${phase} · ${status}` : phase;
+function taskViewBadgeHtml(view) {
+  const auxiliary = (view.auxiliary_badges || [])
+    .map((code) => `<span class="status-badge aux ${escapeHtml(code)}">${escapeHtml(viewLabel(code))}</span>`)
+    .join("");
+  return `<span class="status-badge ${escapeHtml(view.phase)}">${escapeHtml(viewLabel(view.phase))}</span>${auxiliary}`;
 }
 
-function integrationStatus(status) {
-  return { pending: "待集成", done: "已集成", failed: "集成失败" }[status] || status;
+function legacyStatus(status) {
+  return viewFaceLabel("status", status);
 }
 
-function taskIntegrationStatus(task) {
-  return task.execution_status === "cancelled" ? "无需集成" : integrationStatus(task.integration_status);
+function executionFaceLabel(status) {
+  return viewFaceLabel("execution", status);
 }
 
-function taskIntegrationStatusClass(task) {
-  return task.execution_status === "cancelled" ? "not_required" : task.integration_status;
+function verificationFaceLabel(status) {
+  return viewFaceLabel("verification", status);
+}
+
+function integrationFaceLabel(status) {
+  return viewFaceLabel("integration", status);
+}
+
+function taskNeedsIntegration(task) {
+  return taskView(task).execution_status !== "cancelled";
 }
 
 function assignmentStatus(status) {
@@ -591,10 +581,11 @@ function rememberExpandedEvent(eventId) {
 }
 
 function resetProjectFilters() {
-  state.taskFilter = "";
+  state.taskEntry = "";
+  state.taskExpert = { execution: "", verification: "", integration: "", priority: "", owner: "", number: "" };
   state.eventFilter = "all";
-  document.querySelectorAll("#task-filter button").forEach((item) => {
-    item.classList.toggle("is-active", item.dataset.filter === "");
+  document.querySelectorAll("#task-navigation [data-task-entry]").forEach((item) => {
+    item.classList.toggle("is-active", item.dataset.taskEntry === "");
   });
   if (elements["event-filter"]) elements["event-filter"].value = "all";
 }
@@ -1016,9 +1007,9 @@ function renderAgents(agents) {
       const presenceLabel = connected ? "已连接" : "未连接";
       const currentTask = (state.snapshot?.tasks || []).find((task) => task.id === agent.current_task_id);
       const taskSummary = currentTask
-        ? `任务：${agent.current_task_title} · ${taskDisplayLabel(currentTask)}`
+        ? `任务：${agent.current_task_title} · ${taskPhaseLabel(currentTask)}`
         : agent.current_task_id
-          ? `任务：${agent.current_task_title} · ${taskStatus(agent.current_task_status)}`
+          ? `任务：${agent.current_task_title} · ${legacyStatus(agent.current_task_status)}`
           : "当前无任务";
       const details = `${agent.name}\n软件: ${agent.client}\n本次角色: ${agent.role}\n${connectionSummary}\n${taskSummary}\n最后心跳: ${heartbeat}\n最后活动: ${activity}`;
       return `
@@ -1036,18 +1027,23 @@ function renderAgents(agents) {
     : '<div class="empty-state">等待 Agent 通过 MCP 或 CLI 加入</div>';
 }
 
+function taskNotFinished(task) {
+  const group = taskView(task).group;
+  return !["done", "cancelled"].includes(group);
+}
+
 function renderMetrics(agents, tasks, leases) {
   const roster = currentAgentRoster(agents);
   elements["metric-agents"].textContent = roster.length;
-  elements["metric-active"].textContent = tasks.filter((task) => !["done", "cancelled"].includes(bucketOf(task))).length;
+  elements["metric-active"].textContent = tasks.filter(taskNotFinished).length;
   elements["metric-leases"].textContent = leases.length;
-  elements["metric-reviews"].textContent = tasks.filter((task) => task.status === "awaiting_review").length;
+  elements["metric-reviews"].textContent = tasks.filter((task) => taskView(task).needs_attention).length;
 
-  const active = tasks.filter((task) => !["done", "cancelled"].includes(bucketOf(task))).slice(0, 6);
+  const active = tasks.filter(taskNotFinished).slice(0, 6);
   elements["active-task-list"].innerHTML = active.length
     ? active.map((task) => `
       <div class="compact-item">
-        <div class="task-meta"><span class="task-number">任务 #${task.task_number}</span><span class="priority p${task.priority}">P${task.priority}</span><span class="status-badge ${escapeHtml(taskPhaseClass(task))}">${escapeHtml(taskPhaseLabel(task))}</span></div>
+        <div class="task-meta"><span class="task-number">任务 #${task.task_number}</span><span class="priority p${task.priority}">P${task.priority}</span>${taskViewBadgeHtml(taskView(task))}</div>
         <p><strong>${escapeHtml(task.title)}</strong></p>
       </div>`).join("")
     : '<div class="empty-state">当前没有进行中的工作。点「+ 新建任务」把第一件事交给受理 Agent。</div>';
@@ -1069,24 +1065,148 @@ function renderMetrics(agents, tasks, leases) {
     : '<div class="empty-state">还没有动态。Agent 加入、认领任务、提交报告都会按时间显示在这里。</div>';
 }
 
+function taskNavigationEntries(tasks) {
+  const config = taskViewConfig();
+  const counts = { attention: 0 };
+  const attentionIds = new Set();
+  for (const task of tasks) {
+    const view = taskView(task);
+    counts[view.group] = (counts[view.group] || 0) + 1;
+    if (view.needs_attention) attentionIds.add(task.id);
+  }
+  counts.attention = attentionIds.size;
+  const entries = [
+    { key: "", label: "全部任务", count: tasks.length, kind: "reset" },
+    { key: "attention", label: config?.attention_label || "需要处理", count: counts.attention || 0, kind: "attention" },
+    ...["claimable", "active", "review", "integration", "done", "cancelled"]
+      .map((group) => ({ key: group, label: viewGroupLabel(group), count: counts[group] || 0, kind: "group" })),
+  ];
+  const unclassified = counts.unclassified || 0;
+  if (unclassified) {
+    entries.push({ key: "unclassified", label: viewGroupLabel("unclassified"), count: unclassified, kind: "group warning" });
+  }
+  return entries;
+}
+
+function activeSubgroupRank(phase) {
+  const order = taskViewConfig()?.active_subgroup_order || ["changes_requested", "blocked", "in_progress", "claimed"];
+  const index = order.indexOf(phase);
+  return index === -1 ? order.length : index;
+}
+
+function sortForEntry(tasks, entry) {
+  const sorted = [...tasks];
+  if (entry.key === "attention") {
+    const phaseOrder = { integration_failed: 0, changes_requested: 1, blocked: 2 };
+    sorted.sort((left, right) => {
+      const leftPhase = taskView(left).phase;
+      const rightPhase = taskView(right).phase;
+      return (phaseOrder[leftPhase] ?? 9) - (phaseOrder[rightPhase] ?? 9);
+    });
+    return sorted;
+  }
+  if (entry.key === "active") {
+    sorted.sort((left, right) => {
+      const leftView = taskView(left);
+      const rightView = taskView(right);
+      return activeSubgroupRank(leftView.phase) - activeSubgroupRank(rightView.phase);
+    });
+    return sorted;
+  }
+  return sorted;
+}
+
+function matchesEntry(task, entry) {
+  const view = taskView(task);
+  if (entry.key === "") return true;
+  if (entry.key === "attention") return view.needs_attention;
+  return view.group === entry.key;
+}
+
+function matchesExpert(task, expert) {
+  const view = taskView(task);
+  if (expert.execution && view.execution_status !== expert.execution) return false;
+  if (expert.verification && view.verification_status !== expert.verification) return false;
+  if (expert.integration && view.integration_status !== expert.integration) return false;
+  if (expert.priority !== "" && String(task.priority) !== String(expert.priority)) return false;
+  if (expert.owner && (task.owner_session_id || "") !== expert.owner) return false;
+  if (expert.number && String(task.task_number) !== String(expert.number).trim()) return false;
+  return true;
+}
+
+function renderTaskNavigation(tasks) {
+  const container = document.getElementById("task-navigation");
+  if (!container) return;
+  const entries = taskNavigationEntries(tasks);
+  container.innerHTML = entries.map((entry) => `
+    <button type="button" class="${entry.kind.startsWith("attention") ? "attention-entry" : entry.kind} ${state.taskEntry === entry.key ? "is-active" : ""}" data-task-entry="${escapeHtml(entry.key)}">
+      ${escapeHtml(entry.label)}<span class="entry-count">${entry.count}</span>
+    </button>`).join("");
+}
+
+function renderTaskExpertFilters(tasks) {
+  const container = document.getElementById("task-expert-filters");
+  if (!container) return;
+  const expert = state.taskExpert;
+  const names = Object.fromEntries((state.snapshot?.agents || []).map((agent) => [agent.id, agent.name]));
+  const owners = [...new Set(tasks.map((task) => task.owner_session_id).filter(Boolean))]
+    .map((id) => `<option value="${escapeHtml(id)}" ${expert.owner === id ? "selected" : ""}>${escapeHtml(names[id] || shortId(id))}</option>`)
+    .join("");
+  const options = (kind, codes) => codes
+    .map((code) => `<option value="${escapeHtml(code)}" ${expert[kind] === code ? "selected" : ""}>${escapeHtml(kind === "phase" ? viewLabel(code) : viewFaceLabel(kind, code))}</option>`)
+    .join("");
+  const phases = taskViewConfig()?.phases || [];
+  const executionCodes = taskViewConfig()?.phases
+    ? ["todo", "claimed", "in_progress", "blocked", "completed", "cancelled"]
+    : [];
+  container.innerHTML = `
+    <label>执行<select data-expert="execution"><option value="">全部</option>${options("execution", executionCodes)}</select></label>
+    <label>验收<select data-expert="verification"><option value="">全部</option>${options("verification", ["not_required", "pending", "changes_requested", "approved"])}</select></label>
+    <label>集成<select data-expert="integration"><option value="">全部</option>${options("integration", ["pending", "done", "failed"])}</select></label>
+    <label>优先级<select data-expert="priority"><option value="">全部</option>${[0, 1, 2, 3, 4].map((value) => `<option value="${value}" ${expert.priority !== "" && String(expert.priority) === String(value) ? "selected" : ""}>P${value}</option>`).join("")}</select></label>
+    <label>负责人<select data-expert="owner"><option value="">全部</option>${owners}</select></label>
+    <label>任务号<input type="search" inputmode="numeric" placeholder="#号" data-expert="number" value="${escapeHtml(expert.number)}"></label>
+    ${phases.length ? `<label>精确状态<select data-expert="phase"><option value="">全部</option>${options("phase", phases)}</select></label>` : ""}`;
+}
+
 function renderTasks(tasks) {
-  const filtered = state.taskFilter ? tasks.filter((task) => bucketOf(task) === state.taskFilter) : tasks;
+  renderTaskNavigation(tasks);
+  renderTaskExpertFilters(tasks);
+  renderTaskTable(tasks);
+}
+
+function renderTaskTable(tasks) {
+  const entry = taskNavigationEntries(tasks).find((item) => item.key === state.taskEntry) || { key: "" };
+  const expert = state.taskExpert;
+  const expertActive = Object.values(expert).some((value) => value !== "");
+  let filtered = tasks.filter((task) => matchesEntry(task, entry));
+  if (expertActive) {
+    const exactPhase = expert.phase;
+    filtered = filtered.filter((task) => {
+      if (!matchesExpert(task, expert)) return false;
+      if (exactPhase && taskView(task).phase !== exactPhase) return false;
+      return true;
+    });
+  }
+  filtered = sortForEntry(filtered, entry);
   const names = Object.fromEntries((state.snapshot?.agents || []).map((agent) => [agent.id, agent.name]));
   elements["task-table"].innerHTML = filtered.length
-    ? filtered.map((task) => `
-      <button class="task-row" type="button" data-task-id="${escapeHtml(task.id)}">
+    ? filtered.map((task) => {
+      const view = taskView(task);
+      return `
+      <button class="task-row ${view.needs_attention ? "needs-attention" : ""}" type="button" data-task-id="${escapeHtml(task.id)}">
         <span class="task-number">#${task.task_number}</span>
         <div>
           <h3>${escapeHtml(task.title)}</h3>
           <p>${escapeHtml(task.description || task.acceptance_criteria.join(" · ") || "尚未填写正式说明")}${task.current_step ? ` · 当前：${escapeHtml(task.current_step)}` : ""}${task.blocker_reason ? ` · 阻塞：${escapeHtml(task.blocker_reason)}` : ""}</p>
         </div>
         <div class="task-meta">
-          <span class="status-badge ${escapeHtml(taskPhaseClass(task))}">${escapeHtml(taskPhaseLabel(task))}</span>
           <span class="priority p${task.priority}">P${task.priority}</span>
-          ${taskStatus(task.status) !== taskPhaseLabel(task) ? `<span class="status-badge ${escapeHtml(task.status)}">${escapeHtml(taskStatus(task.status))}</span>` : ""}
+          ${taskViewBadgeHtml(view)}
           <span class="secondary-text">${task.progress_percent}%${task.owner_session_id ? ` · ${escapeHtml(names[task.owner_session_id] || shortId(task.owner_session_id))}` : " · 尚未指定 Agent"}${task.depends_on?.length ? ` · 依赖 ${task.depends_on.length} 项` : ""}</span>
         </div>
-      </button>`).join("")
+      </button>`;
+    }).join("")
     : '<div class="empty-state">当前筛选下没有正式任务。新提交的原始意图会显示在下方，等待 Agent 受理和定义。</div>';
 }
 
@@ -1130,7 +1250,7 @@ function renderLeases(leases, agents) {
 
 function renderReviews(tasks, agents) {
   const names = Object.fromEntries(agents.map((agent) => [agent.id, agent.name]));
-  const awaiting = tasks.filter((task) => task.status === "awaiting_review");
+  const awaiting = tasks.filter((task) => taskView(task).phase === "awaiting_review");
   const completed = state.snapshot.reviews.slice(0, 8);
   const items = [
     ...awaiting.map((task) => ({ type: "awaiting", task })),
@@ -1139,7 +1259,7 @@ function renderReviews(tasks, agents) {
   elements["review-list"].innerHTML = items.length
     ? items.map((item) => item.type === "awaiting" ? `
       <article class="review-item">
-        <div class="task-meta"><span class="status-badge ${escapeHtml(taskPhaseClass(item.task))}">${escapeHtml(taskDisplayLabel(item.task))}</span><strong>${escapeHtml(item.task.title)}</strong></div>
+        <div class="task-meta"><span class="status-badge ${escapeHtml(taskPhaseClass(item.task))}">${escapeHtml(taskPhaseLabel(item.task))}</span><strong>${escapeHtml(item.task.title)}</strong></div>
         <p>等待独立 Agent 检查 ${item.task.acceptance_criteria.length} 条验收条件</p>
         ${renderReportEvidence(item.task.id)}
       </article>` : `
@@ -1348,7 +1468,7 @@ function renderEvents(agents, tasks) {
       const conflict = event.event_type === "lease.conflict"
         ? ` · ${escapeHtml(event.payload?.path_pattern || "")} 与 ${escapeHtml((event.payload?.conflicts || []).map((item) => `${item.agent_name}:${item.path_pattern}`).join("、"))} 冲突`
         : "";
-      return `<div class="system-event">${eventIdBadge(event.id)} <strong>${escapeHtml(agent?.name || "系统")}</strong> ${escapeHtml(eventLabel(event.event_type))}${task ? ` · ${escapeHtml(task.title)} · ${escapeHtml(taskDisplayLabel(task))}` : ""}${conflict} <span>· ${escapeHtml(formatTime(event.created_at))}</span></div>`;
+      return `<div class="system-event">${eventIdBadge(event.id)} <strong>${escapeHtml(agent?.name || "系统")}</strong> ${escapeHtml(eventLabel(event.event_type))}${task ? ` · ${escapeHtml(task.title)} · ${escapeHtml(taskPhaseLabel(task))}` : ""}${conflict} <span>· ${escapeHtml(formatTime(event.created_at))}</span></div>`;
     }).join("")
     : '<div class="empty-state">当前筛选下没有动态</div>';
   const notice = elements["new-message-notice"];
@@ -1664,12 +1784,28 @@ document.querySelector(".tabs").addEventListener("keydown", (event) => {
   activateTab(tabs[nextIndex]);
 });
 
-document.getElementById("task-filter").addEventListener("click", (event) => {
-  const button = event.target.closest("[data-filter]");
+document.getElementById("task-navigation").addEventListener("click", (event) => {
+  const button = event.target.closest("[data-task-entry]");
   if (!button) return;
-  state.taskFilter = button.dataset.filter;
-  document.querySelectorAll("#task-filter button").forEach((item) => item.classList.toggle("is-active", item === button));
-  if (state.snapshot) renderTasks(state.snapshot.tasks);
+  state.taskEntry = button.dataset.taskEntry;
+  document.querySelectorAll("#task-navigation [data-task-entry]").forEach((item) => {
+    item.classList.toggle("is-active", item === button);
+  });
+  if (state.snapshot) renderTaskTable(state.snapshot.tasks);
+});
+
+document.getElementById("task-expert-filters").addEventListener("change", (event) => {
+  const field = event.target.dataset.expert;
+  if (!field || field === "number") return;
+  state.taskExpert[field] = event.target.value;
+  if (state.snapshot) renderTaskTable(state.snapshot.tasks);
+});
+
+document.getElementById("task-expert-filters").addEventListener("input", (event) => {
+  const field = event.target.dataset.expert;
+  if (field !== "number") return;
+  state.taskExpert.number = event.target.value;
+  if (state.snapshot) renderTaskTable(state.snapshot.tasks);
 });
 
 elements["task-history-filter"].addEventListener("change", () => {
@@ -2023,7 +2159,7 @@ function handleError(error) {
 
 function renderMessageTaskOptions(tasks) {
   const selected = elements["message-task"].value;
-  const candidates = tasks.filter((task) => !["done", "cancelled"].includes(task.status));
+  const candidates = tasks.filter((task) => taskNotFinished(task));
   elements["message-task"].innerHTML = [
     '<option value="">不关联任务</option>',
     ...candidates.map((task) => `<option value="${escapeHtml(task.id)}">任务 #${task.task_number} · ${escapeHtml(task.title)}</option>`),
@@ -2224,15 +2360,23 @@ async function loadTaskHistory(taskId, { direction } = {}) {
 function renderTaskContract(task) {
   const dependencies = task.dependency_details || [];
   const criteria = task.acceptance_criteria || [];
-  const statusSummary = `${taskPhaseLabel(task)} · ${taskStatus(task.status)} · ${executionStatus(task.execution_status, task)} · ${verificationStatus(task.verification_status)} · ${taskIntegrationStatus(task)}`;
+  const view = taskView(task);
+  const phaseSummary = [
+    `阶段：${viewLabel(view.phase)}`,
+    view.group !== view.phase ? `分组：${viewGroupLabel(view.group)}` : "",
+    view.needs_attention ? "已进入需要处理收件箱" : "",
+  ].filter(Boolean).join(" · ");
   elements["task-detail-heading"].textContent = `任务 #${task.task_number} · ${task.title}`;
   elements["task-detail-contract"].innerHTML = `
     <div class="task-contract-header">
       <div><span class="task-number">任务 #${task.task_number}</span><span class="secondary-text">内部 ID：${escapeHtml(task.id)}</span></div>
-      <div class="task-meta"><span class="priority p${task.priority}">P${task.priority}</span><span class="status-badge ${escapeHtml(taskPhaseClass(task))}">${escapeHtml(taskPhaseLabel(task))}</span></div>
+      <div class="task-meta"><span class="priority p${task.priority}">P${task.priority}</span>${taskViewBadgeHtml(view)}</div>
     </div>
     <dl class="task-contract-grid">
-      <div><dt>执行状态</dt><dd>${escapeHtml(statusSummary)}</dd></div>
+      <div><dt>当前阶段</dt><dd>${escapeHtml(phaseSummary)}</dd></div>
+      <div><dt>执行状态</dt><dd>${escapeHtml(`${view.execution_status} · ${executionFaceLabel(view.execution_status)}`)}</dd></div>
+      <div><dt>验收状态</dt><dd>${escapeHtml(`${view.verification_status} · ${verificationFaceLabel(view.verification_status)}`)}</dd></div>
+      <div><dt>集成状态</dt><dd>${escapeHtml(`${view.integration_status} · ${integrationFaceLabel(view.integration_status)}`)}</dd></div>
       <div><dt>完成度</dt><dd>${escapeHtml(`${task.progress_percent}%`)}</dd></div>
       <div><dt>当前步骤</dt><dd>${escapeHtml(task.current_step || "暂无")}</dd></div>
       <div><dt>下一步</dt><dd>${escapeHtml(task.next_step || "暂无")}</dd></div>
@@ -2261,7 +2405,7 @@ async function openTaskDetails(taskId, options = {}) {
   renderTaskContract(task);
   renderTaskAssignments(task);
   renderTaskTimeline(task);
-  elements["task-assign-button"].disabled = ["cancelled", "done"].includes(task.status);
+  elements["task-assign-button"].disabled = ["done", "cancelled"].includes(taskView(task).phase);
   elements["task-edit-dialog"].showModal();
   try {
     await loadTaskHistory(taskId);

@@ -64,9 +64,21 @@ def test_health_and_project_room_flow(settings, project_dir):
         assert public_config.json()["domain"]["bootstrap_required_actions"][
             "identity_not_configured"
         ] == "open_local_mcp_config_assistant"
-        assert public_config.json()["domain"]["schema_version"] == 6
+        assert public_config.json()["domain"]["schema_version"] == 7
         assert public_config.json()["domain"]["task_phases"][0] == "todo"
-        assert public_config.json()["domain"]["task_phase_labels"]["awaiting_review"] == "已提交"
+        task_view_config = public_config.json()["domain"]["task_view"]
+        assert task_view_config["schema_version"] == 2
+        assert task_view_config["phases"][0] == "todo"
+        assert "unclassified" in task_view_config["phases"]
+        assert task_view_config["phase_labels"]["awaiting_review"] == "待验收"
+        assert task_view_config["phase_labels"]["changes_requested"] == "已退回"
+        assert task_view_config["phase_labels"]["pending_integration"] == "待集成"
+        assert task_view_config["attention_label"] == "需要处理"
+        assert set(task_view_config["attention_phases"]) == {
+            "changes_requested",
+            "blocked",
+            "integration_failed",
+        }
         assert public_config.json()["domain"]["task_phase_commands"]["awaiting_review"] == "work_report"
         assert public_config.json()["domain"]["agent_connection_statuses"] == [
             "connected",

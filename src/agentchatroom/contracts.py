@@ -5,7 +5,7 @@ from typing import Any
 from typing_extensions import NotRequired, TypedDict
 
 
-DOMAIN_SCHEMA_VERSION = 6
+DOMAIN_SCHEMA_VERSION = 7
 PROJECT_MEMBER_SCHEMA_VERSION = 1
 KNOWLEDGE_SCHEMA_VERSION = 1
 MODEL_DISPLAY_NAME_MAX_LENGTH = 160
@@ -49,36 +49,174 @@ TASK_VERIFICATION_STATUSES = {
     "approved",
 }
 TASK_INTEGRATION_STATUSES = {"pending", "done", "failed"}
-TASK_PHASES = (
+
+# ---------------------------------------------------------------------------
+# Versioned task view projection (Plan D, event #2788 + #2795 corrections).
+#
+# L2 projection layer: a pure, deterministic function of the three canonical
+# state faces (execution x verification x integration). It emits stable
+# semantic codes only — no localized text, colors, icons, or themes live in
+# the domain layer. Presentation metadata is served as versioned config by
+# the REST adapter and consumed by REST / MCP / CLI / Web alike.
+# ---------------------------------------------------------------------------
+TASK_VIEW_SCHEMA_VERSION = 2
+
+# The 11 valid phases of the Plan D phase table. P7 (completed, approved,
+# pending) and P11 (completed, not_required, pending) share the
+# "pending_integration" phase code and the integration navigation group.
+TASK_VIEW_PHASES = (
     "todo",
     "claimed",
     "in_progress",
     "blocked",
     "awaiting_review",
-    "verified",
+    "changes_requested",
+    "pending_integration",
+    "integration_failed",
     "done",
     "cancelled",
 )
-TASK_PHASE_FILTERS = TASK_PHASES
-TASK_PHASE_LABELS = {
-    "todo": "待认领",
-    "claimed": "已认领",
-    "in_progress": "执行中",
-    "blocked": "阻塞",
-    "awaiting_review": "已提交",
-    "verified": "待验收",
-    "done": "已完成",
-    "cancelled": "已取消",
+TASK_VIEW_UNCLASSIFIED_PHASE = "unclassified"
+TASK_VIEW_ALL_PHASES = (*TASK_VIEW_PHASES, TASK_VIEW_UNCLASSIFIED_PHASE)
+
+# Navigation groups (vertical slices); attention is a query, never a state.
+TASK_VIEW_GROUPS = {
+    "todo": "claimable",
+    "claimed": "active",
+    "in_progress": "active",
+    "blocked": "active",
+    "changes_requested": "active",
+    "awaiting_review": "review",
+    "pending_integration": "integration",
+    "integration_failed": "integration",
+    "done": "done",
+    "cancelled": "cancelled",
+    "unclassified": "unclassified",
 }
+TASK_VIEW_GROUP_CODES = (
+    "claimable",
+    "active",
+    "review",
+    "integration",
+    "done",
+    "cancelled",
+    "unclassified",
+)
+
+# Inbox semantics: exactly the three anomaly phases ("something is wrong").
+# todo stays out because 待认领 already has its own navigation entry.
+TASK_VIEW_ATTENTION_PHASES = {"changes_requested", "blocked", "integration_failed"}
+
+# Terminal-state guard: a cancelled task must never be masked by stale
+# verification/integration residue carried over from earlier phases.
+TASK_VIEW_CANCELLED_VERIFICATION_STATUSES = set(TASK_VERIFICATION_STATUSES)
+
+# "修改中" also covers released-after-review tasks returning to the pool as
+# (todo, changes_requested, pending) — contract of task #43.
+_TASK_VIEW_REOPEN_EXECUTION_STATUSES = {"todo", "claimed", "in_progress", "blocked"}
+_TASK_VIEW_CLOSED_VERIFICATION = {"approved", "not_required"}
+
+
+def task_view(
+    *,
+    execution_status: str,
+    verification_status: str,
+    integration_status: str,
+) -> dict[str, Any]:
+    """Project the three state faces onto stable view codes.
+
+    Deterministic pure function: input is exactly the (E, V, I) triple, output
+    carries phase / group / needs_attention / badge codes only. Unknown or
+    illegal combinations fall through to the explicit "unclassified" phase so
+    that new states or legacy residue are surfaced instead of being silently
+    disguised as a normal phase.
+    """
+    execution = str(execution_status)
+    verification = str(verification_status)
+    integration = str(integration_status)
+    if execution == "cancelled" and integration == "pending":
+        phase = "cancelled"
+    elif (
+        execution == "completed"
+        and verification in _TASK_VIEW_CLOSED_VERIFICATION
+        and integration == "done"
+    ):
+        phase = "done"
+    elif (
+        execution == "completed"
+        and verification in _TASK_VIEW_CLOSED_VERIFICATION
+        and integration == "failed"
+    ):
+        phase = "integration_failed"
+    elif (
+        verification == "changes_requested"
+        and execution in _TASK_VIEW_REOPEN_EXECUTION_STATUSES
+        and integration == "pending"
+    ):
+        phase = "changes_requested"
+    elif (
+        execution == "completed"
+        and verification == "pending"
+        and integration == "pending"
+    ):
+        phase = "awaiting_review"
+    elif (
+        execution == "completed"
+        and verification in _TASK_VIEW_CLOSED_VERIFICATION
+        and integration == "pending"
+    ):
+        phase = "pending_integration"
+    elif (
+        execution in _TASK_VIEW_REOPEN_EXECUTION_STATUSES
+        and verification == "not_required"
+        and integration == "pending"
+    ):
+        phase = execution
+    else:
+        phase = TASK_VIEW_UNCLASSIFIED_PHASE
+    auxiliary = []
+    if phase == "changes_requested" and execution == "blocked":
+        auxiliary.append("blocked")
+    return {
+        "schema_version": TASK_VIEW_SCHEMA_VERSION,
+        "phase": phase,
+        "group": TASK_VIEW_GROUPS[phase],
+        "needs_attention": phase in TASK_VIEW_ATTENTION_PHASES,
+        "primary_badge": phase,
+        "auxiliary_badges": auxiliary,
+        "execution_status": execution,
+        "verification_status": verification,
+        "integration_status": integration,
+    }
+
+
+def task_view_contract(
+    *,
+    execution_status: str,
+    verification_status: str,
+    integration_status: str,
+) -> dict[str, Any]:
+    """Alias kept for the contract name used in the Plan D spec (event #2788)."""
+    return task_view(
+        execution_status=execution_status,
+        verification_status=verification_status,
+        integration_status=integration_status,
+    )
+
+TASK_PHASES = TASK_VIEW_ALL_PHASES
+TASK_PHASE_FILTERS = TASK_PHASES
 TASK_PHASE_COMMANDS = {
-    "todo": "create or define a task; it stays unclaimed until task_claim",
+    "todo": "create or define a task; it stays unclaimed until task_claim; task_release returns an owned task here",
     "claimed": "task_claim",
     "in_progress": "task_update status=in_progress",
     "blocked": "task_update status=blocked",
     "awaiting_review": "work_report",
-    "verified": "review_submit verdict=approved",
+    "changes_requested": "review_submit verdict=changes_requested",
+    "pending_integration": "review_submit verdict=approved",
+    "integration_failed": "integration_submit result=failed",
     "done": "integration_submit result=done",
     "cancelled": "task_update status=cancelled",
+    "unclassified": "not reachable through state machine commands; surfaced for legacy or invalid data",
 }
 TASK_INTAKE_STATUSES = {
     "pending",
@@ -96,6 +234,16 @@ TASK_INTAKE_TRANSITIONS = {
     "blocked": {"blocked", "pending", "cancelled"},
     "cancelled": {"cancelled"},
 }
+
+TASK_RELEASE_REASON_CODES = {
+    "quota_exhausted",
+    "agent_unavailable",
+    "user_requested",
+    "reassignment_needed",
+    "other",
+}
+TASK_RELEASE_EXECUTION_STATUSES = {"claimed", "in_progress", "blocked"}
+TASK_RELEASE_COMPAT_REASON_CODE = "other"
 
 ASSIGNMENT_STATUSES = {"pending", "accepted", "declined", "blocked", "cancelled"}
 ASSIGNMENT_RESPONSES = {"accepted", "declined", "blocked"}
@@ -198,26 +346,19 @@ def task_phase(
     integration_status: str,
     status: str = "",
 ) -> str:
-    """Derive the shared user-facing phase from the three task state faces."""
-    if execution_status == "cancelled" or status == "cancelled":
-        return "cancelled"
-    if (
-        execution_status == "completed"
-        and verification_status == "approved"
-        and integration_status == "done"
-    ):
-        return "done"
-    if verification_status == "approved" and integration_status != "done":
-        return "verified"
-    if execution_status == "completed":
-        return "awaiting_review"
-    if execution_status == "blocked":
-        return "blocked"
-    if execution_status == "claimed":
-        return "claimed"
-    if execution_status == "in_progress":
-        return "in_progress"
-    return "todo"
+    """Legacy phase accessor, kept as a read-only compatible output.
+
+    Delegates to the versioned task_view projection so every consumer sees
+    the same phase code; the previous hand-rolled mapping (which masked
+    pending_integration and integration_failed as verified/awaiting_review)
+    is retired by this delegation.
+    """
+    del status  # legacy_status must not drive the projection
+    return task_view(
+        execution_status=execution_status,
+        verification_status=verification_status,
+        integration_status=integration_status,
+    )["phase"]
 
 
 def task_state_for_legacy_status(
