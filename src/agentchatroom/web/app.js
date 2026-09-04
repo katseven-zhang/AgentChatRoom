@@ -1096,13 +1096,17 @@ function renderAgents(agents) {
         : agent.current_task_id
           ? `任务：${agent.current_task_title} · ${legacyStatus(agent.current_task_status)}`
           : "当前无任务";
-      const details = `${agent.name}\n软件: ${agent.client}\n本次角色: ${agent.role}\n${connectionSummary}\n${taskSummary}\n最后心跳: ${heartbeat}\n最后活动: ${activity}`;
+      // 统一模型标签：后端未上报任何模型时明确显示 unknown，不猜测。
+      const { models: identityModels } = agent;
+      const modelList = Array.isArray(identityModels) ? identityModels.filter(Boolean) : [];
+      const modelLabel = modelList.length ? modelList.join(" / ") : "unknown";
+      const details = `${agent.name}\n软件: ${agent.client}\n本次角色: ${agent.role}\n模型: ${modelLabel}\n${connectionSummary}\n${taskSummary}\n最后心跳: ${heartbeat}\n最后活动: ${activity}`;
       return `
       <div class="agent-item ${connected ? "" : "is-disconnected"}" title="${escapeHtml(details)}">
         <span class="agent-avatar ${avatarColorClass(agent.id)}">${escapeHtml(initials(agent.name))}</span>
         <span class="agent-copy">
           <strong>${escapeHtml(agent.name)}${agent.unread_count ? ` <span class="unread-count" title="未读事件数：该 Agent 最前沿 Session 的已读游标之后、尚未同步的 Room 事件数">${agent.unread_count}</span>` : ""}</strong>
-          <small>${escapeHtml(agent.client)} · ${escapeHtml(agent.role)}</small>
+          <small>${escapeHtml(agent.client)} · ${escapeHtml(agent.role)} · 模型 ${escapeHtml(modelLabel)}</small>
           <small>${escapeHtml(taskSummary)}</small>
           <small>心跳 ${escapeHtml(heartbeat)} · 活动 ${escapeHtml(activity)}</small>
         </span>

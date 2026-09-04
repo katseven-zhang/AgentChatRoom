@@ -770,3 +770,77 @@ def test_web_feed_uses_safe_structured_renderer():
     # The Room feed must go through the fallback wrapper, never the raw renderer.
     assert "renderMessageBodySafely(event.id, event.payload?.body || \"\")" in javascript
     assert 'renderMessageBody(event.id, event.payload?.body' not in javascript
+
+
+def test_web_agent_cards_use_unified_projection_with_model_fallback(tmp_path):
+    """Regression for task #53: every agent card renders the same field
+    sequence (name, client · role · model, task context, heartbeat) from
+    the shared identity projection, with an explicit `unknown` model when
+    the backend reports none — and never branches on vendor names."""
+    javascript = (WEB_DIR / "app.js").read_text(encoding="utf-8")
+    start = javascript.index("function renderAgents(agents)")
+    end = javascript.index("function taskNotFinished(task)", start)
+
+    harness = tmp_path / "agent_cards_harness.js"
+    harness.write_text(
+        "const state = { snapshot: { tasks: [] } };\n"
+        "function escapeHtml(value) { return String(value ?? ''); }\n"
+        "function shortId(value) { return String(value); }\n"
+        "function initials() { return 'AB'; }\n"
+        "function avatarColorClass() { return 'a'; }\n"
+        "function formatRelativeTime() { return '刚刚'; }\n"
+        "function legacyStatus(status) { return String(status); }\n"
+        "function taskPhaseLabel() { return '待认领'; }\n"
+        "function currentAgentRoster(agents) { return agents; }\n"
+        "const captured = {};\n"
+        "const document = { getElementById: (id) => ({ set innerHTML(value) { captured[id] = value; }, get innerHTML() { return captured[id] || ''; }, set textContent(value) { captured[id + ':text'] = value; } }) };\n"
+        "const elements = new Proxy({}, { get: (target, key) => document.getElementById(key) });\n"
+        + javascript[start:end]
+        + "\n"
+        + r"""
+const agents = [
+  {
+    id: 'a1', name: 'Alpha', client: 'codex', role: 'executor',
+    connection_status: 'connected', session_count: 5, models: ['GPT-5'],
+    last_heartbeat: 'now', last_activity_at: 'now', unread_count: 0,
+  },
+  {
+    id: 'a2', name: 'Beta', client: 'trae', role: 'reviewer',
+    connection_status: 'disconnected', session_count: 2, models: [],
+    last_heartbeat: 'earlier', last_activity_at: 'earlier', unread_count: 3,
+  },
+  {
+    id: 'a3', name: 'Gamma', client: 'workbuddy', role: 'executor',
+    connection_status: 'disconnected', session_count: 1, models: null,
+    last_heartbeat: 'old', last_activity_at: 'old', unread_count: 0,
+  },
+];
+renderAgents(agents);
+const html = captured['agent-list'];
+const outcomes = {};
+outcomes.rendersAllThree = (html.match(/agent-item/g) || []).length === 3;
+outcomes.modelShown = html.includes('模型 GPT-5');
+outcomes.unknownFallbacks = (html.match(/模型 unknown/g) || []).length === 2;
+outcomes.unifiedClientRoleLine = (html.match(/· 模型 /g) || []).length === 3;
+outcomes.disconnectedBadge = html.includes('已接入 · 未连接');
+outcomes.offlineSortedLast = html.indexOf('agent-item') < html.indexOf('is-disconnected');
+// 模型缺失必须显式 unknown；渲染层绝不硬编码厂商名或猜测模型。
+console.log(JSON.stringify(outcomes));
+""",
+        encoding="utf-8",
+    )
+    run = subprocess.run(["node", str(harness)], capture_output=True, text=True, encoding="utf-8")
+    assert run.returncode == 0, f"node harness failed: {run.stderr[-2000:]}"
+    outcomes = json.loads(run.stdout)
+    assert outcomes == {
+        "rendersAllThree": True,
+        "modelShown": True,
+        "unknownFallbacks": True,
+        "unifiedClientRoleLine": True,
+        "disconnectedBadge": True,
+        "offlineSortedLast": True,
+    }
+    # 渲染层不得按厂商名分支：renderAgents 段不允许出现厂商字面量比较。
+    agent_section = javascript[start:end]
+    vendor_pattern = re.compile(r"""(===|!==)\s*["'](codex|workbuddy|grok|trae)""", re.I)
+    assert not vendor_pattern.search(agent_section)
