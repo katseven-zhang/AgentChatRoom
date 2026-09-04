@@ -872,6 +872,7 @@ function renderTasks(tasks) {
     ? filtered.map((task) => `
       <button class="task-row" type="button" data-task-id="${escapeHtml(task.id)}">
         <span class="task-number">#${task.task_number}</span>
+          <span class="priority p${task.priority}">P${task.priority}</span>
         <div>
           <h3>${escapeHtml(task.title)}</h3>
           <p>${escapeHtml(task.description || task.acceptance_criteria.join(" · ") || "尚未填写正式说明")}${task.current_step ? ` · 当前：${escapeHtml(task.current_step)}` : ""}${task.blocker_reason ? ` · 阻塞：${escapeHtml(task.blocker_reason)}` : ""}</p>

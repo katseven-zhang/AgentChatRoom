@@ -96,6 +96,18 @@ def test_web_treats_cancelled_tasks_as_not_requiring_integration():
     assert '!["todo", "done", "cancelled"].includes(task.status)' in javascript
 
 
+def test_web_task_list_renders_task_number_and_priority_together():
+    javascript = (WEB_DIR / "app.js").read_text(encoding="utf-8")
+    render_tasks = javascript[
+        javascript.index("function renderTasks(tasks)") : javascript.index(
+            "function intakeTargetName", javascript.index("function renderTasks(tasks)")
+        )
+    ]
+
+    assert "<span class=\"task-number\">#${task.task_number}</span>" in render_tasks
+    assert "<span class=\"priority p${task.priority}\">P${task.priority}</span>" in render_tasks
+
+
 def test_web_supports_human_reading_and_guided_interactions():
     javascript = (WEB_DIR / "app.js").read_text(encoding="utf-8")
     markup = (WEB_DIR / "index.html").read_text(encoding="utf-8")
