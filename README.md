@@ -274,6 +274,25 @@ room_bootstrap
 
 `room_join` 仍作为兼容入口保留：仅在仓库作用域与 checkout 登记都为空时，第一个 Agent 可以请求创建 Room。正常已登记工作区的新对话只调用 `room_bootstrap`。
 
+### 任务管理状态机与权限矩阵
+
+任务从发布到集成的每条迁移都有唯一命令入口（REST/MCP/CLI/Web 共用领域服务），全部写入 append-only 事件（含 event_id、操作者软件身份、before→after、reason；带 `request_id` 的调用幂等重放，不产生重复事件）：
+
+| 迁移 | 命令 | 发起者 | 前置条件 | 主要失败码 | 副作用 |
+| --- | --- | --- | --- | --- | --- |
+| 创建 → 待认领 | `task_create` | 用户/Agent | 任务合同完整 | `invalid_task` | 无 owner、无指派，绝不隐式派发 |
+| 待认领 → 已认领 | `task_claim` | 任意 Agent | 无 owner、execution=todo、依赖满足 | `task_already_claimed`、`task_dependencies_incomplete` | owner 更新；并发只有一个胜出 |
+| 已认领 → 执行中/阻塞 | `task_update` | 当前 owner | 合法 legacy 迁移 | `invalid_transition`、`structured_transition_required` | 状态与 blocker_reason 更新 |
+| 执行中 → 待验收 | `work_report` | 当前 owner | execution∈{claimed,in_progress,blocked}；证据齐全、worktree 受信 | `insufficient_work_evidence`、`not_task_owner`、`invalid_transition` | 释放任务租约、进度 100 |
+| 待验收 → 已退回 | `review_submit verdict=changes_requested` | 独立身份（≠owner） | awaiting_review | `invalid_transition`、`reviewer_not_independent` | execution 回 in_progress、保留 changes_requested |
+| 待验收 → 待集成 | `review_submit verdict=approved` | 独立身份 | awaiting_review；逐条验收标准 passed | `acceptance_criteria_not_satisfied` | verification=approved |
+| 待集成 → 已完成/集成失败 | `integration_submit` | Agent 或管理端 | verification=approved | `task_not_ready_for_integration`、`task_already_integrated`、`integration_tests_failed` | integration=done/failed；done 要求测试全过 |
+| 已认领/执行中/阻塞/已退回 → 待认领 | `task_release` | owner 自助或管理端代释放 | 未进入待验收及之后阶段 | `not_task_owner`、`task_not_releasable`、`task_release_conflict` | 原子清 owner 与活跃租约、失效 pending 指派/交接、保留进度与 changes_requested |
+| 任意未完成 → 已取消 | `task_update status=cancelled` | 用户/owner | 非终态 | `invalid_transition` | 终态，不可再认领 |
+| → 待认领（重派） | `task_assign` + 目标确认 | 管理端/Agent | 目标身份已接入且未吊销（可离线） | `assignment_target_not_found`、`assignment_target_revoked`、`invalid_assignment_target` | pending 指派留痕，重连后可受理 |
+
+租约、验证证据与任务状态分别由各自领域服务维护；上表副作用中涉及的租约清理均调用同一租约服务。
+
 ### 文件占用（Lease）状态与边界
 
 文件租约是 Agent 对文件或 glob 范围的限时编辑意图声明，只保护文件范围，不等于任务所有权、任务三维状态或 Agent 在线状态。REST、MCP、CLI、Web 复用同一领域服务，事件追加留痕：

@@ -2837,3 +2837,60 @@ def test_concurrent_reviews_have_single_winner(service, project, joined_agents):
     ) == ["first", "invalid_transition"]
     assert len(results) == 1
     assert errors == ["invalid_transition"]
+
+
+def test_concurrent_release_has_single_winner_and_idempotent_loser(
+    service, project, joined_agents
+):
+    import threading
+
+    owner, _ = joined_agents
+    task = service.create_task(
+        project["id"],
+        title="Concurrent release",
+        acceptance_criteria=["One release wins"],
+    )["task"]
+    service.claim_task(
+        project["id"], task["id"], owner["agent"]["id"], owner["token"]
+    )
+
+    outcomes: list[dict] = []
+
+    def attempt():
+        outcomes.append(
+            service.release_task(
+                project["id"], task["id"], reason_code="other"
+            )
+        )
+
+    threads = [threading.Thread(target=attempt) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert len(outcomes) == 2
+    # 管理端代释放是幂等的：两线程串行进入写事务后，恰好一个真实释放，
+    # 另一个看到 todo 幂等返回，事件只写一条。
+    assert sum(1 for item in outcomes if item.get("released") is True) == 1
+    events = service.list_events(project["id"], after=0)["events"]
+    assert len([e for e in events if e["event_type"] == "task.released"]) == 1
+
+
+def test_idempotent_request_id_does_not_duplicate_events(
+    service, project, joined_agents
+):
+    owner, _ = joined_agents
+    kwargs = dict(
+        session_id=owner["agent"]["id"],
+        token=owner["token"],
+        path_pattern="src/idem/**",
+        mode="exclusive",
+    )
+    first = service.acquire_lease(project["id"], request_id="req-lease-1", **kwargs)
+    replay = service.acquire_lease(project["id"], request_id="req-lease-1", **kwargs)
+
+    assert replay["lease"]["id"] == first["lease"]["id"]
+    assert replay["event_id"] == first["event_id"]
+    events = service.list_events(project["id"], after=0)["events"]
+    assert len([e for e in events if e["event_type"] == "lease.acquired"]) == 1
