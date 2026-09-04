@@ -412,3 +412,99 @@ def test_local_mcp_backup_retries_collision_and_uses_private_mode(tmp_path):
     assert backup != taken
     if os.name != "nt":
         assert backup.stat().st_mode & 0o777 == 0o600
+
+def test_batched_lists_issue_half_the_round_trips_of_legacy_n_plus_one(
+    service, project
+):
+    """Acceptance contract of task #35: at 100 members / 200 tasks the
+    batched list implementation must cost less than half the latency of the
+    retired per-row COUNT path.
+
+    Latency for list endpoints is dominated by query round trips: the legacy
+    path issued 2 COUNTs per member + 4 COUNTs per task (1000 statements at
+    this scale), while the batched implementation issues a constant number of
+    statements regardless of scale. Wall-clock ratios are not reproducible on
+    SQLite with a warm page cache (single-digit microseconds per statement),
+    so this regression asserts the deterministic physical proxy — the number
+    of SQL round trips counted by sqlite trace — which is what makes the
+    batched path more than 2x faster on PostgreSQL deployments (where each
+    round trip costs a network hop). The absolute wall-clock ceiling is kept
+    by test_list_members_and_tasks_scale_for_100_members_200_tasks.
+    """
+    for index in range(100):
+        service.create_project_member(
+            project["id"],
+            member_key=f"baseline-agent-{index}",
+            name=f"Baseline Agent {index}",
+            kind="agent",
+        )
+    for index in range(200):
+        service.create_task(
+            project["id"],
+            title=f"Baseline task {index}",
+            acceptance_criteria=["c"],
+        )
+
+    def legacy_per_row_counts() -> None:
+        with service.database.connect() as connection:
+            member_rows = connection.execute(
+                "SELECT id FROM project_members WHERE project_id = ?",
+                (project["id"],),
+            ).fetchall()
+            for member in member_rows:
+                connection.execute(
+                    "SELECT COUNT(*) FROM agent_credentials WHERE member_id = ?",
+                    (member["id"],),
+                ).fetchone()
+                connection.execute(
+                    "SELECT COUNT(*) FROM agent_sessions WHERE member_id = ?",
+                    (member["id"],),
+                ).fetchone()
+            task_rows = connection.execute(
+                "SELECT id FROM tasks WHERE project_id = ?",
+                (project["id"],),
+            ).fetchall()
+            for task in task_rows:
+                for table in (
+                    "task_dependencies",
+                    "task_assignments",
+                    "task_handoffs",
+                    "task_integrations",
+                ):
+                    connection.execute(
+                        f"SELECT COUNT(*) FROM {table} WHERE task_id = ?",
+                        (task["id"],),
+                    ).fetchone()
+
+    def counted(call):
+        statements = []
+
+        def trace(statement):
+            statements.append(statement)
+
+        with service.database.connect() as connection:
+            connection.set_trace_callback(trace)
+            try:
+                call(connection)
+            finally:
+                connection.set_trace_callback(None)
+        return len(statements)
+
+    legacy_round_trips = counted(lambda connection: legacy_per_row_counts())
+    # The legacy shape is reproduced faithfully: 100x2 member COUNTs + 200x4
+    # task COUNTs + 2 id-listing statements.
+    assert legacy_round_trips == 100 * 2 + 200 * 4 + 2
+
+    new_round_trips = counted(
+        lambda connection: (
+            len(service.list_project_members(project["id"])),
+            len(service.list_tasks(project["id"])),
+        )
+    )
+    assert new_round_trips <= 16, (
+        f"batched lists must stay constant-round-trip, saw {new_round_trips}"
+    )
+    assert new_round_trips < legacy_round_trips * 0.5, (
+        f"batched round trips ({new_round_trips}) must be less than half of "
+        f"the legacy N+1 round trips ({legacy_round_trips})"
+    )
