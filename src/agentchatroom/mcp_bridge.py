@@ -48,6 +48,7 @@ AUTO_IDEMPOTENCY_TOOL_NAMES = frozenset(
         "task_claim",
         "task_assign",
         "task_acknowledge",
+        "task_release",
         "task_handoff",
         "task_handoff_acknowledge",
         "task_update",

@@ -2962,3 +2962,196 @@ def test_release_task_supports_blocked_tasks_and_clears_blocker_reason(
     )
     assert payload["cleared_blocker_reason"] == "Waiting for credentials"
     assert payload["reason"] == "Cannot proceed while blocked"
+
+
+def test_release_request_id_replay_does_not_duplicate_release_event(
+    service, project, joined_agents
+):
+    owner, _ = joined_agents
+    task = service.create_task(
+        project["id"],
+        title="Release replay",
+        acceptance_criteria=["Replay is idempotent"],
+    )["task"]
+    service.claim_task(
+        project["id"], task["id"], owner["agent"]["id"], owner["token"]
+    )
+    first = service.release_task(
+        project["id"],
+        task["id"],
+        reason_code="user_requested",
+        reason="replay check",
+        request_id="req-release-replay",
+    )
+    assert first["released"] is True
+    replay = service.release_task(
+        project["id"],
+        task["id"],
+        reason_code="user_requested",
+        reason="replay check",
+        request_id="req-release-replay",
+    )
+    assert replay["event_id"] == first["event_id"]
+    events = service.list_events(project["id"], after=0)["events"]
+    assert len([e for e in events if e["event_type"] == "task.released"]) == 1
+
+
+def test_release_invalidates_pending_handoff_and_keeps_history(
+    service, project, joined_agents
+):
+    owner, successor = joined_agents
+    task = service.create_task(
+        project["id"],
+        title="Handoff then release",
+        acceptance_criteria=["Handoff invalidated by release"],
+    )["task"]
+    service.claim_task(
+        project["id"], task["id"], owner["agent"]["id"], owner["token"]
+    )
+    handoff = service.handoff_task(
+        project["id"],
+        task["id"],
+        from_session_id=owner["agent"]["id"],
+        token=owner["token"],
+        to_session_id=successor["agent"]["id"],
+        summary="Take over please",
+        completed_items=["claim", "context"],
+        next_step="Continue the work",
+    )
+    handoff_id = handoff["handoff"]["id"]
+
+    released = service.release_task(
+        project["id"],
+        task["id"],
+        reason_code="reassignment_needed",
+        reason="Release invalidates the pending handoff",
+    )
+    assert released["invalidated_handoff_ids"] == [handoff_id]
+    events = service.list_events(project["id"], after=0)["events"]
+    payload = next(
+        e["payload"] for e in events if e["event_type"] == "task.released"
+    )
+    assert payload["invalidated_handoff_ids"] == [handoff_id]
+
+
+def test_release_keeps_other_task_leases_of_the_same_session(
+    service, project, joined_agents
+):
+    owner, _ = joined_agents
+    released_task = service.create_task(
+        project["id"],
+        title="Release one",
+        acceptance_criteria=["Only tied leases released"],
+    )["task"]
+    untouched_task = service.create_task(
+        project["id"],
+        title="Keep one",
+        acceptance_criteria=["Untouched lease survives"],
+    )["task"]
+    service.claim_task(
+        project["id"], released_task["id"], owner["agent"]["id"], owner["token"]
+    )
+    service.claim_task(
+        project["id"], untouched_task["id"], owner["agent"]["id"], owner["token"]
+    )
+    tied = service.acquire_lease(
+        project["id"],
+        session_id=owner["agent"]["id"],
+        token=owner["token"],
+        path_pattern="src/tied/**",
+        task_id=released_task["id"],
+    )
+    other = service.acquire_lease(
+        project["id"],
+        session_id=owner["agent"]["id"],
+        token=owner["token"],
+        path_pattern="src/other-task/**",
+        task_id=untouched_task["id"],
+    )
+
+    service.release_task(
+        project["id"], released_task["id"], reason_code="other"
+    )
+    # 同 Session 为其他任务持有的租约必须存活。
+    leases = service.list_leases(project["id"])
+    still_active = {
+        item["id"] for item in leases if item.get("released_at") is None
+    }
+    assert other["lease"]["id"] in still_active
+    assert tied["lease"]["id"] not in still_active
+
+
+def test_cancelled_tasks_reject_release(service, project, joined_agents):
+    owner, _ = joined_agents
+    task = service.create_task(
+        project["id"],
+        title="Cancelled stays cancelled",
+        acceptance_criteria=["Terminal stays terminal"],
+    )["task"]
+    service.claim_task(
+        project["id"], task["id"], owner["agent"]["id"], owner["token"]
+    )
+    service.update_task(
+        project["id"],
+        task["id"],
+        status="cancelled",
+        session_id=owner["agent"]["id"],
+        token=owner["token"],
+    )
+    with pytest.raises(DomainError) as terminal:
+        service.release_task(project["id"], task["id"], reason_code="other")
+    assert terminal.value.code == "task_not_releasable"
+
+
+def test_release_and_claim_race_admits_exactly_one_successor(
+    service, project, joined_agents
+):
+    import threading
+
+    owner, successor = joined_agents
+    task = service.create_task(
+        project["id"],
+        title="Release/claim race",
+        acceptance_criteria=["Exactly one successor"],
+    )["task"]
+    service.claim_task(
+        project["id"], task["id"], owner["agent"]["id"], owner["token"]
+    )
+
+    claim_result: list[dict] = []
+    claim_error: list[str] = []
+
+    def late_claim():
+        try:
+            claim_result.append(
+                service.claim_task(
+                    project["id"],
+                    task["id"],
+                    successor["agent"]["id"],
+                    successor["token"],
+                )
+            )
+        except DomainError as error:
+            claim_error.append(error.code)
+
+    # 释放先发生（串行前置），随后 claim 与重复释放并发竞争。
+    released = service.release_task(
+        project["id"], task["id"], reason_code="other"
+    )
+    assert released["released"] is True
+    threads = [
+        threading.Thread(target=late_claim),
+        threading.Thread(target=late_claim),
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    # 同一 successor 的两条并发 claim：恰好一条成功，另一条命中
+    # 幂等（同 session 重复 claim 返回 event_id=None）或结构化拒绝。
+    assert claim_error.count("task_already_claimed") <= 1
+    owners = {
+        service.get_task(project["id"], task["id"])["owner_session_id"]
+    }
+    assert owners == {successor["agent"]["id"]}

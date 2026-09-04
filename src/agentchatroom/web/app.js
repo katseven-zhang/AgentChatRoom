@@ -674,6 +674,11 @@ function resetProjectFilters() {
   if (elements["event-filter"]) elements["event-filter"].value = "all";
 }
 
+function taskReleaseVisible(task) {
+  // 释放按钮只在可释放的执行阶段显示；终态与待验收阶段不换执行者。
+  return ["claimed", "in_progress", "blocked"].includes(task.execution_status);
+}
+
 function clearDialogDrafts(dialog) {
   // 嵌套弹窗（如指定 Agent）关闭时不能清掉外层任务详情仍需要的编辑上下文。
   if (["login-dialog", "token-secret-dialog"].includes(dialog.id)) return;
@@ -2583,10 +2588,7 @@ async function openTaskDetails(taskId, options = {}) {
   renderTaskAssignments(task);
   renderTaskTimeline(task);
   elements["task-assign-button"].disabled = ["done", "cancelled"].includes(taskView(task).phase);
-  elements["task-release-button"].classList.toggle(
-    "is-hidden",
-    !["claimed", "in_progress", "blocked"].includes(task.execution_status),
-  );
+  elements["task-release-button"].classList.toggle("is-hidden", !taskReleaseVisible(task));
   elements["task-edit-dialog"].showModal();
   try {
     await loadTaskHistory(taskId);

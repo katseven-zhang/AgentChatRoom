@@ -810,3 +810,35 @@ def test_parse_review_criteria_rejects_ambiguous_status_segment():
     # evidence 内含 :: 会把倒数第二段误读为状态；结构化拒绝优于猜测。
     with pytest.raises(SystemExit):
         cli.parse_review_criteria(["Approved::passed::pytest 404::0 output"])
+
+
+def test_task_release_cli_posts_structured_reason(monkeypatch, capsys):
+    captured = {}
+
+    def fake_request_json(base, method, path, body=None, *, request_id=None):
+        captured.update({"method": method, "path": path, "body": body})
+        return {"ok": True}
+
+    monkeypatch.setattr(cli, "request_json", fake_request_json)
+
+    main(
+        [
+            "task-release",
+            "project_example",
+            "task_example",
+            "--reason-code",
+            "quota_exhausted",
+            "--reason",
+            "Out of quota",
+        ]
+    )
+
+    assert captured["method"] == "POST"
+    assert captured["path"].endswith("/tasks/task_example/release")
+    # 未提供 --session-id/--token 时以 None 透传 = 管理端代释放语义。
+    assert captured["body"] == {
+        "reason_code": "quota_exhausted",
+        "reason": "Out of quota",
+        "session_id": None,
+        "token": None,
+    }
