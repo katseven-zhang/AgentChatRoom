@@ -1,14 +1,41 @@
 from __future__ import annotations
 
 import json
+import logging
 from dataclasses import replace
 
 import pytest
 from fastapi.testclient import TestClient
 
-from agentchatroom.api import create_app
+from agentchatroom.api import (
+    CredentialRedactingLogFilter,
+    _redact_log_line,
+    create_app,
+)
 from agentchatroom.desktop import DirectoryPickerUnavailable
 from agentchatroom.local_mcp import LocalMcpConfigurator, LocalMcpEnvironment
+
+
+def _register_workspace(api_client, project):
+    return api_client.post(
+        f"/api/v1/projects/{project['id']}/workspaces",
+        json={
+            "host_key": "test-host",
+            "host_name": "Test Host",
+            "local_path": project["root_path"],
+        },
+    ).json()
+
+
+def _join_agent(api_client, project, **payload):
+    registered = _register_workspace(api_client, project)
+    payload.setdefault("worktree", project["root_path"])
+    payload.setdefault("host_id", registered["host"]["id"])
+    payload.setdefault("workspace_id", registered["workspace"]["id"])
+    return api_client.post(
+        f"/api/v1/projects/{project['id']}/agents/join",
+        json=payload,
+    ).json()
 
 
 def test_health_and_project_room_flow(settings, project_dir):
@@ -31,7 +58,16 @@ def test_health_and_project_room_flow(settings, project_dir):
         assert public_config.json()["deployment_profile"] == settings.deployment_profile
         assert public_config.json()["capabilities"]["local_folder_picker"] is True
         assert public_config.json()["capabilities"]["local_mcp_config_assistant"] is True
+        assert public_config.json()["capabilities"]["room_bootstrap"] is True
+        assert public_config.json()["domain"]["bootstrap_schema_version"] == 1
+        assert "ready" in public_config.json()["domain"]["bootstrap_states"]
+        assert public_config.json()["domain"]["bootstrap_required_actions"][
+            "identity_not_configured"
+        ] == "open_local_mcp_config_assistant"
         assert public_config.json()["domain"]["schema_version"] == 6
+        assert public_config.json()["domain"]["task_phases"][0] == "todo"
+        assert public_config.json()["domain"]["task_phase_labels"]["awaiting_review"] == "已提交"
+        assert public_config.json()["domain"]["task_phase_commands"]["awaiting_review"] == "work_report"
         assert public_config.json()["domain"]["agent_connection_statuses"] == [
             "connected",
             "disconnected",
@@ -653,26 +689,24 @@ def test_api_handoff_review_and_integration_are_explicit(settings, project_dir):
             "/api/v1/projects",
             json={"root_path": str(project_dir), "name": "Lifecycle Project"},
         ).json()
-        first = client.post(
-            f"/api/v1/projects/{project['id']}/agents/join",
-            json={
-                "agent_key": "first-main",
-                "name": "First",
-                "client": "codex",
-                "model": "unknown",
-                "role": "executor",
-            },
-        ).json()
-        second = client.post(
-            f"/api/v1/projects/{project['id']}/agents/join",
-            json={
-                "agent_key": "second-main",
-                "name": "Second",
-                "client": "grok-build",
-                "model": "test-model",
-                "role": "executor",
-            },
-        ).json()
+        first = _join_agent(
+            client,
+            project,
+            agent_key="first-main",
+            name="First",
+            client="codex",
+            model="unknown",
+            role="executor",
+        )
+        second = _join_agent(
+            client,
+            project,
+            agent_key="second-main",
+            name="Second",
+            client="grok-build",
+            model="test-model",
+            role="executor",
+        )
         task = client.post(
             f"/api/v1/projects/{project['id']}/tasks",
             json={
@@ -770,16 +804,15 @@ def test_api_allows_approved_task_handoff_before_integration(settings, project_d
             "/api/v1/projects",
             json={"root_path": str(project_dir), "name": "Approved Handoff Project"},
         ).json()
-        executor = client.post(
-            f"/api/v1/projects/{project['id']}/agents/join",
-            json={
-                "agent_key": "executor-main",
-                "name": "Executor",
-                "client": "grok-build",
-                "model": "test-model",
-                "role": "executor",
-            },
-        ).json()
+        executor = _join_agent(
+            client,
+            project,
+            agent_key="executor-main",
+            name="Executor",
+            client="grok-build",
+            model="test-model",
+            role="executor",
+        )
         reviewer = client.post(
             f"/api/v1/projects/{project['id']}/agents/join",
             json={
@@ -879,15 +912,14 @@ def test_api_accepts_no_code_work_report(settings, project_dir):
         project = client.post(
             "/api/v1/projects", json={"root_path": str(project_dir)}
         ).json()
-        agent = client.post(
-            f"/api/v1/projects/{project['id']}/agents/join",
-            json={
-                "agent_key": "investigator-main",
-                "name": "Investigator",
-                "client": "grok-build",
-                "model": "test-model",
-            },
-        ).json()
+        agent = _join_agent(
+            client,
+            project,
+            agent_key="investigator-main",
+            name="Investigator",
+            client="grok-build",
+            model="test-model",
+        )
         task = client.post(
             f"/api/v1/projects/{project['id']}/tasks",
             json={
@@ -1266,3 +1298,112 @@ def test_agent_join_generates_identity_key_and_requires_model(
         assert accepted.status_code == 201
         assert accepted.json()["agent"]["agent_key"] == accepted.json()["agent"]["member_id"]
         assert accepted.json()["agent"]["member_id"] == generated.json()["agent"]["member_id"]
+
+
+def test_redact_log_line_covers_token_bearer_authorization_and_cookies():
+    query_line = (
+        '127.0.0.1:1 - "DELETE /api/v1/projects/p/leases/l'
+        '?session_id=agent_example&token=super-secret HTTP/1.1" 200'
+    )
+    redacted_query = _redact_log_line(query_line)
+    assert "super-secret" not in redacted_query
+    assert "token=[REDACTED]" in redacted_query
+
+    bearer_line = "Authorization: Bearer session-token-value"
+    redacted_bearer = _redact_log_line(bearer_line)
+    assert "session-token-value" not in redacted_bearer
+    assert "[REDACTED]" in redacted_bearer
+
+    cookie_header = "Cookie: sid=abc123; theme=dark"
+    redacted_cookie = _redact_log_line(cookie_header)
+    assert "abc123" not in redacted_cookie
+    assert "Cookie: [REDACTED]" in redacted_cookie
+
+    cookie_value = "session_cookie=abc123"
+    redacted_value = _redact_log_line(cookie_value)
+    assert "abc123" not in redacted_value
+    assert "[REDACTED]" in redacted_value
+
+
+def test_access_log_filter_redacts_uvicorn_full_path_args():
+    record = logging.LogRecord(
+        name="uvicorn.access",
+        level=logging.INFO,
+        pathname=__file__,
+        lineno=1,
+        msg='%s - "%s %s HTTP/%s" %d',
+        args=(
+            "127.0.0.1:9",
+            "DELETE",
+            "/api/v1/projects/p/leases/l?token=super-secret",
+            "1.1",
+            200,
+        ),
+        exc_info=None,
+    )
+    assert CredentialRedactingLogFilter().filter(record) is True
+    assert record.args[2] == "/api/v1/projects/p/leases/l?token=[REDACTED]"
+    assert "super-secret" not in record.getMessage()
+
+
+def test_release_lease_uses_json_body_and_rejects_query_credentials(
+    settings, project_dir
+):
+    with TestClient(create_app(settings)) as client:
+        created = client.post(
+            "/api/v1/projects",
+            json={"root_path": str(project_dir), "name": "Lease Project"},
+        )
+        assert created.status_code == 201
+        project = created.json()
+        joined = client.post(
+            f"/api/v1/projects/{project['id']}/agents/join",
+            json={"name": "Worker", "client": "generic", "model": "unknown"},
+        )
+        assert joined.status_code == 201
+        agent = joined.json()
+        acquired = client.post(
+            f"/api/v1/projects/{project['id']}/leases",
+            json={
+                "session_id": agent["agent"]["id"],
+                "token": agent["token"],
+                "path_pattern": "src/example.py",
+            },
+        )
+        assert acquired.status_code == 201
+        lease_id = acquired.json()["lease"]["id"]
+        query_only = client.delete(
+            f"/api/v1/projects/{project['id']}/leases/{lease_id}",
+            params={
+                "session_id": agent["agent"]["id"],
+                "token": agent["token"],
+            },
+        )
+        assert query_only.status_code in {400, 422}
+
+        query_release = client.request(
+            "DELETE",
+            f"/api/v1/projects/{project['id']}/leases/{lease_id}",
+            params={
+                "session_id": agent["agent"]["id"],
+                "token": agent["token"],
+            },
+            json={
+                "session_id": agent["agent"]["id"],
+                "token": agent["token"],
+            },
+        )
+        assert query_release.status_code == 400
+        assert query_release.json()["error"]["code"] == "credentials_in_query_rejected"
+
+        body_release = client.request(
+            "DELETE",
+            f"/api/v1/projects/{project['id']}/leases/{lease_id}",
+            json={
+                "session_id": agent["agent"]["id"],
+                "token": agent["token"],
+            },
+        )
+        assert body_release.status_code == 200
+        assert body_release.json()["released"] is True
+        assert "token=" not in str(body_release.request.url)

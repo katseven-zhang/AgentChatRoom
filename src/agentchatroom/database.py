@@ -11,7 +11,7 @@ if TYPE_CHECKING:
     from .config import Settings
 
 
-SCHEMA_VERSION = 17
+SCHEMA_VERSION = 18
 
 
 class DatabaseBackend(Protocol):
@@ -155,6 +155,11 @@ CREATE TABLE IF NOT EXISTS tasks (
 
 CREATE INDEX IF NOT EXISTS idx_tasks_project_status
 ON tasks(project_id, status, priority, created_at);
+
+CREATE TABLE IF NOT EXISTS task_number_sequences (
+    project_id TEXT PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,
+    next_value INTEGER NOT NULL
+);
 
 CREATE TABLE IF NOT EXISTS task_intakes (
     id TEXT PRIMARY KEY,
@@ -680,6 +685,16 @@ MIGRATIONS = {
         WHERE task_number IS NULL;
         CREATE UNIQUE INDEX IF NOT EXISTS idx_tasks_project_task_number
         ON tasks(project_id, task_number);
+    """,
+    18: """
+        CREATE TABLE IF NOT EXISTS task_number_sequences (
+            project_id TEXT PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,
+            next_value INTEGER NOT NULL
+        );
+        INSERT INTO task_number_sequences(project_id, next_value)
+        SELECT project_id, COALESCE(MAX(task_number), 0) + 1
+        FROM tasks
+        GROUP BY project_id;
     """,
 }
 

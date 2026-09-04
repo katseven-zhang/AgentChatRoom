@@ -42,6 +42,7 @@ def _configure_local_software(
 def test_mcp_exposes_standard_tool_set():
     names = {tool.name for tool in mcp_server.mcp._tool_manager.list_tools()}
     assert names == {
+        "room_bootstrap",
         "room_join",
         "room_sync",
         "session_heartbeat",
@@ -50,6 +51,7 @@ def test_mcp_exposes_standard_tool_set():
         "message_acknowledge",
         "task_list",
         "task_get",
+        "task_history",
         "task_get_by_number",
         "task_intake_targets",
         "task_intake_submit",
@@ -89,7 +91,8 @@ def test_bridge_adds_request_id_only_to_retryable_cached_writes():
     forwarded = prepare_tool_arguments("message_post", original)
 
     assert original == {"project_id": "project_1", "body": "hello"}
-    assert forwarded["request_id"].startswith("request_")
+    assert forwarded["request_id"].startswith("bridge:")
+    assert ":request_" in forwarded["request_id"]
     assert prepare_tool_arguments("message_post", forwarded) == forwarded
     assert prepare_tool_arguments("room_sync", original) == original
     assert prepare_tool_arguments("session_heartbeat", original) == original
@@ -132,7 +135,7 @@ def test_mcp_evidence_tools_publish_nested_scalar_schema():
 def test_mcp_message_post_requires_message_level_model_provenance():
     message_post = mcp_server.mcp._tool_manager.get_tool("message_post")
 
-    assert "model_display_name" in message_post.parameters["required"]
+    assert "model_display_name" in message_post.parameters["properties"]
     assert message_post.parameters["properties"]["model_display_name"]["type"] == "string"
 
 
@@ -142,8 +145,14 @@ def test_mcp_room_join_requires_project_path_and_model_only():
     assert "project_path" in room_join.parameters["required"]
     assert "model" in room_join.parameters["required"]
     assert "agent_key" not in room_join.parameters["required"]
-    assert "automatically establishes Presence" in mcp_server.MCP_INSTRUCTIONS
-    assert "still call room_join and room_sync" in mcp_server.MCP_INSTRUCTIONS
+    assert "Call room_bootstrap once" in mcp_server.MCP_INSTRUCTIONS
+    assert "holds the Session Token in memory" in mcp_server.MCP_INSTRUCTIONS
+    bootstrap = mcp_server.mcp._tool_manager.get_tool("room_bootstrap")
+    assert bootstrap.parameters.get("required", []) == []
+    assert "project_path" not in bootstrap.parameters.get("properties", {})
+    assert "project_id" not in bootstrap.parameters.get("properties", {})
+    assert "token" not in bootstrap.parameters.get("properties", {})
+    assert "agent_key" not in bootstrap.parameters.get("properties", {})
 
 
 def test_mcp_project_member_tools_share_the_domain_service(

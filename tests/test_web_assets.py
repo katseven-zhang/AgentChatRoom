@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 import re
+import subprocess
 from pathlib import Path
 
 
@@ -36,7 +38,8 @@ def test_web_bootstrap_and_phase_one_local_agent_hooks_are_complete():
 
     assert "async function loadAuthenticatedApp()" in javascript
     assert 'api("/api/v1/auth/status")' in javascript
-    assert 'autocomplete="username"' in markup
+    assert 'id="login-username"' not in markup
+    assert 'autocomplete="current-password"' in markup
     assert "function renderIntegrationJoin()" in javascript
     assert 'data-integration-transport=' not in markup
     assert '"streamable_http_config_text"' not in javascript
@@ -93,7 +96,22 @@ def test_web_treats_cancelled_tasks_as_not_requiring_integration():
     assert 'task.execution_status === "cancelled" ? "not_required"' in javascript
     assert "taskIntegrationStatus(task)" in javascript
     assert "taskIntegrationStatusClass(task)" in javascript
-    assert '!["todo", "done", "cancelled"].includes(task.status)' in javascript
+    assert "function bucketOf(task)" in javascript
+    assert "function taskPhaseLabel(task)" in javascript
+    assert "function taskDisplayLabel(task)" in javascript
+    assert "legacy_status" not in javascript
+    markup = (WEB_DIR / "index.html").read_text(encoding="utf-8")
+    assert 'data-filter="">全部' in markup
+    assert 'data-filter="todo">待认领' in markup
+    assert 'data-filter="claimed">已认领' in markup
+    assert 'data-filter="in_progress">执行中' in markup
+    assert 'data-filter="blocked">阻塞' in markup
+    assert 'data-filter="awaiting_review">已提交' in markup
+    assert 'data-filter="verified">待验收' in markup
+    assert 'data-filter="done">已完成' in markup
+    assert 'data-filter="cancelled">已取消' in markup
+    assert "P${task.priority}" in javascript
+    assert 'aria-label="任务阶段筛选"' in markup
 
 
 def test_web_task_list_renders_task_number_and_priority_together():
@@ -104,8 +122,8 @@ def test_web_task_list_renders_task_number_and_priority_together():
         )
     ]
 
-    assert "<span class=\"task-number\">#${task.task_number}</span>" in render_tasks
-    assert "<span class=\"priority p${task.priority}\">P${task.priority}</span>" in render_tasks
+    assert '<span class="task-number">#${task.task_number}</span>' in render_tasks
+    assert '<span class="priority p${task.priority}">P${task.priority}</span>' in render_tasks
 
 
 def test_web_supports_human_reading_and_guided_interactions():
@@ -131,8 +149,13 @@ def test_web_supports_human_reading_and_guided_interactions():
     assert "snapshot.agent_identities" in javascript
     assert "当前连接" in javascript
     assert "累计" in javascript and "次接入" in javascript
-    assert 'app.css?v=1.0.0-central22' in markup
-    assert 'app.js?v=1.0.0-central22' in markup
+    assert 'app.css?v=1.0.0-central26' in markup
+    assert 'app.js?v=1.0.0-central26' in markup
+    assert 'id="task-history-filter"' in markup
+    assert "function loadTaskHistory(" in javascript
+    assert "function renderHistoryEvidence(" in javascript
+    assert "data-copy-event" in javascript
+    assert "data-open-event" in javascript
     assert "function renderIntegrationTabs()" in javascript
     assert 'class="segmented-control integration-tabs" id="integration-format-tabs"' in markup
     assert "state.integration.profiles" in javascript
@@ -218,9 +241,19 @@ def test_web_local_mcp_assistant_separates_write_reload_and_presence_states():
     assert "只新增或更新 mcpServers.agentchatroom" in javascript
     assert "配置存在不代表客户端当前已经连接" in javascript
     assert "当前 Room 尚未连接" in javascript
+    assert "Presence 不是当前模型对话同步" in javascript
+    assert "浏览器无法观察" in javascript
+    assert 'id="integration-local-facts"' in markup
+    assert "function renderLocalMcpFacts(" in javascript
+    assert "软件配置" in javascript
+    assert "进程连接" in javascript
+    assert "Room Session" in javascript
+    assert "当前对话同步" in javascript
+    assert "room_bootstrap" in javascript
     assert "不会自动提权" in javascript
     assert ".local-mcp-assistant" in stylesheet
-    assert '.local-mcp-presence[data-connected="true"]' in stylesheet
+    assert ".local-mcp-facts" in stylesheet
+    assert '.local-mcp-fact[data-state="ready"]' in stylesheet
     assert "grid-template-columns: repeat(2, minmax(0, 1fr));" in stylesheet
     assert ".integration-tabs button:last-child" in stylesheet
     assert ".integration-transport-tabs" not in stylesheet
@@ -247,3 +280,76 @@ def test_web_desktop_panels_are_resizable_readable_and_persistent():
     assert ".panel-resizer {" in stylesheet
     assert '"side left-resizer work right-resizer chat"' in stylesheet
     assert "grid-template-columns: 232px minmax(500px, 1fr) 360px;" not in stylesheet
+
+
+def test_web_sse_and_project_switch_guard_stale_snapshots():
+    javascript = (WEB_DIR / "app.js").read_text(encoding="utf-8")
+    markup = (WEB_DIR / "index.html").read_text(encoding="utf-8")
+    stylesheet = (WEB_DIR / "app.css").read_text(encoding="utf-8")
+
+    assert "function refreshSnapshot(projectId)" in javascript
+    assert "JSON.parse(message.data)" in javascript
+    assert "Ignored malformed room event" in javascript
+    assert "applySnapshotIfCurrent" in javascript
+    assert "function renderForEvent(event)" in javascript
+    assert "state.streamHadError" in javascript
+    assert "resetProjectFilters()" in javascript
+    assert "clearDialogDrafts()" in javascript
+    assert 'aria-live="polite"' in markup
+    assert 'role="tablist"' in markup
+    assert 'role="tabpanel"' in markup
+    assert "function withBusy(work)" in javascript
+    assert 'document.body.setAttribute("aria-busy", "true")' in javascript
+    assert "function activateTab(button)" in javascript
+    assert 'event.key === "ArrowRight"' in javascript
+    assert "alreadyKnown && previousId" in javascript
+    assert "streamVisible" in javascript
+    assert "profile.software_key" in javascript
+    assert 'replaceAll("_", "-")' not in javascript
+    assert "--danger:" in stylesheet
+    assert 'maxlength="20000"' in markup
+    assert "rememberExpandedEvent" in javascript
+
+
+def test_web_task_filter_buckets_cover_legacy_status_samples(tmp_path):
+    javascript = (WEB_DIR / "app.js").read_text(encoding="utf-8")
+    start = javascript.index("function bucketOf(task)")
+    end = javascript.index("function taskStatus(status)")
+    harness = tmp_path / "task_buckets.js"
+    harness.write_text(
+        javascript[start:end]
+        + """
+const samples = [
+  {legacy: "todo", status: "todo", execution_status: "todo", verification_status: "not_required", integration_status: "pending"},
+  {legacy: "claimed", status: "claimed", execution_status: "claimed", verification_status: "not_required", integration_status: "pending"},
+  {legacy: "in_progress", status: "in_progress", execution_status: "in_progress", verification_status: "not_required", integration_status: "pending"},
+  {legacy: "blocked", status: "blocked", execution_status: "blocked", verification_status: "not_required", integration_status: "pending"},
+  {legacy: "awaiting_review", status: "awaiting_review", execution_status: "completed", verification_status: "pending", integration_status: "pending"},
+  {legacy: "verified", status: "verified", execution_status: "completed", verification_status: "approved", integration_status: "pending"},
+  {legacy: "done", status: "done", execution_status: "completed", verification_status: "approved", integration_status: "done"},
+  {legacy: "cancelled", status: "cancelled", execution_status: "cancelled", verification_status: "not_required", integration_status: "pending"}
+];
+const mapping = Object.fromEntries(samples.map((sample) => [sample.legacy, {
+  bucket: bucketOf(sample),
+  label: bucketLabel(bucketOf(sample))
+}]));
+console.log(JSON.stringify(mapping));
+""",
+        encoding="utf-8",
+    )
+    output = subprocess.check_output(
+        ["node", str(harness)],
+        text=True,
+        encoding="utf-8",
+    )
+    mapping = json.loads(output)
+    assert mapping == {
+        "todo": {"bucket": "todo", "label": "待认领"},
+        "claimed": {"bucket": "claimed", "label": "已认领"},
+        "in_progress": {"bucket": "in_progress", "label": "执行中"},
+        "blocked": {"bucket": "blocked", "label": "阻塞"},
+        "awaiting_review": {"bucket": "awaiting_review", "label": "已提交"},
+        "verified": {"bucket": "verified", "label": "待验收"},
+        "done": {"bucket": "done", "label": "已完成"},
+        "cancelled": {"bucket": "cancelled", "label": "已取消"},
+    }

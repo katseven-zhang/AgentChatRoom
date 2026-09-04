@@ -4,6 +4,24 @@ AgentChatRoom 是一个面向异构 AI 编程 Agent 的项目级实时协作中�
 
 当前一期提供 Python 后端、浏览器管理端、REST、SSE、本机 MCP stdio、CLI 和 SQLite 本地档案。Streamable HTTP MCP、远程 stdio Bridge、PostgreSQL 和服务器部署适配器保留为后续阶段基础，不作为当前单机产品能力展示。
 
+## 2026-09-03 新会话入口与任务筛选
+
+- 已配置且已登记的本机 Agent 新开对话时，调用一次零参数 `room_bootstrap` 即可解析当前 checkout、恢复或替换同一软件身份的 Session，并完成本次对话的首次同步。
+- Session Token 只保存在本机 MCP 进程内存中，不出现在工具结果、日志、URL、Room 消息或 checkout 登记里；后续 MCP 工具从当前绑定注入 `project_id` / `session_id` / `token`。
+- MCP 启动后的自动 Presence 仍然只表示进程在线，不等于当前模型对话已同步。
+- Web 任务筛选改为 待认领 / 已认领 / 执行中 / 阻塞 / 已提交 / 待验收，并保留全部、已完成、已取消。`phase` 由共享领域合同派生；已提交 Work Report 显示为「已提交」，已验证待集成显示为「待验收」。
+
+## 2026-09-03 审查修复
+
+本次收口 Token 校验写锁、任务序号并发、SSE 鉴权、Git 证据路径信任、本机 MCP 备份权限，以及 Web 项目边界 / SSE / 可访问性：
+
+- Agent Token 校验改为只读；`last_used_at` 后台批量更新，不再让每次 MCP 调用抢 SQLite writer。
+- `task_number` 通过项目级计数器在同一写事务内分配，并发创建不会撞号。
+- `events/stream` 拒绝匿名订阅，并按项目 / IP 限制连接数。
+- Work Report 的 Git 证据只接受已登记 Workspace 内的路径，且 `commit_hash` 必须可解析。
+- 本机 MCP 备份改为 `0o600`，文件名冲突时重试；Bridge 转发的 `request_id` 带实例前缀。
+- Web 以服务端项目列表为事实源，SSE 解析失败不再卡住，项目切换不会被旧 snapshot 覆盖。
+
 ## 2026-09-02 修复更新
 
 本次修复版重点收口用户任务入口、Agent 受理和 Project 级稳定任务序号：
@@ -12,7 +30,7 @@ AgentChatRoom 是一个面向异构 AI 编程 Agent 的项目级实时协作中�
 - 用户不再填写正式标题、验收条件、优先级、依赖或内部状态；用户唯一保留的控制是指定 / 改派 Agent。
 - 依赖继续由 Agent 判断并写入共享领域服务，用户侧只读展示。
 - 待受理、待定义阶段不能被普通 Agent 认领、提交 Work Report、独立 Review 或最终集成。
-- Project / Room 级新增稳定、唯一、后端生成的人类可读 `task_number`（从 1 开始，事务性生成，不能由前端传入；取消、改派、交接、验证和集成后保持不变）。
+- Project / Room 级新增稳定、唯一、后端生成的人类可读 `task_number`（从 1 开始，在写事务内通过 `task_number_sequences` 计数器分配，不能由前端传入；取消、改派、交接、验证和集成后保持不变，已分配号码不会被复用）。
 - 历史任务按 `created_at, id` 回填 `task_number`；内部 `task_<随机码>` ID 仍然保留。
 - REST、MCP、CLI、Web 共享同一领域服务和状态机；公开 Schema 版本升到 `6`。
 - Web 任务 Tab 文案改为「协作视图」并新增 Intake 列表、时间线、依赖只读、只读详情视图与时间线样式。
@@ -163,11 +181,11 @@ Linux 或 macOS：
 2. 本机部署可点击“选择文件夹”打开系统目录选择器，也可手工填写需要协作的项目文件夹；取消选择不会修改原输入。该路径只保存在运行数据库和 checkout 本地登记中，不会写入公开仓库配置。
 3. 点击“配置本机 Agent”并选择客户端；一期 Web 固定使用本机 stdio，不显示 HTTP 或远程连接选项。
 4. 本机 WorkBuddy 或 Trae 可先使用页面的 MCP 配置助手检测现有配置；确认预览后再应用。也可以把页面生成的 MCP 接入信息交给 Agent：内容只包含目标客户端、连接方式和当前环境动态生成的 `agentchatroom` 配置，配置位置、写入方式和异常处理由 Agent 自行判断并向用户反馈。
-5. 按页面提示重启客户端、重新加载 MCP 或新开会话。配置文件已写入不等于已经连接，必须等左侧显示该软件在当前 Room“已连接”。
-6. Agent 开始工作前仍调用 `room_join` 和 `room_sync` 获取本次运行凭据并同步事实。
+5. 按页面提示重启客户端、重新加载 MCP 或新开会话。配置文件已写入不等于已经连接，必须等左侧显示该软件在当前 Room“已连接”。左侧已连接只表示 MCP 进程 Presence，不等于当前模型对话已经同步。
+6. Agent 开始工作前调用一次 `room_bootstrap`。不要读取或修改 `mcp.json` / `config.toml`，也不要检查源码或数据库；只有该工具返回 `identity_not_configured` 时才使用本机 MCP 配置助手。
 7. 在 Room 动态中查看消息、模型标签、任务进展、文件占用、验证结果和事件顺序。
 
-一个本机 Agent 软件安装在一个 Project 中只对应一个持久软件身份。Codex、Trae、WorkBuddy、Grok Build 等客户端的本机 stdio MCP 配置通过 `AGENTCHATROOM_SOFTWARE_KEY`、`AGENTCHATROOM_SOFTWARE_NAME` 和 `AGENTCHATROOM_SOFTWARE_CLIENT` 注入身份，并通过 `AGENTCHATROOM_PROJECT_PATH` 指向当前 checkout。四项配置完整且 checkout 已登记时，MCP 进程启动即自动建立 Presence；缺少配置时不会根据模型参数猜测身份，也不会自动创建 Room。模型不得按任务、角色、审核或运行检查临时改名。数据库 `agent_key`/`member_id` 由后端生成，不由 Agent 填写。每次连接仍保留新的 Session 审计记录，但同一软件同时最多一个活动 Session。
+一个本机 Agent 软件安装在一个 Project 中只对应一个持久软件身份。Codex、Trae、WorkBuddy、Grok Build 等客户端的本机 stdio MCP 配置通过 `AGENTCHATROOM_SOFTWARE_KEY`、`AGENTCHATROOM_SOFTWARE_NAME` 和 `AGENTCHATROOM_SOFTWARE_CLIENT` 注入身份，并通过 `AGENTCHATROOM_PROJECT_PATH` 指向当前 checkout。四项配置完整且 checkout 已登记时，MCP 进程启动即自动建立 Presence；缺少配置时不会根据模型参数猜测身份，也不会自动创建 Room。自动 Presence 不能代替新对话的 `room_bootstrap`。模型不得按任务、角色、审核或运行检查临时改名。数据库 `agent_key`/`member_id` 由后端生成，不由 Agent 填写。每次连接仍保留新的 Session 审计记录，但同一软件同时最多一个活动 Session。
 
 Project 的创建、归档、永久删除和 Agent 接入使用不同语义：代码项目作用域还
 没有 Room 时，第一个 Agent 的 `room_join` 可以请求后端创建它，Web 管理端、REST 和
@@ -215,7 +233,11 @@ Room。`room_join` 会从忽略的 `.agentchatroom/project.json` 读取后端登
 - `streamable-http`：后续阶段客户端直接连接中心 `/mcp` 的基础适配，当前不在 Web 展示。
 - `remote-bridge`：后续阶段由本机 Bridge 转发到远程中心的基础适配，当前不在 Web 展示。
 
-一期 Web 只提供 `local-stdio` 配置流程。远程能力完成独立设计、代码同步边界和端到端验收前，不应通过隐藏入口或手工参数将其视为已支持产品能力。未来使用的远程 Token 只允许放在客户端安全配置或环境变量中，不写入 README、项目规则、日志、消息正文或 Git。
+一期 Web 只提供 `local-stdio` 配置流程。远程能力完成独立设计、代码同步边界和端到端验收前，不应通过隐藏入口或手工参数将其视为已支持产品能力。
+
+### Agent 凭据传输约束
+
+Agent Session Token 与 access token 只能放在 JSON 请求体、`Authorization: Bearer` 头，或客户端本地安全配置 / 环境变量中。不得把这些凭据放进 URL 路径、查询参数、Referer、access log、代理日志、消息正文、项目规则或 Git。`release_lease` 等敏感操作必须走请求体或请求头，不能把 `session_id` 或 `token` 拼进查询字符串。服务端 access log 会对 `token=`、`Bearer`、`Authorization` 和 Cookie 值脱敏；脱敏不能替代正确的传输方式。未来使用的远程 Token 同样只允许放在客户端安全配置或环境变量中。
 
 ### 本机 MCP 配置助手
 
@@ -226,7 +248,7 @@ Room。`room_join` 会从忽略的 `.agentchatroom/project.json` 读取后端登
 - Trae 优先检测 `%APPDATA%/TRAE SOLO CN/User/mcp.json`；只有其他候选配置文件实际存在时才使用，不创建猜测路径。
 - 只新增或替换 `mcpServers.agentchatroom`，保留其他 MCP Server 和客户端设置。
 - 预览返回当前文件 SHA-256；应用时哈希不一致会拒绝覆盖，要求重新检测。
-- 写入前在同一目录创建带 UTC 时间戳的备份，并通过同目录临时文件和原子替换更新原文件。
+- 写入前在同一目录创建带 UTC 时间戳的备份（权限 `0o600`，文件名冲突时重试），并通过同目录临时文件、再次哈希校验和原子替换更新原文件；应用期间配置被外部改写会失败而不是覆盖。
 - 配置缺失、JSON 无效、不可读、不可写时降级为辅助或手动配置；不会静默覆盖、自动提权或修改未知文件。
 - “让 Agent 配置 MCP”只发送目标客户端、连接方式和当前环境动态生成的配置，不混入项目协作规则、配置文件路径假设、权限处理或任务流程；具体接入方式由 Agent 根据实际客户端自行判断。
 - LAN/服务器部署只生成配置和人工指引，绝不尝试修改 Agent 电脑上的文件。
@@ -238,7 +260,7 @@ WorkBuddy 配置变化可能触发新的连接器审批；Trae/WorkBuddy 都可�
 ## 标准协作流程
 
 ```text
-room_join -> room_sync
+room_bootstrap
 -> 创建或接收 Task
 -> task_claim / task_acknowledge
 -> lease_acquire
@@ -249,6 +271,61 @@ room_join -> room_sync
 -> integration_submit
 -> lease_release / session_leave
 ```
+
+`room_join` 仍作为兼容入口保留：仅在仓库作用域与 checkout 登记都为空时，第一个 Agent 可以请求创建 Room。正常已登记工作区的新对话只调用 `room_bootstrap`。
+
+### 新对话 Room Bootstrap
+
+`room_bootstrap` 是公开、幂等、默认零参数的 MCP 工具；CLI 提供 `room-bootstrap`，REST 公开配置声明同一套状态模型。解析当前 checkout 的固定优先级为：
+
+1. MCP 客户端提供的 workspace roots；
+2. 当前工作目录向上查找 `.agentchatroom/project.json`；
+3. 已验证的 `AGENTCHATROOM_PROJECT_PATH` 覆盖项。
+
+只有一个有效候选时自动进入。没有候选返回 `project_not_registered`，登记损坏返回 `registration_invalid`，多个不同 Project 返回 `ambiguous_workspace`，禁止猜测或误入其他 Room。
+
+成功结果区分四件独立事实：软件已配置、MCP 进程已连接、Room Session 已恢复或替换、当前模型对话已同步。失败状态是有限集合，每种只有一个 `required_action`：
+
+| 状态 | 下一步 |
+| --- | --- |
+| `identity_not_configured` | `open_local_mcp_config_assistant` |
+| `mcp_restart_required` | `restart_mcp_client_session` |
+| `project_not_registered` | `create_or_open_project_in_web` |
+| `registration_invalid` | `recreate_checkout_registration_via_web` |
+| `ambiguous_workspace` | `open_one_workspace_folder` |
+| `room_unavailable` | `restore_or_wait_for_room` |
+| `session_expired` | `call_room_bootstrap` |
+
+配置助手只负责首次安装或明确缺失配置，不得声称已经连接或同步。`room_bootstrap` 不编辑第三方客户端配置文件，不认领任务，不改写历史事件。兼容期仍可显式传入 `project_id` / `session_id` / `token`，但必须与当前绑定一致；跨 Project 或旧 Session 会被拒绝。非目标：不要求所有 MCP 客户端都支持自动 Resource 注入，也不把完全零调用作为首版硬要求。
+
+Web「配置本机 Agent」把四件事实分开显示：软件配置、进程连接（MCP Presence）、Room Session、当前对话同步。浏览器无法观察某个模型对话是否已同步，因此不会把左侧「已连接」画成「当前对话已同步」。CLI `room-bootstrap` 复用同一领域服务，成功结果也不打印 Session Token。
+
+### Web 任务阶段筛选
+
+后端仍使用执行 / 验证 / 集成三面状态机；REST、MCP、CLI、持久化和 Web 共用派生字段 `phase`。Agent 不得自造阶段名。公开筛选阶段是：
+
+| 阶段 | 含义 | Agent 提交入口 |
+| --- | --- | --- |
+| 待认领 `todo` | 正式任务尚未被认领 | `task_create` / intake define |
+| 已认领 `claimed` | 已指定执行者，尚未开始 | `task_claim` |
+| 执行中 `in_progress` | 正在执行 | `task_update status=in_progress` |
+| 阻塞 `blocked` | 执行受阻 | `task_update status=blocked` |
+| 已提交 `awaiting_review` | Work Report 已提交，待独立验证 | `work_report` |
+| 待验收 `verified` | 独立验证通过，待集成 | `review_submit verdict=approved` |
+| 已完成 `done` | 验证通过且集成完成 | `integration_submit result=done` |
+| 已取消 `cancelled` | 已取消，不再进入验证或集成 | `task_update status=cancelled` |
+
+Web 任务列表按上述阶段分别筛选，并保留「全部」。任务卡片同时显示 `#<task_number>` 与 `P<priority>`，二者互不替代。公开语义上「已完成 = 验证通过 + 集成完成」。
+
+### 任务证据链与分页历史
+
+任务详情时间线不再依赖 Room 动态最近 120 条事件。REST `GET /api/v1/projects/{project_id}/tasks/{task_id}/history`、MCP `task_history` 和 CLI `task-history` 复用同一领域投影，按 `event_id` 稳定排序，支持 `after` / `before` / `limit` / `event_type`。投影联结 append-only 事件与不可变 Work Report、Review、Integration、Message、Acknowledgement 记录，显示原文、逐条验收证据、测试命令、状态 before→after、确认人和当时软件身份。Agent 消息只使用该条消息自己的 `model_display_name`，缺失则为 `unknown`。验证通过不等于最终完成；集成结果单独显示。历史结果走共享脱敏，不会返回 Token、Authorization、Cookie 或私钥。事件编号可复制为 `任务 #N / 事件 #ID`，并用 `#event-ID` 定位。
+
+Agent Session Token 校验与 `last_used_at` 更新是分开的：校验走只读连接，使用时间在后台批量写入（默认至少间隔 60 秒或累计 32 次调用），进程退出时 flush。`session_heartbeat` 只刷新连接存活，不承担 Token 校验写锁。
+
+浏览器订阅 `events/stream` 必须携带 Agent Session 凭据（请求头）或已建立的浏览器 Session Cookie；匿名订阅返回 401。公开配置提供 `max_sse_clients_per_project`（默认 64）和 `sse_per_ip_limit`（默认 16），超限返回 429。
+
+Agent 自报的 `worktree` 不会被服务盲目信任。Work Report 采集 Git 证据前必须有已登记 Workspace，路径只能是该 Workspace 的 `local_path` 或其子目录，上报的 `commit_hash` 必须能在该 worktree 内解析；否则拒绝，不会把伪造路径或伪造 commit 写成事实。
 
 后台 MCP/Bridge 进程只负责连接 Presence。`session_heartbeat` 只刷新连接存活，
 不再依赖 Agent 主动提交 `working`、`idle` 或 `blocked`。左侧显示已连接/未连接、

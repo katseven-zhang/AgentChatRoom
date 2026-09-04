@@ -38,18 +38,37 @@ def project(service, project_dir):
     return service.create_project(root_path=str(project_dir), name="Test Project")
 
 
+def bind_workspace(service, project):
+    return service.register_workspace(
+        project["id"],
+        host_key="test-host",
+        host_name="Test Host",
+        local_path=project["root_path"],
+    )
+
+
+def join_room_with_workspace(service, project, **kwargs):
+    registered = bind_workspace(service, project)
+    kwargs.setdefault("worktree", project["root_path"])
+    kwargs.setdefault("host_id", registered["host"]["id"])
+    kwargs.setdefault("workspace_id", registered["workspace"]["id"])
+    return service.join_room(project["id"], **kwargs)
+
+
 @pytest.fixture()
 def joined_agents(service, project):
-    executor = service.join_room(
-        project["id"],
+    executor = join_room_with_workspace(
+        service,
+        project,
         agent_key="builder-main",
         name="Builder",
         client="codex",
         model="test-model",
         role="executor",
     )
-    reviewer = service.join_room(
-        project["id"],
+    reviewer = join_room_with_workspace(
+        service,
+        project,
         agent_key="reviewer-main",
         name="Reviewer",
         client="qoder",

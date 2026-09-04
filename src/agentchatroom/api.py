@@ -3,10 +3,13 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import hmac
+import ipaddress
 import json
+import logging
 import os
 import re
 import secrets
+import threading
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -30,6 +33,8 @@ from .project_registration import (
     register_checkout_project,
     remove_checkout_project_registration,
 )
+from .bootstrap import BOOTSTRAP_SCHEMA_VERSION, BOOTSTRAP_STATES, REQUIRED_ACTIONS
+from .task_history import TASK_HISTORY_SCHEMA_VERSION
 from .contracts import (
     ASSIGNMENT_RESPONSES,
     ASSIGNMENT_STATUSES,
@@ -44,6 +49,9 @@ from .contracts import (
     TASK_INTEGRATION_STATUSES,
     TASK_INTAKE_STATUSES,
     TASK_INTAKE_TRANSITIONS,
+    TASK_PHASES,
+    TASK_PHASE_COMMANDS,
+    TASK_PHASE_LABELS,
     TASK_VERIFICATION_STATUSES,
     knowledge_contract,
 )
@@ -60,6 +68,43 @@ from .services import (
     REQUEST_ID_PATTERN,
     new_id,
 )
+
+
+def trusted_proxy_peer(peer_host: str, trusted_proxy_ips: str) -> bool:
+    raw = str(peer_host or "").strip()
+    if not raw or raw == "unknown":
+        return False
+    try:
+        peer = ipaddress.ip_address(raw)
+    except ValueError:
+        return False
+    for item in str(trusted_proxy_ips or "").split(","):
+        candidate = item.strip()
+        if not candidate:
+            continue
+        try:
+            if "/" in candidate:
+                if peer in ipaddress.ip_network(candidate, strict=False):
+                    return True
+            elif peer == ipaddress.ip_address(candidate):
+                return True
+        except ValueError:
+            continue
+    return False
+
+
+def request_client_ip(
+    request: Request,
+    *,
+    trusted_proxy_headers: bool,
+    trusted_proxy_ips: str,
+) -> str:
+    peer = request.client.host if request.client else "unknown"
+    if trusted_proxy_headers and trusted_proxy_peer(peer, trusted_proxy_ips):
+        forwarded = request.headers.get("x-forwarded-for", "").split(",")[0].strip()
+        if forwarded:
+            return forwarded
+    return peer or "unknown"
 
 
 class StrictModel(BaseModel):
@@ -151,18 +196,78 @@ class AdminLogin(StrictModel):
     token: str
 
 
+_CREDENTIAL_VALUE = r"[^\s,;}\]&\"']+"
+
+
 def _redact_log_line(line: str) -> str:
     """Keep operational context while removing common credential-shaped values."""
     redacted = re.sub(
-        r"(?i)(bearer\s+)[^\s,}\]]+",
+        r"(?i)(authorization\s*[:=]\s*)[^\r\n]+",
         r"\1[REDACTED]",
         line,
     )
+    redacted = re.sub(
+        r"(?i)(bearer\s+)" + _CREDENTIAL_VALUE,
+        r"\1[REDACTED]",
+        redacted,
+    )
+    redacted = re.sub(
+        r"(?i)(cookie\s*[:=]\s*)[^\r\n]+",
+        r"\1[REDACTED]",
+        redacted,
+    )
+    redacted = re.sub(
+        r"(?i)((?:^|[;,\s])[a-z0-9_-]*cookie[a-z0-9_-]*\s*[:=]\s*)" + _CREDENTIAL_VALUE,
+        r"\1[REDACTED]",
+        redacted,
+    )
     return re.sub(
-        r"(?i)(token|secret|password|api[_-]?key)(\s*[:=]\s*)[^\s,}\]]+",
+        r"(?i)(token|secret|password|api[_-]?key)(\s*[:=]\s*)" + _CREDENTIAL_VALUE,
         r"\1\2[REDACTED]",
         redacted,
     )
+
+
+class CredentialRedactingLogFilter(logging.Filter):
+    """Redact credentials in uvicorn access logs and other logger records."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if isinstance(record.msg, str):
+            record.msg = _redact_log_line(record.msg)
+        if record.args:
+            if isinstance(record.args, tuple):
+                record.args = tuple(
+                    _redact_log_line(arg) if isinstance(arg, str) else arg
+                    for arg in record.args
+                )
+            elif isinstance(record.args, dict):
+                record.args = {
+                    key: _redact_log_line(value) if isinstance(value, str) else value
+                    for key, value in record.args.items()
+                }
+        return True
+
+
+def install_credential_log_redaction() -> None:
+    """Attach credential redaction to server loggers once per process."""
+    log_filter = CredentialRedactingLogFilter()
+    for name in ("uvicorn", "uvicorn.access", "uvicorn.error", "agentchatroom"):
+        logger = logging.getLogger(name)
+        if not any(
+            isinstance(existing, CredentialRedactingLogFilter)
+            for existing in logger.filters
+        ):
+            logger.addFilter(log_filter)
+
+
+def _reject_credentials_in_query(request: Request) -> None:
+    keys = {key.lower() for key in request.query_params.keys()}
+    if keys & {"token", "session_id", "access_token"}:
+        raise DomainError(
+            "credentials_in_query_rejected",
+            "Agent credentials must be sent in the JSON body, not the URL query string",
+            status_code=400,
+        )
 
 
 def _management_session_hash(session_id: str) -> str:
@@ -202,6 +307,9 @@ class AgentJoin(StrictModel):
     capabilities: dict[str, Any] = Field(default_factory=dict)
     metadata: dict[str, Any] = Field(default_factory=dict)
     member_id: str | None = None
+    host_id: str | None = None
+    workspace_id: str | None = None
+    credential_id: str | None = None
 
 
 class AgentHeartbeat(StrictModel):
@@ -386,6 +494,11 @@ class LeaseCreate(StrictModel):
     ttl_seconds: int | None = None
 
 
+class LeaseRelease(StrictModel):
+    session_id: str
+    token: str
+
+
 class LeaseCheck(StrictModel):
     paths: list[str]
     session_id: str | None = None
@@ -451,6 +564,54 @@ class KnowledgeAssetAction(StrictModel):
     reason: str = ""
 
 
+class SSELimiter:
+    """Bound in-process SSE occupancy by Project and client address."""
+
+    def __init__(self, *, max_per_project: int, max_per_ip: int) -> None:
+        self.max_per_project = max_per_project
+        self.max_per_ip = max_per_ip
+        self._guard = threading.Lock()
+        self._project_counts: dict[str, int] = {}
+        self._ip_counts: dict[str, int] = {}
+
+    def acquire(self, project_id: str, client_ip: str) -> None:
+        with self._guard:
+            project_count = self._project_counts.get(project_id, 0)
+            ip_count = self._ip_counts.get(client_ip, 0)
+            if project_count >= self.max_per_project:
+                raise DomainError(
+                    "sse_limit_exceeded",
+                    "Too many event stream clients for this Project",
+                    status_code=429,
+                    details={
+                        "limit": self.max_per_project,
+                        "scope": "project",
+                    },
+                )
+            if ip_count >= self.max_per_ip:
+                raise DomainError(
+                    "sse_limit_exceeded",
+                    "Too many event stream clients from this address",
+                    status_code=429,
+                    details={"limit": self.max_per_ip, "scope": "ip"},
+                )
+            self._project_counts[project_id] = project_count + 1
+            self._ip_counts[client_ip] = ip_count + 1
+
+    def release(self, project_id: str, client_ip: str) -> None:
+        with self._guard:
+            project_count = self._project_counts.get(project_id, 0) - 1
+            ip_count = self._ip_counts.get(client_ip, 0) - 1
+            if project_count > 0:
+                self._project_counts[project_id] = project_count
+            else:
+                self._project_counts.pop(project_id, None)
+            if ip_count > 0:
+                self._ip_counts[client_ip] = ip_count
+            else:
+                self._ip_counts.pop(client_ip, None)
+
+
 def create_app(
     settings: Settings | None = None,
     *,
@@ -497,7 +658,7 @@ def create_app(
                 async with mcp_server.session_manager.run():
                     yield
         finally:
-            service.database.close()
+            service.close()
 
     app = FastAPI(
         title=resolved.product_name,
@@ -529,11 +690,102 @@ def create_app(
             ).fetchone()
         return row is not None and float(row["expires_at"]) > time.time()
 
+    def browser_session_valid(session_id: str) -> bool:
+        if not session_id:
+            return False
+        with service.database.connect() as connection:
+            row = connection.execute(
+                "SELECT expires_at FROM management_sessions WHERE session_hash = ?",
+                (_management_session_hash(session_id),),
+            ).fetchone()
+        return row is not None and float(row["expires_at"]) > time.time()
+
+    def issue_browser_session() -> tuple[str, JSONResponse]:
+        session_id = secrets.token_urlsafe(32)
+        now = time.time()
+        expires_at = now + resolved.management_session_ttl_seconds
+        with service.database.connect(write=True) as connection:
+            connection.execute(
+                "DELETE FROM management_sessions WHERE expires_at <= ?",
+                (now,),
+            )
+            connection.execute(
+                """
+                INSERT INTO management_sessions(session_hash, expires_at, created_at)
+                VALUES (?, ?, ?)
+                """,
+                (_management_session_hash(session_id), expires_at, now),
+            )
+        payload = {
+            "authenticated": True,
+            "expires_in_seconds": resolved.management_session_ttl_seconds,
+        }
+        return session_id, JSONResponse(payload)
+
+    def attach_browser_cookie(response: JSONResponse, session_id: str) -> JSONResponse:
+        response.set_cookie(
+            resolved.management_cookie_name,
+            session_id,
+            max_age=resolved.management_session_ttl_seconds,
+            httponly=True,
+            secure=base_url.startswith("https://"),
+            samesite="strict",
+            path="/",
+        )
+        return response
+
+    def event_stream_client_ip(request: Request) -> str:
+        return request_client_ip(
+            request,
+            trusted_proxy_headers=resolved.trusted_proxy_headers,
+            trusted_proxy_ips=resolved.trusted_proxy_ips,
+        )
+
+    def authorize_event_stream(request: Request, project_id: str) -> None:
+        session_id = (
+            request.headers.get("x-agentchatroom-session-id")
+            or request.headers.get("x-session-id")
+            or ""
+        ).strip()
+        token = (request.headers.get("x-agentchatroom-token") or "").strip()
+        authorization = request.headers.get("authorization", "")
+        bearer = (
+            authorization[7:].strip()
+            if authorization.lower().startswith("bearer ")
+            else ""
+        )
+        if session_id and not token:
+            token = bearer
+        if session_id and token:
+            service.verify_session(project_id, session_id, token)
+            return
+        if bearer:
+            service.authenticate_agent_token(
+                bearer,
+                project_id=project_id,
+                required_permission="room:read",
+            )
+            return
+        cookie = request.cookies.get(resolved.management_cookie_name, "")
+        if browser_session_valid(cookie):
+            return
+        raise DomainError(
+            "unauthorized_sse",
+            "Event stream requires Agent session credentials or a browser session",
+            status_code=401,
+        )
+
+    sse_limiter = SSELimiter(
+        max_per_project=resolved.max_sse_clients_per_project,
+        max_per_ip=resolved.sse_per_ip_limit,
+    )
+
     app.add_middleware(
         ManagementAuthASGIMiddleware,
         authenticated=management_authenticated,
     )
     app.add_middleware(RequestIdASGIMiddleware)
+    install_credential_log_redaction()
 
     @app.exception_handler(DomainError)
     async def domain_error_handler(_request: Request, error: DomainError) -> JSONResponse:
@@ -591,11 +843,30 @@ def create_app(
         )
 
     @app.get("/api/v1/auth/status")
-    def management_auth_status(request: Request) -> dict[str, Any]:
-        return {
-            "required": resolved.management_auth_required,
-            "authenticated": management_authenticated(request),
-        }
+    def management_auth_status(request: Request) -> JSONResponse:
+        cookie = request.cookies.get(resolved.management_cookie_name, "")
+        authenticated = management_authenticated(request)
+        response = JSONResponse(
+            {
+                "required": resolved.management_auth_required,
+                "authenticated": authenticated,
+            }
+        )
+        if (
+            not resolved.management_auth_required
+            and authenticated
+            and not browser_session_valid(cookie)
+        ):
+            session_id, _issued = issue_browser_session()
+            response = JSONResponse(
+                {
+                    "required": False,
+                    "authenticated": True,
+                    "expires_in_seconds": resolved.management_session_ttl_seconds,
+                }
+            )
+            attach_browser_cookie(response, session_id)
+        return response
 
     @app.post("/api/v1/auth/login")
     def management_login(body: AdminLogin) -> JSONResponse:
@@ -612,37 +883,8 @@ def create_app(
                     }
                 },
             )
-        session_id = secrets.token_urlsafe(32)
-        now = time.time()
-        expires_at = now + resolved.management_session_ttl_seconds
-        with service.database.connect(write=True) as connection:
-            connection.execute(
-                "DELETE FROM management_sessions WHERE expires_at <= ?",
-                (now,),
-            )
-            connection.execute(
-                """
-                INSERT INTO management_sessions(session_hash, expires_at, created_at)
-                VALUES (?, ?, ?)
-                """,
-                (_management_session_hash(session_id), expires_at, now),
-            )
-        response = JSONResponse(
-            {
-                "authenticated": True,
-                "expires_in_seconds": resolved.management_session_ttl_seconds,
-            }
-        )
-        response.set_cookie(
-            resolved.management_cookie_name,
-            session_id,
-            max_age=resolved.management_session_ttl_seconds,
-            httponly=True,
-            secure=base_url.startswith("https://"),
-            samesite="strict",
-            path="/",
-        )
-        return response
+        session_id, response = issue_browser_session()
+        return attach_browser_cookie(response, session_id)
 
     @app.post("/api/v1/auth/logout")
     def management_logout(request: Request) -> JSONResponse:
@@ -671,6 +913,10 @@ def create_app(
             "config_schema_version": resolved.config_schema_version,
             "default_lease_ttl_seconds": resolved.default_lease_ttl_seconds,
             "presence_refresh_interval_seconds": resolved.presence_refresh_interval_seconds,
+            "max_sse_clients_per_project": resolved.max_sse_clients_per_project,
+            "sse_per_ip_limit": resolved.sse_per_ip_limit,
+            "token_touch_interval_seconds": resolved.token_touch_interval_seconds,
+            "token_touch_min_calls": resolved.token_touch_min_calls,
             "capabilities": {
                 "mcp": True,
                 "local_folder_picker": resolved.deployment_profile == "local",
@@ -683,6 +929,7 @@ def create_app(
                 "streamable_http_mcp_auth_required": resolved.mcp_http_auth_required,
                 "sse": True,
                 "cli": True,
+                "room_bootstrap": True,
                 "api_version": "v1",
             },
             "proxy": {
@@ -703,7 +950,14 @@ def create_app(
                 "task_execution_statuses": sorted(TASK_EXECUTION_STATUSES),
                 "task_verification_statuses": sorted(TASK_VERIFICATION_STATUSES),
                 "task_integration_statuses": sorted(TASK_INTEGRATION_STATUSES),
+                "task_phases": list(TASK_PHASES),
+                "task_phase_labels": dict(TASK_PHASE_LABELS),
+                "task_phase_commands": dict(TASK_PHASE_COMMANDS),
+                "task_history_schema_version": TASK_HISTORY_SCHEMA_VERSION,
                 "task_intake_statuses": sorted(TASK_INTAKE_STATUSES),
+                "bootstrap_schema_version": BOOTSTRAP_SCHEMA_VERSION,
+                "bootstrap_states": list(BOOTSTRAP_STATES),
+                "bootstrap_required_actions": dict(REQUIRED_ACTIONS),
                 "task_intake_transitions": {
                     status: sorted(next_states)
                     for status, next_states in TASK_INTAKE_TRANSITIONS.items()
@@ -967,6 +1221,9 @@ def create_app(
         after: int = Query(0, ge=0),
     ) -> StreamingResponse:
         service.get_project(project_id)
+        authorize_event_stream(request, project_id)
+        client_ip = event_stream_client_ip(request)
+        sse_limiter.acquire(project_id, client_ip)
         header_cursor = request.headers.get("last-event-id", "")
         if header_cursor.isdigit():
             after = max(after, int(header_cursor))
@@ -974,20 +1231,26 @@ def create_app(
         async def event_stream():
             cursor = after
             idle_ticks = 0
-            while not await request.is_disconnected():
-                result = service.list_events(project_id, after=cursor, limit=200)
-                if result["events"]:
-                    for event in result["events"]:
-                        cursor = event["id"]
-                        payload = json.dumps(event, ensure_ascii=False, separators=(",", ":"))
-                        yield f"id: {cursor}\nevent: room_event\ndata: {payload}\n\n"
-                    idle_ticks = 0
-                else:
-                    idle_ticks += 1
-                    if idle_ticks * resolved.sse_poll_interval_seconds >= 15:
-                        yield ": heartbeat\n\n"
+            try:
+                yield ": connected\n\n"
+                while not await request.is_disconnected():
+                    result = service.list_events(project_id, after=cursor, limit=200)
+                    if result["events"]:
+                        for event in result["events"]:
+                            cursor = event["id"]
+                            payload = json.dumps(
+                                event, ensure_ascii=False, separators=(",", ":")
+                            )
+                            yield f"id: {cursor}\nevent: room_event\ndata: {payload}\n\n"
                         idle_ticks = 0
-                await asyncio.sleep(resolved.sse_poll_interval_seconds)
+                    else:
+                        idle_ticks += 1
+                        if idle_ticks * resolved.sse_poll_interval_seconds >= 15:
+                            yield ": heartbeat\n\n"
+                            idle_ticks = 0
+                    await asyncio.sleep(resolved.sse_poll_interval_seconds)
+            finally:
+                sse_limiter.release(project_id, client_ip)
 
         return StreamingResponse(
             event_stream(),
@@ -1132,6 +1395,24 @@ def create_app(
     @app.get("/api/v1/projects/{project_id}/tasks/{task_id}")
     def get_task(project_id: str, task_id: str) -> dict[str, Any]:
         return {"task": service.get_task(project_id, task_id)}
+
+    @app.get("/api/v1/projects/{project_id}/tasks/{task_id}/history")
+    def list_task_history(
+        project_id: str,
+        task_id: str,
+        after: int = Query(0, ge=0),
+        before: int = Query(0, ge=0),
+        limit: int = Query(50, ge=1, le=200),
+        event_type: str | None = None,
+    ) -> dict[str, Any]:
+        return service.list_task_history(
+            project_id,
+            task_id,
+            after=after,
+            before=before,
+            limit=limit,
+            event_type=event_type or "",
+        )
 
     @app.get("/api/v1/projects/{project_id}/task-intakes/targets")
     def list_task_intake_targets(project_id: str) -> dict[str, Any]:
@@ -1331,14 +1612,14 @@ def create_app(
         request: Request,
         project_id: str,
         lease_id: str,
-        session_id: str,
-        token: str,
+        body: LeaseRelease,
     ) -> dict[str, Any]:
+        _reject_credentials_in_query(request)
         return service.release_lease(
             project_id,
             lease_id,
-            session_id,
-            token,
+            body.session_id,
+            body.token,
             request_id=request.state.request_id,
         )
 

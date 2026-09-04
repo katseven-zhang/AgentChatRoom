@@ -8,6 +8,12 @@ from agentchatroom.errors import DomainError
 
 
 def _join(service, project, *, agent_key, name, client="codex"):
+    registered = service.register_workspace(
+        project["id"],
+        host_key="test-host",
+        host_name="Test Host",
+        local_path=project["root_path"],
+    )
     return service.join_room(
         project["id"],
         agent_key=agent_key,
@@ -16,6 +22,9 @@ def _join(service, project, *, agent_key, name, client="codex"):
         software_key=agent_key,
         model="test-model",
         role="executor",
+        worktree=project["root_path"],
+        host_id=registered["host"]["id"],
+        workspace_id=registered["workspace"]["id"],
     )
 
 

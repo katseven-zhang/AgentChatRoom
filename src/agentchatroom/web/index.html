@@ -6,7 +6,7 @@
     <meta name="color-scheme" content="light">
     <title>AgentChatRoom</title>
     <link rel="icon" href="/assets/favicon.svg?v=1.0.0-central1" type="image/svg+xml">
-    <link rel="stylesheet" href="/assets/app.css?v=1.0.0-central22">
+    <link rel="stylesheet" href="/assets/app.css?v=1.0.0-central26">
   </head>
   <body>
     <div class="app-shell" id="app-shell">
@@ -77,15 +77,15 @@
           </div>
         </section>
 
-        <nav class="tabs" aria-label="项目视图">
-          <button type="button" class="tab is-active" data-tab="overview"><span class="tab-label">总览</span></button>
-          <button type="button" class="tab" data-tab="tasks" title="查看任务合同与协作过程" aria-label="任务"><span class="tab-label">任务</span><span class="tab-status">协作视图</span></button>
-          <button type="button" class="tab" data-tab="leases" title="当前功能尚未形成完整闭环" aria-label="文件占用，未闭环"><span class="tab-label">文件占用</span><span class="tab-status">未闭环</span></button>
-          <button type="button" class="tab" data-tab="reviews" title="当前功能尚未形成完整闭环" aria-label="验证，未闭环"><span class="tab-label">验证</span><span class="tab-status">未闭环</span></button>
-          <button type="button" class="tab" data-tab="management" title="当前功能尚未形成完整闭环" aria-label="管理，未闭环"><span class="tab-label">管理</span><span class="tab-status">未闭环</span></button>
+        <nav class="tabs" role="tablist" aria-label="项目视图">
+          <button type="button" class="tab is-active" role="tab" id="tab-overview" data-tab="overview" aria-selected="true" aria-controls="panel-overview"><span class="tab-label">总览</span></button>
+          <button type="button" class="tab" role="tab" id="tab-tasks" data-tab="tasks" title="查看任务合同与协作过程" aria-label="任务" aria-selected="false" aria-controls="panel-tasks"><span class="tab-label">任务</span><span class="tab-status">协作视图</span></button>
+          <button type="button" class="tab" role="tab" id="tab-leases" data-tab="leases" title="当前功能尚未形成完整闭环" aria-label="文件占用，未闭环" aria-selected="false" aria-controls="panel-leases"><span class="tab-label">文件占用</span><span class="tab-status">未闭环</span></button>
+          <button type="button" class="tab" role="tab" id="tab-reviews" data-tab="reviews" title="当前功能尚未形成完整闭环" aria-label="验证，未闭环" aria-selected="false" aria-controls="panel-reviews"><span class="tab-label">验证</span><span class="tab-status">未闭环</span></button>
+          <button type="button" class="tab" role="tab" id="tab-management" data-tab="management" title="当前功能尚未形成完整闭环" aria-label="管理，未闭环" aria-selected="false" aria-controls="panel-management"><span class="tab-label">管理</span><span class="tab-status">未闭环</span></button>
         </nav>
 
-        <section class="tab-panel is-active" id="panel-overview">
+        <section class="tab-panel is-active" id="panel-overview" role="tabpanel" aria-labelledby="tab-overview">
           <section class="onboarding is-hidden" id="onboarding">
             <h3>三步开始多 Agent 协作</h3>
             <ol class="onboarding-steps">
@@ -118,14 +118,17 @@
           </div>
         </section>
 
-        <section class="tab-panel" id="panel-tasks">
+        <section class="tab-panel" id="panel-tasks" role="tabpanel" aria-labelledby="tab-tasks">
           <div class="scope-status"><span>协作视图</span><p>提交原始任务说明后，由目标 Agent 受理并补全正式任务合同；执行、验证和集成过程在详情中只读呈现。</p></div>
           <div class="panel-toolbar">
-            <div class="segmented-control" id="task-filter" aria-label="任务状态筛选">
+            <div class="segmented-control" id="task-filter" aria-label="任务阶段筛选">
               <button type="button" class="is-active" data-filter="">全部</button>
               <button type="button" data-filter="todo">待认领</button>
-              <button type="button" data-filter="in_progress">进行中</button>
-              <button type="button" data-filter="awaiting_review">待验证</button>
+              <button type="button" data-filter="claimed">已认领</button>
+              <button type="button" data-filter="in_progress">执行中</button>
+              <button type="button" data-filter="blocked">阻塞</button>
+              <button type="button" data-filter="awaiting_review">已提交</button>
+              <button type="button" data-filter="verified">待验收</button>
               <button type="button" data-filter="done">已完成</button>
               <button type="button" data-filter="cancelled">已取消</button>
             </div>
@@ -134,7 +137,7 @@
           <div id="task-intake-list" class="task-intake-list" aria-live="polite"></div>
         </section>
 
-        <section class="tab-panel" id="panel-leases">
+        <section class="tab-panel" id="panel-leases" role="tabpanel" aria-labelledby="tab-leases">
           <div class="scope-status"><span>未闭环</span><p>当前只展示 Agent 通过 MCP 申请的租约；网页端暂不提供申请与释放。</p></div>
           <div class="data-section unframed">
             <div class="section-heading">
@@ -147,7 +150,7 @@
           </div>
         </section>
 
-        <section class="tab-panel" id="panel-reviews">
+        <section class="tab-panel" id="panel-reviews" role="tabpanel" aria-labelledby="tab-reviews">
           <div class="scope-status"><span>未闭环</span><p>当前只展示工作报告和独立验证结果；网页端暂不提供评审提交。</p></div>
           <div class="data-section unframed">
             <div class="section-heading">
@@ -160,7 +163,7 @@
           </div>
         </section>
 
-        <section class="tab-panel" id="panel-management">
+        <section class="tab-panel" id="panel-management" role="tabpanel" aria-labelledby="tab-management">
           <div class="scope-status"><span>未闭环</span><p>当前管理能力处于试运行阶段；成员、Token、Workspace 与审计仍缺少完整使用闭环。</p></div>
           <div class="management-stack">
             <section class="data-section unframed management-section">
@@ -283,7 +286,7 @@
         </div>
         <form class="composer" id="message-form">
           <label class="sr-only" for="message-input">发送 Room 消息</label>
-          <textarea id="message-input" rows="3" placeholder="向当前 Room 发送消息（Ctrl+Enter 发送）" disabled></textarea>
+          <textarea id="message-input" rows="3" maxlength="20000" placeholder="向当前 Room 发送消息（Ctrl+Enter 发送）" disabled></textarea>
           <div class="composer-actions">
             <details class="composer-advanced" id="composer-advanced">
               <summary>高级选项</summary>
@@ -350,7 +353,7 @@
           <button type="button" class="icon-button dialog-close" title="关闭" aria-label="关闭">×</button>
         </div>
         <p class="form-hint task-intake-hint">只需描述想完成的事情并选择一名已接入且未吊销的受理 Agent，当前未连接也可以先提交。标题、验收条件、优先级和依赖由 Agent 受理后补全。</p>
-        <label>原始任务说明 <textarea id="task-raw-description-input" name="raw_description" rows="6" required placeholder="例如：检查登录流程的异常处理，并补充必要的自动化测试"></textarea></label>
+        <label>原始任务说明 <textarea id="task-raw-description-input" name="raw_description" rows="6" maxlength="20000" required placeholder="例如：检查登录流程的异常处理，并补充必要的自动化测试"></textarea></label>
         <label>受理 Agent
           <select id="task-target-agent-input" name="target_member_id" required>
             <option value="">正在加载可受理 Agent…</option>
@@ -388,10 +391,24 @@
           <div class="section-heading">
             <div>
               <h3>协作时间线</h3>
-              <p class="secondary-text">受理、定义、执行、交接、报告、验证和集成均为过程事实。</p>
+              <p class="secondary-text">按事件编号追溯原文、证据、状态迁移和确认记录。</p>
             </div>
+            <label class="timeline-filter-label">
+              <span class="secondary-text">事件类型</span>
+              <select id="task-history-filter" aria-label="任务历史事件类型">
+                <option value="">全部事件</option>
+                <option value="review.submitted">验证结论</option>
+                <option value="work.reported">工作证据</option>
+                <option value="message.decision">决策</option>
+                <option value="message.message">消息</option>
+                <option value="task.integration_completed">集成</option>
+                <option value="task.updated">状态变更</option>
+              </select>
+            </label>
           </div>
+          <button type="button" class="secondary-button" id="task-history-load-earlier">加载更早事件</button>
           <div id="task-timeline" class="task-timeline"></div>
+          <button type="button" class="secondary-button" id="task-history-load-later">加载更新事件</button>
         </section>
         <div class="dialog-actions">
           <button type="button" class="primary-button dialog-close">完成</button>
@@ -496,7 +513,7 @@
           <p id="integration-local-message" class="local-mcp-message">只检测，不会在打开页面时自动写入。</p>
           <p id="integration-local-changes" class="secondary-text"></p>
           <p id="integration-local-reload" class="secondary-text"></p>
-          <p id="integration-local-presence" class="local-mcp-presence" data-connected="false"></p>
+          <dl id="integration-local-facts" class="local-mcp-facts"></dl>
           <p id="integration-local-backup" class="secondary-text local-mcp-backup"></p>
           <div class="local-mcp-actions">
             <button id="integration-local-refresh" type="button" class="secondary-button" disabled>重新检测</button>
@@ -577,7 +594,6 @@
             <h2>登录 AgentChatRoom</h2>
           </div>
         </div>
-        <input class="sr-only" id="login-username" name="username" type="text" value="admin" autocomplete="username" tabindex="-1" aria-hidden="true">
         <label>管理员 Secret <input id="login-token" type="password" autocomplete="current-password" required></label>
         <p class="form-error" id="login-error" role="alert"></p>
         <div class="dialog-actions">
@@ -691,7 +707,7 @@
       </form>
     </dialog>
 
-    <div class="toast-region" id="toast-region" aria-live="assertive"></div>
-    <script src="/assets/app.js?v=1.0.0-central22" defer></script>
+    <div class="toast-region" id="toast-region" aria-live="polite"></div>
+    <script src="/assets/app.js?v=1.0.0-central26" defer></script>
   </body>
 </html>

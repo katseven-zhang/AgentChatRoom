@@ -100,12 +100,12 @@ def build_project_coordination_instructions(project: Mapping[str, Any]) -> str:
 - The backend owns the opaque Project key and keeps the checkout registration in ignored `.agentchatroom/project.json`. Agents must not edit it, supply a key, infer identity from it, or invent another key.
 - Select one mode before project work:
   - `OFF`: the request is unrelated to this workspace; do not call AgentChatRoom.
-  - `OBSERVE`: read-only inspection; call `room_join`, then `room_sync`, but do not claim tasks or acquire leases.
-  - `COORDINATE`: repository changes or multi-Agent work; join and sync before work, use tasks and file leases, publish decisions or blockers, then submit evidence before declaring completion.
-- Before inspecting or editing this repository in `OBSERVE` or `COORDINATE`, call `room_join`, keep the MCP/Bridge process alive, then call `room_sync`. Do not begin project work while disconnected.
+  - `OBSERVE`: read-only inspection; call `room_bootstrap` once, then inspect. Do not claim tasks or acquire leases.
+  - `COORDINATE`: repository changes or multi-Agent work; call `room_bootstrap` once before work, use tasks and file leases, publish decisions or blockers, then submit evidence before declaring completion.
+- Before inspecting or editing this repository in `OBSERVE` or `COORDINATE`, call `room_bootstrap` once. Do not begin project work while disconnected. Presence from MCP startup is not conversation sync.
 - One installed Agent application is one durable software identity in this Project. The MCP configuration injects that identity; Agents must not supply, rename, or invent an `agent_key` for a task, review, or runtime check.
 - Each software identity may have only one active Session. Reconnecting replaces the prior Session while preserving history and transferring unfinished owned work and active leases.
-- `room_join.model` is required initial Session metadata, not the authoritative model for later messages. Use the exact client model code when available; otherwise explicitly use `unknown`. Never guess or pin a model name in project rules.
+- Optional `room_bootstrap.model` is initial Session metadata, not the authoritative model for later messages. Use the exact client model code when available; otherwise explicitly use `unknown`. Never guess or pin a model name in project rules.
 - Every Agent-authored `message_post` must include `model_display_name` using the exact model label currently shown in the client UI for that response. If the client exposes no model label, use `unknown`. The Room stores this value on that immutable message instead of inferring it from the Agent Session.
 - The stdio MCP or remote Bridge process owns connection Presence. `session_heartbeat` only refreshes liveness; Task state records work progress. Do not use `room_sync` as a timer.
 - Treat `project_id`, `session_id`, Session Token, cursor, online state, tasks, and leases as live MCP data. Never persist those values here as current facts.
@@ -336,8 +336,12 @@ def build_mcp_integration(
             http_config_text = codex_streamable_http_toml
         else:
             http_config_text = grok_streamable_http_toml
+        identity_env = _profile_identity_environment(profile_id, profile)
         profiles[profile_id] = {
             **profile,
+            "software_key": identity_env.get(SOFTWARE_KEY_ENV_VAR, ""),
+            "software_name": identity_env.get(SOFTWARE_NAME_ENV_VAR, ""),
+            "software_client": identity_env.get(SOFTWARE_CLIENT_ENV_VAR, ""),
             "server_name": MCP_SERVER_NAME,
             "config": local_json if profile["format"] == "json" else config_text,
             "config_text": config_text,

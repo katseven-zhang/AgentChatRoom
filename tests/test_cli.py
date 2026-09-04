@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+import json
 import os
 import socket
 import subprocess
@@ -387,6 +388,35 @@ def test_task_get_cli_uses_exact_task_endpoint(monkeypatch, capsys):
     assert '"task"' in capsys.readouterr().out
 
 
+def test_task_history_cli_uses_paginated_history_endpoint(monkeypatch, capsys):
+    captured = {}
+
+    def fake_request_json(base, method, path, body=None, *, request_id=None):
+        captured.update({"method": method, "path": path, "body": body})
+        return {"items": [], "total": 0}
+
+    monkeypatch.setattr(cli, "request_json", fake_request_json)
+    main(
+        [
+            "task-history",
+            "project_example",
+            "task_example",
+            "--after",
+            "10",
+            "--limit",
+            "20",
+            "--event-type",
+            "review.submitted",
+        ]
+    )
+    assert captured["method"] == "GET"
+    assert "/tasks/task_example/history?" in captured["path"]
+    assert "after=10" in captured["path"]
+    assert "limit=20" in captured["path"]
+    assert "event_type=review.submitted" in captured["path"]
+    assert '"total": 0' in capsys.readouterr().out
+
+
 def test_project_member_cli_commands_use_shared_rest_contract(monkeypatch, capsys):
     calls = []
 
@@ -528,6 +558,47 @@ def test_room_leave_cli_forwards_explicit_request_id(monkeypatch, capsys):
     assert '"status": "offline"' in capsys.readouterr().out
 
 
+def test_room_bootstrap_cli_uses_shared_service_and_hides_token(
+    monkeypatch, capsys, settings, service, project_dir
+):
+    from agentchatroom.bootstrap import (
+        SOFTWARE_CLIENT_ENV,
+        SOFTWARE_KEY_ENV,
+        SOFTWARE_NAME_ENV,
+    )
+    from agentchatroom.project_registration import register_checkout_project
+
+    monkeypatch.setattr(cli, "load_settings", lambda path=None: settings)
+    for key in (SOFTWARE_KEY_ENV, SOFTWARE_NAME_ENV, SOFTWARE_CLIENT_ENV):
+        monkeypatch.delenv(key, raising=False)
+
+    main(["room-bootstrap", "--cwd", str(project_dir)])
+    missing = json.loads(capsys.readouterr().out)
+    assert missing["status"] == "identity_not_configured"
+    assert missing["required_action"] == "open_local_mcp_config_assistant"
+    assert "token" not in missing
+
+    project = service.create_project(root_path=str(project_dir), name="CLI Bootstrap")
+    register_checkout_project(project_dir, project)
+    monkeypatch.setenv(SOFTWARE_KEY_ENV, "cli-boot")
+    monkeypatch.setenv(SOFTWARE_NAME_ENV, "CLI Boot")
+    monkeypatch.setenv(SOFTWARE_CLIENT_ENV, "codex")
+
+    main(["room-bootstrap", "--cwd", str(project_dir), "--model", "unknown"])
+    ready = json.loads(capsys.readouterr().out)
+    assert ready["status"] == "ready"
+    assert ready["project"]["id"] == project["id"]
+    assert ready["conversation_synced"] is True
+    encoded = json.dumps(ready)
+    assert "token" not in ready
+    assert "token" not in ready.get("session", {})
+    snapshot = service.snapshot(project["id"])
+    online = [agent for agent in snapshot["agents"] if agent["status"] == "online"]
+    assert len(online) == 1
+    assert online[0]["id"] == ready["session"]["id"]
+    assert "token" not in encoded
+
+
 def test_room_join_cli_forwards_stable_agent_key_and_model(monkeypatch, capsys):
     captured = {}
 
@@ -592,3 +663,39 @@ def test_message_post_cli_forwards_message_level_model(monkeypatch, capsys):
     assert captured["path"] == "/api/v1/projects/project_example/messages"
     assert captured["body"]["model_display_name"] == "WorkBuddy UI Model"
     assert '"ok": true' in capsys.readouterr().out
+
+
+def test_lease_release_cli_sends_credentials_in_json_body(monkeypatch, capsys):
+    captured = {}
+
+    def fake_request_json(base, method, path, body=None, *, request_id=None):
+        captured.update(
+            {
+                "method": method,
+                "path": path,
+                "body": body,
+                "request_id": request_id,
+            }
+        )
+        return {"released": True}
+
+    monkeypatch.setattr(cli, "request_json", fake_request_json)
+
+    main(
+        [
+            "lease-release",
+            "project_example",
+            "lease_example",
+            "--session-id",
+            "agent_example",
+            "--token",
+            "session-token",
+        ]
+    )
+
+    assert captured["method"] == "DELETE"
+    assert captured["path"] == "/api/v1/projects/project_example/leases/lease_example"
+    assert "?" not in captured["path"]
+    assert captured["body"]["session_id"] == "agent_example"
+    assert captured["body"]["token"] == "session-token"
+    assert '"released": true' in capsys.readouterr().out

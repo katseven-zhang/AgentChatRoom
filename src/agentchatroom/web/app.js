@@ -9,13 +9,17 @@ const state = {
   authRequired: false,
   authenticated: false,
   projects: [],
-  projectId: localStorage.getItem("agentchatroom.projectId") || null,
+  projectId: null,
   snapshot: null,
   events: [],
   eventIds: new Set(),
   eventSource: null,
   presenceTimer: null,
   presenceRefreshInFlight: false,
+  snapshotInFlight: null,
+  selectGeneration: 0,
+  streamHadError: false,
+  busyCount: 0,
   taskFilter: "",
   eventFilter: "all",
   taskIntakeTargets: [],
@@ -31,6 +35,8 @@ const state = {
   expandedEvents: new Set(),
   collapsedGroups: new Set(),
   lastRenderedEventId: 0,
+  taskHistory: null,
+  focusEventId: 0,
 };
 
 const elements = Object.fromEntries(
@@ -50,6 +56,7 @@ const elements = Object.fromEntries(
     "task-dialog", "task-form", "task-raw-description-input", "task-target-agent-input",
     "task-target-agent-empty", "task-intake-submit", "task-intake-list", "task-table",
     "task-edit-dialog", "task-detail-heading", "task-detail-contract", "task-timeline",
+    "task-history-filter", "task-history-load-earlier", "task-history-load-later",
     "task-assign-button", "task-assignment-list", "task-assign-dialog", "task-assign-form",
     "task-assign-title", "task-assign-agent", "task-assign-agent-empty", "task-assign-note", "task-assign-submit",
     "settings-dialog", "settings-form", "settings-project-name", "settings-lease-policy", "settings-roles",
@@ -60,7 +67,7 @@ const elements = Object.fromEntries(
     "integration-project-rules-path", "integration-project-rules-code", "integration-onboarding-prompt", "toast-region",
     "integration-local-assistant", "integration-local-state", "integration-local-mode",
     "integration-local-path", "integration-local-message", "integration-local-changes",
-    "integration-local-reload", "integration-local-presence", "integration-local-backup",
+    "integration-local-reload", "integration-local-facts", "integration-local-backup",
     "integration-local-refresh", "integration-local-apply",
     "create-member-button", "member-list", "refresh-audit-button", "audit-event-filter",
     "create-token-button", "register-workspace-button", "token-list", "workspace-list", "audit-list",
@@ -339,14 +346,51 @@ function connectedAgentCount(agentIdentities) {
     .filter((agent) => agent.connection_status === "connected").length;
 }
 
+function bucketOf(task) {
+  if (task?.phase) return task.phase;
+  const execution = task?.execution_status || "";
+  const verification = task?.verification_status || "";
+  const integration = task?.integration_status || "";
+  if (execution === "cancelled" || task?.status === "cancelled") return "cancelled";
+  if (execution === "completed" && verification === "approved" && integration === "done") {
+    return "done";
+  }
+  if (verification === "approved" && integration !== "done") return "verified";
+  if (execution === "completed") return "awaiting_review";
+  if (execution === "blocked") return "blocked";
+  if (execution === "claimed") return "claimed";
+  if (execution === "in_progress") return "in_progress";
+  return "todo";
+}
+
+function bucketLabel(bucket) {
+  return {
+    todo: "待认领",
+    claimed: "已认领",
+    in_progress: "执行中",
+    blocked: "阻塞",
+    awaiting_review: "已提交",
+    verified: "待验收",
+    pending_integration: "待验收",
+    done: "已完成",
+    cancelled: "已取消",
+  }[bucket] || bucket;
+}
+
 function taskStatus(status) {
   return {
     todo: "待认领", claimed: "已认领", in_progress: "进行中", blocked: "阻塞",
-    awaiting_review: "待验证", verified: "已验证", done: "已完成", cancelled: "已取消",
+    awaiting_review: "已提交", verified: "待验收", done: "已完成", cancelled: "已取消",
   }[status] || status;
 }
 
-function executionStatus(status) {
+function executionStatus(status, task) {
+  if (status === "completed" && task && bucketOf(task) === "awaiting_review") {
+    return "执行完成（已提交）";
+  }
+  if (status === "completed" && task && bucketOf(task) === "verified") {
+    return "执行完成（待验收）";
+  }
   return {
     todo: "待开始", claimed: "已认领", in_progress: "执行中", blocked: "阻塞",
     completed: "执行完成", cancelled: "已取消",
@@ -357,6 +401,20 @@ function verificationStatus(status) {
   return {
     not_required: "无需验证", pending: "待验证", changes_requested: "需修改", approved: "已通过",
   }[status] || status;
+}
+
+function taskPhaseLabel(task) {
+  return bucketLabel(bucketOf(task));
+}
+
+function taskPhaseClass(task) {
+  return bucketOf(task);
+}
+
+function taskDisplayLabel(task) {
+  const phase = taskPhaseLabel(task);
+  const status = taskStatus(task.status);
+  return status && status !== phase ? `${phase} · ${status}` : phase;
 }
 
 function integrationStatus(status) {
@@ -452,7 +510,7 @@ function messageModelBadge(event) {
 function eventIdBadge(eventId) {
   const value = Number(eventId);
   if (!Number.isFinite(value)) return "";
-  return `<span class="event-id" title="事件 ID ${value}" aria-label="事件 ID ${value}">#${value}</span>`;
+  return `<button type="button" class="event-id" data-open-event="${value}" title="打开并定位事件 #${value}" aria-label="事件 ID ${value}">#${value}</button>`;
 }
 
 function avatarColorClass(seed) {
@@ -508,8 +566,56 @@ function showToast(message, type = "success") {
   const item = document.createElement("div");
   item.className = `toast ${type}`;
   item.textContent = message;
-  elements["toast-region"].append(item);
+  const region = elements["toast-region"];
+  region.setAttribute("aria-live", type === "error" ? "assertive" : "polite");
+  region.append(item);
   setTimeout(() => item.remove(), 3600);
+}
+
+function withBusy(work) {
+  state.busyCount += 1;
+  document.body.setAttribute("aria-busy", "true");
+  return Promise.resolve()
+    .then(work)
+    .finally(() => {
+      state.busyCount = Math.max(0, state.busyCount - 1);
+      if (state.busyCount === 0) document.body.removeAttribute("aria-busy");
+    });
+}
+
+function rememberExpandedEvent(eventId) {
+  state.expandedEvents.add(Number(eventId));
+  if (state.expandedEvents.size <= 80) return;
+  const oldest = [...state.expandedEvents][0];
+  state.expandedEvents.delete(oldest);
+}
+
+function resetProjectFilters() {
+  state.taskFilter = "";
+  state.eventFilter = "all";
+  document.querySelectorAll("#task-filter button").forEach((item) => {
+    item.classList.toggle("is-active", item.dataset.filter === "");
+  });
+  if (elements["event-filter"]) elements["event-filter"].value = "all";
+}
+
+function clearDialogDrafts() {
+  state.editingTaskId = null;
+  state.editingIntakeId = null;
+  state.editingMemberId = null;
+}
+
+function refreshSnapshot(projectId) {
+  if (!projectId) return Promise.resolve(null);
+  if (state.snapshotInFlight && state.snapshotInFlight.projectId === projectId) {
+    return state.snapshotInFlight.promise;
+  }
+  const request = { projectId, promise: null };
+  request.promise = api(`/api/v1/projects/${projectId}/snapshot`).finally(() => {
+    if (state.snapshotInFlight === request) state.snapshotInFlight = null;
+  });
+  state.snapshotInFlight = request;
+  return request.promise;
 }
 
 async function api(path, options = {}) {
@@ -545,14 +651,19 @@ function setConnection(status, label) {
   elements["connection-label"].textContent = label;
 }
 
-async function loadProjects() {
+async function loadProjects(preferredId) {
+  const cachedId = preferredId || localStorage.getItem("agentchatroom.projectId") || state.projectId;
   const result = await api("/api/v1/projects");
   state.projects = result.projects;
-  let selected = state.projects.find((project) => project.id === state.projectId);
-  if (!selected) selected = state.projects[0] || null;
-  state.projectId = selected?.id || null;
-  if (selected) {
-    localStorage.setItem("agentchatroom.projectId", selected.id);
+  const available = new Set(state.projects.map((project) => project.id));
+  let selectedId = cachedId && available.has(cachedId) ? cachedId : null;
+  if (cachedId && !available.has(cachedId)) {
+    localStorage.removeItem("agentchatroom.projectId");
+  }
+  if (!selectedId) selectedId = state.projects[0]?.id || null;
+  state.projectId = selectedId;
+  if (selectedId) {
+    localStorage.setItem("agentchatroom.projectId", selectedId);
   } else {
     localStorage.removeItem("agentchatroom.projectId");
   }
@@ -599,35 +710,51 @@ async function loadRecentAuditEvents(projectId, eventType) {
 }
 
 async function selectProject(projectId) {
-  state.projectId = projectId;
-  localStorage.setItem("agentchatroom.projectId", projectId);
-  state.events = [];
-  state.eventIds = new Set();
-  renderProjects();
+  const previousId = state.projectId;
+  const generation = ++state.selectGeneration;
   closeEventSource();
-  const [snapshot, eventPage, members, credentials, workspaces, audit, runtime, intakeTargets, intakes] = await Promise.all([
-    api(`/api/v1/projects/${projectId}/snapshot`),
-    loadRecentEvents(projectId),
-    api(`/api/v1/projects/${projectId}/members`),
-    api(`/api/v1/projects/${projectId}/agent-tokens`),
-    api(`/api/v1/projects/${projectId}/workspaces`),
-    loadRecentAuditEvents(projectId),
-    api("/api/v1/admin/runtime?lines=80"),
-    api(`/api/v1/projects/${projectId}/task-intakes/targets`),
-    api(`/api/v1/projects/${projectId}/task-intakes`),
-  ]);
-  state.snapshot = snapshot;
-  state.members = members.members;
-  state.credentials = credentials.credentials;
-  state.workspaces = workspaces.workspaces;
-  state.taskIntakeTargets = intakeTargets.targets || [];
-  state.taskIntakes = intakes.intakes || [];
-  state.auditEvents = audit.events.slice(-AUDIT_WINDOW_SIZE);
-  state.runtime = runtime;
-  mergeEvents(eventPage.events);
-  renderAll();
-  connectEvents(eventPage.cursor);
-  startPresenceRefresh();
+  stopPresenceRefresh();
+  try {
+    const [snapshot, eventPage, members, credentials, workspaces, audit, runtime, intakeTargets, intakes] = await Promise.all([
+      refreshSnapshot(projectId),
+      loadRecentEvents(projectId),
+      api(`/api/v1/projects/${projectId}/members`),
+      api(`/api/v1/projects/${projectId}/agent-tokens`),
+      api(`/api/v1/projects/${projectId}/workspaces`),
+      loadRecentAuditEvents(projectId),
+      api("/api/v1/admin/runtime?lines=80"),
+      api(`/api/v1/projects/${projectId}/task-intakes/targets`),
+      api(`/api/v1/projects/${projectId}/task-intakes`),
+    ]);
+    if (generation !== state.selectGeneration) return;
+    if (snapshot?.project?.id && snapshot.project.id !== projectId) return;
+    state.projectId = projectId;
+    localStorage.setItem("agentchatroom.projectId", projectId);
+    resetProjectFilters();
+    state.events = [];
+    state.eventIds = new Set();
+    state.snapshot = snapshot;
+    state.members = members.members;
+    state.credentials = credentials.credentials;
+    state.workspaces = workspaces.workspaces;
+    state.taskIntakeTargets = intakeTargets.targets || [];
+    state.taskIntakes = intakes.intakes || [];
+    state.auditEvents = audit.events.slice(-AUDIT_WINDOW_SIZE);
+    state.runtime = runtime;
+    mergeEvents(eventPage.events);
+    renderProjects();
+    renderAll();
+    connectEvents(eventPage.cursor);
+    startPresenceRefresh();
+  } catch (error) {
+    if (generation !== state.selectGeneration) return;
+    if (previousId && previousId !== projectId) {
+      showToast(error.message || "项目切换失败，已回到上一个项目", "error");
+      await selectProject(previousId);
+      return;
+    }
+    throw error;
+  }
 }
 
 function mergeEvents(events) {
@@ -662,10 +789,11 @@ function startPresenceRefresh() {
 
 async function refreshPresence() {
   if (!state.projectId || state.presenceRefreshInFlight) return;
+  const projectId = state.projectId;
   state.presenceRefreshInFlight = true;
   try {
-    const snapshot = await api(`/api/v1/projects/${state.projectId}/snapshot`);
-    if (snapshot.project.id !== state.projectId) return;
+    const snapshot = await refreshSnapshot(projectId);
+    if (projectId !== state.projectId || snapshot?.project?.id !== state.projectId) return;
     state.snapshot = snapshot;
     state.members = snapshot.members || state.members;
     const agentIdentities = currentAgentRoster(snapshot.agent_identities);
@@ -680,19 +808,92 @@ async function refreshPresence() {
   }
 }
 
+function applySnapshotIfCurrent(projectId, snapshot) {
+  if (!snapshot || projectId !== state.projectId || snapshot.project?.id !== state.projectId) {
+    return false;
+  }
+  state.snapshot = snapshot;
+  state.members = snapshot.members || state.members;
+  return true;
+}
+
+function renderForEvent(event) {
+  if (!state.snapshot) return renderEmptyRoom();
+  const type = String(event?.event_type || "");
+  const { agents, tasks, leases } = state.snapshot;
+  const agentIdentities = currentAgentRoster(state.snapshot.agent_identities);
+  if (type.startsWith("message.")) {
+    renderEvents(agents, tasks);
+    return;
+  }
+  if (
+    type.startsWith("task.")
+    || type.startsWith("work.")
+    || type.startsWith("review.")
+    || type.startsWith("integration.")
+    || type.startsWith("assignment.")
+    || type.startsWith("handoff.")
+    || type.startsWith("intake.")
+  ) {
+    renderTasks(tasks);
+    renderTaskIntakes();
+    renderReviews(tasks, agents);
+    renderMetrics(agentIdentities, tasks, leases);
+    renderEvents(agents, tasks);
+    renderMessageTaskOptions(tasks);
+    return;
+  }
+  if (type.startsWith("lease.")) {
+    renderLeases(leases, agents);
+    renderMetrics(agentIdentities, tasks, leases);
+    renderEvents(agents, tasks);
+    return;
+  }
+  if (type.startsWith("agent.") || type.startsWith("credential.") || type.startsWith("member.")) {
+    renderAgents(agentIdentities);
+    renderMetrics(agentIdentities, tasks, leases);
+    renderEvents(agents, tasks);
+    renderManagement();
+    return;
+  }
+  renderAll();
+}
+
 function connectEvents(after) {
   if (!state.projectId) return;
+  const projectId = state.projectId;
   setConnection("connecting", "浏览器正在连接");
-  const source = new EventSource(`/api/v1/projects/${state.projectId}/events/stream?after=${after}`);
+  const source = new EventSource(`/api/v1/projects/${projectId}/events/stream?after=${after}`);
   state.eventSource = source;
-  source.onopen = () => setConnection("online", "浏览器已连接");
-  source.onerror = () => setConnection("offline", "浏览器正在重连");
+  source.onopen = () => {
+    setConnection("online", "浏览器已连接");
+    if (state.streamHadError) {
+      state.streamHadError = false;
+      refreshSnapshot(state.projectId).then((snapshot) => {
+        if (!applySnapshotIfCurrent(state.projectId, snapshot)) return;
+        renderAll();
+      }).catch((error) => showToast(error.message, "error"));
+    }
+  };
+  source.onerror = () => {
+    state.streamHadError = true;
+    setConnection("offline", "浏览器正在重连");
+  };
   source.addEventListener("room_event", async (message) => {
-    const event = JSON.parse(message.data);
+    const capturedProjectId = projectId;
+    let event;
+    try {
+      event = JSON.parse(message.data);
+    } catch (error) {
+      console.warn("Ignored malformed room event", error);
+      return;
+    }
+    if (capturedProjectId !== state.projectId) return;
     mergeEvents([event]);
     try {
-      state.snapshot = await api(`/api/v1/projects/${state.projectId}/snapshot`);
-      renderAll();
+      const snapshot = await refreshSnapshot(capturedProjectId);
+      if (!applySnapshotIfCurrent(capturedProjectId, snapshot)) return;
+      renderForEvent(event);
     } catch (error) {
       showToast(error.message, "error");
     }
@@ -813,9 +1014,12 @@ function renderAgents(agents) {
         : `已接入 · 未连接 · 累计接入 ${agent.session_count} 次`;
       const presenceStatus = connected ? "online" : "offline";
       const presenceLabel = connected ? "已连接" : "未连接";
-      const taskSummary = agent.current_task_id
-        ? `任务：${agent.current_task_title} · ${taskStatus(agent.current_task_status)}`
-        : "当前无任务";
+      const currentTask = (state.snapshot?.tasks || []).find((task) => task.id === agent.current_task_id);
+      const taskSummary = currentTask
+        ? `任务：${agent.current_task_title} · ${taskDisplayLabel(currentTask)}`
+        : agent.current_task_id
+          ? `任务：${agent.current_task_title} · ${taskStatus(agent.current_task_status)}`
+          : "当前无任务";
       const details = `${agent.name}\n软件: ${agent.client}\n本次角色: ${agent.role}\n${connectionSummary}\n${taskSummary}\n最后心跳: ${heartbeat}\n最后活动: ${activity}`;
       return `
       <div class="agent-item ${connected ? "" : "is-disconnected"}" title="${escapeHtml(details)}">
@@ -835,15 +1039,15 @@ function renderAgents(agents) {
 function renderMetrics(agents, tasks, leases) {
   const roster = currentAgentRoster(agents);
   elements["metric-agents"].textContent = roster.length;
-  elements["metric-active"].textContent = tasks.filter((task) => ["claimed", "in_progress", "blocked"].includes(task.status)).length;
+  elements["metric-active"].textContent = tasks.filter((task) => !["done", "cancelled"].includes(bucketOf(task))).length;
   elements["metric-leases"].textContent = leases.length;
   elements["metric-reviews"].textContent = tasks.filter((task) => task.status === "awaiting_review").length;
 
-  const active = tasks.filter((task) => !["todo", "done", "cancelled"].includes(task.status)).slice(0, 6);
+  const active = tasks.filter((task) => !["done", "cancelled"].includes(bucketOf(task))).slice(0, 6);
   elements["active-task-list"].innerHTML = active.length
     ? active.map((task) => `
       <div class="compact-item">
-        <div class="task-meta"><span class="task-number">任务 #${task.task_number}</span><span class="priority p${task.priority}">P${task.priority}</span><span class="status-badge ${escapeHtml(task.status)}">${escapeHtml(taskStatus(task.status))}</span></div>
+        <div class="task-meta"><span class="task-number">任务 #${task.task_number}</span><span class="priority p${task.priority}">P${task.priority}</span><span class="status-badge ${escapeHtml(taskPhaseClass(task))}">${escapeHtml(taskPhaseLabel(task))}</span></div>
         <p><strong>${escapeHtml(task.title)}</strong></p>
       </div>`).join("")
     : '<div class="empty-state">当前没有进行中的工作。点「+ 新建任务」把第一件事交给受理 Agent。</div>';
@@ -866,21 +1070,20 @@ function renderMetrics(agents, tasks, leases) {
 }
 
 function renderTasks(tasks) {
-  const filtered = state.taskFilter ? tasks.filter((task) => task.status === state.taskFilter) : tasks;
+  const filtered = state.taskFilter ? tasks.filter((task) => bucketOf(task) === state.taskFilter) : tasks;
   const names = Object.fromEntries((state.snapshot?.agents || []).map((agent) => [agent.id, agent.name]));
   elements["task-table"].innerHTML = filtered.length
     ? filtered.map((task) => `
       <button class="task-row" type="button" data-task-id="${escapeHtml(task.id)}">
         <span class="task-number">#${task.task_number}</span>
-          <span class="priority p${task.priority}">P${task.priority}</span>
         <div>
           <h3>${escapeHtml(task.title)}</h3>
           <p>${escapeHtml(task.description || task.acceptance_criteria.join(" · ") || "尚未填写正式说明")}${task.current_step ? ` · 当前：${escapeHtml(task.current_step)}` : ""}${task.blocker_reason ? ` · 阻塞：${escapeHtml(task.blocker_reason)}` : ""}</p>
         </div>
         <div class="task-meta">
-          <span class="status-badge ${escapeHtml(task.status)}">${escapeHtml(taskStatus(task.status))}</span>
-          <span class="status-badge ${escapeHtml(task.execution_status)}">${escapeHtml(executionStatus(task.execution_status))}</span>
-          <span class="status-badge ${escapeHtml(task.verification_status)}">${escapeHtml(verificationStatus(task.verification_status))}</span>
+          <span class="status-badge ${escapeHtml(taskPhaseClass(task))}">${escapeHtml(taskPhaseLabel(task))}</span>
+          <span class="priority p${task.priority}">P${task.priority}</span>
+          ${taskStatus(task.status) !== taskPhaseLabel(task) ? `<span class="status-badge ${escapeHtml(task.status)}">${escapeHtml(taskStatus(task.status))}</span>` : ""}
           <span class="secondary-text">${task.progress_percent}%${task.owner_session_id ? ` · ${escapeHtml(names[task.owner_session_id] || shortId(task.owner_session_id))}` : " · 尚未指定 Agent"}${task.depends_on?.length ? ` · 依赖 ${task.depends_on.length} 项` : ""}</span>
         </div>
       </button>`).join("")
@@ -936,7 +1139,7 @@ function renderReviews(tasks, agents) {
   elements["review-list"].innerHTML = items.length
     ? items.map((item) => item.type === "awaiting" ? `
       <article class="review-item">
-        <div class="task-meta"><span class="status-badge awaiting_review">待验证</span><strong>${escapeHtml(item.task.title)}</strong></div>
+        <div class="task-meta"><span class="status-badge ${escapeHtml(taskPhaseClass(item.task))}">${escapeHtml(taskDisplayLabel(item.task))}</span><strong>${escapeHtml(item.task.title)}</strong></div>
         <p>等待独立 Agent 检查 ${item.task.acceptance_criteria.length} 条验收条件</p>
         ${renderReportEvidence(item.task.id)}
       </article>` : `
@@ -1118,8 +1321,9 @@ function renderEvents(agents, tasks) {
   if (state.eventFilter === "decisions") events = events.filter((event) => ["message.decision", "message.blocker"].includes(event.event_type));
   events = events.slice(-120);
   const stream = elements["chat-stream"];
+  const streamVisible = stream.offsetParent !== null && stream.clientHeight > 0;
   const distanceFromBottom = stream.scrollHeight - stream.scrollTop - stream.clientHeight;
-  const wasAtBottom = distanceFromBottom < 40;
+  const wasAtBottom = streamVisible && distanceFromBottom < 40;
   const previousScrollTop = stream.scrollTop;
   const latestEventId = events.length ? events[events.length - 1].id : 0;
   const hasNewEvents = latestEventId > state.lastRenderedEventId && state.lastRenderedEventId > 0;
@@ -1144,11 +1348,13 @@ function renderEvents(agents, tasks) {
       const conflict = event.event_type === "lease.conflict"
         ? ` · ${escapeHtml(event.payload?.path_pattern || "")} 与 ${escapeHtml((event.payload?.conflicts || []).map((item) => `${item.agent_name}:${item.path_pattern}`).join("、"))} 冲突`
         : "";
-      return `<div class="system-event">${eventIdBadge(event.id)} <strong>${escapeHtml(agent?.name || "系统")}</strong> ${escapeHtml(eventLabel(event.event_type))}${task ? ` · ${escapeHtml(task.title)}` : ""}${conflict} <span>· ${escapeHtml(formatTime(event.created_at))}</span></div>`;
+      return `<div class="system-event">${eventIdBadge(event.id)} <strong>${escapeHtml(agent?.name || "系统")}</strong> ${escapeHtml(eventLabel(event.event_type))}${task ? ` · ${escapeHtml(task.title)} · ${escapeHtml(taskDisplayLabel(task))}` : ""}${conflict} <span>· ${escapeHtml(formatTime(event.created_at))}</span></div>`;
     }).join("")
     : '<div class="empty-state">当前筛选下没有动态</div>';
   const notice = elements["new-message-notice"];
-  if (wasAtBottom) {
+  if (!streamVisible) {
+    if (hasNewEvents) notice.classList.remove("is-hidden");
+  } else if (wasAtBottom) {
     stream.scrollTop = stream.scrollHeight;
     notice.classList.add("is-hidden");
   } else {
@@ -1165,10 +1371,10 @@ elements["project-folder-picker-button"].addEventListener("click", async () => {
   button.disabled = true;
   button.textContent = "正在选择...";
   try {
-    const result = await api("/api/v1/local/folders/pick", {
+    const result = await withBusy(() => api("/api/v1/local/folders/pick", {
       method: "POST",
       body: JSON.stringify({ initial_path: input.value.trim() }),
-    });
+    }));
     if (!result.cancelled && result.path) {
       input.value = result.path;
       input.focus();
@@ -1205,7 +1411,10 @@ document.getElementById("project-settings-button").addEventListener("click", () 
   elements["settings-dialog"].showModal();
 });
 document.getElementById("export-project-button").addEventListener("click", () => downloadProjectExport().catch(handleError));
-document.getElementById("refresh-button").addEventListener("click", () => state.projectId && selectProject(state.projectId).catch(handleError));
+document.getElementById("refresh-button").addEventListener("click", () => {
+  if (!state.projectId) return;
+  withBusy(() => selectProject(state.projectId)).catch(handleError);
+});
 elements["connect-agent-button"].addEventListener("click", () => openIntegrationDialog().catch(handleError));
 elements["logout-button"].addEventListener("click", async () => {
   try {
@@ -1305,13 +1514,13 @@ elements["project-list"].addEventListener("click", (event) => {
     return;
   }
   const button = event.target.closest("[data-project-id]");
-  if (button) selectProject(button.dataset.projectId).catch(handleError);
+  if (button) withBusy(() => selectProject(button.dataset.projectId)).catch(handleError);
 });
 
 elements["chat-stream"].addEventListener("click", (event) => {
   const expand = event.target.closest("[data-expand-event]");
   if (expand) {
-    state.expandedEvents.add(Number(expand.dataset.expandEvent));
+    rememberExpandedEvent(expand.dataset.expandEvent);
     if (state.snapshot) renderEvents(state.snapshot.agents, state.snapshot.tasks);
     return;
   }
@@ -1347,6 +1556,10 @@ document.querySelectorAll("dialog").forEach((dialog) => {
     if (event.target === dialog && !["login-dialog", "token-secret-dialog"].includes(dialog.id)) {
       dialog.close();
     }
+  });
+  dialog.addEventListener("close", () => {
+    if (["login-dialog", "token-secret-dialog"].includes(dialog.id)) return;
+    clearDialogDrafts();
   });
 });
 
@@ -1416,11 +1629,39 @@ elements["member-list"].addEventListener("click", async (event) => {
   }
 });
 
+function activateTab(button) {
+  if (!button) return;
+  document.querySelectorAll(".tab").forEach((item) => {
+    const selected = item === button;
+    item.classList.toggle("is-active", selected);
+    item.setAttribute("aria-selected", selected ? "true" : "false");
+    item.tabIndex = selected ? 0 : -1;
+  });
+  document.querySelectorAll(".tab-panel").forEach((panel) => {
+    panel.classList.toggle("is-active", panel.id === `panel-${button.dataset.tab}`);
+  });
+}
+
 document.querySelector(".tabs").addEventListener("click", (event) => {
   const button = event.target.closest("[data-tab]");
   if (!button) return;
-  document.querySelectorAll(".tab").forEach((item) => item.classList.toggle("is-active", item === button));
-  document.querySelectorAll(".tab-panel").forEach((panel) => panel.classList.toggle("is-active", panel.id === `panel-${button.dataset.tab}`));
+  withBusy(async () => activateTab(button)).catch(handleError);
+});
+
+document.querySelector(".tabs").addEventListener("keydown", (event) => {
+  if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
+  const tabs = [...document.querySelectorAll(".tab")];
+  if (!tabs.length) return;
+  const current = event.target.closest("[data-tab]") || tabs.find((item) => item.classList.contains("is-active"));
+  const index = Math.max(0, tabs.indexOf(current));
+  let nextIndex = index;
+  if (event.key === "ArrowRight") nextIndex = (index + 1) % tabs.length;
+  if (event.key === "ArrowLeft") nextIndex = (index - 1 + tabs.length) % tabs.length;
+  if (event.key === "Home") nextIndex = 0;
+  if (event.key === "End") nextIndex = tabs.length - 1;
+  event.preventDefault();
+  tabs[nextIndex].focus();
+  activateTab(tabs[nextIndex]);
 });
 
 document.getElementById("task-filter").addEventListener("click", (event) => {
@@ -1429,6 +1670,68 @@ document.getElementById("task-filter").addEventListener("click", (event) => {
   state.taskFilter = button.dataset.filter;
   document.querySelectorAll("#task-filter button").forEach((item) => item.classList.toggle("is-active", item === button));
   if (state.snapshot) renderTasks(state.snapshot.tasks);
+});
+
+elements["task-history-filter"].addEventListener("change", () => {
+  if (!state.editingTaskId) return;
+  state.taskHistory = {
+    ...(state.taskHistory || {}),
+    taskId: state.editingTaskId,
+    items: [],
+    eventType: elements["task-history-filter"].value || "",
+  };
+  withBusy(async () => {
+    await loadTaskHistory(state.editingTaskId);
+    const task = state.snapshot?.tasks.find((item) => item.id === state.editingTaskId);
+    if (task) renderTaskTimeline(task);
+  }).catch(handleError);
+});
+
+elements["task-history-load-earlier"].addEventListener("click", () => {
+  if (!state.editingTaskId) return;
+  withBusy(async () => {
+    await loadTaskHistory(state.editingTaskId, { direction: "earlier" });
+    const task = state.snapshot?.tasks.find((item) => item.id === state.editingTaskId);
+    if (task) renderTaskTimeline(task);
+  }).catch(handleError);
+});
+
+elements["task-history-load-later"].addEventListener("click", () => {
+  if (!state.editingTaskId) return;
+  withBusy(async () => {
+    await loadTaskHistory(state.editingTaskId, { direction: "later" });
+    const task = state.snapshot?.tasks.find((item) => item.id === state.editingTaskId);
+    if (task) renderTaskTimeline(task);
+  }).catch(handleError);
+});
+
+elements["task-timeline"].addEventListener("click", (event) => {
+  const expand = event.target.closest("[data-expand-history]");
+  if (expand) {
+    const eventId = Number(expand.dataset.expandHistory);
+    if (state.expandedEvents.has(eventId)) state.expandedEvents.delete(eventId);
+    else rememberExpandedEvent(eventId);
+    const task = state.snapshot?.tasks.find((item) => item.id === state.editingTaskId);
+    if (task) renderTaskTimeline(task);
+    return;
+  }
+  const copy = event.target.closest("[data-copy-event]");
+  if (copy) {
+    copyEventReference(copy.dataset.copyEvent, copy.dataset.taskNumber);
+  }
+});
+
+document.addEventListener("click", (event) => {
+  const openEvent = event.target.closest("[data-open-event]");
+  if (!openEvent) return;
+  if (openEvent.closest("#task-timeline")) return;
+  withBusy(() => openEventReference(openEvent.dataset.openEvent)).catch(handleError);
+});
+
+window.addEventListener("hashchange", () => {
+  const matched = location.hash.match(/^#event-(\d+)$/);
+  if (!matched) return;
+  withBusy(() => openEventReference(matched[1])).catch(handleError);
 });
 
 elements["event-filter"].addEventListener("change", () => {
@@ -1447,17 +1750,18 @@ elements["message-task"].addEventListener("change", () => {
 elements["project-form"].addEventListener("submit", async (event) => {
   event.preventDefault();
   try {
-    const project = await api("/api/v1/projects", {
+    const project = await withBusy(() => api("/api/v1/projects", {
       method: "POST",
       body: JSON.stringify({
         name: elements["project-name-input"].value.trim() || null,
         root_path: elements["project-path-input"].value.trim(),
       }),
-    });
+    }));
     elements["project-dialog"].close();
     elements["project-form"].reset();
-    state.projectId = project.id;
-    await loadProjects();
+    const previousId = state.projectId;
+    const alreadyKnown = state.projects.some((item) => item.id === project.id);
+    await loadProjects(alreadyKnown && previousId ? previousId : project.id);
     showToast("项目已添加");
   } catch (error) {
     handleError(error);
@@ -1498,10 +1802,10 @@ elements["task-form"].addEventListener("submit", async (event) => {
   }
   elements["task-intake-submit"].disabled = true;
   try {
-    await api(`/api/v1/projects/${state.projectId}/task-intakes`, {
+    await withBusy(() => api(`/api/v1/projects/${state.projectId}/task-intakes`, {
       method: "POST",
       body: JSON.stringify({ raw_description: rawDescription, target_member_id: targetMemberId }),
-    });
+    }));
     elements["task-dialog"].close();
     elements["task-form"].reset();
     await refreshTaskIntakeData();
@@ -1566,10 +1870,10 @@ elements["login-form"].addEventListener("submit", async (event) => {
   event.preventDefault();
   elements["login-error"].textContent = "";
   try {
-    await api("/api/v1/auth/login", {
+    await withBusy(() => api("/api/v1/auth/login", {
       method: "POST",
       body: JSON.stringify({ token: elements["login-token"].value }),
-    });
+    }));
     state.authenticated = true;
     elements["login-token"].value = "";
     elements["login-dialog"].close();
@@ -1799,52 +2103,133 @@ function renderTaskAssignments(task) {
     : '<div class="empty-state">尚未派发</div>';
 }
 
-function taskTimelineEvents(task) {
-  const intakeIds = new Set(
-    state.taskIntakes.filter((intake) => intake.formal_task_id === task.id).map((intake) => intake.id)
-  );
-  return state.events
-    .filter((event) => event.task_id === task.id || intakeIds.has(event.payload?.intake_id))
-    .sort((left, right) => left.id - right.id);
+function historyActorLabel(actor) {
+  if (!actor) return "unknown";
+  const parts = [actor.name || "unknown", actor.client || "", actor.role || ""].filter(Boolean);
+  return parts.join(" · ");
 }
 
-function timelineDetails(event) {
-  const payload = event.payload || {};
-  const details = [];
-  if (payload.response) details.push(`结果：${payload.response}`);
-  if (payload.note) details.push(payload.note);
-  if (payload.summary) details.push(payload.summary);
-  if (payload.raw_description && event.event_type !== "task.intake_submitted") details.push(payload.raw_description);
-  if (payload.files?.length) details.push(`文件：${payload.files.join("、")}`);
-  if (payload.tests?.length) details.push(`测试：${payload.tests.map((test) => `${test.exit_code === 0 ? "通过" : "失败"} · ${test.command}`).join("；")}`);
-  if (payload.commit_hash) details.push(`Commit：${shortId(payload.commit_hash)}`);
-  return details.join(" · ");
+function renderHistoryEvidence(item) {
+  return (item.evidence_sections || []).map((section, index) => {
+    const sectionId = `history-${item.event_id}-sec-${index}`;
+    if (section.kind === "message") {
+      const expanded = state.expandedEvents.has(item.event_id);
+      const body = String((section.items || [])[0] || "");
+      const lines = body.split("\n");
+      const canToggle = section.expandable;
+      const shown = expanded || !canToggle ? lines : lines.slice(0, 8);
+      return `<div class="history-evidence">
+        <button type="button" class="expand-toggle" data-expand-history="${item.event_id}" aria-expanded="${expanded ? "true" : "false"}" aria-controls="${sectionId}">${expanded || !canToggle ? "正文" : "展开正文"}</button>
+        <div id="${sectionId}" class="event-body ${!expanded && canToggle ? "is-collapsed" : ""}">${renderMessageLines(shown)}</div>
+      </div>`;
+    }
+    if (section.kind === "criteria") {
+      return `<div class="history-evidence"><h4>验收记录</h4><ul class="criteria-list">${(section.items || []).map((criterion) => {
+        const status = criterion.status || "unknown";
+        const failed = status !== "passed";
+        return `<li class="criterion ${escapeHtml(status)}${failed ? " is-failed" : ""}"><strong>${escapeHtml(status)}</strong> · ${escapeHtml(criterion.criterion || "")}${criterion.evidence ? `<p>${escapeHtml(criterion.evidence)}</p>` : ""}</li>`;
+      }).join("")}</ul></div>`;
+    }
+    if (section.kind === "tests") {
+      return `<div class="history-evidence"><h4>测试证据</h4><ul class="readonly-list">${(section.items || []).map((test) => {
+        const failed = Number(test.exit_code) !== 0;
+        return `<li class="${failed ? "test-failed" : "test-passed"}">${failed ? "失败" : "通过"} · ${escapeHtml(test.command || "")}${test.notes ? ` · ${escapeHtml(test.notes)}` : ""}</li>`;
+      }).join("")}</ul></div>`;
+    }
+    if (section.kind === "state") {
+      return `<div class="history-evidence"><h4>状态迁移</h4><ul class="readonly-list">${(section.items || []).map((change) => `<li><code>${escapeHtml(change.field)}</code> ${escapeHtml(String(change.before))} → ${escapeHtml(String(change.after))}</li>`).join("")}</ul></div>`;
+    }
+    if (section.kind === "git") {
+      const git = section.items?.[0] || {};
+      return `<div class="history-evidence"><h4>Git 证据</h4><p>${escapeHtml(git.branch || "detached")} · ${escapeHtml(git.head || git.commit_hash || "unknown")}${git.captured ? "" : ` · ${escapeHtml(git.reason || "未采集")}`}</p></div>`;
+    }
+    const text = (section.items || []).map((entry) => {
+      if (typeof entry === "string") return escapeHtml(entry);
+      if (entry && entry.label) return `${escapeHtml(entry.label)}：${escapeHtml(JSON.stringify(entry.value))}`;
+      return escapeHtml(JSON.stringify(entry));
+    }).join("<br>");
+    return `<div class="history-evidence"><h4>${escapeHtml(section.title || section.kind)}</h4><p>${text}</p></div>`;
+  }).join("");
+}
+
+function renderHistoryAcknowledgements(item) {
+  if (!item.requires_ack && !(item.acknowledgements || []).length) return "";
+  if (!item.acknowledgements?.length) return `<p class="secondary-text">需要确认 · 尚未确认</p>`;
+  return `<p class="secondary-text">已确认 ${item.acknowledgements.length} 次：${item.acknowledgements.map((ack) => `${escapeHtml(ack.actor?.name || "unknown")} · ${escapeHtml(formatTime(ack.created_at))}`).join("；")}</p>`;
 }
 
 function renderTaskTimeline(task) {
-  const events = taskTimelineEvents(task);
-  elements["task-timeline"].innerHTML = events.length
-    ? `<ol class="timeline-list">${events.map((event) => `
-      <li class="timeline-item">
+  const history = state.taskHistory;
+  const items = history?.taskId === task.id ? (history.items || []) : [];
+  elements["task-history-load-earlier"].disabled = !history?.has_more_before;
+  elements["task-history-load-later"].disabled = !history?.has_more_after;
+  elements["task-timeline"].innerHTML = items.length
+    ? `<ol class="timeline-list">${items.map((item) => `
+      <li class="timeline-item${state.focusEventId === item.event_id ? " is-focused" : ""}" id="history-event-${item.event_id}">
         <span class="timeline-marker" aria-hidden="true"></span>
         <div class="timeline-content">
-          <div class="timeline-heading"><strong>${escapeHtml(eventLabel(event.event_type))}</strong><span class="secondary-text">${escapeHtml(sessionName(event.actor_session_id))} · ${escapeHtml(formatTime(event.created_at))}</span></div>
-          ${timelineDetails(event) ? `<p>${escapeHtml(timelineDetails(event))}</p>` : ""}
-          <small class="secondary-text">${eventIdBadge(event.id)}${event.task_number ? ` · 任务 #${escapeHtml(event.task_number)}` : ""}</small>
+          <div class="timeline-heading">
+            <strong>${escapeHtml(eventLabel(item.event_type))}</strong>
+            <span class="secondary-text">${escapeHtml(historyActorLabel(item.actor))} · ${escapeHtml(formatTime(item.occurred_at))}</span>
+          </div>
+          ${item.model_display_name ? `<p class="secondary-text">模型 · ${escapeHtml(item.model_display_name)}</p>` : ""}
+          ${item.verdict ? `<p><span class="status-badge ${escapeHtml(item.verdict)}">${escapeHtml(item.verdict)}</span> ${escapeHtml(item.summary || "")}</p>` : `<p>${escapeHtml(item.summary || "")}</p>`}
+          ${item.result ? `<p>集成结果：${escapeHtml(item.result)}。验证通过不等于最终完成。</p>` : ""}
+          ${renderHistoryEvidence(item)}
+          ${renderHistoryAcknowledgements(item)}
+          <small class="secondary-text">${eventIdBadge(item.event_id)}${item.task_number ? ` · 任务 #${escapeHtml(item.task_number)}` : ""} <button type="button" class="link-button" data-copy-event="${item.event_id}" data-task-number="${item.task_number || ""}">复制引用</button></small>
         </div>
       </li>`).join("")}</ol>`
     : '<div class="empty-state">尚无协作事件</div>';
+  if (state.focusEventId) {
+    const focused = document.getElementById(`history-event-${state.focusEventId}`);
+    if (focused) focused.scrollIntoView({ block: "center" });
+  }
+}
+
+async function loadTaskHistory(taskId, { direction } = {}) {
+  if (!state.projectId || !taskId) return;
+  const eventType = elements["task-history-filter"]?.value || state.taskHistory?.eventType || "";
+  const params = new URLSearchParams({ limit: "50" });
+  if (eventType) params.set("event_type", eventType);
+  if (direction === "earlier" && state.taskHistory?.next_before) {
+    params.set("before", String(state.taskHistory.next_before));
+  } else if (direction === "later" && state.taskHistory?.next_after) {
+    params.set("after", String(state.taskHistory.next_after));
+  }
+  const page = await api(`/api/v1/projects/${state.projectId}/tasks/${taskId}/history?${params}`);
+  const incoming = page.items || [];
+  const existing = state.taskHistory?.taskId === taskId ? (state.taskHistory.items || []) : [];
+  let items = incoming;
+  if (direction === "earlier") items = [...incoming, ...existing];
+  if (direction === "later") items = [...existing, ...incoming];
+  const seen = new Set();
+  items = items.filter((item) => {
+    if (seen.has(item.event_id)) return false;
+    seen.add(item.event_id);
+    return true;
+  }).sort((left, right) => left.event_id - right.event_id);
+  state.taskHistory = {
+    taskId,
+    items,
+    total: page.total,
+    next_after: items[items.length - 1]?.event_id || page.next_after,
+    next_before: items[0]?.event_id || page.next_before,
+    has_more_after: direction === "later" ? Boolean(page.has_more_after) : direction === "earlier" ? true : Boolean(page.has_more_after),
+    has_more_before: direction === "earlier" ? Boolean(page.has_more_before) : direction === "later" ? true : Boolean(page.has_more_before),
+    eventType,
+  };
 }
 
 function renderTaskContract(task) {
   const dependencies = task.dependency_details || [];
   const criteria = task.acceptance_criteria || [];
-  const statusSummary = `${taskStatus(task.status)} · ${executionStatus(task.execution_status)} · ${verificationStatus(task.verification_status)} · ${taskIntegrationStatus(task)}`;
+  const statusSummary = `${taskPhaseLabel(task)} · ${taskStatus(task.status)} · ${executionStatus(task.execution_status, task)} · ${verificationStatus(task.verification_status)} · ${taskIntegrationStatus(task)}`;
   elements["task-detail-heading"].textContent = `任务 #${task.task_number} · ${task.title}`;
   elements["task-detail-contract"].innerHTML = `
     <div class="task-contract-header">
       <div><span class="task-number">任务 #${task.task_number}</span><span class="secondary-text">内部 ID：${escapeHtml(task.id)}</span></div>
-      <div class="task-meta"><span class="priority p${task.priority}">P${task.priority}</span><span class="status-badge ${escapeHtml(task.status)}">${escapeHtml(taskStatus(task.status))}</span></div>
+      <div class="task-meta"><span class="priority p${task.priority}">P${task.priority}</span><span class="status-badge ${escapeHtml(taskPhaseClass(task))}">${escapeHtml(taskPhaseLabel(task))}</span></div>
     </div>
     <dl class="task-contract-grid">
       <div><dt>执行状态</dt><dd>${escapeHtml(statusSummary)}</dd></div>
@@ -1854,27 +2239,80 @@ function renderTaskContract(task) {
       ${task.blocker_reason ? `<div class="task-contract-wide"><dt>阻塞原因</dt><dd>${escapeHtml(task.blocker_reason)}</dd></div>` : ""}
       <div class="task-contract-wide"><dt>正式说明</dt><dd class="task-contract-description">${escapeHtml(task.description || "暂无正式说明")}</dd></div>
       <div class="task-contract-wide"><dt>验收条件</dt><dd>${criteria.length ? `<ul class="readonly-list">${criteria.map((criterion) => `<li>${escapeHtml(criterion)}</li>`).join("")}</ul>` : "暂无验收条件"}</dd></div>
-      ${dependencies.length ? `<div class="task-contract-wide task-dependencies"><dt>前置依赖</dt><dd><ul class="readonly-list">${dependencies.map((dependency) => `<li><span><strong>任务 #${dependency.task_number}</strong> · ${escapeHtml(dependency.title)} · ${escapeHtml(taskStatus(dependency.status))}</span><button type="button" class="link-button" data-related-task-id="${escapeHtml(dependency.id)}">查看</button></li>`).join("")}</ul></dd></div>` : ""}
+      ${dependencies.length ? `<div class="task-contract-wide task-dependencies"><dt>前置依赖</dt><dd><ul class="readonly-list">${dependencies.map((dependency) => `<li><span><strong>任务 #${dependency.task_number}</strong> · ${escapeHtml(dependency.title)} · ${escapeHtml(taskPhaseLabel(dependency))}</span><button type="button" class="link-button" data-related-task-id="${escapeHtml(dependency.id)}">查看</button></li>`).join("")}</ul></dd></div>` : ""}
     </dl>`;
 }
 
-async function openTaskDetails(taskId) {
+async function openTaskDetails(taskId, options = {}) {
   const task = state.snapshot?.tasks.find((item) => item.id === taskId);
   if (!task || !state.projectId) return;
   state.editingTaskId = taskId;
+  state.focusEventId = Number(options.focusEventId || 0);
+  if (options.eventType !== undefined) {
+    elements["task-history-filter"].value = options.eventType || "";
+  }
+  state.taskHistory = {
+    taskId,
+    items: [],
+    eventType: elements["task-history-filter"].value || "",
+    has_more_after: false,
+    has_more_before: false,
+  };
   renderTaskContract(task);
   renderTaskAssignments(task);
   renderTaskTimeline(task);
   elements["task-assign-button"].disabled = ["cancelled", "done"].includes(task.status);
   elements["task-edit-dialog"].showModal();
   try {
-    const page = await loadTaskEvents(state.projectId, taskId);
-    mergeEvents(page.events);
+    await loadTaskHistory(taskId);
+    if (state.focusEventId && !(state.taskHistory.items || []).some((item) => item.event_id === state.focusEventId)) {
+      await loadTaskHistoryUntil(taskId, state.focusEventId);
+    }
     const currentTask = state.snapshot?.tasks.find((item) => item.id === taskId) || task;
     renderTaskTimeline(currentTask);
   } catch (error) {
     showToast("任务历史暂时无法加载，已显示当前缓存", "error");
   }
+}
+
+async function loadTaskHistoryUntil(taskId, eventId) {
+  for (let attempt = 0; attempt < 8; attempt += 1) {
+    if ((state.taskHistory.items || []).some((item) => item.event_id === eventId)) return;
+    if (!state.taskHistory.has_more_before && !state.taskHistory.has_more_after) return;
+    if (state.taskHistory.next_before && eventId < (state.taskHistory.items[0]?.event_id || eventId + 1)) {
+      await loadTaskHistory(taskId, { direction: "earlier" });
+    } else if (state.taskHistory.has_more_after) {
+      await loadTaskHistory(taskId, { direction: "later" });
+    } else {
+      await loadTaskHistory(taskId, { direction: "earlier" });
+    }
+  }
+}
+
+async function copyEventReference(eventId, taskNumber) {
+  const text = taskNumber ? `任务 #${taskNumber} / 事件 #${eventId}` : `事件 #${eventId}`;
+  location.hash = `event-${eventId}`;
+  try {
+    await navigator.clipboard.writeText(text);
+    showToast("已复制事件引用");
+  } catch (error) {
+    showToast(text);
+  }
+}
+
+function eventFromCaches(eventId) {
+  return (state.events || []).find((event) => Number(event.id) === Number(eventId))
+    || (state.taskHistory?.items || []).find((item) => Number(item.event_id) === Number(eventId));
+}
+
+async function openEventReference(eventId) {
+  const event = eventFromCaches(eventId);
+  const taskId = event?.task_id || state.editingTaskId;
+  if (!taskId) {
+    showToast("当前缓存中没有该事件的任务关联", "error");
+    return;
+  }
+  await openTaskDetails(taskId, { focusEventId: Number(eventId) });
 }
 
 async function openTaskAssignmentDialog() {
@@ -1924,12 +2362,60 @@ function localMcpAssistantSupported() {
   return state.integrationTransport === "local" && Boolean(profile?.local_config);
 }
 
+function localMcpIdentity() {
+  const profile = state.integration?.profiles?.[state.integrationFormat] || {};
+  const softwareKey = profile.software_key || "";
+  const softwareClient = profile.software_client || "";
+  return (state.snapshot?.agent_identities || []).find((agent) => (
+    (softwareKey && agent.software_key === softwareKey)
+    || (softwareClient && agent.client === softwareClient)
+    || (profile.label && agent.name === profile.label)
+  )) || null;
+}
+
 function localMcpPresence() {
-  const softwareKey = state.integrationFormat.replaceAll("_", "-");
-  const identity = (state.snapshot?.agent_identities || []).find(
-    (agent) => agent.software_key === softwareKey
-  );
-  return identity?.connection_status === "connected";
+  return localMcpIdentity()?.connection_status === "connected";
+}
+
+function renderLocalMcpFacts() {
+  const plan = state.integrationLocalPlan;
+  const identity = localMcpIdentity();
+  const softwareConfigured = plan?.state === "current";
+  const processConnected = identity?.connection_status === "connected";
+  const roomSession = Number(identity?.active_session_count || 0) > 0;
+  const facts = [
+    {
+      label: "软件配置",
+      value: !plan ? "正在检测" : softwareConfigured ? "已配置" : "未就绪",
+      state: !plan ? "loading" : softwareConfigured ? "ready" : "pending",
+      note: softwareConfigured
+        ? "配置存在不代表客户端当前已经连接"
+        : "配置助手只负责首次安装或明确缺失配置",
+    },
+    {
+      label: "进程连接",
+      value: processConnected ? "MCP Presence 已连接" : "当前 Room 尚未连接",
+      state: processConnected ? "ready" : "pending",
+      note: "Presence 不是当前模型对话同步",
+    },
+    {
+      label: "Room Session",
+      value: roomSession ? "已有活动 Session" : "无活动 Session",
+      state: roomSession ? "ready" : "pending",
+      note: "自动上线不能代替新对话的 room_bootstrap",
+    },
+    {
+      label: "当前对话同步",
+      value: "浏览器无法观察",
+      state: "unknown",
+      note: "新对话请调用一次 room_bootstrap",
+    },
+  ];
+  elements["integration-local-facts"].innerHTML = facts.map((fact) => `
+    <div class="local-mcp-fact" data-state="${escapeHtml(fact.state)}">
+      <dt>${escapeHtml(fact.label)}</dt>
+      <dd><strong>${escapeHtml(fact.value)}</strong><span>${escapeHtml(fact.note)}</span></dd>
+    </div>`).join("");
 }
 
 function renderLocalMcpPlan() {
@@ -1940,11 +2426,7 @@ function renderLocalMcpPlan() {
 
   const profile = state.integration.profiles[state.integrationFormat];
   const plan = state.integrationLocalPlan;
-  const connected = localMcpPresence();
-  elements["integration-local-presence"].textContent = connected
-    ? "当前 Room 已连接：客户端 MCP Presence 正常"
-    : "当前 Room 尚未连接：写入配置后仍需重启或新开会话并等待 Presence";
-  elements["integration-local-presence"].dataset.connected = connected ? "true" : "false";
+  renderLocalMcpFacts();
   elements["integration-local-backup"].textContent = state.integrationLocalApplyResult?.backup_path
     ? `本次备份：${state.integrationLocalApplyResult.backup_path}`
     : "";
@@ -2220,4 +2702,7 @@ async function bootstrap() {
 }
 
 initializePanelLayout();
+document.querySelectorAll(".tab").forEach((item) => {
+  item.tabIndex = item.classList.contains("is-active") ? 0 : -1;
+});
 bootstrap();

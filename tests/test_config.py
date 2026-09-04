@@ -61,6 +61,10 @@ default_theme = "dark"
     assert settings.presence_keepalive_enabled is True
     assert settings.presence_keepalive_interval_seconds == 20
     assert settings.presence_refresh_interval_seconds == 1.5
+    assert settings.max_sse_clients_per_project == 64
+    assert settings.sse_per_ip_limit == 16
+    assert settings.token_touch_interval_seconds == 60.0
+    assert settings.token_touch_min_calls == 32
     assert settings.management_auth_required is True
     assert settings.database_backend == "postgresql"
     assert settings.database_url_env == "ROOM_DATABASE_URL"

@@ -1,11 +1,16 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
+import inspect
 import logging
 import os
+import socket
 import sys
+import threading
 from collections.abc import Callable
 from contextvars import ContextVar
+from pathlib import Path
 from typing import Any
 
 from mcp.server.fastmcp import FastMCP
@@ -20,6 +25,18 @@ from .database import create_database
 from .errors import DomainError
 from .mcp_compat import CompatibleToolManager
 from .presence import LocalPresenceManager
+from .bootstrap import (
+    RuntimeBinding,
+    bind_runtime_arguments,
+    bootstrap_local_room,
+    bootstrap_status_payload,
+    configured_software_identity,
+    workspace_path_from_file_uri,
+    PROJECT_PATH_ENV,
+    SOFTWARE_CLIENT_ENV,
+    SOFTWARE_KEY_ENV,
+    SOFTWARE_NAME_ENV,
+)
 from .project_registration import (
     register_checkout_project,
     resolve_checkout_project_key,
@@ -36,6 +53,17 @@ _bound_service_provider: ContextVar[ServiceProvider | None] = ContextVar(
     "agentchatroom_mcp_service_provider",
     default=None,
 )
+_runtime_binding: ContextVar[RuntimeBinding | None] = ContextVar(
+    "agentchatroom_runtime_binding",
+    default=None,
+)
+_session_bindings: dict[str, RuntimeBinding] = {}
+_session_bindings_lock = threading.RLock()
+_loaded_identity: tuple[str, str, str] | None = None
+_bootstrap_workspace_roots: ContextVar[list[Path] | None] = ContextVar(
+    "agentchatroom_bootstrap_workspace_roots",
+    default=None,
+)
 
 
 class ServiceBoundToolManager(CompatibleToolManager):
@@ -50,52 +78,166 @@ class ServiceBoundToolManager(CompatibleToolManager):
         context: Any = None,
         convert_result: bool = False,
     ) -> Any:
-        binding = None
+        provider_token = None
+        roots_token = None
+        session_key = mcp_session_key(context)
+        previous_binding = _runtime_binding.get()
         if self.service_provider is not None:
-            binding = _bound_service_provider.set(self.service_provider)
+            provider_token = _bound_service_provider.set(self.service_provider)
         try:
-            return await super().call_tool(
+            forwarded = dict(arguments or {})
+            restored = get_runtime_binding(session_key)
+            if restored is not None:
+                _runtime_binding.set(restored)
+            if name == "room_bootstrap":
+                roots_token = _bootstrap_workspace_roots.set(
+                    await collect_mcp_workspace_roots(context)
+                )
+            elif name != "room_join":
+                tool = self.get_tool(name)
+                if tool is not None:
+                    forwarded = bind_runtime_arguments(
+                        list(inspect.signature(tool.fn).parameters),
+                        forwarded,
+                        get_runtime_binding(session_key),
+                    )
+            result = await super().call_tool(
                 name,
-                arguments,
+                forwarded,
                 context=context,
                 convert_result=convert_result,
             )
+            if name == "room_bootstrap":
+                persist_runtime_binding(session_key, _runtime_binding.get())
+            elif name == "session_leave":
+                persist_runtime_binding(session_key, None)
+                clear_bindings_for_agent_session(str(forwarded.get("session_id") or ""))
+            return result
+        except DomainError as error:
+            return {"ok": False, **error.as_dict()}
         finally:
-            if binding is not None:
-                _bound_service_provider.reset(binding)
+            if roots_token is not None:
+                _bootstrap_workspace_roots.reset(roots_token)
+            if name == "session_leave":
+                _runtime_binding.set(None)
+            else:
+                _runtime_binding.set(previous_binding)
+            if provider_token is not None:
+                _bound_service_provider.reset(provider_token)
 
 
 MCP_INSTRUCTIONS = (
-    "Join the current project before doing work. Never supply, infer, or replace "
-    "a project_key: the backend owns it and local room_join reads the server-managed "
-    ".agentchatroom/project.json registration. Agents also do not supply logical_path; "
-    "the backend derives it from project_path relative to the detected repository root. "
-    "The MCP process owns one configured software identity. Agents must not invent "
-    "or rename agent_key, agent_name, or client values for different tasks or roles. "
-    "A fully configured local stdio process automatically establishes Presence for "
-    "an existing registered checkout, but Agents still call room_join and room_sync "
-    "before work to obtain runtime credentials and synchronize current facts. "
-    "room_join may create a Room only when "
-    "the repository scope is genuinely empty. Sync before claiming a task, "
-    "before editing files, and before reporting completion. Acquire file leases "
-    "before edits and include evidence in work reports. Every Agent-authored "
-    "message must include model_display_name exactly as shown in the client UI."
+    "Call room_bootstrap once at the start of a new conversation before project "
+    "work. Do not read or edit mcp.json, config.toml, AgentChatRoom source, or "
+    "the database on the normal path. Never supply, infer, or replace a "
+    "project_key, logical_path, agent_key, member_id, software name, or client "
+    "type. Agents also do not supply logical_path. Local stdio resolves ignored "
+    ".agentchatroom/project.json; the MCP process owns one configured software "
+    "identity and holds the Session Token in memory. Do not copy project_id, "
+    "session_id, or token between tools. Presence from MCP startup is not "
+    "conversation sync. If room_bootstrap returns identity_not_configured, use "
+    "the local MCP configuration assistant; otherwise follow the single "
+    "required_action. room_join remains a compatibility entry and may create a "
+    "Room only when the repository scope is genuinely empty. Sync, claim, lease, "
+    "and report through the current binding. Every Agent-authored message must "
+    "include model_display_name exactly as shown in the client UI."
 )
-
-SOFTWARE_KEY_ENV = "AGENTCHATROOM_SOFTWARE_KEY"
-SOFTWARE_NAME_ENV = "AGENTCHATROOM_SOFTWARE_NAME"
-SOFTWARE_CLIENT_ENV = "AGENTCHATROOM_SOFTWARE_CLIENT"
-PROJECT_PATH_ENV = "AGENTCHATROOM_PROJECT_PATH"
 
 
 def _configured_local_identity() -> tuple[str, str, str] | None:
-    software_key = os.getenv(SOFTWARE_KEY_ENV, "").strip()
-    software_name = os.getenv(SOFTWARE_NAME_ENV, "").strip()
-    client = os.getenv(SOFTWARE_CLIENT_ENV, "").strip()
-    values = (software_key, software_name, client)
-    if not all(values) or any(value.startswith("<") for value in values):
-        return None
-    return software_key, software_name, client
+    return configured_software_identity()
+
+
+def mcp_session_key(context: Any = None) -> str:
+    request_context = getattr(context, "request_context", None) if context is not None else None
+    if request_context is None and context is not None:
+        request_context = getattr(context, "_request_context", None)
+    session = getattr(request_context, "session", None) if request_context is not None else None
+    if session is None and context is not None:
+        session = getattr(context, "session", None)
+    for attr in ("session_id", "_session_id", "id"):
+        value = getattr(session, attr, None) if session is not None else None
+        if value:
+            return f"mcp:{value}"
+    try:
+        access = get_access_token()
+    except LookupError:
+        access = None
+    token = getattr(access, "token", "") if access is not None else ""
+    if token:
+        digest = hashlib.sha256(str(token).encode("utf-8")).hexdigest()[:16]
+        return f"auth:{digest}"
+    return "stdio:local"
+
+
+def get_runtime_binding(session_key: str | None = None) -> RuntimeBinding | None:
+    key = session_key or "stdio:local"
+    with _session_bindings_lock:
+        if key in _session_bindings:
+            return _session_bindings[key]
+        if session_key is not None:
+            return None
+    return _runtime_binding.get()
+
+
+def persist_runtime_binding(session_key: str, binding: RuntimeBinding | None) -> None:
+    with _session_bindings_lock:
+        _session_bindings[session_key] = binding
+
+
+def set_runtime_binding(
+    binding: RuntimeBinding | None,
+    session_key: str | None = None,
+) -> None:
+    _runtime_binding.set(binding)
+    persist_runtime_binding(session_key or "stdio:local", binding)
+
+
+def clear_runtime_binding(session_key: str | None = None) -> None:
+    _runtime_binding.set(None)
+    if session_key is None:
+        with _session_bindings_lock:
+            _session_bindings.clear()
+        return
+    persist_runtime_binding(session_key, None)
+
+
+def clear_bindings_for_agent_session(session_id: str) -> None:
+    if not session_id:
+        return
+    with _session_bindings_lock:
+        for key, binding in list(_session_bindings.items()):
+            if binding is not None and binding.session_id == session_id:
+                _session_bindings[key] = None
+    current = _runtime_binding.get()
+    if current is not None and current.session_id == session_id:
+        _runtime_binding.set(None)
+
+
+async def collect_mcp_workspace_roots(context: Any) -> list[Path]:
+    if context is None:
+        return []
+    request_context = getattr(context, "request_context", None)
+    if request_context is None:
+        request_context = getattr(context, "_request_context", None)
+    session = getattr(request_context, "session", None) if request_context is not None else None
+    if session is None:
+        session = getattr(context, "session", None)
+    list_roots = getattr(session, "list_roots", None) if session is not None else None
+    if list_roots is None:
+        return []
+    try:
+        result = await list_roots()
+    except Exception:
+        logger.debug("MCP client did not provide workspace roots")
+        return []
+    roots: list[Path] = []
+    for root in getattr(result, "roots", None) or []:
+        uri = str(getattr(root, "uri", "") or "")
+        path = workspace_path_from_file_uri(uri)
+        if path is not None:
+            roots.append(path)
+    return roots
 
 
 def _auto_join_local_checkout() -> dict[str, Any] | None:
@@ -245,6 +387,64 @@ class AgentCredentialTokenVerifier:
 
 
 @mcp.tool()
+def room_bootstrap(model: str = "") -> dict[str, Any]:
+    """Restore the current checkout Room for this conversation.
+
+    Zero-parameter on the normal path. The MCP process supplies software
+    identity and checkout registration; the Session Token stays in process memory.
+    """
+    identity = _configured_local_identity()
+    if identity is None:
+        payload = bootstrap_status_payload("identity_not_configured")
+        return {
+            "ok": False,
+            "result": payload,
+            "error": {
+                "code": payload["status"],
+                "message": "Local MCP software identity is not configured",
+                "details": {"required_action": payload["required_action"]},
+            },
+        }
+    software_key, software_name, client = identity
+    outcome = bootstrap_local_room(
+        get_service(),
+        software_key=software_key,
+        software_name=software_name,
+        client=client,
+        model=model,
+        workspace_roots=_bootstrap_workspace_roots.get(),
+        cwd=Path.cwd(),
+        explicit_project_path=os.getenv(PROJECT_PATH_ENV, "").strip() or None,
+        loaded_identity=_loaded_identity,
+    )
+    if outcome.binding is None:
+        payload = outcome.public
+        return {
+            "ok": False,
+            "result": payload,
+            "error": {
+                "code": payload["status"],
+                "message": "Room bootstrap is not ready",
+                "details": {
+                    "required_action": payload.get("required_action"),
+                },
+            },
+        }
+    set_runtime_binding(outcome.binding)
+    _register_local_presence(
+        {
+            "project": {"id": outcome.binding.project_id},
+            "agent": {
+                "id": outcome.binding.session_id,
+                "agent_key": outcome.binding.agent_key,
+            },
+            "token": outcome.binding.token,
+        }
+    )
+    return {"ok": True, "result": outcome.public}
+
+
+@mcp.tool()
 def room_join(
     project_path: str,
     model: str,
@@ -307,6 +507,18 @@ def room_join(
         )
         validate_project_scope(project_path, project)
         register_checkout_project(project_path, project, replace_existing=True)
+        workspace_path = str(Path(worktree or project_path).expanduser().resolve())
+        local_host_name = host_name.strip() or socket.gethostname() or "local-host"
+        local_host_key = host_key.strip() or f"host:{local_host_name}"
+        registered = room_service.register_workspace(
+            project["id"],
+            host_key=local_host_key,
+            host_name=local_host_name,
+            local_path=workspace_path,
+            branch=branch,
+            worktree=worktree or workspace_path,
+            git_remote=git_remote,
+        )
         joined = room_service.join_room(
             project["id"],
             agent_key=agent_key,
@@ -316,9 +528,11 @@ def room_join(
             model=model,
             role=role,
             branch=branch,
-            worktree=worktree or project_path,
+            worktree=worktree or workspace_path,
             capabilities=capabilities or {"mcp": True},
             member_id=member_id or None,
+            host_id=registered["host"]["id"],
+            workspace_id=registered["workspace"]["id"],
         )
         payload = {"project": project, **joined}
         _register_local_presence(payload)
@@ -329,9 +543,9 @@ def room_join(
 
 @mcp.tool()
 def room_sync(
-    project_id: str,
-    session_id: str,
-    token: str,
+    project_id: str = "",
+    session_id: str = "",
+    token: str = "",
     after: int = 0,
 ) -> dict[str, Any]:
     """Return the room snapshot and events newer than the supplied cursor."""
@@ -353,9 +567,9 @@ def room_sync(
 
 @mcp.tool()
 def session_heartbeat(
-    project_id: str,
-    session_id: str,
-    token: str,
+    project_id: str = "",
+    session_id: str = "",
+    token: str = "",
     request_id: str = "",
 ) -> dict[str, Any]:
     """Refresh connection liveness without advancing the Room cursor."""
@@ -377,9 +591,9 @@ def session_heartbeat(
 
 @mcp.tool()
 def session_leave(
-    project_id: str,
-    session_id: str,
-    token: str,
+    project_id: str = "",
+    session_id: str = "",
+    token: str = "",
     request_id: str = "",
 ) -> dict[str, Any]:
     """Close an Agent session explicitly and release its active file leases."""
@@ -396,16 +610,19 @@ def session_leave(
     )
     if result.get("ok") and presence_manager is not None:
         presence_manager.unregister(session_id)
+    binding = get_runtime_binding()
+    if binding is not None and binding.session_id == session_id:
+        clear_bindings_for_agent_session(session_id)
     return result
 
 
 @mcp.tool()
 def message_post(
-    project_id: str,
-    session_id: str,
-    token: str,
-    body: str,
-    model_display_name: str,
+    project_id: str = "",
+    session_id: str = "",
+    token: str = "",
+    body: str = "",
+    model_display_name: str = "",
     kind: str = "message",
     task_id: str = "",
     mentions: list[str] | None = None,
@@ -443,10 +660,10 @@ def message_post(
 
 @mcp.tool()
 def message_acknowledge(
-    project_id: str,
-    event_id: int,
-    session_id: str,
-    token: str,
+    project_id: str = "",
+    event_id: int = 0,
+    session_id: str = "",
+    token: str = "",
     request_id: str = "",
 ) -> dict[str, Any]:
     """Acknowledge a room message that explicitly requires confirmation."""
@@ -465,7 +682,7 @@ def message_acknowledge(
 
 
 @mcp.tool()
-def task_list(project_id: str, status: str = "") -> dict[str, Any]:
+def task_list(project_id: str = "", status: str = "") -> dict[str, Any]:
     """List project tasks, optionally filtered by status."""
     try:
         _authorize_remote(project_id, "room:read")
@@ -475,7 +692,7 @@ def task_list(project_id: str, status: str = "") -> dict[str, Any]:
 
 
 @mcp.tool()
-def task_get(project_id: str, task_id: str) -> dict[str, Any]:
+def task_get(project_id: str = "", task_id: str = "") -> dict[str, Any]:
     """Return one complete task by ID without expanding the whole project board."""
     try:
         _authorize_remote(project_id, "room:read")
@@ -485,7 +702,32 @@ def task_get(project_id: str, task_id: str) -> dict[str, Any]:
 
 
 @mcp.tool()
-def task_get_by_number(project_id: str, task_number: int) -> dict[str, Any]:
+def task_history(
+    project_id: str = "",
+    task_id: str = "",
+    after: int = 0,
+    before: int = 0,
+    limit: int = 50,
+    event_type: str = "",
+) -> dict[str, Any]:
+    """Return a paginated, redacted evidence chain for one task."""
+    try:
+        _authorize_remote(project_id, "room:read")
+    except DomainError as error:
+        return {"ok": False, **error.as_dict()}
+    return _tool_result(
+        get_service().list_task_history,
+        project_id,
+        task_id,
+        after=after,
+        before=before,
+        limit=limit,
+        event_type=event_type,
+    )
+
+
+@mcp.tool()
+def task_get_by_number(project_id: str = "", task_number: int = 0) -> dict[str, Any]:
     """Return one complete task by its stable human-readable Project number."""
     try:
         _authorize_remote(project_id, "room:read")
@@ -495,7 +737,7 @@ def task_get_by_number(project_id: str, task_number: int) -> dict[str, Any]:
 
 
 @mcp.tool()
-def task_intake_targets(project_id: str) -> dict[str, Any]:
+def task_intake_targets(project_id: str = "") -> dict[str, Any]:
     """List all non-revoked Agent identities that can receive a user task intake.
 
     The result includes previously connected but currently offline identities;
@@ -510,9 +752,9 @@ def task_intake_targets(project_id: str) -> dict[str, Any]:
 
 @mcp.tool()
 def task_intake_submit(
-    project_id: str,
-    raw_description: str,
-    target_member_id: str,
+    project_id: str = "",
+    raw_description: str = "",
+    target_member_id: str = "",
     target_session_id: str = "",
     created_by_session_id: str = "",
     token: str = "",
@@ -536,7 +778,7 @@ def task_intake_submit(
 
 
 @mcp.tool()
-def task_intake_list(project_id: str, status: str = "") -> dict[str, Any]:
+def task_intake_list(project_id: str = "", status: str = "") -> dict[str, Any]:
     """List user task intakes, optionally filtered by lifecycle status."""
     try:
         _authorize_remote(project_id, "room:read")
@@ -550,7 +792,7 @@ def task_intake_list(project_id: str, status: str = "") -> dict[str, Any]:
 
 
 @mcp.tool()
-def task_intake_get(project_id: str, intake_id: str) -> dict[str, Any]:
+def task_intake_get(project_id: str = "", intake_id: str = "") -> dict[str, Any]:
     """Return one user task intake and its current formal-task link."""
     try:
         _authorize_remote(project_id, "room:read")
@@ -561,10 +803,10 @@ def task_intake_get(project_id: str, intake_id: str) -> dict[str, Any]:
 
 @mcp.tool()
 def task_intake_acknowledge(
-    project_id: str,
-    intake_id: str,
-    session_id: str,
-    token: str,
+    project_id: str = "",
+    intake_id: str = "",
+    session_id: str = "",
+    token: str = "",
     response: str = "accepted",
     note: str = "",
     request_id: str = "",
@@ -588,9 +830,9 @@ def task_intake_acknowledge(
 
 @mcp.tool()
 def task_intake_reassign(
-    project_id: str,
-    intake_id: str,
-    target_member_id: str,
+    project_id: str = "",
+    intake_id: str = "",
+    target_member_id: str = "",
     target_session_id: str = "",
     note: str = "",
     request_id: str = "",
@@ -613,12 +855,12 @@ def task_intake_reassign(
 
 @mcp.tool()
 def task_define_from_intake(
-    project_id: str,
-    intake_id: str,
-    session_id: str,
-    token: str,
-    title: str,
-    acceptance_criteria: list[str],
+    project_id: str = "",
+    intake_id: str = "",
+    session_id: str = "",
+    token: str = "",
+    title: str = "",
+    acceptance_criteria: list[str] | None = None,
     description: str = "",
     depends_on: list[str] | None = None,
     priority: int = 2,
@@ -648,7 +890,7 @@ def task_define_from_intake(
 
 @mcp.tool()
 def audit_query(
-    project_id: str,
+    project_id: str = "",
     after: int = 0,
     limit: int = 200,
     event_type: str = "",
@@ -672,7 +914,7 @@ def audit_query(
 
 
 @mcp.tool()
-def member_list(project_id: str, include_revoked: bool = True) -> dict[str, Any]:
+def member_list(project_id: str = "", include_revoked: bool = True) -> dict[str, Any]:
     """List versioned Project members and their token/session counts."""
     try:
         _authorize_remote(project_id, "member:read")
@@ -687,9 +929,9 @@ def member_list(project_id: str, include_revoked: bool = True) -> dict[str, Any]
 
 @mcp.tool()
 def member_create(
-    project_id: str,
-    member_key: str,
-    name: str,
+    project_id: str = "",
+    member_key: str = "",
+    name: str = "",
     kind: str = "agent",
     role: str = "",
     status: str = "active",
@@ -720,8 +962,8 @@ def member_create(
 
 @mcp.tool()
 def member_update(
-    project_id: str,
-    member_id: str,
+    project_id: str = "",
+    member_id: str = "",
     name: str = "",
     kind: str = "",
     role: str = "",
@@ -753,8 +995,8 @@ def member_update(
 
 @mcp.tool()
 def member_revoke(
-    project_id: str,
-    member_id: str,
+    project_id: str = "",
+    member_id: str = "",
     actor_session_id: str = "",
     token: str = "",
     request_id: str = "",
@@ -776,9 +1018,9 @@ def member_revoke(
 
 @mcp.tool()
 def task_create(
-    project_id: str,
-    title: str,
-    acceptance_criteria: list[str],
+    project_id: str = "",
+    title: str = "",
+    acceptance_criteria: list[str] | None = None,
     description: str = "",
     depends_on: list[str] | None = None,
     priority: int = 2,
@@ -807,10 +1049,10 @@ def task_create(
 
 @mcp.tool()
 def task_claim(
-    project_id: str,
-    task_id: str,
-    session_id: str,
-    token: str,
+    project_id: str = "",
+    task_id: str = "",
+    session_id: str = "",
+    token: str = "",
     request_id: str = "",
 ) -> dict[str, Any]:
     """Atomically claim an available task for this agent session."""
@@ -830,10 +1072,10 @@ def task_claim(
 
 @mcp.tool()
 def task_assign(
-    project_id: str,
-    task_id: str,
-    assigned_by_session_id: str,
-    token: str,
+    project_id: str = "",
+    task_id: str = "",
+    assigned_by_session_id: str = "",
+    token: str = "",
     assigned_to_session_id: str = "",
     target_role: str = "",
     required_capability: str = "",
@@ -861,12 +1103,12 @@ def task_assign(
 
 @mcp.tool()
 def task_acknowledge(
-    project_id: str,
-    task_id: str,
-    assignment_id: str,
-    session_id: str,
-    token: str,
-    response: str,
+    project_id: str = "",
+    task_id: str = "",
+    assignment_id: str = "",
+    session_id: str = "",
+    token: str = "",
+    response: str = "",
     note: str = "",
     request_id: str = "",
 ) -> dict[str, Any]:
@@ -890,13 +1132,13 @@ def task_acknowledge(
 
 @mcp.tool()
 def task_handoff(
-    project_id: str,
-    task_id: str,
-    from_session_id: str,
-    token: str,
-    to_session_id: str,
-    summary: str,
-    next_step: str,
+    project_id: str = "",
+    task_id: str = "",
+    from_session_id: str = "",
+    token: str = "",
+    to_session_id: str = "",
+    summary: str = "",
+    next_step: str = "",
     completed_items: list[str] | None = None,
     pending_items: list[str] | None = None,
     files: list[str] | None = None,
@@ -927,12 +1169,12 @@ def task_handoff(
 
 @mcp.tool()
 def task_handoff_acknowledge(
-    project_id: str,
-    task_id: str,
-    handoff_id: str,
-    session_id: str,
-    token: str,
-    response: str,
+    project_id: str = "",
+    task_id: str = "",
+    handoff_id: str = "",
+    session_id: str = "",
+    token: str = "",
+    response: str = "",
     note: str = "",
     request_id: str = "",
 ) -> dict[str, Any]:
@@ -956,10 +1198,10 @@ def task_handoff_acknowledge(
 
 @mcp.tool()
 def task_update(
-    project_id: str,
-    task_id: str,
-    session_id: str,
-    token: str,
+    project_id: str = "",
+    task_id: str = "",
+    session_id: str = "",
+    token: str = "",
     status: str = "",
     title: str = "",
     description: str = "",
@@ -999,10 +1241,10 @@ def task_update(
 
 @mcp.tool()
 def lease_acquire(
-    project_id: str,
-    session_id: str,
-    token: str,
-    path_pattern: str,
+    project_id: str = "",
+    session_id: str = "",
+    token: str = "",
+    path_pattern: str = "",
     mode: str = "exclusive",
     task_id: str = "",
     reason: str = "",
@@ -1030,10 +1272,10 @@ def lease_acquire(
 
 @mcp.tool()
 def lease_release(
-    project_id: str,
-    lease_id: str,
-    session_id: str,
-    token: str,
+    project_id: str = "",
+    lease_id: str = "",
+    session_id: str = "",
+    token: str = "",
     request_id: str = "",
 ) -> dict[str, Any]:
     """Release a file lease owned by this agent session."""
@@ -1053,13 +1295,13 @@ def lease_release(
 
 @mcp.tool()
 def work_report(
-    project_id: str,
-    task_id: str,
-    session_id: str,
-    token: str,
-    summary: str,
-    files: list[str],
-    tests: list[TestEvidence],
+    project_id: str = "",
+    task_id: str = "",
+    session_id: str = "",
+    token: str = "",
+    summary: str = "",
+    files: list[str] | None = None,
+    tests: list[TestEvidence] | None = None,
     commit_hash: str = "",
     no_code_change_reason: str = "",
     request_id: str = "",
@@ -1076,8 +1318,8 @@ def work_report(
         session_id=session_id,
         token=token,
         summary=summary,
-        files=files,
-        tests=tests,
+        files=files or [],
+        tests=tests or [],
         commit_hash=commit_hash,
         no_code_change_reason=no_code_change_reason,
         request_id=_mcp_request_id(request_id),
@@ -1086,12 +1328,12 @@ def work_report(
 
 @mcp.tool()
 def review_submit(
-    project_id: str,
-    task_id: str,
-    reviewer_session_id: str,
-    token: str,
-    verdict: str,
-    criteria: list[ReviewCriterion],
+    project_id: str = "",
+    task_id: str = "",
+    reviewer_session_id: str = "",
+    token: str = "",
+    verdict: str = "",
+    criteria: list[ReviewCriterion] | None = None,
     notes: str = "",
     request_id: str = "",
 ) -> dict[str, Any]:
@@ -1107,7 +1349,7 @@ def review_submit(
         reviewer_session_id=reviewer_session_id,
         token=token,
         verdict=verdict,
-        criteria=criteria,
+        criteria=criteria or [],
         notes=notes,
         request_id=_mcp_request_id(request_id),
     )
@@ -1115,13 +1357,13 @@ def review_submit(
 
 @mcp.tool()
 def integration_submit(
-    project_id: str,
-    task_id: str,
-    integrator_session_id: str,
-    token: str,
-    result: str,
-    summary: str,
-    tests: list[TestEvidence],
+    project_id: str = "",
+    task_id: str = "",
+    integrator_session_id: str = "",
+    token: str = "",
+    result: str = "",
+    summary: str = "",
+    tests: list[TestEvidence] | None = None,
     files: list[str] | None = None,
     commit_hash: str = "",
     request_id: str = "",
@@ -1139,8 +1381,8 @@ def integration_submit(
         token=token,
         result=result,
         summary=summary,
-        files=files,
-        tests=tests,
+        files=files or [],
+        tests=tests or [],
         commit_hash=commit_hash,
         request_id=_mcp_request_id(request_id),
     )
@@ -1148,12 +1390,12 @@ def integration_submit(
 
 @mcp.tool()
 def knowledge_candidate_submit(
-    project_id: str,
-    session_id: str,
-    token: str,
-    title: str,
-    body: str,
-    kind: str,
+    project_id: str = "",
+    session_id: str = "",
+    token: str = "",
+    title: str = "",
+    body: str = "",
+    kind: str = "",
     summary: str = "",
     tags: list[str] | None = None,
     source_type: str = "manual",
@@ -1193,12 +1435,12 @@ def knowledge_candidate_submit(
 
 @mcp.tool()
 def knowledge_review(
-    project_id: str,
-    asset_id: str,
-    reviewer_session_id: str,
-    token: str,
-    verdict: str,
-    criteria: list[ReviewCriterion],
+    project_id: str = "",
+    asset_id: str = "",
+    reviewer_session_id: str = "",
+    token: str = "",
+    verdict: str = "",
+    criteria: list[ReviewCriterion] | None = None,
     notes: str = "",
     request_id: str = "",
 ) -> dict[str, Any]:
@@ -1214,7 +1456,7 @@ def knowledge_review(
         reviewer_session_id=reviewer_session_id,
         token=token,
         verdict=verdict,
-        criteria=criteria,
+        criteria=criteria or [],
         notes=notes,
         request_id=_mcp_request_id(request_id),
     )
@@ -1222,10 +1464,10 @@ def knowledge_review(
 
 @mcp.tool()
 def knowledge_supersede(
-    project_id: str,
-    asset_id: str,
-    session_id: str,
-    token: str,
+    project_id: str = "",
+    asset_id: str = "",
+    session_id: str = "",
+    token: str = "",
     reason: str = "",
     request_id: str = "",
 ) -> dict[str, Any]:
@@ -1247,10 +1489,10 @@ def knowledge_supersede(
 
 @mcp.tool()
 def knowledge_archive(
-    project_id: str,
-    asset_id: str,
-    session_id: str,
-    token: str,
+    project_id: str = "",
+    asset_id: str = "",
+    session_id: str = "",
+    token: str = "",
     reason: str = "",
     request_id: str = "",
 ) -> dict[str, Any]:
@@ -1272,8 +1514,8 @@ def knowledge_archive(
 
 @mcp.tool()
 def knowledge_get(
-    project_id: str,
-    asset_id: str,
+    project_id: str = "",
+    asset_id: str = "",
     version_id: str = "",
 ) -> dict[str, Any]:
     """Read one Knowledge Asset with its full version and review history."""
@@ -1291,7 +1533,7 @@ def knowledge_get(
 
 @mcp.tool()
 def knowledge_list(
-    project_id: str,
+    project_id: str = "",
     status: str = "",
     kind: str = "",
     source_task_id: str = "",
@@ -1368,8 +1610,10 @@ def main(argv: list[str] | None = None) -> None:
         version=f"%(prog)s {__version__}",
     )
     parser.parse_args(argv)
+    global _loaded_identity
     settings = load_settings()
     room_service = get_service()
+    _loaded_identity = _configured_local_identity()
     presence_manager = LocalPresenceManager(
         room_service,
         enabled=settings.presence_keepalive_enabled,

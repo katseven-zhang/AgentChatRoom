@@ -534,6 +534,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="Confirm irreversible deletion",
     )
 
+    bootstrap = commands.add_parser(
+        "room-bootstrap",
+        help="Restore the current checkout Room without printing a Session Token",
+    )
+    bootstrap.add_argument("--cwd", default="", help="Checkout directory to resolve")
+    bootstrap.add_argument("--model", default="unknown")
+    bootstrap.add_argument("--config")
+
     join = commands.add_parser("room-join", help="Join a project room")
     join.add_argument("project_id")
     join.add_argument("--agent-key", default="", help=argparse.SUPPRESS)
@@ -596,6 +604,16 @@ def build_parser() -> argparse.ArgumentParser:
     task_get = commands.add_parser("task-get", help="Get one task")
     task_get.add_argument("project_id")
     task_get.add_argument("task_id")
+
+    task_history = commands.add_parser(
+        "task-history", help="List the paginated evidence chain for one task"
+    )
+    task_history.add_argument("project_id")
+    task_history.add_argument("task_id")
+    task_history.add_argument("--after", type=int, default=0)
+    task_history.add_argument("--before", type=int, default=0)
+    task_history.add_argument("--limit", type=int, default=50)
+    task_history.add_argument("--event-type", default="")
 
     task_number = commands.add_parser("task-get-by-number", help="Get a task by number")
     task_number.add_argument("project_id")
@@ -1044,6 +1062,36 @@ def main(argv: list[str] | None = None) -> None:
             "DELETE",
             f"/api/v1/projects/{args.project_id}?permanent=true",
         )
+    elif args.command == "room-bootstrap":
+        from .bootstrap import bootstrap_local_room, configured_software_identity
+        from .database import create_database
+        from .services import AgentChatRoomService
+
+        identity = configured_software_identity()
+        if identity is None:
+            from .bootstrap import bootstrap_status_payload
+
+            result = bootstrap_status_payload("identity_not_configured")
+        else:
+            from .bootstrap import PROJECT_PATH_ENV
+
+            settings = load_settings(args.config)
+            room_service = AgentChatRoomService(create_database(settings), settings)
+            room_service.initialize()
+            outcome = bootstrap_local_room(
+                room_service,
+                software_key=identity[0],
+                software_name=identity[1],
+                client=identity[2],
+                model=args.model,
+                cwd=args.cwd or os.getcwd(),
+                explicit_project_path=os.getenv(PROJECT_PATH_ENV, "").strip() or None,
+            )
+            result = outcome.public
+            if outcome.binding is not None and outcome.binding.token in json.dumps(
+                result, ensure_ascii=False, default=str
+            ):
+                raise SystemExit("room-bootstrap refused to print a Session Token")
     elif args.command == "room-join":
         result = call_api(
             "POST",
@@ -1112,6 +1160,19 @@ def main(argv: list[str] | None = None) -> None:
         result = call_api(
             "GET",
             f"/api/v1/projects/{args.project_id}/tasks/{args.task_id}",
+        )
+    elif args.command == "task-history":
+        query = urllib.parse.urlencode(
+            {
+                "after": args.after,
+                "before": args.before,
+                "limit": args.limit,
+                **({"event_type": args.event_type} if args.event_type else {}),
+            }
+        )
+        result = call_api(
+            "GET",
+            f"/api/v1/projects/{args.project_id}/tasks/{args.task_id}/history?{query}",
         )
     elif args.command == "task-get-by-number":
         result = call_api(
@@ -1247,10 +1308,10 @@ def main(argv: list[str] | None = None) -> None:
             },
         )
     elif args.command == "lease-release":
-        query = urllib.parse.urlencode({"session_id": args.session_id, "token": args.token})
         result = call_api(
             "DELETE",
-            f"/api/v1/projects/{args.project_id}/leases/{args.lease_id}?{query}",
+            f"/api/v1/projects/{args.project_id}/leases/{args.lease_id}",
+            {"session_id": args.session_id, "token": args.token},
         )
     elif args.command == "lease-check":
         result = call_api(

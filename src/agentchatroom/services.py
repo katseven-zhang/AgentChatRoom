@@ -1,14 +1,19 @@
 from __future__ import annotations
 
+import atexit
 import fnmatch
 import hashlib
 import hmac
 import inspect
 import json
+import logging
 import os
 import re
 import secrets
+import sqlite3
 import subprocess
+import threading
+import time
 import uuid
 from functools import wraps
 from datetime import UTC, datetime, timedelta
@@ -45,6 +50,12 @@ from .contracts import (
 from .database import DatabaseBackend
 from .errors import DomainError
 from .project_registration import derive_logical_path
+from .task_history import (
+    TASK_HISTORY_LIMIT_MAX,
+    TASK_HISTORY_SCHEMA_VERSION,
+    actor_snapshot,
+    project_history_item,
+)
 
 
 TASK_STATUSES = LEGACY_TASK_STATUSES
@@ -82,7 +93,114 @@ SENSITIVE_REQUEST_FIELDS = {
     "admin_token",
     "password",
     "secret",
+    "authorization",
+    "bearer",
+    "cookie",
+    "api_key",
 }
+logger = logging.getLogger(__name__)
+
+
+def _is_unique_constraint_error(error: BaseException) -> bool:
+    if isinstance(error, sqlite3.IntegrityError):
+        return True
+    name = error.__class__.__name__.lower()
+    return "integrity" in name or "unique" in name
+
+
+def _sql_placeholders(count: int) -> str:
+    return ",".join("?" for _ in range(count))
+
+
+class TokenTouchBuffer:
+    """Queue last_used_at updates so token verification stays on a read path."""
+
+    def __init__(
+        self,
+        service: "AgentChatRoomService",
+        *,
+        interval_seconds: float,
+        min_calls: int,
+    ) -> None:
+        self._service = service
+        self._interval_seconds = max(1.0, float(interval_seconds))
+        self._min_calls = max(1, int(min_calls))
+        self._lock = threading.Lock()
+        self._pending: dict[str, str] = {}
+        self._calls_since_flush = 0
+        self._last_flush = time.monotonic()
+        self._closed = False
+        self._wakeup = threading.Event()
+        self._backoff_seconds = 0.05
+        self._thread: threading.Thread | None = None
+        atexit.register(self.flush)
+
+    def note(self, credential_id: str) -> None:
+        if not credential_id or self._closed:
+            return
+        used_at = iso_now()
+        with self._lock:
+            self._pending[credential_id] = used_at
+            self._calls_since_flush += 1
+            due = (
+                self._calls_since_flush >= self._min_calls
+                or (time.monotonic() - self._last_flush) >= self._interval_seconds
+            )
+            self._ensure_thread_locked()
+        if due:
+            self._wakeup.set()
+
+    def flush(self) -> None:
+        with self._lock:
+            pending = self._pending
+            self._pending = {}
+            self._calls_since_flush = 0
+            self._last_flush = time.monotonic()
+        if not pending:
+            return
+        try:
+            with self._service.database.connect(write=True) as connection:
+                now = iso_now()
+                for credential_id, used_at in pending.items():
+                    connection.execute(
+                        """
+                        UPDATE agent_credentials
+                        SET last_used_at = ?, updated_at = ?
+                        WHERE id = ?
+                        """,
+                        (used_at or now, now, credential_id),
+                    )
+            self._backoff_seconds = 0.05
+        except Exception:
+            logger.exception("Failed to flush Agent token last_used_at updates")
+            with self._lock:
+                for credential_id, used_at in pending.items():
+                    self._pending.setdefault(credential_id, used_at)
+            self._backoff_seconds = min(self._backoff_seconds * 2, 5.0)
+            if not self._closed:
+                time.sleep(self._backoff_seconds)
+
+    def close(self) -> None:
+        self._closed = True
+        self._wakeup.set()
+        self.flush()
+
+    def _ensure_thread_locked(self) -> None:
+        if self._thread is None or not self._thread.is_alive():
+            self._thread = threading.Thread(
+                target=self._run,
+                name="agentchatroom-token-touch",
+                daemon=True,
+            )
+            self._thread.start()
+
+    def _run(self) -> None:
+        while not self._closed:
+            self._wakeup.wait(timeout=self._interval_seconds)
+            self._wakeup.clear()
+            if self._closed:
+                break
+            self.flush()
 
 
 def utc_now() -> datetime:
@@ -287,9 +405,18 @@ class AgentChatRoomService:
     def __init__(self, database: DatabaseBackend, settings: Settings) -> None:
         self.database = database
         self.settings = settings
+        self._token_touch = TokenTouchBuffer(
+            self,
+            interval_seconds=settings.token_touch_interval_seconds,
+            min_calls=settings.token_touch_min_calls,
+        )
 
     def initialize(self) -> None:
         self.database.initialize()
+
+    def close(self) -> None:
+        self._token_touch.close()
+        self.database.close()
 
     def _execute_idempotent(
         self,
@@ -394,14 +521,59 @@ class AgentChatRoomService:
             raise DomainError("task_not_found", "Task does not exist", status_code=404)
         return row
 
-    def _next_task_number(self, connection: Any, project_id: str) -> int:
-        """Allocate the next Project-scoped number inside the caller's write transaction."""
-        row = connection.execute(
-            "SELECT COALESCE(MAX(task_number), 0) + 1 AS task_number "
-            "FROM tasks WHERE project_id = ?",
+    def _lock_task_number_sequence(
+        self, connection: Any, project_id: str
+    ) -> Mapping[str, Any] | None:
+        if getattr(self.database, "backend", "sqlite") == "postgresql":
+            return connection.execute(
+                """
+                SELECT next_value FROM task_number_sequences
+                WHERE project_id = ? FOR UPDATE
+                """,
+                (project_id,),
+            ).fetchone()
+        return connection.execute(
+            "SELECT next_value FROM task_number_sequences WHERE project_id = ?",
             (project_id,),
         ).fetchone()
-        return int(row["task_number"])
+
+    def _next_task_number(self, connection: Any, project_id: str) -> int:
+        """Allocate the next Project-scoped number inside the caller's write transaction."""
+        for _ in range(5):
+            row = self._lock_task_number_sequence(connection, project_id)
+            if row is None:
+                maximum = int(
+                    connection.execute(
+                        """
+                        SELECT COALESCE(MAX(task_number), 0) AS task_number
+                        FROM tasks WHERE project_id = ?
+                        """,
+                        (project_id,),
+                    ).fetchone()["task_number"]
+                )
+                connection.execute(
+                    """
+                    INSERT INTO task_number_sequences(project_id, next_value)
+                    VALUES (?, ?)
+                    ON CONFLICT(project_id) DO NOTHING
+                    """,
+                    (project_id, maximum + 1),
+                )
+                continue
+            allocated = int(row["next_value"])
+            connection.execute(
+                """
+                UPDATE task_number_sequences
+                SET next_value = ? WHERE project_id = ?
+                """,
+                (allocated + 1, project_id),
+            )
+            return allocated
+        raise DomainError(
+            "task_number_conflict",
+            "Could not allocate a unique task number",
+            status_code=409,
+        )
 
     def _require_task_by_number(
         self, connection: Any, project_id: str, task_number: int
@@ -957,6 +1129,7 @@ class AgentChatRoomService:
             integration_status=data["integration_status"],
             legacy_status=data["status"],
         )
+        data["phase"] = data["state"]["phase"]
         return data
 
     def _handoff_dict(self, row: Mapping[str, Any]) -> dict[str, Any]:
@@ -1015,56 +1188,92 @@ class AgentChatRoomService:
     def _task_with_dependencies(
         self, connection: Any, row: Mapping[str, Any]
     ) -> dict[str, Any]:
-        data = self._task_dict(row)
-        dependencies = connection.execute(
-            """
-            SELECT t.id, t.task_number, t.title, t.status, t.execution_status,
-                   t.verification_status, t.integration_status
+        return self._tasks_with_relations(connection, [row])[0]
+
+    def _tasks_with_relations(
+        self, connection: Any, rows: Iterable[Mapping[str, Any]]
+    ) -> list[dict[str, Any]]:
+        materialized = list(rows)
+        if not materialized:
+            return []
+        task_ids = [row["id"] for row in materialized]
+        placeholders = _sql_placeholders(len(task_ids))
+        dependencies_by_task: dict[str, list[Mapping[str, Any]]] = {
+            task_id: [] for task_id in task_ids
+        }
+        for dependency in connection.execute(
+            f"""
+            SELECT d.task_id AS child_task_id, t.id, t.task_number, t.title,
+                   t.status, t.execution_status, t.verification_status,
+                   t.integration_status
             FROM task_dependencies d
             JOIN tasks t ON t.id = d.depends_on_task_id
-            WHERE d.task_id = ? ORDER BY d.created_at
+            WHERE d.task_id IN ({placeholders})
+            ORDER BY d.created_at
             """,
-            (row["id"],),
-        ).fetchall()
-        data["depends_on"] = [dependency["id"] for dependency in dependencies]
-        data["dependency_details"] = [
-            {
-                **dict(dependency),
-                "task_number": int(dependency["task_number"]),
-            }
-            for dependency in dependencies
-        ]
-        data["assignments"] = [
-            dict(assignment)
-            for assignment in connection.execute(
-                """
-                SELECT * FROM task_assignments
-                WHERE task_id = ? ORDER BY created_at
-                """,
-                (row["id"],),
-            ).fetchall()
-        ]
-        data["handoffs"] = [
-            self._handoff_dict(handoff)
-            for handoff in connection.execute(
-                """
-                SELECT * FROM task_handoffs
-                WHERE task_id = ? ORDER BY created_at
-                """,
-                (row["id"],),
-            ).fetchall()
-        ]
-        data["integrations"] = [
-            self._integration_dict(integration)
-            for integration in connection.execute(
-                """
-                SELECT * FROM task_integrations
-                WHERE task_id = ? ORDER BY created_at
-                """,
-                (row["id"],),
-            ).fetchall()
-        ]
-        return data
+            task_ids,
+        ).fetchall():
+            dependencies_by_task[str(dependency["child_task_id"])].append(dependency)
+        assignments_by_task: dict[str, list[dict[str, Any]]] = {
+            task_id: [] for task_id in task_ids
+        }
+        for assignment in connection.execute(
+            f"""
+            SELECT * FROM task_assignments
+            WHERE task_id IN ({placeholders})
+            ORDER BY created_at
+            """,
+            task_ids,
+        ).fetchall():
+            assignments_by_task[str(assignment["task_id"])].append(dict(assignment))
+        handoffs_by_task: dict[str, list[dict[str, Any]]] = {
+            task_id: [] for task_id in task_ids
+        }
+        for handoff in connection.execute(
+            f"""
+            SELECT * FROM task_handoffs
+            WHERE task_id IN ({placeholders})
+            ORDER BY created_at
+            """,
+            task_ids,
+        ).fetchall():
+            handoffs_by_task[str(handoff["task_id"])].append(self._handoff_dict(handoff))
+        integrations_by_task: dict[str, list[dict[str, Any]]] = {
+            task_id: [] for task_id in task_ids
+        }
+        for integration in connection.execute(
+            f"""
+            SELECT * FROM task_integrations
+            WHERE task_id IN ({placeholders})
+            ORDER BY created_at
+            """,
+            task_ids,
+        ).fetchall():
+            integrations_by_task[str(integration["task_id"])].append(
+                self._integration_dict(integration)
+            )
+        assembled: list[dict[str, Any]] = []
+        for row in materialized:
+            data = self._task_dict(row)
+            dependencies = dependencies_by_task.get(row["id"], [])
+            data["depends_on"] = [dependency["id"] for dependency in dependencies]
+            data["dependency_details"] = [
+                {
+                    "id": dependency["id"],
+                    "task_number": int(dependency["task_number"]),
+                    "title": dependency["title"],
+                    "status": dependency["status"],
+                    "execution_status": dependency["execution_status"],
+                    "verification_status": dependency["verification_status"],
+                    "integration_status": dependency["integration_status"],
+                }
+                for dependency in dependencies
+            ]
+            data["assignments"] = assignments_by_task.get(row["id"], [])
+            data["handoffs"] = handoffs_by_task.get(row["id"], [])
+            data["integrations"] = integrations_by_task.get(row["id"], [])
+            assembled.append(data)
+        return assembled
 
     def _lease_dict(self, row: Mapping[str, Any]) -> dict[str, Any]:
         data = dict(row)
@@ -1178,6 +1387,14 @@ class AgentChatRoomService:
                 project_id,
                 "project.created",
                 payload={"name": name or root.name, "root_path": str(root)},
+            )
+            connection.execute(
+                """
+                INSERT INTO task_number_sequences(project_id, next_value)
+                VALUES (?, 1)
+                ON CONFLICT(project_id) DO NOTHING
+                """,
+                (project_id,),
             )
             row = connection.execute(
                 "SELECT * FROM projects WHERE id = ?", (project_id,)
@@ -1471,37 +1688,51 @@ class AgentChatRoomService:
     ) -> list[dict[str, Any]]:
         with self.database.connect() as connection:
             self._require_project(connection, project_id)
-            where = "project_id = ?"
-            parameters: list[Any] = [project_id]
-            if not include_revoked:
-                where += " AND status <> 'revoked'"
-            rows = connection.execute(
-                f"SELECT * FROM project_members WHERE {where} ORDER BY created_at, member_key",
-                parameters,
-            ).fetchall()
-            members: list[dict[str, Any]] = []
-            for row in rows:
-                member = self._member_dict(row)
-                member["credential_count"] = int(
-                    connection.execute(
-                        """
-                        SELECT COUNT(*) AS count FROM agent_credentials
-                        WHERE project_id = ? AND member_id = ?
-                        """,
-                        (project_id, row["id"]),
-                    ).fetchone()["count"]
-                )
-                member["session_count"] = int(
-                    connection.execute(
-                        """
-                        SELECT COUNT(*) AS count FROM agent_sessions
-                        WHERE project_id = ? AND member_id = ?
-                        """,
-                        (project_id, row["id"]),
-                    ).fetchone()["count"]
-                )
-                members.append(member)
-            return members
+            return self._list_project_members(
+                connection, project_id, include_revoked=include_revoked
+            )
+
+    def _list_project_members(
+        self,
+        connection: Any,
+        project_id: str,
+        *,
+        include_revoked: bool = True,
+    ) -> list[dict[str, Any]]:
+        where = "m.project_id = ?"
+        parameters: list[Any] = [project_id, project_id, project_id]
+        if not include_revoked:
+            where += " AND m.status <> 'revoked'"
+        rows = connection.execute(
+            f"""
+            SELECT m.*,
+                   COALESCE(c.credential_count, 0) AS credential_count,
+                   COALESCE(s.session_count, 0) AS session_count
+            FROM project_members m
+            LEFT JOIN (
+                SELECT member_id, COUNT(*) AS credential_count
+                FROM agent_credentials
+                WHERE project_id = ?
+                GROUP BY member_id
+            ) c ON c.member_id = m.id
+            LEFT JOIN (
+                SELECT member_id, COUNT(*) AS session_count
+                FROM agent_sessions
+                WHERE project_id = ?
+                GROUP BY member_id
+            ) s ON s.member_id = m.id
+            WHERE {where}
+            ORDER BY m.created_at, m.member_key
+            """,
+            parameters,
+        ).fetchall()
+        members: list[dict[str, Any]] = []
+        for row in rows:
+            member = self._member_dict(row)
+            member["credential_count"] = int(row["credential_count"] or 0)
+            member["session_count"] = int(row["session_count"] or 0)
+            members.append(member)
+        return members
 
     @idempotent_write("project_member.update")
     def update_project_member(
@@ -1738,8 +1969,7 @@ class AgentChatRoomService:
             raise DomainError(
                 "invalid_agent_token", "Agent token is invalid", status_code=401
             )
-        context = self.database.connect(write=touch)
-        with context as connection:
+        with self.database.connect() as connection:
             row = connection.execute(
                 "SELECT * FROM agent_credentials WHERE id = ?", (parts[1],)
             ).fetchone()
@@ -1771,15 +2001,11 @@ class AgentChatRoomService:
                     status_code=403,
                     details={"required_permission": required_permission},
                 )
-            if touch:
-                connection.execute(
-                    "UPDATE agent_credentials SET last_used_at = ?, updated_at = ? WHERE id = ?",
-                    (iso_now(), iso_now(), row["id"]),
-                )
-                row = connection.execute(
-                    "SELECT * FROM agent_credentials WHERE id = ?", (row["id"],)
-                ).fetchone()
-            return self._credential_dict(row)
+            credential = self._credential_dict(row)
+        if touch:
+            self._token_touch.note(str(credential["id"]))
+            credential["last_used_at"] = iso_now()
+        return credential
 
     def revoke_agent_token(self, project_id: str, credential_id: str) -> dict[str, Any]:
         with self.database.connect(write=True) as connection:
@@ -2422,24 +2648,42 @@ class AgentChatRoomService:
     def list_events(
         self, project_id: str, *, after: int = 0, limit: int = 200
     ) -> dict[str, Any]:
-        limit = max(1, min(limit, 1000))
         with self.database.connect() as connection:
             self._require_project(connection, project_id)
-            rows = connection.execute(
-                """
-                SELECT * FROM events
-                WHERE project_id = ? AND id > ?
-                ORDER BY id ASC LIMIT ?
-                """,
-                (project_id, after, limit),
-            ).fetchall()
-            events = [self._event_dict(row, connection) for row in rows]
-            cursor = events[-1]["id"] if events else after
-            latest = connection.execute(
-                "SELECT COALESCE(MAX(id), 0) AS cursor FROM events WHERE project_id = ?",
-                (project_id,),
-            ).fetchone()["cursor"]
-            return {"events": events, "cursor": cursor, "latest_cursor": latest}
+            return self._list_events(connection, project_id, after=after, limit=limit)
+
+    def _list_events(
+        self,
+        connection: Any,
+        project_id: str,
+        *,
+        after: int = 0,
+        limit: int = 200,
+    ) -> dict[str, Any]:
+        limit = max(1, min(limit, 1000))
+        rows = connection.execute(
+            """
+            SELECT * FROM events
+            WHERE project_id = ? AND id > ?
+            ORDER BY id ASC LIMIT ?
+            """,
+            (project_id, after, limit),
+        ).fetchall()
+        events = [self._event_dict(row, connection) for row in rows]
+        cursor = events[-1]["id"] if events else after
+        latest = connection.execute(
+            "SELECT COALESCE(MAX(id), 0) AS cursor FROM events WHERE project_id = ?",
+            (project_id,),
+        ).fetchone()["cursor"]
+        return {"events": events, "cursor": cursor, "latest_cursor": latest}
+
+    def verify_session(
+        self, project_id: str, session_id: str, token: str
+    ) -> dict[str, Any]:
+        with self.database.connect() as connection:
+            return self._agent_dict(
+                self._authenticate(connection, project_id, session_id, token)
+            )
 
     def query_audit(
         self,
@@ -2488,6 +2732,249 @@ class AgentChatRoomService:
                 },
             }
 
+    def list_task_history(
+        self,
+        project_id: str,
+        task_id: str,
+        *,
+        after: int = 0,
+        before: int = 0,
+        limit: int = 50,
+        event_type: str = "",
+    ) -> dict[str, Any]:
+        limit = max(1, min(int(limit or 50), TASK_HISTORY_LIMIT_MAX))
+        after = max(0, int(after or 0))
+        before = max(0, int(before or 0))
+        wanted_type = str(event_type or "").strip()
+        with self.database.connect() as connection:
+            self._require_project(connection, project_id)
+            task = self._require_task(connection, project_id, task_id)
+            intake_ids = [
+                str(row["id"])
+                for row in connection.execute(
+                    """
+                    SELECT id FROM task_intakes
+                    WHERE project_id = ? AND formal_task_id = ?
+                    """,
+                    (project_id, task_id),
+                ).fetchall()
+            ]
+            clauses = ["project_id = ?"]
+            parameters: list[Any] = [project_id]
+            task_clause = "task_id = ?"
+            parameters.append(task_id)
+            if intake_ids:
+                placeholders = _sql_placeholders(len(intake_ids))
+                extractor = (
+                    "(payload_json::json->>'intake_id')"
+                    if getattr(self.database, "backend", "sqlite") == "postgresql"
+                    else "json_extract(payload_json, '$.intake_id')"
+                )
+                task_clause = f"(task_id = ? OR {extractor} IN ({placeholders}))"
+                parameters.extend(intake_ids)
+            clauses.append(task_clause)
+            if wanted_type:
+                clauses.append("event_type = ?")
+                parameters.append(wanted_type)
+            count_sql = (
+                f"SELECT COUNT(*) AS total FROM events WHERE {' AND '.join(clauses)}"
+            )
+            total = int(connection.execute(count_sql, parameters).fetchone()["total"])
+            page_clauses = list(clauses)
+            page_parameters = list(parameters)
+            descending = after == 0 and before > 0
+            if after:
+                page_clauses.append("id > ?")
+                page_parameters.append(after)
+            if before:
+                page_clauses.append("id < ?")
+                page_parameters.append(before)
+            order = "DESC" if descending or (before and not after) else "ASC"
+            if after == 0 and before == 0:
+                order = "DESC"
+            page_parameters.append(limit)
+            rows = connection.execute(
+                f"""
+                SELECT * FROM events
+                WHERE {' AND '.join(page_clauses)}
+                ORDER BY id {order} LIMIT ?
+                """,
+                page_parameters,
+            ).fetchall()
+            events = [self._event_dict(row, connection) for row in rows]
+            if order == "DESC":
+                events.reverse()
+            items = self._project_task_history_items(connection, events)
+            next_after = items[-1]["event_id"] if items else after
+            next_before = items[0]["event_id"] if items else before
+            latest = self.latest_cursor(connection, project_id)
+            return {
+                "schema_version": TASK_HISTORY_SCHEMA_VERSION,
+                "task_id": task_id,
+                "task_number": int(task["task_number"]),
+                "items": items,
+                "total": total,
+                "limit": limit,
+                "after": after,
+                "before": before,
+                "next_after": next_after,
+                "next_before": next_before,
+                "has_more_after": bool(items) and next_after < latest,
+                "has_more_before": bool(items) and next_before > 1 and total > len(items),
+                "latest_cursor": latest,
+                "event_type": wanted_type,
+            }
+
+    def _project_task_history_items(
+        self, connection: Any, events: list[dict[str, Any]]
+    ) -> list[dict[str, Any]]:
+        if not events:
+            return []
+        session_ids = {
+            str(event.get("actor_session_id") or "")
+            for event in events
+            if event.get("actor_session_id")
+        }
+        report_ids = {
+            str((event.get("payload") or {}).get("report_id") or "")
+            for event in events
+        }
+        review_ids = {
+            str((event.get("payload") or {}).get("review_id") or "")
+            for event in events
+        }
+        integration_ids = {
+            str((event.get("payload") or {}).get("integration_id") or "")
+            for event in events
+        }
+        event_ids = [int(event["id"]) for event in events]
+        sessions = self._rows_by_id(
+            connection, "agent_sessions", session_ids, redact_token=True
+        )
+        member_ids = {
+            str(session.get("member_id") or "")
+            for session in sessions.values()
+            if session.get("member_id")
+        }
+        members = self._rows_by_id(connection, "project_members", member_ids)
+        for member in members.values():
+            member["metadata"] = json_load(member.get("metadata_json"), {})
+        reports = self._rows_by_id(connection, "work_reports", report_ids)
+        for report in reports.values():
+            report["files"] = json_load(report.get("files_json"), [])
+            report["tests"] = json_load(report.get("tests_json"), [])
+            report["system_evidence"] = json_load(
+                report.get("system_evidence_json"), {}
+            )
+        reviews = self._rows_by_id(connection, "reviews", review_ids)
+        for review in reviews.values():
+            review["criteria"] = json_load(review.get("criteria_json"), [])
+        integrations = self._rows_by_id(
+            connection, "task_integrations", integration_ids
+        )
+        for integration in integrations.values():
+            integration["files"] = json_load(integration.get("files_json"), [])
+            integration["tests"] = json_load(integration.get("tests_json"), [])
+        acknowledgements_by_event: dict[int, list[dict[str, Any]]] = {
+            event_id: [] for event_id in event_ids
+        }
+        if event_ids:
+            placeholders = _sql_placeholders(len(event_ids))
+            for row in connection.execute(
+                f"""
+                SELECT event_id, session_id, created_at
+                FROM event_acknowledgements
+                WHERE event_id IN ({placeholders})
+                ORDER BY created_at
+                """,
+                event_ids,
+            ).fetchall():
+                ack_session = sessions.get(str(row["session_id"]))
+                if ack_session is None:
+                    loaded = self._rows_by_id(
+                        connection,
+                        "agent_sessions",
+                        {str(row["session_id"])},
+                        redact_token=True,
+                    )
+                    sessions.update(loaded)
+                    ack_session = loaded.get(str(row["session_id"]))
+                    member_id = str((ack_session or {}).get("member_id") or "")
+                    if member_id and member_id not in members:
+                        members.update(
+                            self._rows_by_id(
+                                connection, "project_members", {member_id}
+                            )
+                        )
+                        if member_id in members:
+                            members[member_id]["metadata"] = json_load(
+                                members[member_id].get("metadata_json"), {}
+                            )
+                acknowledgements_by_event[int(row["event_id"])].append(
+                    {
+                        "session_id": str(row["session_id"]),
+                        "created_at": row["created_at"],
+                        "actor": actor_snapshot(
+                            ack_session,
+                            members.get(str((ack_session or {}).get("member_id") or "")),
+                        ),
+                    }
+                )
+        items = []
+        for event in events:
+            payload = event.get("payload") or {}
+            session = sessions.get(str(event.get("actor_session_id") or ""))
+            member = members.get(str((session or {}).get("member_id") or ""))
+            related = {
+                "report": reports.get(str(payload.get("report_id") or "")),
+                "review": reviews.get(str(payload.get("review_id") or "")),
+                "integration": integrations.get(
+                    str(payload.get("integration_id") or "")
+                ),
+            }
+            items.append(
+                project_history_item(
+                    event,
+                    actor=actor_snapshot(session, member),
+                    related=related,
+                    acknowledgements=acknowledgements_by_event.get(int(event["id"]), []),
+                )
+            )
+        return items
+
+    def _rows_by_id(
+        self,
+        connection: Any,
+        table: str,
+        ids: set[str],
+        *,
+        redact_token: bool = False,
+    ) -> dict[str, dict[str, Any]]:
+        allowed = {
+            "agent_sessions",
+            "project_members",
+            "work_reports",
+            "reviews",
+            "task_integrations",
+        }
+        if table not in allowed:
+            raise ValueError(f"Unsupported history lookup table: {table}")
+        clean = {item for item in ids if item}
+        if not clean:
+            return {}
+        placeholders = _sql_placeholders(len(clean))
+        rows = connection.execute(
+            f"SELECT * FROM {table} WHERE id IN ({placeholders})",
+            list(clean),
+        ).fetchall()
+        result: dict[str, dict[str, Any]] = {}
+        for row in rows:
+            data = dict(row)
+            if redact_token:
+                data.pop("token_hash", None)
+            result[str(data["id"])] = data
+        return result
+
     def room_sync(
         self,
         project_id: str,
@@ -2503,11 +2990,27 @@ class AgentChatRoomService:
                 status_code=401,
             )
         if session_id:
-            with self.database.connect() as connection:
-                self._authenticate(connection, project_id, session_id, token or "")
             self.heartbeat(project_id, session_id, token or "")
-        event_result = self.list_events(project_id, after=after)
-        unread_count = None
+        with self.database.connect() as connection:
+            self._require_project(connection, project_id)
+            if session_id:
+                self._authenticate(connection, project_id, session_id, token or "")
+            event_result = self._list_events(
+                connection, project_id, after=after
+            )
+            snapshot = self._snapshot(connection, project_id)
+            unread_count = None
+            if session_id:
+                read_cursor = min(event_result["cursor"], event_result["latest_cursor"])
+                unread_count = int(
+                    connection.execute(
+                        """
+                        SELECT COUNT(*) AS unread_count
+                        FROM events WHERE project_id = ? AND id > ?
+                        """,
+                        (project_id, read_cursor),
+                    ).fetchone()["unread_count"]
+                )
         if session_id:
             read_cursor = min(event_result["cursor"], event_result["latest_cursor"])
             with self.database.connect(write=True) as connection:
@@ -2523,14 +3026,14 @@ class AgentChatRoomService:
                     """,
                     (read_cursor, read_cursor, session_id),
                 )
-                unread_count = int(
-                    connection.execute(
-                        "SELECT COUNT(*) AS unread_count FROM events WHERE project_id = ? AND id > ?",
-                        (project_id, read_cursor),
-                    ).fetchone()["unread_count"]
-                )
+            for agent in snapshot["agents"]:
+                if agent["id"] == session_id:
+                    agent["last_read_cursor"] = max(
+                        int(agent.get("last_read_cursor") or 0), read_cursor
+                    )
+                    agent["unread_count"] = unread_count or 0
         return {
-            "snapshot": self.snapshot(project_id),
+            "snapshot": snapshot,
             **event_result,
             "unread_count": unread_count,
         }
@@ -3075,29 +3578,38 @@ class AgentChatRoomService:
             for dependency_id in dependencies:
                 self._require_task(connection, project_id, dependency_id)
             task_number = self._next_task_number(connection, project_id)
-            connection.execute(
-                """
-                INSERT INTO tasks(
-                    id, project_id, task_number, title, description,
-                    acceptance_criteria_json, priority, status, execution_status,
-                    verification_status, integration_status, created_by_session_id,
-                    created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, 'todo', 'todo', 'not_required',
-                          'pending', ?, ?, ?)
-                """,
-                (
-                    task_id,
-                    project_id,
-                    task_number,
-                    title.strip(),
-                    description.strip(),
-                    json_dump(criteria),
-                    priority,
-                    actor_session_id,
-                    now,
-                    now,
-                ),
-            )
+            try:
+                connection.execute(
+                    """
+                    INSERT INTO tasks(
+                        id, project_id, task_number, title, description,
+                        acceptance_criteria_json, priority, status, execution_status,
+                        verification_status, integration_status, created_by_session_id,
+                        created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, 'todo', 'todo', 'not_required',
+                              'pending', ?, ?, ?)
+                    """,
+                    (
+                        task_id,
+                        project_id,
+                        task_number,
+                        title.strip(),
+                        description.strip(),
+                        json_dump(criteria),
+                        priority,
+                        actor_session_id,
+                        now,
+                        now,
+                    ),
+                )
+            except Exception as error:
+                if _is_unique_constraint_error(error):
+                    raise DomainError(
+                        "task_number_conflict",
+                        "Could not allocate a unique task number",
+                        status_code=409,
+                    ) from error
+                raise
             for dependency_id in dependencies:
                 connection.execute(
                     """
@@ -3129,24 +3641,32 @@ class AgentChatRoomService:
     def list_tasks(self, project_id: str, status: str | None = None) -> list[dict[str, Any]]:
         with self.database.connect() as connection:
             self._require_project(connection, project_id)
-            if status:
-                rows = connection.execute(
-                    """
-                    SELECT * FROM tasks WHERE project_id = ? AND status = ?
-                    ORDER BY priority ASC, created_at ASC
-                    """,
-                    (project_id, status),
-                ).fetchall()
-            else:
-                rows = connection.execute(
-                    """
-                    SELECT * FROM tasks WHERE project_id = ?
-                    ORDER BY CASE status WHEN 'done' THEN 1 ELSE 0 END,
-                             priority ASC, created_at ASC
-                    """,
-                    (project_id,),
-                ).fetchall()
-            return [self._task_with_dependencies(connection, row) for row in rows]
+            return self._list_tasks(connection, project_id, status=status)
+
+    def _list_tasks(
+        self,
+        connection: Any,
+        project_id: str,
+        status: str | None = None,
+    ) -> list[dict[str, Any]]:
+        if status:
+            rows = connection.execute(
+                """
+                SELECT * FROM tasks WHERE project_id = ? AND status = ?
+                ORDER BY priority ASC, created_at ASC
+                """,
+                (project_id, status),
+            ).fetchall()
+        else:
+            rows = connection.execute(
+                """
+                SELECT * FROM tasks WHERE project_id = ?
+                ORDER BY CASE status WHEN 'done' THEN 1 ELSE 0 END,
+                         priority ASC, created_at ASC
+                """,
+                (project_id,),
+            ).fetchall()
+        return self._tasks_with_relations(connection, rows)
 
     def get_task(self, project_id: str, task_id: str) -> dict[str, Any]:
         """Return one complete task without requiring a large project list."""
@@ -4367,7 +4887,40 @@ class AgentChatRoomService:
         with self.database.connect() as connection:
             agent = self._authenticate(connection, project_id, session_id, token)
             project = self._require_project(connection, project_id)
-        system_evidence = self._collect_git_evidence(project, agent, commit_hash)
+            worktree = self._trusted_worktree(connection, project, agent)
+        system_evidence = self._collect_git_evidence(
+            project, agent, commit_hash, worktree=worktree
+        )
+        stored_commit = str(system_evidence.get("commit_hash") or "")
+        if commit_hash.strip() and (
+            not system_evidence.get("captured")
+            or system_evidence.get("reported_commit_exists") is not True
+        ):
+            with self.database.connect(write=True) as connection:
+                self._authenticate(connection, project_id, session_id, token)
+                event_id = self._emit(
+                    connection,
+                    project_id,
+                    "work_report.commit_unverified",
+                    actor_session_id=session_id,
+                    task_id=task_id,
+                    payload={
+                        "commit_hash": "unknown",
+                        "reported_commit_hash": commit_hash.strip(),
+                        "worktree": str(worktree),
+                        "captured": bool(system_evidence.get("captured")),
+                        "reported_commit_exists": system_evidence.get(
+                            "reported_commit_exists"
+                        ),
+                        "reason": system_evidence.get("reason") or "unverified_commit",
+                    },
+                )
+            raise DomainError(
+                "invalid_commit_hash",
+                "Reported commit_hash could not be verified in the registered worktree",
+                status_code=400,
+                details={"commit_hash": "unknown", "event_id": event_id},
+            )
         with self.database.connect(write=True) as connection:
             self._authenticate(connection, project_id, session_id, token)
             task = self._require_task(connection, project_id, task_id)
@@ -4397,7 +4950,7 @@ class AgentChatRoomService:
                     summary.strip(),
                     json_dump(clean_files),
                     clean_no_code_reason,
-                    commit_hash.strip(),
+                    stored_commit,
                     json_dump(tests),
                     json_dump(system_evidence),
                     now,
@@ -5473,14 +6026,64 @@ class AgentChatRoomService:
             ).fetchall()
             return [self._knowledge_asset_dict(connection, row) for row in rows]
 
+    def _trusted_worktree(
+        self,
+        connection: Any,
+        project: Mapping[str, Any],
+        agent: Mapping[str, Any],
+    ) -> Path:
+        workspace = None
+        agent_data = dict(agent)
+        workspace_id = str(agent_data.get("workspace_id") or "").strip()
+        if workspace_id:
+            workspace = connection.execute(
+                """
+                SELECT * FROM workspaces
+                WHERE id = ? AND project_id = ?
+                """,
+                (workspace_id, project["id"]),
+            ).fetchone()
+        if workspace is None:
+            raise DomainError(
+                "workspace_not_registered",
+                "未登记工作区: the Agent has no registered workspace",
+                status_code=409,
+            )
+        root = Path(str(workspace["local_path"])).expanduser().resolve(strict=False)
+        reported_raw = str(agent_data.get("worktree") or "").strip()
+        reported = (
+            Path(reported_raw).expanduser().resolve(strict=False) if reported_raw else root
+        )
+        try:
+            reported.relative_to(root)
+        except ValueError as error:
+            raise DomainError(
+                "untrusted_worktree",
+                "Agent-reported worktree is outside the registered workspace",
+                status_code=403,
+                details={"workspace_id": workspace["id"]},
+            ) from error
+        return reported
+
+    def _collect_git_status(self, worktree: Path) -> dict[str, Any]:
+        return self._collect_git_evidence_from_worktree(worktree, "")
+
     def _collect_git_evidence(
         self,
         project: Mapping[str, Any],
         agent: Mapping[str, Any],
         commit_hash: str,
+        *,
+        worktree: Path | None = None,
     ) -> dict[str, Any]:
-        worktree = Path(agent["worktree"] or project["root_path"])
+        resolved = worktree or Path(agent["worktree"] or project["root_path"])
+        return self._collect_git_evidence_from_worktree(resolved, commit_hash)
 
+    def _collect_git_evidence_from_worktree(
+        self,
+        worktree: Path,
+        commit_hash: str,
+    ) -> dict[str, Any]:
         def git(*arguments: str) -> tuple[int, str]:
             try:
                 completed = subprocess.run(
@@ -5497,18 +6100,29 @@ class AgentChatRoomService:
 
         inside_code, inside = git("rev-parse", "--is-inside-work-tree")
         if inside_code != 0 or inside != "true":
-            return {"captured": False, "reason": "not_a_git_worktree", "worktree": str(worktree)}
+            return {
+                "captured": False,
+                "reason": "not_a_git_worktree",
+                "worktree": str(worktree),
+                "reported_commit_exists": False,
+                "commit_hash": "unknown" if commit_hash.strip() else "",
+            }
         _, head = git("rev-parse", "HEAD")
         _, branch = git("branch", "--show-current")
         _, status = git("status", "--porcelain")
         commit_exists = None
         commit_files: list[str] = []
-        if commit_hash.strip():
-            commit_code, _ = git("cat-file", "-e", f"{commit_hash.strip()}^{{commit}}")
+        stored_commit = commit_hash.strip()
+        if stored_commit:
+            commit_code, _ = git("rev-parse", "--verify", f"{stored_commit}^{{commit}}")
             commit_exists = commit_code == 0
             if commit_exists:
-                _, changed = git("show", "--format=", "--name-only", commit_hash.strip())
-                commit_files = sorted({line for line in changed.splitlines() if line.strip()})
+                _, changed = git("show", "--format=", "--name-only", stored_commit)
+                commit_files = sorted(
+                    {line for line in changed.splitlines() if line.strip()}
+                )
+            else:
+                stored_commit = "unknown"
         return {
             "captured": True,
             "worktree": str(worktree.resolve()),
@@ -5517,6 +6131,7 @@ class AgentChatRoomService:
             "dirty_files": status.splitlines()[:200] if status else [],
             "reported_commit_exists": commit_exists,
             "commit_files": commit_files,
+            "commit_hash": stored_commit,
         }
 
     def latest_cursor(self, connection: Any, project_id: str) -> int:
@@ -5529,6 +6144,9 @@ class AgentChatRoomService:
 
     def snapshot(self, project_id: str) -> dict[str, Any]:
         with self.database.connect() as connection:
+            return self._snapshot(connection, project_id)
+
+    def _snapshot(self, connection: Any, project_id: str) -> dict[str, Any]:
             project = self._project_dict(self._require_project(connection, project_id))
             agent_rows = connection.execute(
                 """
@@ -5537,7 +6155,13 @@ class AgentChatRoomService:
                     FROM events e
                     WHERE e.project_id = a.project_id
                       AND e.actor_session_id = a.id
-                ) AS last_activity_at
+                ) AS last_activity_at,
+                (
+                    SELECT COUNT(*)
+                    FROM events e
+                    WHERE e.project_id = a.project_id
+                      AND e.id > a.last_read_cursor
+                ) AS unread_count
                 FROM agent_sessions a
                 WHERE a.project_id = ?
                 ORDER BY a.created_at
@@ -5547,21 +6171,16 @@ class AgentChatRoomService:
             agents = []
             for row in agent_rows:
                 agent = self._agent_dict(row)
-                agent["unread_count"] = int(
-                    connection.execute(
-                        "SELECT COUNT(*) AS unread_count FROM events WHERE project_id = ? AND id > ?",
-                        (project_id, row["last_read_cursor"]),
-                    ).fetchone()["unread_count"]
-                )
+                agent["unread_count"] = int(row["unread_count"] or 0)
                 agents.append(agent)
-            tasks = [
-                self._task_with_dependencies(connection, row)
-                for row in connection.execute(
+            tasks = self._tasks_with_relations(
+                connection,
+                connection.execute(
                     "SELECT * FROM tasks WHERE project_id = ? ORDER BY priority, created_at",
                     (project_id,),
-                ).fetchall()
-            ]
-            members = self.list_project_members(project_id)
+                ).fetchall(),
+            )
+            members = self._list_project_members(connection, project_id)
             leases = [
                 lease
                 for lease in (

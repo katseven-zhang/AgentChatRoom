@@ -685,12 +685,14 @@ def test_task_contract_exposes_versioned_state(service, project):
     assert task["execution_status"] == "todo"
     assert task["verification_status"] == "not_required"
     assert task["integration_status"] == "pending"
+    assert task["phase"] == "todo"
     assert task["state"] == {
         "schema_version": 6,
         "execution_status": "todo",
         "verification_status": "not_required",
         "integration_status": "pending",
         "legacy_status": "todo",
+        "phase": "todo",
         "completed": False,
         "verified": False,
         "integrated": False,
@@ -1081,7 +1083,6 @@ def test_work_must_be_independently_reviewed(service, project, joined_agents):
         summary="Implemented login",
         files=["src/auth/login.py"],
         tests=[{"command": "pytest", "exit_code": 0}],
-        commit_hash="abc123",
     )
     assert report["task_status"] == "awaiting_review"
     assert report["execution_status"] == "completed"
@@ -1177,6 +1178,12 @@ def test_work_must_be_independently_reviewed(service, project, joined_agents):
 def test_same_software_cannot_become_an_independent_reviewer_by_reconnecting(
     service, project
 ):
+    registered = service.register_workspace(
+        project["id"],
+        host_key="test-host",
+        host_name="Test Host",
+        local_path=project["root_path"],
+    )
     executor = service.join_room(
         project["id"],
         agent_key="codex-main",
@@ -1184,6 +1191,9 @@ def test_same_software_cannot_become_an_independent_reviewer_by_reconnecting(
         client="codex",
         model="unknown",
         role="executor",
+        worktree=project["root_path"],
+        host_id=registered["host"]["id"],
+        workspace_id=registered["workspace"]["id"],
     )
     task = service.create_task(
         project["id"],
@@ -1393,6 +1403,12 @@ def test_changes_requested_task_can_be_reassigned_after_owner_leaves(
     service, project, joined_agents
 ):
     executor, reviewer = joined_agents
+    registered = service.register_workspace(
+        project["id"],
+        host_key="test-host",
+        host_name="Test Host",
+        local_path=project["root_path"],
+    )
     replacement = service.join_room(
         project["id"],
         agent_key="revision-worker-main",
@@ -1401,6 +1417,9 @@ def test_changes_requested_task_can_be_reassigned_after_owner_leaves(
         model="MiniMax-M3",
         role="executor",
         capabilities={"mcp": True},
+        worktree=project["root_path"],
+        host_id=registered["host"]["id"],
+        workspace_id=registered["workspace"]["id"],
     )
     task = service.create_task(
         project["id"],

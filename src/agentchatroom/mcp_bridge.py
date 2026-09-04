@@ -24,6 +24,7 @@ from . import __version__
 
 
 logger = logging.getLogger(__name__)
+BRIDGE_INSTANCE_ID = uuid.uuid4().hex
 
 
 @dataclass(frozen=True, slots=True)
@@ -157,11 +158,19 @@ def prepare_tool_arguments(
     arguments: dict[str, object],
 ) -> dict[str, object]:
     forwarded = dict(arguments)
-    if (
-        name in AUTO_IDEMPOTENCY_TOOL_NAMES
-        and not str(forwarded.get("request_id", "")).strip()
-    ):
-        forwarded["request_id"] = f"request_{uuid.uuid4().hex}"
+    if name not in AUTO_IDEMPOTENCY_TOOL_NAMES:
+        return forwarded
+    current = str(forwarded.get("request_id", "")).strip()
+    if not current:
+        current = f"request_{uuid.uuid4().hex}"
+    prefix = f"bridge:{BRIDGE_INSTANCE_ID}:"
+    if not current.startswith(prefix):
+        scoped = prefix + current
+        if len(scoped) > 128:
+            digest = uuid.uuid5(uuid.NAMESPACE_URL, current).hex
+            scoped = f"{prefix}{digest}"[:128]
+        current = scoped
+    forwarded["request_id"] = current
     return forwarded
 
 

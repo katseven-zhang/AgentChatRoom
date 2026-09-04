@@ -49,6 +49,37 @@ TASK_VERIFICATION_STATUSES = {
     "approved",
 }
 TASK_INTEGRATION_STATUSES = {"pending", "done", "failed"}
+TASK_PHASES = (
+    "todo",
+    "claimed",
+    "in_progress",
+    "blocked",
+    "awaiting_review",
+    "verified",
+    "done",
+    "cancelled",
+)
+TASK_PHASE_FILTERS = TASK_PHASES
+TASK_PHASE_LABELS = {
+    "todo": "待认领",
+    "claimed": "已认领",
+    "in_progress": "执行中",
+    "blocked": "阻塞",
+    "awaiting_review": "已提交",
+    "verified": "待验收",
+    "done": "已完成",
+    "cancelled": "已取消",
+}
+TASK_PHASE_COMMANDS = {
+    "todo": "create or define a task; it stays unclaimed until task_claim",
+    "claimed": "task_claim",
+    "in_progress": "task_update status=in_progress",
+    "blocked": "task_update status=blocked",
+    "awaiting_review": "work_report",
+    "verified": "review_submit verdict=approved",
+    "done": "integration_submit result=done",
+    "cancelled": "task_update status=cancelled",
+}
 TASK_INTAKE_STATUSES = {
     "pending",
     "accepted",
@@ -160,6 +191,35 @@ def knowledge_contract(
     }
 
 
+def task_phase(
+    *,
+    execution_status: str,
+    verification_status: str,
+    integration_status: str,
+    status: str = "",
+) -> str:
+    """Derive the shared user-facing phase from the three task state faces."""
+    if execution_status == "cancelled" or status == "cancelled":
+        return "cancelled"
+    if (
+        execution_status == "completed"
+        and verification_status == "approved"
+        and integration_status == "done"
+    ):
+        return "done"
+    if verification_status == "approved" and integration_status != "done":
+        return "verified"
+    if execution_status == "completed":
+        return "awaiting_review"
+    if execution_status == "blocked":
+        return "blocked"
+    if execution_status == "claimed":
+        return "claimed"
+    if execution_status == "in_progress":
+        return "in_progress"
+    return "todo"
+
+
 def task_state_for_legacy_status(
     status: str,
     *,
@@ -188,12 +248,19 @@ def task_contract(
     integration_status: str,
     legacy_status: str,
 ) -> dict[str, Any]:
+    phase = task_phase(
+        execution_status=execution_status,
+        verification_status=verification_status,
+        integration_status=integration_status,
+        status=legacy_status,
+    )
     return {
         "schema_version": DOMAIN_SCHEMA_VERSION,
         "execution_status": execution_status,
         "verification_status": verification_status,
         "integration_status": integration_status,
         "legacy_status": legacy_status,
+        "phase": phase,
         "completed": execution_status == "completed",
         "verified": execution_status == "completed"
         and verification_status in {"not_required", "approved"},

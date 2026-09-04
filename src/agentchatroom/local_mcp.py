@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import logging
 import os
 import tempfile
 from dataclasses import dataclass
@@ -11,6 +12,9 @@ from pathlib import Path
 from typing import Any, Callable, Mapping
 
 from .errors import DomainError
+
+logger = logging.getLogger(__name__)
+BACKUP_NAME_ATTEMPTS = 8
 
 
 @dataclass(frozen=True, slots=True)
@@ -372,6 +376,54 @@ class LocalMcpConfigurator:
             ),
         }
 
+    def _write_private_backup(self, path: Path, content: bytes) -> Path:
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        last_error: OSError | None = None
+        candidate = path
+        for attempt in range(BACKUP_NAME_ATTEMPTS):
+            timestamp = self._now().astimezone(timezone.utc).strftime(
+                "%Y%m%d-%H%M%S-%f"
+            )
+            if attempt:
+                timestamp = f"{timestamp}-{attempt}"
+            candidate = path.with_name(
+                f"{path.name}.agentchatroom-backup-{timestamp}"
+            )
+            try:
+                fd = os.open(str(candidate), flags, 0o600)
+                with os.fdopen(fd, "wb") as backup:
+                    backup.write(content)
+                    backup.flush()
+                    os.fsync(backup.fileno())
+                try:
+                    os.chmod(candidate, 0o600)
+                except OSError:
+                    pass
+                return candidate
+            except FileExistsError as error:
+                last_error = error
+                continue
+        logger.warning(
+            "MCP configuration backup path collided; overwriting %s", candidate
+        )
+        fallback_flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+        if hasattr(os, "O_NOFOLLOW"):
+            fallback_flags |= os.O_NOFOLLOW
+        fd = os.open(str(candidate), fallback_flags, 0o600)
+        with os.fdopen(fd, "wb") as backup:
+            backup.write(content)
+            backup.flush()
+            os.fsync(backup.fileno())
+        try:
+            os.chmod(candidate, 0o600)
+        except OSError:
+            pass
+        if last_error is not None:
+            logger.debug("Backup collision detail: %s", last_error)
+        return candidate
+
     def apply(
         self,
         *,
@@ -430,12 +482,7 @@ class LocalMcpConfigurator:
         self._load_json(serialized)
 
         temp_path: Path | None = None
-        timestamp = self._now().astimezone(timezone.utc).strftime(
-            "%Y%m%d-%H%M%S-%f"
-        )
-        backup_path = path.with_name(
-            f"{path.name}.agentchatroom-backup-{timestamp}"
-        )
+        backup_path: Path | None = None
         try:
             with tempfile.NamedTemporaryFile(
                 mode="wb",
@@ -456,10 +503,14 @@ class LocalMcpConfigurator:
                     "The MCP configuration changed during apply; refresh before retrying",
                     status_code=409,
                 )
-            with backup_path.open("xb") as backup:
-                backup.write(latest_content)
-                backup.flush()
-                os.fsync(backup.fileno())
+            backup_path = self._write_private_backup(path, latest_content)
+            reread = path.read_bytes()
+            if _sha256(reread) != expected_current_sha256:
+                raise DomainError(
+                    "local_mcp_config_changed",
+                    "The MCP configuration changed during apply; refresh before retrying",
+                    status_code=409,
+                )
             os.replace(temp_path, path)
             temp_path = None
             updated = self._load_json(path.read_bytes())

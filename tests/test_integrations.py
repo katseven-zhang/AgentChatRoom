@@ -115,6 +115,7 @@ def test_project_integration_builds_stable_workbuddy_memory_without_live_state(t
     assert "session_heartbeat" in memory
     assert "must not supply, rename, or invent an `agent_key`" in memory
     assert "Do not begin project work while disconnected" in memory
+    assert "room_bootstrap" in memory
     assert "use `unknown`" in memory
     assert ".agentchatroom/project.json" in memory
     assert "must not edit it, supply a key" in memory
@@ -124,6 +125,7 @@ def test_project_integration_builds_stable_workbuddy_memory_without_live_state(t
     assert "请根据当前客户端和运行环境自行完成接入" in prompt
     assert "project_key：sample-project" not in prompt
     assert "room_join" not in prompt
+    assert "room_bootstrap" not in prompt
     assert "model_display_name" not in prompt
     assert "协作规则" not in prompt
     assert ".agentchatroom/project.json" not in prompt

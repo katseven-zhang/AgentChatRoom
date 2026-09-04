@@ -47,6 +47,10 @@ CONFIG_FILE_SCHEMA: dict[str, dict[str, tuple[type, ...]]] = {
         "max_lease_ttl_seconds": (int,),
         "sse_poll_interval_seconds": (int, float),
         "presence_refresh_interval_seconds": (int, float),
+        "max_sse_clients_per_project": (int,),
+        "sse_per_ip_limit": (int,),
+        "token_touch_interval_seconds": (int, float),
+        "token_touch_min_calls": (int,),
     },
     "security": {
         "agent_token_ttl_seconds": (int,),
@@ -154,6 +158,10 @@ class Settings:
     max_lease_ttl_seconds: int = 86400
     sse_poll_interval_seconds: float = 0.5
     presence_refresh_interval_seconds: float = 1.0
+    max_sse_clients_per_project: int = 64
+    sse_per_ip_limit: int = 16
+    token_touch_interval_seconds: float = 60.0
+    token_touch_min_calls: int = 32
     knowledge_kinds: tuple[str, ...] = tuple(KNOWLEDGE_DEFAULT_KINDS)
     knowledge_require_verified_task: bool = True
     product_name: str = "AgentChatRoom"
@@ -258,6 +266,16 @@ def _merge_toml(path: Path) -> dict[str, Any]:
         ),
         "presence_refresh_interval_seconds": raw.get("coordination", {}).get(
             "presence_refresh_interval_seconds"
+        ),
+        "max_sse_clients_per_project": raw.get("coordination", {}).get(
+            "max_sse_clients_per_project"
+        ),
+        "sse_per_ip_limit": raw.get("coordination", {}).get("sse_per_ip_limit"),
+        "token_touch_interval_seconds": raw.get("coordination", {}).get(
+            "token_touch_interval_seconds"
+        ),
+        "token_touch_min_calls": raw.get("coordination", {}).get(
+            "token_touch_min_calls"
         ),
         "agent_token_ttl_seconds": raw.get("security", {}).get(
             "agent_token_ttl_seconds"
@@ -460,6 +478,30 @@ def load_settings(
                 file_values.get("presence_refresh_interval_seconds", 1.0),
             )
         ),
+        "max_sse_clients_per_project": int(
+            os.getenv(
+                "AGENTCHATROOM_MAX_SSE_CLIENTS_PER_PROJECT",
+                file_values.get("max_sse_clients_per_project", 64),
+            )
+        ),
+        "sse_per_ip_limit": int(
+            os.getenv(
+                "AGENTCHATROOM_SSE_PER_IP_LIMIT",
+                file_values.get("sse_per_ip_limit", 16),
+            )
+        ),
+        "token_touch_interval_seconds": float(
+            os.getenv(
+                "AGENTCHATROOM_TOKEN_TOUCH_INTERVAL_SECONDS",
+                file_values.get("token_touch_interval_seconds", 60.0),
+            )
+        ),
+        "token_touch_min_calls": int(
+            os.getenv(
+                "AGENTCHATROOM_TOKEN_TOUCH_MIN_CALLS",
+                file_values.get("token_touch_min_calls", 32),
+            )
+        ),
         "knowledge_kinds": normalize_knowledge_kinds(
             os.getenv("AGENTCHATROOM_KNOWLEDGE_KINDS")
             if os.getenv("AGENTCHATROOM_KNOWLEDGE_KINDS") is not None
@@ -582,6 +624,14 @@ def load_settings(
         raise ValueError("SSE poll interval must be positive")
     if not 0.25 <= values["presence_refresh_interval_seconds"] <= 10:
         raise ValueError("presence refresh interval must be between 0.25 and 10 seconds")
+    if values["max_sse_clients_per_project"] < 1:
+        raise ValueError("max SSE clients per project must be at least 1")
+    if values["sse_per_ip_limit"] < 1:
+        raise ValueError("SSE per-IP limit must be at least 1")
+    if values["token_touch_interval_seconds"] < 1:
+        raise ValueError("token touch interval must be at least 1 second")
+    if values["token_touch_min_calls"] < 1:
+        raise ValueError("token touch minimum call count must be at least 1")
     if not str(values["product_name"]).strip():
         raise ValueError("product name must not be empty")
     if values["default_theme"] not in {"system", "light", "dark"}:
