@@ -314,6 +314,8 @@ room_bootstrap
 
 任务详情中的「指定 Agent」候选来自本 Project 所有已接入且未吊销的 Agent 身份：当前连接的 Agent 按活动 Session 立即派发；曾接入但暂时离线的 Agent 明确标注「已接入 · 当前离线」，可被指定为延迟指派。延迟指派记录在持久身份上（事件留痕 `assigned_to_member_id` 与目标是否离线），目标 Agent 重新接入、Session 替换后仍由该身份受理，不会转移给其他身份；已吊销、未知或从未接入过的身份会被领域服务明确拒绝。在线 Agent 的既有指派行为保持不变，REST、MCP、Web 复用同一领域服务。
 
+重新指派是原子操作：对新目标创建 pending 指派时，同一任务指向其他目标的待确认指派会在同一写事务内失效（`superseded by reassignment`，留 `task.assignment_cancelled(by=reassign)` 事件），因此任意时刻任务至多一个待确认指派；被失效的旧目标再次确认会收到结构化拒绝，不能重新夺回任务。指派状态与任务状态分离展示：待确认指派不冒充已认领或执行中；被释放或改派终结的旧指派分别显示「因任务释放失效」「因改派失效」，只有用户明确取消任务才显示「任务已取消」；未填写说明的指派显示「未填写说明」。
+
 ### 新对话 Room Bootstrap
 
 `room_bootstrap` 是公开、幂等、默认零参数的 MCP 工具；CLI 提供 `room-bootstrap`，REST 公开配置声明同一套状态模型。解析当前 checkout 的固定优先级为：
