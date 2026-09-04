@@ -844,3 +844,24 @@ console.log(JSON.stringify(outcomes));
     agent_section = javascript[start:end]
     vendor_pattern = re.compile(r"""(===|!==)\s*["'](codex|workbuddy|grok|trae)""", re.I)
     assert not vendor_pattern.search(agent_section)
+
+
+def test_web_typography_baseline_wraps_long_content_and_narrow_selects():
+    """Regression for task #52: a shared wrap baseline keeps CJK/Latin mix,
+    long paths and commands inside every panel without horizontal
+    overflow, and composer selects shrink on narrow viewports."""
+    stylesheet = (WEB_DIR / "app.css").read_text(encoding="utf-8")
+    # 统一换行基线覆盖主要正文/路径/证据容器。
+    baseline = stylesheet[stylesheet.index("/* #52 排版基线") :]
+    for selector in (
+        ".event-content,", ".event-body,", ".msg-line,", ".task-contract-description,",
+        ".lease-item,", ".agent-copy,", ".review-item,", ".criteria-list,",
+    ):
+        assert selector in baseline
+    # 选择器列表聚合声明：一条声明覆盖全部容器。
+    assert baseline.count("overflow-wrap: anywhere;") == 1
+    assert baseline.count(",") >= 7
+    assert "line-height: 1.5;" in baseline
+    # 窄屏下 composer 下拉收缩，不再撑出横向滚动。
+    assert ".composer-options select {" in stylesheet
+    assert "flex: 1 1 auto;" in stylesheet

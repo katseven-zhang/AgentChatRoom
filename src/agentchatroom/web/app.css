@@ -2729,6 +2729,11 @@ dialog::backdrop {
     gap: 6px;
   }
 
+  .composer-options select {
+    max-width: 100%;
+    flex: 1 1 auto;
+  }
+
   .composer-actions {
     align-items: flex-end;
   }
@@ -2912,4 +2917,24 @@ dialog::backdrop {
   background: var(--surface);
   padding: 0 3px;
   border-radius: 3px;
+}
+
+/* #52 排版基线：中英文混排与长路径/长命令统一换行，避免横向溢出与控件跳动。 */
+.event-content,
+.event-body,
+.msg-line,
+.msg-quote,
+.task-title,
+.task-contract-description,
+.lease-item,
+.agent-copy,
+.review-item,
+.criteria-list,
+.readonly-list,
+dd {
+  overflow-wrap: anywhere;
+  min-width: 0;
+}
+.event-body {
+  line-height: 1.5;
 }
