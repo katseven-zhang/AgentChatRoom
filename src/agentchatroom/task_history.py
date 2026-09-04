@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from typing import Any, Mapping
 
 _TOKEN_KEYS = {
@@ -15,10 +16,29 @@ _TOKEN_KEYS = {
     "api_key",
 }
 
+# Value-pattern redaction: credentials embedded inside free-form text
+# (message bodies, notes, evidence) must not leak even when the *key* is
+# benign such as "body" or "summary" (review #44, criterion 12).
+_REDACT_TEXT_PATTERNS = (
+    re.compile(r"(?i)(authorization\s*[:=]\s*)(bearer\s+)?[^\s,;\"']+",),
+    re.compile(r"(?i)\b(bearer)\s+[a-z0-9._~+/=-]{8,}"),
+    re.compile(r"(?i)\b(token|api[_-]?key|secret|password|passwd|session[_-]?token|access[_-]?token)\b(\s*[=:]\s*)(\"[^\"]+\"|'[^']+'|[^\s,;\"']+)"),
+    re.compile(r"(?i)\b(sk-[a-z0-9]{16,}|ghp_[a-z0-9]{20,}|gho_[a-z0-9]{20,}|xox[baprs]-[a-z0-9-]{10,})"),
+)
+_REDACTED = "[redacted]"
+
+
+def redact_text(text: str) -> str:
+    """Redact credential-looking substrings inside free-form text."""
+    redacted = str(text)
+    for pattern in _REDACT_TEXT_PATTERNS:
+        redacted = pattern.sub(_REDACTED, redacted)
+    return redacted
+
 
 def redact_runtime_value(value: Any, *, key: str = "") -> Any:
     if key.lower() in _TOKEN_KEYS:
-        return "[redacted]"
+        return _REDACTED
     if isinstance(value, Mapping):
         return {
             str(item_key): redact_runtime_value(item, key=str(item_key))
@@ -27,6 +47,8 @@ def redact_runtime_value(value: Any, *, key: str = "") -> Any:
         }
     if isinstance(value, (list, tuple)):
         return [redact_runtime_value(item) for item in value]
+    if isinstance(value, str):
+        return redact_text(value)
     return value
 
 
@@ -216,6 +238,23 @@ def evidence_sections(
             sections.append({"kind": "files", "title": "集成文件", "items": files})
         if tests:
             sections.append({"kind": "tests", "title": "集成测试", "items": tests})
+        commit_hash = str(
+            integration.get("commit_hash") or payload.get("commit_hash") or ""
+        ).strip()
+        sections.append(
+            {
+                "kind": "git",
+                "title": "Git 证据",
+                "items": [
+                    {
+                        "branch": "",
+                        "head": commit_hash,
+                        "captured": bool(commit_hash),
+                        "reason": "" if commit_hash else "未采集",
+                    }
+                ],
+            }
+        )
     changes = state_changes(payload)
     if changes:
         sections.append(

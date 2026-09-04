@@ -174,6 +174,11 @@ def discover_workspace_candidates(
 
 
 def redact_runtime_value(value: Any, *, key: str = "") -> Any:
+    # Imported lazily: task_history is a leaf module (typing-only imports),
+    # while bootstrap sits above services, so a module-level import would be
+    # circular. Kept here so both redaction entry points share one policy.
+    from .task_history import redact_text
+
     if key.lower() in _TOKEN_KEYS:
         return "[redacted]"
     if isinstance(value, Mapping):
@@ -186,6 +191,8 @@ def redact_runtime_value(value: Any, *, key: str = "") -> Any:
         return [redact_runtime_value(item) for item in value]
     if isinstance(value, str) and len(value) >= 24 and "token" in key.lower():
         return "[redacted]"
+    if isinstance(value, str):
+        return redact_text(value)
     return value
 
 

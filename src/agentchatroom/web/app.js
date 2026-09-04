@@ -2288,7 +2288,8 @@ function renderHistoryEvidence(item) {
     }
     if (section.kind === "git") {
       const git = section.items?.[0] || {};
-      return `<div class="history-evidence"><h4>Git 证据</h4><p>${escapeHtml(git.branch || "detached")} · ${escapeHtml(git.head || git.commit_hash || "unknown")}${git.captured ? "" : ` · ${escapeHtml(git.reason || "未采集")}`}</p></div>`;
+      const origin = git.branch || (git.head ? "集成提交" : "detached");
+      return `<div class="history-evidence"><h4>Git 证据</h4><p>${escapeHtml(origin)} · ${escapeHtml(git.head || git.commit_hash || "unknown")}${git.captured ? "" : ` · ${escapeHtml(git.reason || "未采集")}`}</p></div>`;
     }
     const text = (section.items || []).map((entry) => {
       if (typeof entry === "string") return escapeHtml(entry);

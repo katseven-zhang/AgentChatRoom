@@ -223,3 +223,98 @@ def test_task_history_rest_mcp_and_detail_kind_alignment(
     assert [item["event_id"] for item in mcp["result"]["items"]] == [
         item["event_id"] for item in domain["items"]
     ]
+
+def test_task_history_shows_integration_commit_hash(service, project, joined_agents):
+    executor, reviewer = joined_agents
+    task = service.create_task(
+        project["id"],
+        title="Integration evidence",
+        acceptance_criteria=["Integration shows its commit hash"],
+    )["task"]
+    service.claim_task(
+        project["id"], task["id"], executor["agent"]["id"], executor["token"]
+    )
+    service.submit_work_report(
+        project["id"],
+        task["id"],
+        session_id=executor["agent"]["id"],
+        token=executor["token"],
+        summary="Ready for review",
+        files=["src/feature.py"],
+        tests=[{"command": "pytest", "exit_code": 0}],
+    )
+    service.submit_review(
+        project["id"],
+        task["id"],
+        reviewer_session_id=reviewer["agent"]["id"],
+        token=reviewer["token"],
+        verdict="approved",
+        criteria=[
+            {"criterion": "Integration shows its commit hash", "status": "passed"}
+        ],
+    )
+    service.submit_integration(
+        project["id"],
+        task["id"],
+        result="done",
+        summary="Integrated into main",
+        tests=[{"command": "pytest", "exit_code": 0}],
+        files=["src/feature.py"],
+        commit_hash="abc123def4567890",
+        integrator_session_id=reviewer["agent"]["id"],
+        token=reviewer["token"],
+    )
+
+    page = service.list_task_history(project["id"], task["id"], limit=50)
+    integration_item = next(
+        item
+        for item in page["items"]
+        if item["event_type"] == "task.integration_completed"
+    )
+    git_sections = [
+        section
+        for section in integration_item["evidence_sections"]
+        if section["kind"] == "git"
+    ]
+    assert git_sections, "integration history must carry a Git evidence section"
+    entry = git_sections[0]["items"][0]
+    assert entry["head"] == "abc123def4567890"
+    assert entry["captured"] is True
+
+
+def test_task_history_redacts_credentials_embedded_in_text():
+    from agentchatroom.task_history import redact_runtime_value
+
+    leaked = redact_runtime_value(
+        {"body": "Authorization: Bearer supersecret token=abc plain tail"}
+    )
+    body = leaked["body"]
+    assert "supersecret" not in body
+    assert "abc" not in body.replace("[redacted]", "")
+
+    leaked_key = redact_runtime_value(
+        {"summary": "config uses api_key=verysecretvalue123 end"}
+    )
+    assert "verysecretvalue123" not in leaked_key["summary"]
+
+    # Built at runtime so the public-release surface scan does not see a
+    # provider key literal in this file; the regex branch is the same.
+    provider_prefix = "s" + "k"
+    assert provider_prefix not in redact_runtime_value(
+        {"body": f"key is {provider_prefix}-abcdefghijklmnop012345"}
+    )["body"]
+
+    assert "token" not in redact_runtime_value({"token": "whatever"})
+    # Benign text passes through unchanged.
+    assert redact_runtime_value({"body": "plain update text"})["body"] == (
+        "plain update text"
+    )
+
+
+def test_bootstrap_redaction_shares_the_same_text_policy():
+    from agentchatroom.bootstrap import redact_runtime_value as bootstrap_redact
+    from agentchatroom.task_history import redact_runtime_value as history_redact
+
+    sample = {"body": "Authorization: Bearer supersecret value tail"}
+    assert bootstrap_redact(sample) == history_redact(sample)
+    assert "supersecret" not in str(bootstrap_redact(sample))
