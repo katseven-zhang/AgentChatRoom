@@ -854,6 +854,13 @@ class AgentChatRoomService:
                             if str(session.get("model") or "").strip()
                         }
                     ),
+                    # 当前模型 = 最近活跃 Session 的自报模型；缺失或占位
+                    # "unknown" 不计入，交给前端显示明确的 unknown。
+                    "current_model": (
+                        str(representative.get("model") or "").strip()
+                        if str(representative.get("model") or "").strip().lower() != "unknown"
+                        else ""
+                    ),
                 }
             )
         return sorted(

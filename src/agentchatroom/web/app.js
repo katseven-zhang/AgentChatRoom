@@ -1109,10 +1109,9 @@ function renderAgents(agents) {
         : agent.current_task_id
           ? `任务：${agent.current_task_title} · ${legacyStatus(agent.current_task_status)}`
           : "当前无任务";
-      // 统一模型标签：后端未上报任何模型时明确显示 unknown，不猜测。
-      const { models: identityModels } = agent;
-      const modelList = Array.isArray(identityModels) ? identityModels.filter(Boolean) : [];
-      const modelLabel = modelList.length ? modelList.join(" / ") : "unknown";
+      // 统一模型标签：显示当前（最近活跃）Session 的模型；后端未上报
+      // 或为占位 unknown 时明确显示 unknown，不猜测、不拼接历史模型。
+      const modelLabel = String(agent.current_model || "").trim() || "unknown";
       const details = `${agent.name}\n软件: ${agent.client}\n本次角色: ${agent.role}\n模型: ${modelLabel}\n${connectionSummary}\n${taskSummary}\n最后心跳: ${heartbeat}\n最后活动: ${activity}`;
       return `
       <div class="agent-item ${connected ? "" : "is-disconnected"}" title="${escapeHtml(details)}">

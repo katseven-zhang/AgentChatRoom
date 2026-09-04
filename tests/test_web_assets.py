@@ -781,6 +781,8 @@ def test_web_agent_cards_use_unified_projection_with_model_fallback(tmp_path):
     start = javascript.index("function renderAgents(agents)")
     end = javascript.index("function taskNotFinished(task)", start)
 
+    assert "agent.current_model" in javascript
+    # 占位 unknown 不作为真名显示；缺失回退 unknown 由前端统一处理。
     harness = tmp_path / "agent_cards_harness.js"
     harness.write_text(
         "const state = { snapshot: { tasks: [] } };\n"
@@ -801,17 +803,17 @@ def test_web_agent_cards_use_unified_projection_with_model_fallback(tmp_path):
 const agents = [
   {
     id: 'a1', name: 'Alpha', client: 'codex', role: 'executor',
-    connection_status: 'connected', session_count: 5, models: ['GPT-5'],
+    connection_status: 'connected', session_count: 5, current_model: 'GPT-5',
     last_heartbeat: 'now', last_activity_at: 'now', unread_count: 0,
   },
   {
     id: 'a2', name: 'Beta', client: 'trae', role: 'reviewer',
-    connection_status: 'disconnected', session_count: 2, models: [],
+    connection_status: 'disconnected', session_count: 2, current_model: '',
     last_heartbeat: 'earlier', last_activity_at: 'earlier', unread_count: 3,
   },
   {
     id: 'a3', name: 'Gamma', client: 'workbuddy', role: 'executor',
-    connection_status: 'disconnected', session_count: 1, models: null,
+    connection_status: 'disconnected', session_count: 1,
     last_heartbeat: 'old', last_activity_at: 'old', unread_count: 0,
   },
 ];
