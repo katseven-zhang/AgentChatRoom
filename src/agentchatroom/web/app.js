@@ -1730,6 +1730,10 @@ elements["task-release-form"].addEventListener("submit", async (event) => {
     });
     elements["task-release-dialog"].close();
     await refreshTaskIntakeData();
+    const updatedTask = state.snapshot?.tasks.find((item) => item.id === task.id) || task;
+    renderTaskContract(updatedTask);
+    renderTaskAssignments(updatedTask);
+    renderTaskTimeline(updatedTask);
     showToast(`任务 #${task.task_number} 已释放回待认领，进度和历史保留`);
   } catch (error) {
     handleError(error);
