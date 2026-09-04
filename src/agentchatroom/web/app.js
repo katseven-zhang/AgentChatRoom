@@ -460,6 +460,7 @@ function eventLabel(type) {
     "task.unblocked": "解除了任务阻塞", "task.released": "释放了任务",
     "task.cancelled": "取消了任务", "lease.acquired": "占用了文件范围",
     "lease.released": "释放了文件范围", "lease.conflict": "检测到文件冲突",
+    "lease.pre_commit_blocked": "提交前检查被文件占用阻断",
     "work.reported": "提交了工作证据", "review.submitted": "提交了验证结论",
     "task.integration_completed": "完成了最终集成", "task.integration_failed": "记录了集成失败",
     "message.acknowledged": "确认了消息",
@@ -1250,15 +1251,24 @@ function renderTaskIntakes() {
 
 function renderLeases(leases, agents) {
   const names = Object.fromEntries(agents.map((agent) => [agent.id, agent.name]));
+  const onlineCutoff = Date.now() - 90 * 1000;
+  const parseTime = (value) => (value ? Date.parse(value) : 0);
   elements["lease-list"].innerHTML = leases.length
-    ? leases.map((lease) => `
-      <article class="lease-item">
+    ? leases.map((lease) => {
+      // snapshot 只包含活跃租约；持有者最近无心跳即标记为可回收。
+      const holderSeen = parseTime(lease.last_heartbeat || lease.last_activity_at);
+      const holderOffline = holderSeen > 0 && holderSeen < onlineCutoff;
+      const holder = holderOffline
+        ? `${escapeHtml(names[lease.session_id] || shortId(lease.session_id))} · 持有者离线，租约可回收`
+        : escapeHtml(names[lease.session_id] || shortId(lease.session_id));
+      return `<article class="lease-item">
         <div class="lease-meta">
           <span class="type-badge">${escapeHtml(leaseMode(lease.mode))}</span>
           <strong>${escapeHtml(lease.path_pattern)}</strong>
         </div>
-        <p>${escapeHtml(names[lease.session_id] || shortId(lease.session_id))} · ${escapeHtml(leaseMode(lease.mode))} · TTL ${lease.ttl_seconds}s · 到期 ${escapeHtml(formatTime(lease.expires_at))}${lease.reason ? ` · ${escapeHtml(lease.reason)}` : ""}</p>
-      </article>`).join("")
+        <p>${holder} · TTL ${lease.ttl_seconds}s · 到期 ${escapeHtml(formatTime(lease.expires_at))}${lease.renewed_at ? ` · 续于 ${escapeHtml(formatTime(lease.renewed_at))}` : ""}${lease.reason ? ` · ${escapeHtml(lease.reason)}` : ""}</p>
+      </article>`;
+    }).join("")
     : '<div class="empty-state">当前没有活跃文件占用。Agent 编辑文件前会在这里声明路径范围，避免两个人同时改同一文件。</div>';
 }
 

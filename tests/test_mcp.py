@@ -1548,3 +1548,26 @@ async def test_stdio_bridge_reconnects_after_center_restart_without_duplicate_wr
             await stop_center(restarted_server, restarted_task)
         elif not server_task.done():
             await stop_center(server, server_task)
+
+
+def test_mcp_lease_acquire_reports_conflict_like_rest(monkeypatch, service, project, joined_agents):
+    from agentchatroom import mcp_server
+
+    holder, rival = joined_agents
+    service.acquire_lease(
+        project["id"],
+        session_id=holder["agent"]["id"],
+        token=holder["token"],
+        path_pattern="src/mcp-lease/**",
+        mode="exclusive",
+    )
+    monkeypatch.setattr(mcp_server, "service", service)
+    result = mcp_server.lease_acquire(
+        project_id=project["id"],
+        session_id=rival["agent"]["id"],
+        token=rival["token"],
+        path_pattern="src/mcp-lease/**",
+        mode="exclusive",
+    )
+    assert result["ok"] is False
+    assert result["error"]["code"] == "lease_conflict"

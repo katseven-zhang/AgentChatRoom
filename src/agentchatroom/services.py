@@ -5146,6 +5146,24 @@ class AgentChatRoomService:
                     "cursor": event_id,
                 }
             else:
+                # 幂等：同一 Session 对同一（归一化）范围的活跃租约重复申请
+                # 直接续用已有租约，不产生并行的重复占用行。
+                existing = next(
+                    (
+                        row
+                        for row in active
+                        if row["session_id"] == session_id
+                        and row["path_pattern"] == pattern
+                    ),
+                    None,
+                )
+                if existing is not None:
+                    return {
+                        "lease": self._lease_dict(existing),
+                        "already_held": True,
+                        "event_id": None,
+                        "cursor": self.latest_cursor(connection, project_id),
+                    }
                 lease_id = new_id("lease")
                 created_at = now.isoformat().replace("+00:00", "Z")
                 expires_at = expires.isoformat().replace("+00:00", "Z")
@@ -5305,10 +5323,17 @@ class AgentChatRoomService:
                 raise DomainError("lease_not_found", "Lease does not exist", status_code=404)
             if lease["session_id"] != session_id:
                 raise DomainError("not_lease_owner", "Only the lease owner can release it", status_code=403)
-            if lease["released_at"] is None:
-                connection.execute(
-                    "UPDATE file_leases SET released_at = ? WHERE id = ?", (iso_now(), lease_id)
-                )
+            if lease["released_at"] is not None:
+                # 幂等：重复释放不再追加事件，返回可区分的 already_released 结果。
+                return {
+                    "released": False,
+                    "already_released": True,
+                    "event_id": None,
+                    "cursor": self.latest_cursor(connection, project_id),
+                }
+            connection.execute(
+                "UPDATE file_leases SET released_at = ? WHERE id = ?", (iso_now(), lease_id)
+            )
             event_id = self._emit(
                 connection,
                 project_id,

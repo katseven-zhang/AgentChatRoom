@@ -274,6 +274,23 @@ room_bootstrap
 
 `room_join` 仍作为兼容入口保留：仅在仓库作用域与 checkout 登记都为空时，第一个 Agent 可以请求创建 Room。正常已登记工作区的新对话只调用 `room_bootstrap`。
 
+### 文件占用（Lease）状态与边界
+
+文件租约是 Agent 对文件或 glob 范围的限时编辑意图声明，只保护文件范围，不等于任务所有权、任务三维状态或 Agent 在线状态。REST、MCP、CLI、Web 复用同一领域服务，事件追加留痕：
+
+| 环节 | 语义 |
+| --- | --- |
+| 申请 | `lease_acquire` 声明 `path_pattern` + 模式（readonly/shared/exclusive）+ TTL（默认 1800s，上限可配）；同一 Session 对同一归一化范围的重复申请幂等续用已有租约，不产生重复占用 |
+| 持有 | 活跃租约在快照/列表中展示模式、路径、持有者、TTL、到期时间、续租时间与原因 |
+| 冲突 | 申请时在同一写事务内做 glob 重叠 + 模式互斥检测；跨 Agent 冲突拒绝申请并写入 `lease.conflict` 事件，并发申请恰好一个成功 |
+| 续租 | Session 心跳自动为未释放、未过期的租约续期；过期租约不会被心跳复活 |
+| 主动释放 | `lease_release` 仅持有者可释放；重复释放幂等（`already_released`），不再追加事件 |
+| 过期回收 | 到期租约惰性失效：不再参与冲突检测、不再出现在活跃快照，他人可立即申请同一范围 |
+| 失联回收 | Session 主动离开或心跳超时即视为失联：离开时原子释放全部租约；重新接入（Session 替换）时活跃租约转移给新 Session；心跳超时的持有者租约标记为可回收 |
+| 任务结束清理 | 任务释放、Work Report 提交、交接确认会原子释放关联租约，`released_lease_ids` 写入对应事件 |
+
+`lease_conflict_policy` 只作用于提交前检查 `check_leases`：`advisory` 返回冲突清单并放行（由调用方决定），`pre_commit_block` 拒绝并写入 `lease.pre_commit_blocked` 事件；申请阶段的冲突始终拒绝，与该设置无关。非法策略值由统一配置校验拒绝。
+
 ### 指定 / 改派 Agent（含离线延迟指派）
 
 任务详情中的「指定 Agent」候选来自本 Project 所有已接入且未吊销的 Agent 身份：当前连接的 Agent 按活动 Session 立即派发；曾接入但暂时离线的 Agent 明确标注「已接入 · 当前离线」，可被指定为延迟指派。延迟指派记录在持久身份上（事件留痕 `assigned_to_member_id` 与目标是否离线），目标 Agent 重新接入、Session 替换后仍由该身份受理，不会转移给其他身份；已吊销、未知或从未接入过的身份会被领域服务明确拒绝。在线 Agent 的既有指派行为保持不变，REST、MCP、Web 复用同一领域服务。

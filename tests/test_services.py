@@ -2517,3 +2517,193 @@ def test_git_worktrees_share_room_and_logical_projects_remain_distinct(
     api_project = service.create_project(root_path=str(api_dir))
     web_project = service.create_project(root_path=str(web_dir))
     assert api_project["id"] != web_project["id"]
+
+
+def test_acquire_lease_is_idempotent_for_same_owner_and_scope(
+    service, project, joined_agents
+):
+    owner, _ = joined_agents
+    first = service.acquire_lease(
+        project["id"],
+        session_id=owner["agent"]["id"],
+        token=owner["token"],
+        path_pattern="src/app/**",
+        mode="exclusive",
+        reason="editing",
+    )
+    assert first.get("already_held") is not True
+
+    repeated = service.acquire_lease(
+        project["id"],
+        session_id=owner["agent"]["id"],
+        token=owner["token"],
+        path_pattern="src/app/**",
+        mode="exclusive",
+        reason="editing",
+    )
+    assert repeated["already_held"] is True
+    assert repeated["lease"]["id"] == first["lease"]["id"]
+    assert repeated["event_id"] is None
+
+    rows = service.list_leases(project["id"])
+    matching = [r for r in rows if r["path_pattern"] == "src/app/**"]
+    assert len(matching) == 1
+
+
+def test_release_lease_is_idempotent_and_owner_gated(
+    service, project, joined_agents
+):
+    owner, stranger = joined_agents
+    lease = service.acquire_lease(
+        project["id"],
+        session_id=owner["agent"]["id"],
+        token=owner["token"],
+        path_pattern="src/once/**",
+    )
+    lease_id = lease["lease"]["id"]
+
+    with pytest.raises(DomainError) as denied:
+        service.release_lease(
+            project["id"],
+            lease_id,
+            stranger["agent"]["id"],
+            stranger["token"],
+        )
+    assert denied.value.code == "not_lease_owner"
+
+    released = service.release_lease(
+        project["id"], lease_id, owner["agent"]["id"], owner["token"]
+    )
+    assert released["released"] is True
+
+    repeated = service.release_lease(
+        project["id"], lease_id, owner["agent"]["id"], owner["token"]
+    )
+    assert repeated["released"] is False
+    assert repeated["already_released"] is True
+    assert repeated["event_id"] is None
+
+    event_types = [
+        event["event_type"]
+        for event in service.list_events(project["id"], after=0)["events"]
+    ]
+    assert event_types.count("lease.released") == 1
+
+
+def test_expired_lease_is_lazily_reclaimed_and_reassignable(
+    service, project, joined_agents
+):
+    from agentchatroom.database import Database
+
+    first, second = joined_agents
+    lease = service.acquire_lease(
+        project["id"],
+        session_id=first["agent"]["id"],
+        token=first["token"],
+        path_pattern="src/gone/**",
+        mode="exclusive",
+        ttl_seconds=1,
+    )
+    lease_id = lease["lease"]["id"]
+    # Simulate wall-clock expiry without sleeping: push expires_at into the past.
+    with service.database.connect(write=True) as connection:
+        connection.execute(
+            "UPDATE file_leases SET expires_at = ? WHERE id = ?",
+            ("2000-01-01T00:00:00Z", lease_id),
+        )
+
+    # The expired lease no longer blocks the same scope for another agent.
+    reacquired = service.acquire_lease(
+        project["id"],
+        session_id=second["agent"]["id"],
+        token=second["token"],
+        path_pattern="src/gone/**",
+        mode="exclusive",
+    )
+    assert reacquired["lease"]["path_pattern"] == "src/gone/**"
+
+    snapshot = service.snapshot(project["id"])
+    active_ids = {item["id"] for item in snapshot["leases"]}
+    assert lease_id not in active_ids
+
+
+def test_concurrent_conflicting_acquires_have_single_winner(
+    service, project, joined_agents
+):
+    import threading
+
+    first, second = joined_agents
+    results: dict[str, dict] = {}
+    errors: dict[str, object] = {}
+
+    def attempt(name, agent):
+        try:
+            results[name] = service.acquire_lease(
+                project["id"],
+                session_id=agent["agent"]["id"],
+                token=agent["token"],
+                path_pattern="src/race/**",
+                mode="exclusive",
+            )
+        except DomainError as error:
+            errors[name] = error
+
+    threads = [
+        threading.Thread(target=attempt, args=("first", first)),
+        threading.Thread(target=attempt, args=("second", second)),
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert len(results) == 1
+    winner_error = errors[next(iter(errors))]
+    assert winner_error.code == "lease_conflict"
+
+
+def test_invalid_lease_conflict_policy_is_rejected(service, project):
+    with pytest.raises(DomainError) as rejected:
+        service.update_project(
+            project["id"],
+            settings={"lease_conflict_policy": "oops"},
+        )
+    assert rejected.value.code == "invalid_project_settings"
+    unchanged = service.get_project(project["id"])
+    assert unchanged["settings"]["lease_conflict_policy"] == "advisory"
+
+
+def test_task_release_payload_reports_released_lease_ids(
+    service, project, joined_agents
+):
+    owner, _ = joined_agents
+    task = service.create_task(
+        project["id"],
+        title="Release with lease",
+        acceptance_criteria=["Lease cleanup visible"],
+    )["task"]
+    service.claim_task(
+        project["id"], task["id"], owner["agent"]["id"], owner["token"]
+    )
+    lease = service.acquire_lease(
+        project["id"],
+        session_id=owner["agent"]["id"],
+        token=owner["token"],
+        path_pattern="src/tied-to-task/**",
+        task_id=task["id"],
+    )
+    lease_id = lease["lease"]["id"]
+
+    released = service.release_task(
+        project["id"],
+        task["id"],
+        reason_code="other",
+        reason="lease cleanup check",
+    )
+    assert lease_id in released["released_lease_ids"]
+
+    events = service.list_events(project["id"], after=0)["events"]
+    release_event = next(
+        event for event in events if event["event_type"] == "task.released"
+    )
+    assert release_event["payload"]["released_lease_ids"] == [lease_id]

@@ -1540,3 +1540,68 @@ def test_release_lease_uses_json_body_and_rejects_query_credentials(
         assert body_release.status_code == 200
         assert body_release.json()["released"] is True
         assert "token=" not in str(body_release.request.url)
+
+
+def test_lease_acquire_conflict_and_advisory_check_over_rest(settings, project_dir):
+    with TestClient(create_app(settings)) as client:
+        project = client.post(
+            "/api/v1/projects",
+            json={"root_path": str(project_dir), "name": "Lease REST Project"},
+        ).json()
+        holder = client.post(
+            f"/api/v1/projects/{project['id']}/agents/join",
+            json={
+                "agent_key": "lease-holder-main",
+                "name": "Lease Holder",
+                "client": "codex",
+                "model": "test-model",
+                "role": "executor",
+            },
+        ).json()
+        rival = client.post(
+            f"/api/v1/projects/{project['id']}/agents/join",
+            json={
+                "agent_key": "lease-rival-main",
+                "name": "Lease Rival",
+                "client": "trae",
+                "model": "test-model",
+                "role": "executor",
+            },
+        ).json()
+        acquired = client.post(
+            f"/api/v1/projects/{project['id']}/leases",
+            json={
+                "session_id": holder["agent"]["id"],
+                "token": holder["token"],
+                "path_pattern": "src/rest-lease/**",
+                "mode": "exclusive",
+            },
+        )
+        assert acquired.status_code == 201
+
+        conflict = client.post(
+            f"/api/v1/projects/{project['id']}/leases",
+            json={
+                "session_id": rival["agent"]["id"],
+                "token": rival["token"],
+                "path_pattern": "src/rest-lease/**",
+                "mode": "exclusive",
+            },
+        )
+        assert conflict.status_code == 409
+        assert conflict.json()["error"]["code"] == "lease_conflict"
+
+        # advisory policy: the pre-commit check reports the conflict without blocking.
+        advisory = client.post(
+            f"/api/v1/projects/{project['id']}/leases/check",
+            json={
+                "session_id": rival["agent"]["id"],
+                "token": rival["token"],
+                "paths": ["src/rest-lease/main.py"],
+            },
+        )
+        assert advisory.status_code == 200
+        body = advisory.json()
+        assert body["policy"] == "advisory"
+        assert body["blocked"] is False
+        assert len(body["conflicts"]) == 1
