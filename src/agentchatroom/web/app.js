@@ -26,7 +26,6 @@ const state = {
   taskIntakeTargets: [],
   taskIntakes: [],
   editingTaskId: null,
-  editingIntakeId: null,
   editingMemberId: null,
   members: [],
   credentials: [],
@@ -590,10 +589,11 @@ function resetProjectFilters() {
   if (elements["event-filter"]) elements["event-filter"].value = "all";
 }
 
-function clearDialogDrafts() {
-  state.editingTaskId = null;
-  state.editingIntakeId = null;
-  state.editingMemberId = null;
+function clearDialogDrafts(dialog) {
+  // 嵌套弹窗（如指定 Agent）关闭时不能清掉外层任务详情仍需要的编辑上下文。
+  if (["login-dialog", "token-secret-dialog"].includes(dialog.id)) return;
+  if (dialog.id === "task-edit-dialog") state.editingTaskId = null;
+  if (dialog.id === "member-dialog") state.editingMemberId = null;
 }
 
 function refreshSnapshot(projectId) {
@@ -1689,8 +1689,7 @@ document.querySelectorAll("dialog").forEach((dialog) => {
     }
   });
   dialog.addEventListener("close", () => {
-    if (["login-dialog", "token-secret-dialog"].includes(dialog.id)) return;
-    clearDialogDrafts();
+    clearDialogDrafts(dialog);
   });
 });
 

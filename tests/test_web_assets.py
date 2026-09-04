@@ -309,7 +309,7 @@ def test_web_sse_and_project_switch_guard_stale_snapshots():
     assert "function renderForEvent(event)" in javascript
     assert "state.streamHadError" in javascript
     assert "resetProjectFilters()" in javascript
-    assert "clearDialogDrafts()" in javascript
+    assert "clearDialogDrafts(dialog)" in javascript
     assert 'aria-live="polite"' in markup
     assert 'role="tablist"' in markup
     assert 'role="tabpanel"' in markup
@@ -497,3 +497,78 @@ def test_web_task_view_harness_covers_state_triple_samples(tmp_path):
         "done", "cancelled",
     ):
         assert f'value="{phase}"' in expert_html
+
+
+def test_web_dialog_close_scopes_draft_cleanup_to_owner_dialog(tmp_path):
+    """Regression for task #46: closing the nested assign dialog must keep
+    the surrounding task-detail context alive.
+
+    Runs the real ``clearDialogDrafts`` body in Node against dialog doubles
+    so the scenario is exercised as behavior (state transitions across the
+    actual close-event sequence), not as source-string matching:
+    open task details -> open the assign dialog -> close it without
+    choosing -> the "指定 Agent" flow must still be able to reopen, so the
+    close of ``task-assign-dialog`` must NOT clear ``editingTaskId``.
+    """
+    javascript = (WEB_DIR / "app.js").read_text(encoding="utf-8")
+    start = javascript.index("function clearDialogDrafts(dialog)")
+    end_marker = 'if (dialog.id === "member-dialog") state.editingMemberId = null;\n}'
+    end = javascript.index(end_marker) + len(end_marker)
+
+    harness = tmp_path / "dialog_cleanup_harness.js"
+    harness.write_text(
+        "const state = { editingTaskId: 'task_abc', editingMemberId: null };\n"
+        + javascript[start:end]
+        + "\n"
+        + r"""
+const outcomes = {};
+// Nested assign dialog closes while task details stay open: editingTaskId survives.
+clearDialogDrafts({ id: 'task-assign-dialog' });
+outcomes.assignCloseKeepsTaskContext = state.editingTaskId === 'task_abc';
+// The nested release confirmation dialog behaves the same way.
+clearDialogDrafts({ id: 'task-release-dialog' });
+outcomes.releaseCloseKeepsTaskContext = state.editingTaskId === 'task_abc';
+// Unknown dialogs never mutate draft state.
+clearDialogDrafts({ id: 'workspace-dialog' });
+outcomes.unknownCloseIsInert = state.editingTaskId === 'task_abc' && state.editingMemberId === null;
+// Auth dialogs are exempt and never clear anything.
+state.editingMemberId = 'member_1';
+clearDialogDrafts({ id: 'login-dialog' });
+outcomes.loginCloseIsExempt = state.editingMemberId === 'member_1';
+clearDialogDrafts({ id: 'token-secret-dialog' });
+outcomes.tokenSecretCloseIsExempt = state.editingMemberId === 'member_1';
+// Closing the task detail dialog itself still hands the context back.
+clearDialogDrafts({ id: 'task-edit-dialog' });
+outcomes.taskDetailCloseClearsTaskContext = state.editingTaskId === null;
+// Closing the member dialog clears only its own draft.
+clearDialogDrafts({ id: 'member-dialog' });
+outcomes.memberDialogCloseClearsMemberContext =
+  state.editingMemberId === null && state.editingTaskId === null;
+console.log(JSON.stringify(outcomes));
+""",
+        encoding="utf-8",
+    )
+    output = subprocess.check_output(["node", str(harness)], text=True, encoding="utf-8")
+    outcomes = json.loads(output)
+    assert outcomes == {
+        "assignCloseKeepsTaskContext": True,
+        "releaseCloseKeepsTaskContext": True,
+        "unknownCloseIsInert": True,
+        "loginCloseIsExempt": True,
+        "tokenSecretCloseIsExempt": True,
+        "taskDetailCloseClearsTaskContext": True,
+        "memberDialogCloseClearsMemberContext": True,
+    }
+
+
+def test_web_every_dialog_close_listener_uses_scoped_cleanup():
+    """The close listener must pass its own dialog into the scoped cleanup,
+    so no dialog close can clear another dialog's editing context."""
+    javascript = (WEB_DIR / "app.js").read_text(encoding="utf-8")
+    listener = javascript[
+        javascript.index('dialog.addEventListener("close"') : javascript.index(
+            "});",
+            javascript.index('dialog.addEventListener("close"'),
+        )
+    ]
+    assert "clearDialogDrafts(dialog)" in listener
