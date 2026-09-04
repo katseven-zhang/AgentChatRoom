@@ -2071,6 +2071,238 @@ def test_task_can_be_edited_released_and_cannot_form_dependency_cycle(
     assert "task.released" in event_types
 
 
+def test_release_task_owner_self_release_keeps_progress_and_allows_reclaim(
+    service, project, joined_agents
+):
+    first, second = joined_agents
+    task = service.create_task(
+        project["id"],
+        title="Release me",
+        acceptance_criteria=["Released, not cancelled"],
+    )["task"]
+    service.claim_task(
+        project["id"], task["id"], first["agent"]["id"], first["token"]
+    )
+    service.update_task(
+        project["id"],
+        task["id"],
+        progress_percent=42,
+        current_step="Halfway",
+        next_step="Finish",
+        session_id=first["agent"]["id"],
+        token=first["token"],
+    )
+
+    released = service.release_task(
+        project["id"],
+        task["id"],
+        reason_code="quota_exhausted",
+        reason="Out of budget for today",
+        session_id=first["agent"]["id"],
+        token=first["token"],
+    )
+
+    assert released["released"] is True
+    assert released["task"]["owner_session_id"] is None
+    assert released["task"]["status"] == "todo"
+    assert released["task"]["execution_status"] == "todo"
+    assert released["task"]["progress_percent"] == 42
+    assert released["task"]["current_step"] == "Halfway"
+    assert released["task"]["next_step"] == "Finish"
+
+    # The task returns to the claimable pool for a different Agent.
+    reclaimed = service.claim_task(
+        project["id"], task["id"], second["agent"]["id"], second["token"]
+    )
+    assert reclaimed["task"]["owner_session_id"] == second["agent"]["id"]
+
+
+def test_release_task_management_releases_for_offline_owner_with_full_event(
+    service, project, joined_agents
+):
+    owner, assigner = joined_agents
+    task = service.create_task(
+        project["id"],
+        title="Management release",
+        acceptance_criteria=["Event carries the whole trail"],
+    )["task"]
+    service.claim_task(
+        project["id"], task["id"], owner["agent"]["id"], owner["token"]
+    )
+    assignment = service.assign_task(
+        project["id"],
+        task["id"],
+        assigned_by_session_id=assigner["agent"]["id"],
+        token=assigner["token"],
+        assigned_to_session_id=owner["agent"]["id"],
+        note="will be invalidated",
+    )
+    service.leave_session(
+        project["id"], owner["agent"]["id"], owner["token"]
+    )
+
+    released = service.release_task(
+        project["id"],
+        task["id"],
+        reason_code="agent_unavailable",
+        reason="Owner lost connection",
+    )
+    assert released["released"] is True
+    assert released["invalidated_assignment_ids"] == [assignment["assignment"]["id"]]
+
+    events = service.list_events(project["id"], after=0)["events"]
+    release_event = next(
+        event for event in events if event["event_type"] == "task.released"
+    )
+    payload = release_event["payload"]
+    assert payload["initiator"] == "management"
+    assert payload["previous_owner_session_id"] == owner["agent"]["id"]
+    assert payload["reason_code"] == "agent_unavailable"
+    assert payload["reason"] == "Owner lost connection"
+    assert payload["from_execution_status"] == "claimed"
+    assert payload["execution_status"] == "todo"
+    assert payload["invalidated_assignment_ids"] == [assignment["assignment"]["id"]]
+    assert payload["task_number"] == task["task_number"]
+
+    # The cancelled assignment stays in history with a release provenance.
+    event_types = [
+        event["event_type"]
+        for event in service.list_events(project["id"], after=0)["events"]
+    ]
+    assert "task.assignment_cancelled" in event_types
+
+
+def test_release_task_rejects_non_owner_and_keeps_ownership(
+    service, project, joined_agents
+):
+    owner, stranger = joined_agents
+    task = service.create_task(
+        project["id"],
+        title="Not yours",
+        acceptance_criteria=["Ownership protected"],
+    )["task"]
+    service.claim_task(
+        project["id"], task["id"], owner["agent"]["id"], owner["token"]
+    )
+    with pytest.raises(DomainError) as denied:
+        service.release_task(
+            project["id"],
+            task["id"],
+            reason_code="other",
+            session_id=stranger["agent"]["id"],
+            token=stranger["token"],
+        )
+    assert denied.value.code == "not_task_owner"
+    still_owned = service.get_task(project["id"], task["id"])
+    assert still_owned["owner_session_id"] == owner["agent"]["id"]
+    assert still_owned["execution_status"] == "claimed"
+
+
+def test_release_task_after_changes_requested_preserves_verification_state(
+    service, project, joined_agents
+):
+    owner, reviewer = joined_agents
+    task = service.create_task(
+        project["id"],
+        title="Returned work",
+        acceptance_criteria=["Fix and resubmit"],
+    )["task"]
+    service.claim_task(
+        project["id"], task["id"], owner["agent"]["id"], owner["token"]
+    )
+    service.submit_work_report(
+        project["id"],
+        task["id"],
+        session_id=owner["agent"]["id"],
+        token=owner["token"],
+        summary="First attempt",
+        files=["src/fix.py"],
+        tests=[{"command": "pytest", "exit_code": 0}],
+    )
+    service.submit_review(
+        project["id"],
+        task["id"],
+        reviewer_session_id=reviewer["agent"]["id"],
+        token=reviewer["token"],
+        verdict="changes_requested",
+        criteria=[
+            {
+                "criterion": "Fix and resubmit",
+                "status": "failed",
+                "evidence": "Needs another pass",
+            },
+        ],
+        notes="Needs another pass",
+    )
+    reviewed = service.get_task(project["id"], task["id"])
+    assert reviewed["verification_status"] == "changes_requested"
+    assert reviewed["execution_status"] == "in_progress"
+
+    released = service.release_task(
+        project["id"],
+        task["id"],
+        reason_code="reassignment_needed",
+        reason="Hand the fixes to someone else",
+    )
+    assert released["task"]["status"] == "todo"
+    assert released["task"]["verification_status"] == "changes_requested"
+    assert released["task"]["integration_status"] == "pending"
+
+
+def test_release_task_is_idempotent_for_todo_and_rejects_terminal_phases(
+    service, project, joined_agents
+):
+    owner, _ = joined_agents
+    task = service.create_task(
+        project["id"],
+        title="Idempotent release",
+        acceptance_criteria=["No duplicate events"],
+    )["task"]
+
+    first_release = service.release_task(
+        project["id"], task["id"], reason_code="other"
+    )
+    assert first_release["released"] is False
+    assert first_release["already_released"] is True
+    second_release = service.release_task(
+        project["id"], task["id"], reason_code="other"
+    )
+    assert second_release["released"] is False
+    assert second_release["already_released"] is True
+
+    service.claim_task(
+        project["id"], task["id"], owner["agent"]["id"], owner["token"]
+    )
+    service.submit_work_report(
+        project["id"],
+        task["id"],
+        session_id=owner["agent"]["id"],
+        token=owner["token"],
+        summary="Awaiting verification",
+        files=["src/idempotent.py"],
+        tests=[{"command": "pytest", "exit_code": 0}],
+    )
+    awaiting = service.get_task(project["id"], task["id"])
+    assert awaiting["execution_status"] == "completed"
+    with pytest.raises(DomainError) as terminal:
+        service.release_task(
+            project["id"], task["id"], reason_code="other"
+        )
+    assert terminal.value.code == "task_not_releasable"
+
+    with pytest.raises(DomainError) as bad_reason:
+        service.release_task(
+            project["id"],
+            service.create_task(
+                project["id"],
+                title="Another task",
+                acceptance_criteria=["c"],
+            )["task"]["id"],
+            reason_code="because",
+        )
+    assert bad_reason.value.code == "invalid_release_reason_code"
+
+
 def test_readonly_lease_does_not_conflict_and_heartbeat_preserves_ttl(
     service, project, joined_agents
 ):

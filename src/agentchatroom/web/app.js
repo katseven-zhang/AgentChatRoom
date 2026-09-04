@@ -59,6 +59,8 @@ const elements = Object.fromEntries(
     "task-edit-dialog", "task-detail-heading", "task-detail-contract", "task-timeline",
     "task-history-filter", "task-history-load-earlier", "task-history-load-later",
     "task-assign-button", "task-assignment-list", "task-assign-dialog", "task-assign-form",
+    "task-release-button", "task-release-dialog", "task-release-form", "task-release-title",
+    "task-release-reason", "task-release-reason-text", "task-release-submit",
     "task-assign-title", "task-assign-agent", "task-assign-agent-empty", "task-assign-note", "task-assign-submit",
     "settings-dialog", "settings-form", "settings-project-name", "settings-lease-policy", "settings-roles",
     "archive-dialog", "archive-form", "archive-project-name", "permanent-delete-input",
@@ -1598,6 +1600,43 @@ elements["refresh-audit-button"].addEventListener("click", () => refreshManageme
 elements["audit-event-filter"].addEventListener("change", () => refreshManagement().catch(handleError));
 elements["refresh-runtime-button"].addEventListener("click", () => refreshManagement().catch(handleError));
 elements["task-assign-button"].addEventListener("click", () => openTaskAssignmentDialog().catch(handleError));
+
+elements["task-release-button"].addEventListener("click", () => {
+  const task = state.snapshot?.tasks.find((item) => item.id === state.editingTaskId);
+  if (!task || !state.projectId) return;
+  elements["task-release-title"].textContent = `释放任务 #${task.task_number}`;
+  elements["task-release-reason"].value = "";
+  elements["task-release-reason-text"].value = "";
+  elements["task-release-dialog"].showModal();
+});
+
+elements["task-release-form"].addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const task = state.snapshot?.tasks.find((item) => item.id === state.editingTaskId);
+  if (!task || !state.projectId) return;
+  const reasonCode = elements["task-release-reason"].value;
+  if (!reasonCode) {
+    showToast("请选择释放原因", "error");
+    return;
+  }
+  elements["task-release-submit"].disabled = true;
+  try {
+    await api(`/api/v1/projects/${state.projectId}/tasks/${task.id}/release`, {
+      method: "POST",
+      body: JSON.stringify({
+        reason_code: reasonCode,
+        reason: elements["task-release-reason-text"].value.trim(),
+      }),
+    });
+    elements["task-release-dialog"].close();
+    await refreshTaskIntakeData();
+    showToast(`任务 #${task.task_number} 已释放回待认领，进度和历史保留`);
+  } catch (error) {
+    handleError(error);
+  } finally {
+    elements["task-release-submit"].disabled = false;
+  }
+});
 elements["token-secret-close"].addEventListener("click", () => {
   elements["token-secret-value"].textContent = "";
   elements["token-secret-dialog"].close();
@@ -2449,6 +2488,10 @@ async function openTaskDetails(taskId, options = {}) {
   renderTaskAssignments(task);
   renderTaskTimeline(task);
   elements["task-assign-button"].disabled = ["done", "cancelled"].includes(taskView(task).phase);
+  elements["task-release-button"].classList.toggle(
+    "is-hidden",
+    !["claimed", "in_progress", "blocked"].includes(task.execution_status),
+  );
   elements["task-edit-dialog"].showModal();
   try {
     await loadTaskHistory(taskId);

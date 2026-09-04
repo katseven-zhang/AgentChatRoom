@@ -4015,6 +4015,7 @@ class AgentChatRoomService:
                 "released_lease_ids": released_lease_ids,
                 "invalidated_assignment_ids": invalidated_assignment_ids,
                 "invalidated_handoff_ids": invalidated_handoff_ids,
+                "task_number": task["task_number"],
             },
         )
         for assignment_id in invalidated_assignment_ids:

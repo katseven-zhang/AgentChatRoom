@@ -695,6 +695,59 @@ def test_api_can_assign_and_acknowledge_task(settings, project_dir):
         assert acknowledged.json()["task"]["execution_status"] == "claimed"
 
 
+def test_api_release_endpoint_returns_task_to_claimable_pool(settings, project_dir):
+    with TestClient(create_app(settings)) as client:
+        project = client.post(
+            "/api/v1/projects",
+            json={"root_path": str(project_dir), "name": "Release Project"},
+        ).json()
+        owner = client.post(
+            f"/api/v1/projects/{project['id']}/agents/join",
+            json={
+                "agent_key": "release-owner-main",
+                "name": "Release Owner",
+                "client": "codex",
+                "model": "test-model",
+                "role": "executor",
+            },
+        ).json()
+        task = client.post(
+            f"/api/v1/projects/{project['id']}/tasks",
+            json={
+                "title": "Released through REST",
+                "acceptance_criteria": ["Back to todo"],
+            },
+        ).json()["task"]
+        client.post(
+            f"/api/v1/projects/{project['id']}/tasks/{task['id']}/claim",
+            json={"session_id": owner["agent"]["id"], "token": owner["token"]},
+        )
+
+        released = client.post(
+            f"/api/v1/projects/{project['id']}/tasks/{task['id']}/release",
+            json={"reason_code": "quota_exhausted", "reason": "Out of quota"},
+        )
+        assert released.status_code == 200
+        body = released.json()
+        assert body["released"] is True
+        assert body["task"]["owner_session_id"] is None
+        assert body["task"]["status"] == "todo"
+
+        # Management release of an already-todo task is idempotent.
+        repeat = client.post(
+            f"/api/v1/projects/{project['id']}/tasks/{task['id']}/release",
+            json={"reason_code": "other"},
+        )
+        assert repeat.status_code == 200
+        assert repeat.json()["already_released"] is True
+
+        missing_reason = client.post(
+            f"/api/v1/projects/{project['id']}/tasks/{task['id']}/release",
+            json={"reason_code": "because"},
+        )
+        assert missing_reason.status_code == 422
+
+
 def test_api_can_assign_an_offline_member_identity(settings, project_dir):
     with TestClient(create_app(settings)) as client:
         project = client.post(

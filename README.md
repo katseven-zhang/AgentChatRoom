@@ -329,6 +329,22 @@ Web 任务模块导航是 7 个常驻入口 + 「全部任务」重置入口：�
 
 REST `GET /api/v1/projects/{project_id}/tasks?phase=`、MCP `task_list(phase=…)`、CLI `task-list --phase=` 复用同一投影过滤：`phase` 接受任一相位代码或 `attention`（收件箱去重视图）。
 
+#### 释放（release）与取消（cancel）的对照
+
+两者是完全不同的动作，使用不同命令、事件类型和文案，绝不共用 `cancelled`：
+
+| | 释放 release | 取消 cancel |
+| --- | --- | --- |
+| 语义 | 非终态的所有权变化：当前执行者退出，任务回到待认领，可由其他 Agent 接续 | 终态业务决定：任务不再执行 |
+| 入口 | MCP `task_release`、REST `POST /tasks/{id}/release`、CLI `task-release`、Web 详情「释放任务」 | `task_update status=cancelled`、Web 取消任务（危险操作） |
+| 事件 | `task.released` | `task.cancelled` |
+| 结构化原因 | `reason_code`：quota_exhausted / agent_unavailable / user_requested / reassignment_needed / other + 自由文本 reason | 无需释放原因 |
+| 可执行阶段 | claimed / in_progress / blocked（含验收退回后的返修）；todo 重复释放幂等；待验收、已通过、已集成、已取消等阶段明确拒绝 | 未完成的任务 |
+| 保留内容 | 进度、步骤、任务合同、依赖、Work Report、Review、Integration 与历史 owner 全部保留；验收退回后释放保留 `changes_requested`，下一位 Agent 可从「待认领」和「需要处理」两个入口找到 | — |
+| 附带处理 | 原子释放该任务活跃文件租约、失效 pending 指派/交接并留痕 | — |
+
+当前 owner 可自助释放；owner 离线、失联或额度耗尽时，具有任务管理权限的用户/管理端（Web 与 REST 的管理身份）可代为释放。
+
 ### 任务证据链与分页历史
 
 任务详情时间线不再依赖 Room 动态最近 120 条事件。REST `GET /api/v1/projects/{project_id}/tasks/{task_id}/history`、MCP `task_history` 和 CLI `task-history` 复用同一领域投影，按 `event_id` 稳定排序，支持 `after` / `before` / `limit` / `event_type`。投影联结 append-only 事件与不可变 Work Report、Review、Integration、Message、Acknowledgement 记录，显示原文、逐条验收证据、测试命令、状态 before→after、确认人和当时软件身份。Agent 消息只使用该条消息自己的 `model_display_name`，缺失则为 `unknown`。验证通过不等于最终完成；集成结果单独显示。历史结果走共享脱敏，不会返回 Token、Authorization、Cookie 或私钥。事件编号可复制为 `任务 #N / 事件 #ID`，并用 `#event-ID` 定位。
