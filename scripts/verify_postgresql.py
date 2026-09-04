@@ -221,6 +221,42 @@ def main() -> None:
             if before_cursor < 1:
                 raise RuntimeError("PostgreSQL center did not persist an event")
 
+            # Task release round-trip: first-class release returns the task
+            # to the claimable pool (never cancelled) and repeats idempotently.
+            release_target = client.post(
+                f"/api/v1/projects/{project['id']}/tasks",
+                json={
+                    "title": "Release acceptance",
+                    "acceptance_criteria": ["Released to the claimable pool"],
+                },
+            )
+            release_target.raise_for_status()
+            release_task_payload = release_target.json()["task"]
+            agent_session = joined.json()
+            claim = client.post(
+                f"/api/v1/projects/{project['id']}/tasks/{release_task_payload['id']}/claim",
+                json={
+                    "session_id": agent_session["agent"]["id"],
+                    "token": agent_session["token"],
+                },
+            )
+            claim.raise_for_status()
+            released = client.post(
+                f"/api/v1/projects/{project['id']}/tasks/{release_task_payload['id']}/release",
+                json={"reason_code": "quota_exhausted", "reason": "PostgreSQL acceptance"},
+            )
+            released.raise_for_status()
+            release_body = released.json()
+            if release_body["released"] is not True or release_body["task"]["owner_session_id"] is not None:
+                raise RuntimeError("PostgreSQL task release did not return the task to the claimable pool")
+            repeated_release = client.post(
+                f"/api/v1/projects/{project['id']}/tasks/{release_task_payload['id']}/release",
+                json={"reason_code": "quota_exhausted", "reason": "PostgreSQL acceptance"},
+            )
+            repeated_release.raise_for_status()
+            if repeated_release.json()["already_released"] is not True:
+                raise RuntimeError("PostgreSQL task release repeat is not idempotent")
+
         restarted = create_app(settings)
         with TestClient(restarted) as client:
             client.cookies.set(settings.management_cookie_name, management_cookie)

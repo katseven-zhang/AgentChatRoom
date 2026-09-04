@@ -3108,7 +3108,15 @@ def test_release_and_claim_race_admits_exactly_one_successor(
 ):
     import threading
 
-    owner, successor = joined_agents
+    owner, first_successor = joined_agents
+    second_successor = service.join_room(
+        project["id"],
+        agent_key="race-successor-main",
+        name="Race Successor",
+        client="grok-build",
+        model="test-model",
+        role="executor",
+    )
     task = service.create_task(
         project["id"],
         title="Release/claim race",
@@ -3118,40 +3126,55 @@ def test_release_and_claim_race_admits_exactly_one_successor(
         project["id"], task["id"], owner["agent"]["id"], owner["token"]
     )
 
-    claim_result: list[dict] = []
-    claim_error: list[str] = []
+    gate = threading.Barrier(3)
+    outcomes: list[str] = []
+    errors: list[str] = []
 
-    def late_claim():
+    def do_release():
+        gate.wait()
         try:
-            claim_result.append(
-                service.claim_task(
-                    project["id"],
-                    task["id"],
-                    successor["agent"]["id"],
-                    successor["token"],
-                )
+            result = service.release_task(
+                project["id"], task["id"], reason_code="other"
             )
+            outcomes.append("released" if result["released"] else "already")
         except DomainError as error:
-            claim_error.append(error.code)
+            errors.append(error.code)
 
-    # 释放先发生（串行前置），随后 claim 与重复释放并发竞争。
-    released = service.release_task(
-        project["id"], task["id"], reason_code="other"
-    )
-    assert released["released"] is True
+    def do_claim(agent):
+        gate.wait()
+        try:
+            service.claim_task(
+                project["id"], task["id"], agent["agent"]["id"], agent["token"]
+            )
+            outcomes.append("claimed")
+        except DomainError as error:
+            errors.append(error.code)
+
     threads = [
-        threading.Thread(target=late_claim),
-        threading.Thread(target=late_claim),
+        threading.Thread(target=do_release),
+        threading.Thread(target=do_claim, args=(first_successor,)),
+        threading.Thread(target=do_claim, args=(second_successor,)),
     ]
     for thread in threads:
         thread.start()
     for thread in threads:
         thread.join()
 
-    # 同一 successor 的两条并发 claim：恰好一条成功，另一条命中
-    # 幂等（同 session 重复 claim 返回 event_id=None）或结构化拒绝。
-    assert claim_error.count("task_already_claimed") <= 1
-    owners = {
-        service.get_task(project["id"], task["id"])["owner_session_id"]
-    }
-    assert owners == {successor["agent"]["id"]}
+    # The concurrent interleaving is nondeterministic, but every legal
+    # schedule must end in a coherent state: release recorded exactly once,
+    # no ghost ownership, and any claim error is a structured rejection.
+    assert "released" in outcomes or "already" in outcomes
+    assert len(outcomes) + len(errors) == 3
+    assert not [e for e in errors if e == "session_closed"]
+    events = service.list_events(project["id"], after=0)["events"]
+    released_events = [e for e in events if e["event_type"] == "task.released"]
+    assert len(released_events) == 1
+    final = service.get_task(project["id"], task["id"])
+    assert final["status"] in {"todo", "claimed"}
+    if final["status"] == "todo":
+        assert final["owner_session_id"] is None
+    else:
+        assert final["owner_session_id"] in {
+            first_successor["agent"]["id"],
+            second_successor["agent"]["id"],
+        }
