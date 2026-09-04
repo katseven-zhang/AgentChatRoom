@@ -432,6 +432,8 @@ require_verified_task = true
 .venv\Scripts\python.exe -m pytest tests -p no:cacheprovider
 ```
 
+pytest 的临时目录（`--basetemp` / `tmp_path`）必须放在本 checkout 之外。临时目录位于 checkout 内时，`room_bootstrap` 的工作区解析会从测试临时目录向上查找 `.agentchatroom/project.json` 并命中仓库自身的登记文件，导致 `test_bootstrap` / `test_project_registration` 中依赖空 checkout 作用域的用例误报 `registration_invalid`；conftest 会在检测到这种情况时输出中文提示。需要显式 `--basetemp` 时请指向仓库外的专用目录。
+
 其他门禁：
 
 ```powershell
