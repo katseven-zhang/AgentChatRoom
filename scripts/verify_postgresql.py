@@ -256,6 +256,8 @@ def main() -> None:
             repeated_release.raise_for_status()
             if repeated_release.json()["already_released"] is not True:
                 raise RuntimeError("PostgreSQL task release repeat is not idempotent")
+            # 重启基线取 release 之后（含全部验收事件）的最新 cursor。
+            settled_cursor = client.get(f"/api/v1/projects/{project['id']}/snapshot").json()["cursor"]
 
         restarted = create_app(settings)
         with TestClient(restarted) as client:
@@ -268,7 +270,7 @@ def main() -> None:
                 )
             recovered = client.get(f"/api/v1/projects/{project['id']}/snapshot")
             recovered.raise_for_status()
-            if recovered.json()["cursor"] != before_cursor:
+            if recovered.json()["cursor"] != settled_cursor:
                 raise RuntimeError("PostgreSQL restart changed the event cursor")
 
         backup_result = backup_postgresql(database_url, backup_path)
