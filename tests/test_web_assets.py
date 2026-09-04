@@ -889,3 +889,19 @@ def test_web_composer_advanced_options_carry_real_semantics_and_hints():
         assert field in submit
     # 组合筛选走唯一入口（#45），隐藏只影响展示。
     assert "function visibleFeedEvents(events)" in javascript
+
+
+def test_web_markup_has_no_duplicate_element_ids():
+    """Regression for the #43 review round: a second hidden
+    task-release-button shipped inside an unreachable section and made the
+    DOM id non-unique; guard every markup id against duplication."""
+    import collections
+
+    markup = (WEB_DIR / "index.html").read_text(encoding="utf-8")
+    ids = re.findall(r'id="([a-z0-9-]+)"', markup)
+    duplicates = [item for item, count in collections.Counter(ids).items() if count > 1]
+    assert duplicates == []
+    # The release button must exist exactly once and stay wired in app.js.
+    assert ids.count("task-release-button") == 1
+    javascript = (WEB_DIR / "app.js").read_text(encoding="utf-8")
+    assert 'elements["task-release-button"].addEventListener' in javascript

@@ -4125,6 +4125,18 @@ class AgentChatRoomService:
                     )
                 self._authenticate(connection, project_id, session_id, token)
                 if task["owner_session_id"] != session_id:
+                    if task["owner_session_id"] is None and task["execution_status"] == "todo":
+                        # 已释放（或本就无主）的任务重复释放：幂等返回而不是
+                        # 对旧 owner 误报 403。
+                        return self._release_task_locked(
+                            connection,
+                            project_id,
+                            task,
+                            reason_code=reason_code,
+                            reason=reason,
+                            initiator="owner",
+                            actor_session_id=session_id,
+                        )
                     raise DomainError(
                         "not_task_owner",
                         "Only the task owner or management can release this task",

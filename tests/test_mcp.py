@@ -1571,3 +1571,49 @@ def test_mcp_lease_acquire_reports_conflict_like_rest(monkeypatch, service, proj
     )
     assert result["ok"] is False
     assert result["error"]["code"] == "lease_conflict"
+
+
+def test_mcp_task_release_enforces_owner_and_idempotent_repeat(monkeypatch, service, project, joined_agents):
+    from agentchatroom import mcp_server
+
+    owner, stranger = joined_agents
+    task = service.create_task(
+        project["id"],
+        title="MCP release parity",
+        acceptance_criteria=["Same semantics over MCP"],
+    )["task"]
+    service.claim_task(
+        project["id"], task["id"], owner["agent"]["id"], owner["token"]
+    )
+    monkeypatch.setattr(mcp_server, "service", service)
+
+    # 非 owner 经 MCP 释放被结构化拒绝，与 REST 同码。
+    denied = mcp_server.task_release(
+        project_id=project["id"],
+        task_id=task["id"],
+        reason_code="other",
+        session_id=stranger["agent"]["id"],
+        token=stranger["token"],
+    )
+    assert denied["ok"] is False
+    assert denied["error"]["code"] == "not_task_owner"
+
+    released = mcp_server.task_release(
+        project_id=project["id"],
+        task_id=task["id"],
+        reason_code="quota_exhausted",
+        session_id=owner["agent"]["id"],
+        token=owner["token"],
+    )
+    assert released.get("ok") is True, f"release failed: {released}"
+    assert released["result"]["released"] is True
+
+    repeated = mcp_server.task_release(
+        project_id=project["id"],
+        task_id=task["id"],
+        reason_code="quota_exhausted",
+        session_id=owner["agent"]["id"],
+        token=owner["token"],
+    )
+    assert repeated["ok"] is True
+    assert repeated["result"]["already_released"] is True

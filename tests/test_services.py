@@ -2832,9 +2832,7 @@ def test_concurrent_reviews_have_single_winner(service, project, joined_agents):
     for thread in threads:
         thread.join()
 
-    assert sorted(results + errors) == ["first", "invalid_transition"] or sorted(
-        results + errors
-    ) == ["first", "invalid_transition"]
+    # 恰好一个 reviewer 胜出（不限定是哪一个），另一个得到结构化拒绝。
     assert len(results) == 1
     assert errors == ["invalid_transition"]
 
@@ -2924,3 +2922,43 @@ def test_project_roles_setting_is_a_deduplicated_readonly_convention(
     source = open(services.__file__, encoding="utf-8").read()
     authenticate_body = source[source.index("def _authenticate"):source.index("def _credential_dict")]
     assert "roles" not in authenticate_body
+
+
+def test_release_task_supports_blocked_tasks_and_clears_blocker_reason(
+    service, project, joined_agents
+):
+    owner, _ = joined_agents
+    task = service.create_task(
+        project["id"],
+        title="Blocked then released",
+        acceptance_criteria=["Blocker cleared on release"],
+    )["task"]
+    service.claim_task(
+        project["id"], task["id"], owner["agent"]["id"], owner["token"]
+    )
+    blocked = service.update_task(
+        project["id"],
+        task["id"],
+        status="blocked",
+        blocker_reason="Waiting for credentials",
+        session_id=owner["agent"]["id"],
+        token=owner["token"],
+    )["task"]
+    assert blocked["status"] == "blocked"
+
+    released = service.release_task(
+        project["id"],
+        task["id"],
+        reason_code="agent_unavailable",
+        reason="Cannot proceed while blocked",
+    )
+    assert released["released"] is True
+    assert released["task"]["status"] == "todo"
+    assert released["task"]["blocker_reason"] == ""
+
+    events = service.list_events(project["id"], after=0)["events"]
+    payload = next(
+        e["payload"] for e in events if e["event_type"] == "task.released"
+    )
+    assert payload["cleared_blocker_reason"] == "Waiting for credentials"
+    assert payload["reason"] == "Cannot proceed while blocked"

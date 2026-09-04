@@ -372,7 +372,7 @@ REST `GET /api/v1/projects/{project_id}/tasks?phase=`、MCP `task_list(phase=…
 | | 释放 release | 取消 cancel |
 | --- | --- | --- |
 | 语义 | 非终态的所有权变化：当前执行者退出，任务回到待认领，可由其他 Agent 接续 | 终态业务决定：任务不再执行 |
-| 入口 | MCP `task_release`、REST `POST /tasks/{id}/release`、CLI `task-release`、Web 详情「释放任务」 | `task_update status=cancelled`、Web 取消任务（危险操作） |
+| 入口 | MCP `task_release`、REST `POST /tasks/{id}/release`、CLI `task-release`、Web 详情「释放任务」 | `task_update status=cancelled`（Agent 适配器/管理入口；Web 面向用户不提供取消按钮，取消是终态须谨慎） |
 | 事件 | `task.released` | `task.cancelled` |
 | 结构化原因 | `reason_code`：quota_exhausted / agent_unavailable / user_requested / reassignment_needed / other + 自由文本 reason | 无需释放原因 |
 | 可执行阶段 | claimed / in_progress / blocked（含验收退回后的返修）；todo 重复释放幂等；待验收、已通过、已集成、已取消等阶段明确拒绝 | 未完成的任务 |
