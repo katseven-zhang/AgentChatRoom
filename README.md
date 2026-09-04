@@ -308,7 +308,7 @@ room_bootstrap
 | 失联回收 | Session 主动离开或心跳超时即视为失联：离开时原子释放全部租约；重新接入（Session 替换）时活跃租约转移给新 Session；心跳超时的持有者租约标记为可回收 |
 | 任务结束清理 | 任务释放、Work Report 提交、交接确认会原子释放关联租约，`released_lease_ids` 写入对应事件 |
 
-`lease_conflict_policy` 只作用于提交前检查 `check_leases`：`advisory` 返回冲突清单并放行（由调用方决定），`pre_commit_block` 拒绝并写入 `lease.pre_commit_blocked` 事件；申请阶段的冲突始终拒绝，与该设置无关。非法策略值由统一配置校验拒绝。
+`lease_conflict_policy` 只作用于提交前检查 `check_leases`：`advisory` 返回冲突清单并放行（由调用方决定），`pre_commit_block` 拒绝并写入 `lease.pre_commit_blocked` 事件；申请阶段的冲突始终拒绝，与该设置无关。非法策略值由统一配置校验拒绝。项目设置中的「协作角色约定」（roles）只是团队协作约定的可读记录（自动去重去空），不参与任何权限判定；Agent 的实际职责由会话角色、成员权限与任务分工决定。
 
 ### 指定 / 改派 Agent（含离线延迟指派）
 

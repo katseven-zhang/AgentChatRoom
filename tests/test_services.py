@@ -2894,3 +2894,33 @@ def test_idempotent_request_id_does_not_duplicate_events(
     assert replay["event_id"] == first["event_id"]
     events = service.list_events(project["id"], after=0)["events"]
     assert len([e for e in events if e["event_type"] == "lease.acquired"]) == 1
+
+
+def test_project_roles_setting_is_a_deduplicated_readonly_convention(
+    service, project
+):
+    """Regression for task #55: the roles list is a collaboration
+    convention — normalization dedupes and drops blanks, and no code path
+    derives permissions from it."""
+    # 空白项被结构化拒绝，而不是静默吞掉。
+    with pytest.raises(DomainError) as blank:
+        service.update_project(
+            project["id"],
+            settings={"roles": ["reviewer", ""]},
+        )
+    assert blank.value.code == "invalid_project_settings"
+
+    # 合法输入保序去重（含前后空格归一）。
+    updated = service.update_project(
+        project["id"],
+        settings={"roles": ["reviewer", " reviewer ", "reviewer", "executor"]},
+    )
+    assert updated["project"]["settings"]["roles"] == ["reviewer", "executor"]
+
+    # The setting is storage/projection only: nothing in the services
+    # module reads roles to gate an operation.
+    from agentchatroom import services
+
+    source = open(services.__file__, encoding="utf-8").read()
+    authenticate_body = source[source.index("def _authenticate"):source.index("def _credential_dict")]
+    assert "roles" not in authenticate_body

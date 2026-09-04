@@ -487,13 +487,13 @@
         </div>
         <label>项目名称 <input id="settings-project-name" autocomplete="off" required></label>
         <label>租约冲突策略
-          <select id="settings-lease-policy">
+          <select id="settings-lease-policy" title="作用于提交前检查（lease check）：「提示并记录」返回冲突清单由调用方决定；「提交前阻断」直接拒绝并写入审计事件。申请租约时的冲突始终拒绝，与本设置无关。">
             <option value="advisory">提示并记录</option>
             <option value="pre_commit_block">提交前阻断</option>
           </select>
         </label>
-        <label>项目角色 <textarea id="settings-roles" rows="4" placeholder="每行一个角色名称"></textarea></label>
-        <p class="form-hint">角色列表用于项目协作约定；Agent 仍可声明其他自定义角色。</p>
+        <label>协作角色约定（仅记录，不控制权限） <textarea id="settings-roles" rows="4" title="每行一个角色名称，自动去重去空。这是团队协作约定清单：不限制 Agent 能做什么，权限由成员权限与项目成员管理决定。" placeholder="每行一个角色名称"></textarea></label>
+        <p class="form-hint">角色列表是协作约定的可读记录（自动去重去空），不参与权限控制；Agent 的实际职责由会话角色与任务分工决定。</p>
         <div class="dialog-actions">
           <button type="button" class="secondary-button dialog-close">取消</button>
           <button type="submit" class="primary-button">保存设置</button>
