@@ -1290,7 +1290,7 @@ function renderReviews(tasks, agents) {
       <article class="review-item">
         <div class="task-meta"><span class="status-badge ${item.review.verdict === "approved" ? "verified" : "blocked"}">${item.review.verdict === "approved" ? "通过" : "退回"}</span><strong>${escapeHtml(item.task?.title || shortId(item.review.task_id))}</strong></div>
         <p>${escapeHtml(names[item.review.reviewer_session_id] || shortId(item.review.reviewer_session_id))} · ${escapeHtml(item.review.notes || `${item.review.criteria.length} 条验收记录`)}</p>
-        <div class="criteria-list">${item.review.criteria.map((criterion) => `<span class="criterion ${escapeHtml(criterion.status)}">${escapeHtml(criterion.status)} · ${escapeHtml(criterion.criterion)}</span>`).join("")}</div>
+        <div class="criteria-list">${item.review.criteria.map((criterion) => `<span class="criterion ${escapeHtml(criterion.status)}" title="${escapeHtml(criterion.evidence || "")}">${escapeHtml(criterion.status)} · ${escapeHtml(criterion.criterion)}${criterion.evidence ? `<span class="criterion-evidence">证据：${escapeHtml(criterion.evidence)}</span>` : ""}</span>`).join("")}</div>
         ${renderReportEvidence(item.review.task_id)}
       </article>`).join("")
     : '<div class="empty-state">这里是独立验收区。Agent 声明「执行完成」后，需要另一个 Agent 检查测试证据并批准或退回 —— 执行者不能自己批准自己。当前没有待验证的工作。</div>';

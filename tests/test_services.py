@@ -2707,3 +2707,133 @@ def test_task_release_payload_reports_released_lease_ids(
         event for event in events if event["event_type"] == "task.released"
     )
     assert release_event["payload"]["released_lease_ids"] == [lease_id]
+
+
+def test_duplicate_review_and_integration_are_rejected_structurally(
+    service, project, joined_agents
+):
+    executor, reviewer = joined_agents
+    task = service.create_task(
+        project["id"],
+        title="Single review only",
+        acceptance_criteria=["Works"],
+    )["task"]
+    service.claim_task(
+        project["id"], task["id"], executor["agent"]["id"], executor["token"]
+    )
+    service.submit_work_report(
+        project["id"],
+        task["id"],
+        session_id=executor["agent"]["id"],
+        token=executor["token"],
+        summary="Ready",
+        files=["src/done.py"],
+        tests=[{"command": "pytest", "exit_code": 0}],
+    )
+    service.submit_review(
+        project["id"],
+        task["id"],
+        reviewer_session_id=reviewer["agent"]["id"],
+        token=reviewer["token"],
+        verdict="approved",
+        criteria=[{"criterion": "Works", "status": "passed", "evidence": "ok"}],
+    )
+
+    with pytest.raises(DomainError) as duplicate_review:
+        service.submit_review(
+            project["id"],
+            task["id"],
+            reviewer_session_id=reviewer["agent"]["id"],
+            token=reviewer["token"],
+            verdict="approved",
+            criteria=[{"criterion": "Works", "status": "passed"}],
+        )
+    assert duplicate_review.value.code == "invalid_transition"
+
+    service.submit_integration(
+        project["id"],
+        task["id"],
+        integrator_session_id=reviewer["agent"]["id"],
+        token=reviewer["token"],
+        result="done",
+        summary="Integrated",
+        files=["src/done.py"],
+        tests=[{"command": "pytest", "exit_code": 0}],
+    )
+    with pytest.raises(DomainError) as duplicate_integration:
+        service.submit_integration(
+            project["id"],
+            task["id"],
+            integrator_session_id=reviewer["agent"]["id"],
+            token=reviewer["token"],
+            result="done",
+            summary="Integrated again",
+            files=["src/done.py"],
+            tests=[{"command": "pytest", "exit_code": 0}],
+        )
+    assert duplicate_integration.value.code == "task_already_integrated"
+
+
+def test_concurrent_reviews_have_single_winner(service, project, joined_agents):
+    import threading
+
+    executor, first_reviewer = joined_agents
+    # client 决定持久软件身份：不同 reviewer 必须用不同 client，
+    # 否则同一身份的重入会替换上一个 Session（session_closed）。
+    second_reviewer = service.join_room(
+        project["id"],
+        agent_key="second-reviewer-main",
+        name="Second Reviewer",
+        client="grok-build",
+        model="test-model",
+        role="reviewer",
+    )
+    task = service.create_task(
+        project["id"],
+        title="Race review",
+        acceptance_criteria=["Works"],
+    )["task"]
+    service.claim_task(
+        project["id"], task["id"], executor["agent"]["id"], executor["token"]
+    )
+    service.submit_work_report(
+        project["id"],
+        task["id"],
+        session_id=executor["agent"]["id"],
+        token=executor["token"],
+        summary="Ready",
+        files=["src/race.py"],
+        tests=[{"command": "pytest", "exit_code": 0}],
+    )
+
+    results: list[str] = []
+    errors: list[str] = []
+
+    def attempt(name, agent):
+        try:
+            service.submit_review(
+                project["id"],
+                task["id"],
+                reviewer_session_id=agent["agent"]["id"],
+                token=agent["token"],
+                verdict="approved",
+                criteria=[{"criterion": "Works", "status": "passed"}],
+            )
+            results.append(name)
+        except DomainError as error:
+            errors.append(error.code)
+
+    threads = [
+        threading.Thread(target=attempt, args=("first", first_reviewer)),
+        threading.Thread(target=attempt, args=("second", second_reviewer)),
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert sorted(results + errors) == ["first", "invalid_transition"] or sorted(
+        results + errors
+    ) == ["first", "invalid_transition"]
+    assert len(results) == 1
+    assert errors == ["invalid_transition"]

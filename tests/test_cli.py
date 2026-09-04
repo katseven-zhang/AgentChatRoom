@@ -726,3 +726,87 @@ def test_lease_release_cli_sends_credentials_in_json_body(monkeypatch, capsys):
     assert captured["body"]["session_id"] == "agent_example"
     assert captured["body"]["token"] == "session-token"
     assert '"released": true' in capsys.readouterr().out
+
+
+def test_review_submit_cli_expresses_failed_criteria_with_evidence(
+    monkeypatch, capsys
+):
+    captured = {}
+
+    def fake_request_json(base, method, path, body=None, *, request_id=None):
+        captured.update({"method": method, "path": path, "body": body})
+        return {"ok": True}
+
+    monkeypatch.setattr(cli, "request_json", fake_request_json)
+
+    main(
+        [
+            "review-submit",
+            "project_example",
+            "task_example",
+            "--session-id",
+            "agent_reviewer",
+            "--token",
+            "session-token",
+            "--verdict",
+            "changes_requested",
+            "--criterion",
+            "Evidence chain shows verdict::passed",
+            "--criterion",
+            "Decision body is visible::failed::UI 只渲染了标题，没有正文",
+            "--criterion",
+            "Bonus path: colons inside the text are safe",
+            "--notes",
+            "Need the original text",
+        ]
+    )
+
+    assert captured["path"].endswith("/tasks/task_example/reviews")
+    criteria = captured["body"]["criteria"]
+    assert criteria[0] == {"criterion": "Evidence chain shows verdict", "status": "passed"}
+    assert criteria[1] == {
+        "criterion": "Decision body is visible",
+        "status": "failed",
+        "evidence": "UI 只渲染了标题，没有正文",
+    }
+    # 标准文本内部的冒号安全；无状态后缀时默认 passed。
+    assert criteria[2] == {
+        "criterion": "Bonus path: colons inside the text are safe",
+        "status": "passed",
+    }
+    assert captured["body"]["verdict"] == "changes_requested"
+
+
+def test_review_submit_cli_rejects_unknown_criterion_status():
+    with pytest.raises(SystemExit):
+        cli.parse_review_criteria(["Some criterion::looks-fine"])
+
+
+def test_parse_review_criteria_full_and_bare_forms():
+    assert cli.parse_review_criteria(
+        [
+            "Bare criterion",
+            "Scoped::failed",
+            "With evidence::failed::traceback tail",
+            "Approved::passed::404 checks pass",
+        ]
+    ) == [
+        {"criterion": "Bare criterion", "status": "passed"},
+        {"criterion": "Scoped", "status": "failed"},
+        {
+            "criterion": "With evidence",
+            "status": "failed",
+            "evidence": "traceback tail",
+        },
+        {
+            "criterion": "Approved",
+            "status": "passed",
+            "evidence": "404 checks pass",
+        },
+    ]
+
+
+def test_parse_review_criteria_rejects_ambiguous_status_segment():
+    # evidence 内含 :: 会把倒数第二段误读为状态；结构化拒绝优于猜测。
+    with pytest.raises(SystemExit):
+        cli.parse_review_criteria(["Approved::passed::pytest 404::0 output"])

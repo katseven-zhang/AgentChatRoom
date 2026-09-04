@@ -135,6 +135,40 @@ def validate_runtime_settings(settings) -> dict[str, Any]:
     return {"valid": True, "settings": settings.public_dict(), "checks": checks}
 
 
+def parse_review_criteria(values: list[str]) -> list[dict[str, Any]]:
+    """Parse --criterion entries as TEXT[::STATUS[::EVIDENCE]].
+
+    STATUS 默认 passed 且只能是 passed/failed，evidence 可选；标准文本
+    本身可以包含双冒号，解析从右侧进行。
+    """
+    criteria = []
+    for value in values:
+        if not value.strip():
+            raise SystemExit("Criterion text must not be empty")
+        remainder, separator, evidence = value.rpartition("::")
+        if not separator:
+            criteria.append({"criterion": value.strip(), "status": "passed"})
+            continue
+        text, inner_separator, status = remainder.rpartition("::")
+        if inner_separator:
+            if status not in ("passed", "failed"):
+                raise SystemExit(
+                    "Criterion status must be passed or failed: TEXT[::passed|failed[::EVIDENCE]]"
+                )
+            entry = {"criterion": text.strip(), "status": status}
+            if evidence.strip():
+                entry["evidence"] = evidence.strip()
+            criteria.append(entry)
+            continue
+        # 只有一个分隔符：它是 TEXT::STATUS。
+        if evidence not in ("passed", "failed"):
+            raise SystemExit(
+                "Criterion status must be passed or failed: TEXT[::passed|failed[::EVIDENCE]]"
+            )
+        criteria.append({"criterion": remainder.strip(), "status": evidence})
+    return criteria
+
+
 def parse_test_evidence(values: list[str]) -> list[dict[str, Any]]:
     evidence = []
     for value in values:
@@ -791,7 +825,12 @@ def build_parser() -> argparse.ArgumentParser:
     review.add_argument("--session-id", required=True)
     review.add_argument("--token", required=True)
     review.add_argument("--verdict", choices=["approved", "changes_requested"], required=True)
-    review.add_argument("--criterion", action="append", required=True)
+    review.add_argument(
+        "--criterion",
+        action="append",
+        required=True,
+        help="TEXT[::passed|failed[::EVIDENCE]]；默认 passed，可带证据文本",
+    )
     review.add_argument("--notes", default="")
 
     integration = commands.add_parser(
@@ -1397,7 +1436,7 @@ def main(argv: list[str] | None = None) -> None:
                 "reviewer_session_id": args.session_id,
                 "token": args.token,
                 "verdict": args.verdict,
-                "criteria": [{"criterion": value, "status": "passed"} for value in args.criterion],
+                "criteria": parse_review_criteria(args.criterion),
                 "notes": args.notes,
             },
         )

@@ -1685,6 +1685,15 @@ button.event-id {
   color: var(--red);
 }
 
+.criterion-evidence {
+  display: block;
+  margin-top: 3px;
+  white-space: pre-wrap;
+  word-break: break-word;
+  color: inherit;
+  opacity: 0.85;
+}
+
 .evidence-block {
   margin-top: 10px;
   padding-top: 9px;
