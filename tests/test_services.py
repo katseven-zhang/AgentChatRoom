@@ -842,6 +842,117 @@ def test_task_assignment_can_be_declined_or_blocked(
     assert acknowledged["task"]["execution_status"] == "todo"
 
 
+def test_offline_member_assignment_targets_persistent_identity_and_survives_rejoin(
+    service, project, joined_agents
+):
+    assigner, worker = joined_agents
+    service.leave_session(project["id"], worker["agent"]["id"], worker["token"])
+    task = service.create_task(
+        project["id"],
+        title="Delayed offline assignment",
+        acceptance_criteria=["Done after reconnect"],
+    )["task"]
+    member_id = worker["agent"]["member_id"]
+
+    assigned = service.assign_task(
+        project["id"],
+        task["id"],
+        assigned_to_member_id=member_id,
+        note="Handle this when you are back online",
+    )
+
+    # The delayed assignment resolves the persistent identity to its latest
+    # session and stays pending; it is neither claimed nor in progress.
+    assert assigned["assignment"]["status"] == "pending"
+    assert assigned["assignment"]["assigned_to_session_id"] == worker["agent"]["id"]
+    assert assigned["task"]["owner_session_id"] is None
+    assert assigned["task"]["execution_status"] == "todo"
+
+    # Rejoining the same identity replaces the session and retargets the
+    # pending assignment, so no other identity can acknowledge it.
+    rejoined = service.join_room(
+        project["id"],
+        agent_key="reviewer-main",
+        name="Reviewer",
+        client="qoder",
+        model="test-model",
+        role="reviewer",
+    )
+    assert rejoined["agent"]["id"] != worker["agent"]["id"]
+
+    accepted = service.acknowledge_task_assignment(
+        project["id"],
+        task["id"],
+        assigned["assignment"]["id"],
+        session_id=rejoined["agent"]["id"],
+        token=rejoined["token"],
+        response="accepted",
+    )
+    assert accepted["assignment"]["status"] == "accepted"
+    assert accepted["assignment"]["responded_by_session_id"] == rejoined["agent"]["id"]
+    assert accepted["task"]["owner_session_id"] == rejoined["agent"]["id"]
+    assert accepted["task"]["execution_status"] == "claimed"
+
+
+def test_member_assignment_rejects_revoked_unknown_or_never_joined_targets(
+    service, project, joined_agents
+):
+    _, worker = joined_agents
+    task = service.create_task(
+        project["id"],
+        title="Guarded offline assignment",
+        acceptance_criteria=["Reject invalid targets"],
+    )["task"]
+
+    with pytest.raises(DomainError) as unknown:
+        service.assign_task(
+            project["id"], task["id"], assigned_to_member_id="member_missing"
+        )
+    assert unknown.value.code == "assignment_target_not_found"
+
+    service.update_project_member(
+        project["id"],
+        worker["agent"]["member_id"],
+        status="revoked",
+    )
+    with pytest.raises(DomainError) as revoked:
+        service.assign_task(
+            project["id"], task["id"], assigned_to_member_id=worker["agent"]["member_id"]
+        )
+    assert revoked.value.code == "assignment_target_revoked"
+
+    never_joined = service.create_project_member(
+        project["id"],
+        member_key="software:ghost",
+        name="Ghost",
+    )
+    ghost_member_id = never_joined["member"]["id"]
+    with pytest.raises(DomainError) as no_session:
+        service.assign_task(
+            project["id"], task["id"], assigned_to_member_id=ghost_member_id
+        )
+    assert no_session.value.code == "assignment_target_not_found"
+
+
+def test_assign_task_rejects_session_and_member_targets_together(
+    service, project, joined_agents
+):
+    _, worker = joined_agents
+    task = service.create_task(
+        project["id"],
+        title="Conflicting targets",
+        acceptance_criteria=["Reject ambiguous targets"],
+    )["task"]
+    with pytest.raises(DomainError) as conflict:
+        service.assign_task(
+            project["id"],
+            task["id"],
+            assigned_to_session_id=worker["agent"]["id"],
+            assigned_to_member_id=worker["agent"]["member_id"],
+        )
+    assert conflict.value.code == "invalid_assignment_target"
+
+
 def test_manager_can_assign_without_impersonating_an_agent(
     service, project, joined_agents
 ):

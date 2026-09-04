@@ -274,6 +274,10 @@ room_bootstrap
 
 `room_join` 仍作为兼容入口保留：仅在仓库作用域与 checkout 登记都为空时，第一个 Agent 可以请求创建 Room。正常已登记工作区的新对话只调用 `room_bootstrap`。
 
+### 指定 / 改派 Agent（含离线延迟指派）
+
+任务详情中的「指定 Agent」候选来自本 Project 所有已接入且未吊销的 Agent 身份：当前连接的 Agent 按活动 Session 立即派发；曾接入但暂时离线的 Agent 明确标注「已接入 · 当前离线」，可被指定为延迟指派。延迟指派记录在持久身份上（事件留痕 `assigned_to_member_id` 与目标是否离线），目标 Agent 重新接入、Session 替换后仍由该身份受理，不会转移给其他身份；已吊销、未知或从未接入过的身份会被领域服务明确拒绝。在线 Agent 的既有指派行为保持不变，REST、MCP、Web 复用同一领域服务。
+
 ### 新对话 Room Bootstrap
 
 `room_bootstrap` 是公开、幂等、默认零参数的 MCP 工具；CLI 提供 `room-bootstrap`，REST 公开配置声明同一套状态模型。解析当前 checkout 的固定优先级为：

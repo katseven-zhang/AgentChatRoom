@@ -539,6 +539,7 @@ class TaskAssign(StrictModel):
     assigned_by_session_id: str | None = None
     token: str | None = None
     assigned_to_session_id: str | None = None
+    assigned_to_member_id: str | None = None
     target_role: str = ""
     required_capability: str = ""
     note: str = ""

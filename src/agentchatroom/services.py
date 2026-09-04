@@ -4117,13 +4117,20 @@ class AgentChatRoomService:
         assigned_by_session_id: str | None = None,
         token: str | None = None,
         assigned_to_session_id: str | None = None,
+        assigned_to_member_id: str | None = None,
         target_role: str = "",
         required_capability: str = "",
         note: str = "",
     ) -> dict[str, Any]:
         role = target_role.strip()
         capability = required_capability.strip()
-        if not assigned_to_session_id and not role and not capability:
+        member_target = (assigned_to_member_id or "").strip()
+        if member_target and assigned_to_session_id:
+            raise DomainError(
+                "invalid_assignment_target",
+                "Provide either an Agent session or a persistent member target, not both",
+            )
+        if not assigned_to_session_id and not member_target and not role and not capability:
             raise DomainError(
                 "missing_assignment_target",
                 "An assignment requires an Agent session, role, or capability target",
@@ -4149,6 +4156,46 @@ class AgentChatRoomService:
                     "Completed or cancelled tasks cannot receive a new assignment",
                     status_code=409,
                 )
+            target_offline = False
+            if member_target:
+                member = connection.execute(
+                    "SELECT * FROM project_members WHERE id = ? AND project_id = ?",
+                    (member_target, project_id),
+                ).fetchone()
+                if member is None:
+                    raise DomainError(
+                        "assignment_target_not_found",
+                        "The target Agent identity does not exist in this Project",
+                        status_code=404,
+                    )
+                if member["status"] == "revoked":
+                    raise DomainError(
+                        "assignment_target_revoked",
+                        "Revoked Agent identities cannot receive assignments",
+                        status_code=409,
+                    )
+                latest_session = connection.execute(
+                    """
+                    SELECT * FROM agent_sessions
+                    WHERE project_id = ? AND member_id = ?
+                    ORDER BY created_at DESC, id DESC LIMIT 1
+                    """,
+                    (project_id, member_target),
+                ).fetchone()
+                if latest_session is None:
+                    raise DomainError(
+                        "assignment_target_not_found",
+                        "The Agent identity has never joined this Project, so there is no resolvable delayed target",
+                        status_code=404,
+                    )
+                target_offline = (
+                    self._agent_dict(latest_session)["status"] == "offline"
+                )
+                # A delayed assignment targets the persistent identity but is
+                # stored on its latest session; session replacement on rejoin
+                # retargets pending assignments to the new session, so the
+                # offline Agent can acknowledge it after reconnecting.
+                assigned_to_session_id = str(latest_session["id"])
             if assigned_to_session_id:
                 target = connection.execute(
                     "SELECT id FROM agent_sessions WHERE id = ? AND project_id = ?",
@@ -4217,6 +4264,8 @@ class AgentChatRoomService:
                 payload={
                     "assignment_id": assignment_id,
                     "assigned_to_session_id": assigned_to_session_id,
+                    "assigned_to_member_id": member_target,
+                    "target_offline": target_offline if member_target else None,
                     "target_role": role,
                     "required_capability": capability,
                     "note": note.strip(),

@@ -1124,12 +1124,13 @@ def task_assign(
     assigned_by_session_id: str = "",
     token: str = "",
     assigned_to_session_id: str = "",
+    assigned_to_member_id: str = "",
     target_role: str = "",
     required_capability: str = "",
     note: str = "",
     request_id: str = "",
 ) -> dict[str, Any]:
-    """Assign a task to a specific Agent or to a role/capability target."""
+    """Assign a task to a specific Agent (online session or persistent offline identity) or to a role/capability target."""
     try:
         _authorize_remote(project_id, "task:write")
     except DomainError as error:
@@ -1141,6 +1142,7 @@ def task_assign(
         assigned_by_session_id=assigned_by_session_id,
         token=token,
         assigned_to_session_id=assigned_to_session_id or None,
+        assigned_to_member_id=assigned_to_member_id or None,
         target_role=target_role,
         required_capability=required_capability,
         note=note,

@@ -2142,17 +2142,22 @@ elements["task-assign-form"].addEventListener("submit", async (event) => {
   event.preventDefault();
   const task = state.snapshot?.tasks.find((item) => item.id === state.editingTaskId);
   if (!task || !state.projectId) return;
-  const assignedTo = elements["task-assign-agent"].value;
-  if (!assignedTo) {
+  const selected = elements["task-assign-agent"].value.split(":");
+  const targetKind = selected[0];
+  const targetValue = selected.slice(1).join(":");
+  if (!targetValue) {
     showToast("请选择目标 Agent", "error");
     return;
   }
+  const targetFields = targetKind === "member"
+    ? { assigned_to_member_id: targetValue }
+    : { assigned_to_session_id: targetValue };
   elements["task-assign-submit"].disabled = true;
   try {
     await api(`/api/v1/projects/${state.projectId}/tasks/${task.id}/assignments`, {
       method: "POST",
       body: JSON.stringify({
-        assigned_to_session_id: assignedTo,
+        ...targetFields,
         target_role: "",
         required_capability: "",
         note: elements["task-assign-note"].value.trim(),
@@ -2246,6 +2251,12 @@ function sessionName(sessionId) {
   return session?.name || shortId(sessionId);
 }
 
+function assignmentTargetOffline(assignment) {
+  if (assignment.status !== "pending" || !assignment.assigned_to_session_id) return false;
+  const session = (state.snapshot?.agents || []).find((agent) => agent.id === assignment.assigned_to_session_id);
+  return Boolean(session && session.status === "offline");
+}
+
 function renderTaskAssignments(task) {
   const assignments = task.assignments || [];
   elements["task-assignment-list"].innerHTML = assignments.length
@@ -2255,10 +2266,14 @@ function renderTaskAssignments(task) {
         : assignment.target_role
           ? `角色 ${assignment.target_role}`
           : `能力 ${assignment.required_capability}`;
+      const delayedNotice = assignmentTargetOffline(assignment)
+        ? `<p class="secondary-text">目标 Agent 当前离线；重新接入后可受理该指派。</p>`
+        : "";
       return `<article class="management-item">
         <div>
           <h4>${escapeHtml(target)} <span class="status-badge ${escapeHtml(assignment.status)}">${escapeHtml(assignmentStatus(assignment.status))}</span></h4>
           <p>${escapeHtml(assignment.note || "无附加说明")}${assignment.response_note ? ` · 回复：${escapeHtml(assignment.response_note)}` : ""}</p>
+          ${delayedNotice}
         </div>
         <span class="secondary-text">${escapeHtml(formatTime(assignment.created_at))}</span>
       </article>`;
@@ -2491,12 +2506,20 @@ async function openTaskAssignmentDialog() {
   const task = state.snapshot?.tasks.find((item) => item.id === state.editingTaskId);
   if (!task || !state.projectId) return;
   await refreshTaskIntakeTargets();
-  const options = state.taskIntakeTargets
-    .flatMap((target) => (target.active_session_ids || []).map((sessionId) => `<option value="${escapeHtml(sessionId)}">${escapeHtml(target.name)} · ${escapeHtml(target.client || target.software_key || "Agent")} · 已连接</option>`));
+  // 候选来自持久化的非吊销成员：在线成员用当前 Session 立即派发，
+  // 离线成员用持久身份登记延迟指派，重新接入后可受理。
+  const options = state.taskIntakeTargets.map((target) => {
+    const liveSession = (target.active_session_ids || [])[0];
+    const connection = liveSession ? "已连接" : "已接入 · 当前离线";
+    const value = liveSession ? `session:${liveSession}` : `member:${target.member_id}`;
+    return `<option value="${escapeHtml(value)}">${escapeHtml(target.name)} · ${escapeHtml(target.client || target.software_key || "Agent")} · ${connection}</option>`;
+  });
   elements["task-assign-title"].textContent = `指定/改派：任务 #${task.task_number}`;
-  elements["task-assign-agent"].innerHTML = options.length ? '<option value="">请选择目标 Agent</option>' + options.join("") : '<option value="">暂无在线 Agent</option>';
+  elements["task-assign-agent"].innerHTML = options.length ? '<option value="">请选择目标 Agent</option>' + options.join("") : '<option value="">暂无已接入的 Agent</option>';
   elements["task-assign-agent"].disabled = !options.length;
-  elements["task-assign-agent-empty"].textContent = options.length ? "正式任务派发需要目标 Agent 当前在线并持有活动 Session。" : "当前没有在线 Agent；离线 Agent 可在新建任务时作为受理 Agent。";
+  elements["task-assign-agent-empty"].textContent = options.length
+    ? "在线 Agent 立即派发；标注「已接入 · 当前离线」的 Agent 会在重新接入后受理该指派。"
+    : "当前没有已接入且未吊销的 Agent。";
   elements["task-assign-submit"].disabled = !options.length;
   elements["task-assign-note"].value = "";
   elements["task-assign-dialog"].showModal();

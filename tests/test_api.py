@@ -695,6 +695,74 @@ def test_api_can_assign_and_acknowledge_task(settings, project_dir):
         assert acknowledged.json()["task"]["execution_status"] == "claimed"
 
 
+def test_api_can_assign_an_offline_member_identity(settings, project_dir):
+    with TestClient(create_app(settings)) as client:
+        project = client.post(
+            "/api/v1/projects",
+            json={"root_path": str(project_dir), "name": "Offline Assign Project"},
+        ).json()
+        worker = client.post(
+            f"/api/v1/projects/{project['id']}/agents/join",
+            json={
+                "agent_key": "offline-worker-main",
+                "name": "Offline Worker",
+                "client": "trae",
+                "model": "test-model",
+                "role": "executor",
+            },
+        ).json()
+        # The target goes offline before the assignment is created.
+        client.post(
+            f"/api/v1/projects/{project['id']}/agents/{worker['agent']['id']}/leave",
+            json={"token": worker["token"]},
+        )
+        targets = client.get(
+            f"/api/v1/projects/{project['id']}/task-intakes/targets"
+        ).json()["targets"]
+        target = next(item for item in targets if item["member_id"] == worker["agent"]["member_id"])
+        assert target["connection_status"] == "disconnected"
+
+        task = client.post(
+            f"/api/v1/projects/{project['id']}/tasks",
+            json={
+                "title": "Queue work for offline Agent",
+                "acceptance_criteria": ["Picked up after reconnect"],
+            },
+        ).json()["task"]
+        assigned = client.post(
+            f"/api/v1/projects/{project['id']}/tasks/{task['id']}/assignments",
+            json={
+                "assigned_to_member_id": worker["agent"]["member_id"],
+                "note": "Delayed assignment",
+            },
+        )
+        assert assigned.status_code == 201
+        assignment = assigned.json()["assignment"]
+        assert assignment["status"] == "pending"
+
+        rejoined = client.post(
+            f"/api/v1/projects/{project['id']}/agents/join",
+            json={
+                "agent_key": "offline-worker-main",
+                "name": "Offline Worker",
+                "client": "trae",
+                "model": "test-model",
+                "role": "executor",
+            },
+        ).json()
+        acknowledged = client.post(
+            f"/api/v1/projects/{project['id']}/tasks/{task['id']}/assignments/"
+            f"{assignment['id']}/acknowledge",
+            json={
+                "session_id": rejoined["agent"]["id"],
+                "token": rejoined["token"],
+                "response": "accepted",
+            },
+        )
+        assert acknowledged.status_code == 200
+        assert acknowledged.json()["assignment"]["status"] == "accepted"
+
+
 def test_api_handoff_review_and_integration_are_explicit(settings, project_dir):
     with TestClient(create_app(settings)) as client:
         project = client.post(
