@@ -347,7 +347,9 @@ def bootstrap_local_room(
             project["id"],
             session_id=joined["agent"]["id"],
             token=joined["token"],
-            after=int(joined.get("cursor") or 0),
+            after=0,
+            mcp_context=True,
+            initial_inject=True,
         )
     except DomainError as error:
         if error.code in {"session_token_expired", "session_closed", "invalid_session_token"}:
@@ -383,6 +385,8 @@ def bootstrap_local_room(
     public["cursor"] = cursor
     public["snapshot"] = compact_room_snapshot(synced.get("snapshot") or {}, cursor=cursor)
     public["unread_count"] = synced.get("unread_count")
+    public["messages"] = synced.get("messages", [])
+    public["events"] = synced.get("events", [])
     public = redact_runtime_value(public)
     if contains_secret(public, token):
         raise DomainError(

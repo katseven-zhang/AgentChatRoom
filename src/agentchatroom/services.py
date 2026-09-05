@@ -37,6 +37,7 @@ from .contracts import (
     KNOWLEDGE_SOURCE_TYPES,
     LEGACY_TASK_STATUSES,
     LEGACY_TASK_TRANSITIONS,
+    MCP_CONTEXT_EVENT_TYPES,
     MODEL_DISPLAY_NAME_MAX_LENGTH,
     PROJECT_MEMBER_SCHEMA_VERSION,
     PROJECT_MEMBER_STATUSES,
@@ -94,6 +95,8 @@ PROJECT_SETTINGS_DEFAULTS: dict[str, Any] = {
     "extensions": {},
     "default_task_priority": 2,
     "audit_retention_days": 0,
+    "mcp_message_limit": 5,
+    "mcp_message_context_limit": 5,
 }
 SOFTWARE_MEMBER_PREFIX = "software:"
 REQUEST_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
@@ -359,12 +362,29 @@ def normalize_project_settings(settings: dict[str, Any] | None) -> dict[str, Any
     extensions = values.get("extensions", PROJECT_SETTINGS_DEFAULTS["extensions"])
     if not isinstance(extensions, dict):
         raise DomainError("invalid_project_settings", "extensions must be an object")
+    if "mcp_message_limit" in values:
+        mcp_limit = values["mcp_message_limit"]
+    elif "mcp_message_context_limit" in values:
+        mcp_limit = values["mcp_message_context_limit"]
+    else:
+        mcp_limit = PROJECT_SETTINGS_DEFAULTS["mcp_message_limit"]
+    if (
+        not isinstance(mcp_limit, int)
+        or isinstance(mcp_limit, bool)
+        or not 1 <= mcp_limit <= 10
+    ):
+        raise DomainError(
+            "invalid_project_settings",
+            "mcp_message_limit must be an integer between 1 and 10",
+        )
     return {
         "lease_conflict_policy": policy,
         "roles": list(dict.fromkeys(role.strip() for role in roles)),
         "extensions": extensions,
         "default_task_priority": default_priority,
         "audit_retention_days": retention,
+        "mcp_message_limit": mcp_limit,
+        "mcp_message_context_limit": mcp_limit,
     }
 
 
@@ -2768,6 +2788,87 @@ class AgentChatRoomService:
         ).fetchone()["cursor"]
         return {"events": events, "cursor": cursor, "latest_cursor": latest}
 
+    def get_project_mcp_message_limit(
+        self, project_id: str, *, connection: Any | None = None
+    ) -> int:
+        def _resolve(conn: Any) -> int:
+            project = self._require_project(conn, project_id)
+            raw = json_load(project["settings_json"], {})
+            if "mcp_message_limit" in raw and raw["mcp_message_limit"] is not None:
+                val = raw["mcp_message_limit"]
+                if isinstance(val, int) and not isinstance(val, bool) and 1 <= val <= 10:
+                    return val
+            if "mcp_message_context_limit" in raw and raw["mcp_message_context_limit"] is not None:
+                val = raw["mcp_message_context_limit"]
+                if isinstance(val, int) and not isinstance(val, bool) and 1 <= val <= 10:
+                    return val
+            env_val = os.environ.get("AGENTCHATROOM_MCP_MESSAGE_LIMIT", "").strip()
+            if env_val.isdigit():
+                parsed = int(env_val)
+                if 1 <= parsed <= 10:
+                    return parsed
+            return getattr(self.settings, "mcp_message_limit", 5)
+
+        if connection is not None:
+            return _resolve(connection)
+        with self.database.connect() as conn:
+            return _resolve(conn)
+
+    def _list_mcp_messages(
+        self,
+        connection: Any,
+        project_id: str,
+        *,
+        after: int = 0,
+        limit: int = 5,
+        session_id: str | None = None,
+        initial_inject: bool = False,
+    ) -> dict[str, Any]:
+        limit = max(1, min(int(limit), 10))
+        effective_after = after
+        if not initial_inject and effective_after <= 0 and session_id:
+            session_row = connection.execute(
+                "SELECT last_read_cursor FROM agent_sessions WHERE id = ? AND project_id = ?",
+                (session_id, project_id),
+            ).fetchone()
+            if session_row and session_row["last_read_cursor"]:
+                effective_after = int(session_row["last_read_cursor"])
+
+        placeholders = ", ".join("?" for _ in MCP_CONTEXT_EVENT_TYPES)
+        if effective_after > 0:
+            query = f"""
+                SELECT * FROM events
+                WHERE project_id = ?
+                  AND event_type IN ({placeholders})
+                  AND id > ?
+                ORDER BY id DESC
+                LIMIT ?
+            """
+            params = (project_id, *MCP_CONTEXT_EVENT_TYPES, effective_after, limit)
+        else:
+            query = f"""
+                SELECT * FROM events
+                WHERE project_id = ?
+                  AND event_type IN ({placeholders})
+                ORDER BY id DESC
+                LIMIT ?
+            """
+            params = (project_id, *MCP_CONTEXT_EVENT_TYPES, limit)
+
+        rows = connection.execute(query, params).fetchall()
+        events = [self._event_dict(row, connection) for row in reversed(rows)]
+        latest = connection.execute(
+            "SELECT COALESCE(MAX(id), 0) AS cursor FROM events WHERE project_id = ?",
+            (project_id,),
+        ).fetchone()["cursor"]
+        cursor = latest if (initial_inject or effective_after <= 0) else max(after, latest)
+        return {
+            "events": events,
+            "messages": events,
+            "cursor": cursor,
+            "latest_cursor": latest,
+        }
+
     def verify_session(
         self, project_id: str, session_id: str, token: str
     ) -> dict[str, Any]:
@@ -3148,6 +3249,8 @@ class AgentChatRoomService:
         after: int = 0,
         session_id: str | None = None,
         token: str | None = None,
+        mcp_context: bool = False,
+        initial_inject: bool = False,
     ) -> dict[str, Any]:
         if bool(session_id) != bool(token):
             raise DomainError(
@@ -3158,12 +3261,25 @@ class AgentChatRoomService:
         if session_id:
             self.heartbeat(project_id, session_id, token or "")
         with self.database.connect() as connection:
-            self._require_project(connection, project_id)
+            project = self._require_project(connection, project_id)
             if session_id:
                 self._authenticate(connection, project_id, session_id, token or "")
-            event_result = self._list_events(
-                connection, project_id, after=after
-            )
+            if mcp_context:
+                limit = self.get_project_mcp_message_limit(
+                    project_id, connection=connection
+                )
+                event_result = self._list_mcp_messages(
+                    connection,
+                    project_id,
+                    after=after,
+                    limit=limit,
+                    session_id=session_id,
+                    initial_inject=initial_inject,
+                )
+            else:
+                event_result = self._list_events(
+                    connection, project_id, after=after
+                )
             snapshot = self._snapshot(connection, project_id)
             unread_count = None
             if session_id:

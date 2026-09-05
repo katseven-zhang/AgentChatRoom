@@ -511,6 +511,20 @@
             <option value="4">P4 · 最低</option>
           </select>
           <small class="form-hint">生效时机：保存后立即生效 · 对谁生效：本项目后续创建且未显式指定优先级的任务（Web/MCP/CLI 一致）</small></label>
+        <label>MCP 消息上下文条数
+          <select id="settings-mcp-message-limit" title="新会话 room_bootstrap 与 room_sync 注入的最近有效 Agent 消息数量（1-10 条，默认 5 条）。仅包含普通消息、决策与阻塞，排除加入、离开、任务、租约等系统事件。">
+            <option value="1">1 条</option>
+            <option value="2">2 条</option>
+            <option value="3">3 条</option>
+            <option value="4">4 条</option>
+            <option value="5">5 条（默认）</option>
+            <option value="6">6 条</option>
+            <option value="7">7 条</option>
+            <option value="8">8 条</option>
+            <option value="9">9 条</option>
+            <option value="10">10 条</option>
+          </select>
+          <small class="form-hint">生效时机：保存后立即生效 · 对谁生效：本项目新会话 room_bootstrap 与后续 room_sync 的 MCP 消息注入</small></label>
         <label>团队约定（仅记录，无控制作用） <textarea id="settings-roles" rows="4" title="每行一个角色名称，自动去重去空。这是团队协作约定清单：不限制 Agent 能做什么，权限由成员权限与项目成员管理决定。" placeholder="每行一个角色名称"></textarea>
           <small class="form-hint">仅是可读的协作约定记录，不控制任何权限 · 生效时机：保存后立即对 Room 内所有成员可见</small></label>
         <label>审计历史保留策略

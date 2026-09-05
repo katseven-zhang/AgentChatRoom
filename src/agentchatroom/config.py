@@ -52,6 +52,8 @@ CONFIG_FILE_SCHEMA: dict[str, dict[str, tuple[type, ...]]] = {
         "audit_window_size": (int,),
         "token_touch_interval_seconds": (int, float),
         "token_touch_min_calls": (int,),
+        "mcp_message_limit": (int,),
+        "mcp_message_context_limit": (int,),
     },
     "security": {
         "agent_token_ttl_seconds": (int,),
@@ -180,6 +182,11 @@ class Settings:
     knowledge_require_verified_task: bool = True
     product_name: str = "AgentChatRoom"
     default_theme: str = "system"
+    mcp_message_limit: int = 5
+
+    @property
+    def mcp_message_context_limit(self) -> int:
+        return self.mcp_message_limit
 
     @property
     def database_path(self) -> Path:
@@ -291,6 +298,11 @@ def _merge_toml(path: Path) -> dict[str, Any]:
         ),
         "token_touch_min_calls": raw.get("coordination", {}).get(
             "token_touch_min_calls"
+        ),
+        "mcp_message_limit": (
+            raw.get("coordination", {}).get("mcp_message_limit")
+            if raw.get("coordination", {}).get("mcp_message_limit") is not None
+            else raw.get("coordination", {}).get("mcp_message_context_limit")
         ),
         "auto_backup_enabled": raw.get("backup", {}).get("auto_backup_enabled"),
         "auto_backup_interval_seconds": raw.get("backup", {}).get(
@@ -566,6 +578,15 @@ def load_settings(
         "default_theme": os.getenv(
             "AGENTCHATROOM_DEFAULT_THEME", file_values.get("default_theme", "system")
         ),
+        "mcp_message_limit": int(
+            os.getenv(
+                "AGENTCHATROOM_MCP_MESSAGE_LIMIT",
+                os.getenv(
+                    "AGENTCHATROOM_MCP_MESSAGE_CONTEXT_LIMIT",
+                    file_values.get("mcp_message_limit", 5),
+                ),
+            )
+        ),
     }
     if not 1 <= values["port"] <= 65535:
         raise ValueError("port must be between 1 and 65535")
@@ -693,4 +714,6 @@ def load_settings(
         raise ValueError("product name must not be empty")
     if values["default_theme"] not in {"system", "light", "dark"}:
         raise ValueError("default theme must be system, light, or dark")
+    if not 1 <= values["mcp_message_limit"] <= 10:
+        raise ValueError("mcp_message_limit must be between 1 and 10")
     return Settings(**values)

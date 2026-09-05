@@ -342,6 +342,19 @@ room_bootstrap
 
 Web「配置本机 Agent」把四件事实分开显示：软件配置、进程连接（MCP Presence）、Room Session、当前对话同步。浏览器无法观察某个模型对话是否已同步，因此不会把左侧「已连接」画成「当前对话已同步」。CLI `room-bootstrap` 复用同一领域服务，成功结果也不打印 Session Token。
 
+### MCP 消息注入限制与有效性过滤
+
+为避免新对话或增量同步时向 Agent 上下文灌入海量系统审计事件（如加入/离开 Room、Session 替换、任务分配/状态变更、文件租约冲突等），`room_bootstrap` 与 MCP `room_sync` 的消息投影仅注入最近有效的 Agent 消息：
+
+- **有效消息类型**：仅包含 `message.message`（普通消息）、`message.decision`（决策）与 `message.blocker`（阻塞）；自动过滤 `agent.joined`、`agent.left`、`agent.session_replaced`、任务/租约/Presence/审计事件以及 `message.system`。
+- **条数限制**：注入条数严格限制在 1–10 条，默认 5 条；按最新时间倒序截取、正序返回，且自动推进已读游标。省略 `after` 参数或重复同步不会重推完整历史。
+- **配置与优先级**：
+  1. 项目设置：`project.settings.mcp_message_limit`（Web「项目设置」提供 1–10 下拉选择）；
+  2. 环境变量：`AGENTCHATROOM_MCP_MESSAGE_LIMIT`；
+  3. 配置文件：`config.toml` 中的 `[coordination].mcp_message_limit`；
+  4. 默认值：`5`。
+- **审计完整性保护**：该限制仅作用于 MCP Agent 上下文投影。底层的 append-only 事件历史、REST/Web 审计查询（`audit_query` / `/api/v1/projects/{id}/audit`）与任务时间线（`task_history`）始终完整记录所有事件，不被裁剪或改写。
+
 ### Web 任务状态投影（方案 D v1）
 
 后端使用执行 / 验证 / 集成三面状态机（append-only，不因展示改动）；REST、MCP、CLI、持久化和 Web 共用 contracts.py 的版本化投影 `state_view`（`TASK_VIEW_PROJECTION` / `task_view_contract()`，schema version 2；公开 Schema 版本升到 `7`）。投影是确定性纯函数：输入仅 `(execution_status, verification_status, integration_status)`，输出 `phase`（唯一）、`group`、`needs_attention`、`primary_badge`、`auxiliary_badges`。核心只输出稳定语义代码，中文文案、分组与计数口径由 REST `/api/v1/config/public` 的 `domain.task_view` 版本化配置提供，四端按同一 schema version 消费；任何非法三元组或历史残留组合显式投影为 `unclassified` 并在服务端告警，不会被宽泛优先级伪装成正常阶段。`legacy_status` 仅作为只读兼容输出，新筛选与展示不得依赖它。
@@ -446,6 +459,7 @@ Agent 自报的 `worktree` 不会被服务盲目信任。Work Report 采集 Git 
 | 项目名称 | Room 显示名 | 保存后立即 | Room 内所有页面与导出数据 |
 | 租约冲突策略 | 提示并记录（advisory）/ 提交前阻断（pre_commit_block） | 保存后立即 | 本项目的文件租约提交前检查（申请租约时的冲突始终拒绝，与本设置无关） |
 | 默认任务优先级 | 0–4；任务创建未显式指定优先级时采用（Web/MCP/CLI 一致） | 保存后立即 | 本项目后续新建任务 |
+| MCP 消息注入条数 | 1–10（默认 5）；控制 MCP `room_bootstrap` 与后续 `room_sync` 初始上下文注入的最近有效 Agent 消息条数 | 保存后下一次 MCP 消息同步生效 | 本项目的 MCP Agent 对话上下文注入（仅过滤展示普通消息/决策/阻塞，审计与事件全量保留） |
 | 团队约定 | 自由记录的协作约定清单（自动去重去空），**无控制作用** | 保存后立即对 Room 内所有成员可见 | 仅作可读记录；权限由成员权限与项目成员管理决定 |
 | 审计历史保留策略 | 永久保留（默认）/ 保留 30 天 / 保留 90 天 | 保存后立即清理一次；此后随审计读取每小时至多清理一次 | 本项目的审计历史；清理只按时间整条删除到期事件，绝不改写或重排保留事件，清理动作本身写审计（`audit.purged`）；删除不可恢复 |
 | 自动备份开关 / 备份保留份数 | 直接读写备份能力引入的 `[backup]` 配置（`GET/PUT /api/v1/admin/backup-settings`），无第二套配置 | 保存即写入配置文件 `[backup]`；自动备份调度在服务重启后的下一个周期按新配置执行 | 整个数据库的自动备份调度（全局，所有项目共用） |

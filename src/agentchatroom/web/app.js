@@ -68,7 +68,7 @@ const elements = Object.fromEntries(
     "task-release-reason", "task-release-reason-text", "task-release-submit",
     "task-assign-title", "task-assign-agent", "task-assign-agent-empty", "task-assign-note", "task-assign-submit",
     "settings-dialog", "settings-form", "settings-project-name", "settings-lease-policy", "settings-roles",
-    "settings-default-priority", "settings-audit-retention", "settings-auto-backup", "settings-backup-max-kept", "settings-backup-hint",
+    "settings-default-priority", "settings-mcp-message-limit", "settings-audit-retention", "settings-auto-backup", "settings-backup-max-kept", "settings-backup-hint",
     "archive-dialog", "archive-form", "archive-project-name", "permanent-delete-input",
     "remove-project-hint", "remove-project-submit",
     "integration-dialog", "integration-data-dir", "integration-log-path",
@@ -1949,6 +1949,9 @@ document.getElementById("project-settings-button").addEventListener("click", () 
   elements["settings-default-priority"].value = String(
     project.settings.default_task_priority ?? 2,
   );
+  elements["settings-mcp-message-limit"].value = String(
+    project.settings.mcp_message_limit ?? 5,
+  );
   elements["settings-audit-retention"].value = String(
     project.settings.audit_retention_days ?? 0,
   );
@@ -2384,6 +2387,7 @@ elements["settings-form"].addEventListener("submit", async (event) => {
           roles: elements["settings-roles"].value.split("\n").map((item) => item.trim()).filter(Boolean),
           extensions: state.snapshot.project.settings.extensions || {},
           default_task_priority: Number(elements["settings-default-priority"].value),
+          mcp_message_limit: Number(elements["settings-mcp-message-limit"].value),
           audit_retention_days: Number(elements["settings-audit-retention"].value),
         },
       }),

@@ -565,6 +565,7 @@ def room_sync(
         after=after,
         session_id=session_id,
         token=token,
+        mcp_context=True,
     )
     if result.get("ok"):
         _ensure_local_presence(project_id, session_id, token)

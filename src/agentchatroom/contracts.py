@@ -9,6 +9,7 @@ DOMAIN_SCHEMA_VERSION = 7
 PROJECT_MEMBER_SCHEMA_VERSION = 1
 KNOWLEDGE_SCHEMA_VERSION = 1
 MODEL_DISPLAY_NAME_MAX_LENGTH = 160
+MCP_CONTEXT_EVENT_TYPES = ("message.message", "message.decision", "message.blocker")
 
 PROJECT_MEMBER_STATUSES = {"invited", "active", "suspended", "revoked"}
 

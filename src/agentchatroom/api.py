@@ -470,6 +470,7 @@ class RoomSync(StrictModel):
     session_id: str | None = None
     token: str | None = None
     after: int = Field(default=0, ge=0)
+    mcp_context: bool = False
 
 
 class MessageCreate(StrictModel):
