@@ -2734,14 +2734,32 @@ class AgentChatRoomService:
         project_id: str,
         *,
         after: int = 0,
+        before: int = 0,
         limit: int = 200,
         event_type: str | None = None,
         actor_session_id: str | None = None,
         task_id: str | None = None,
     ) -> dict[str, Any]:
+        """Page through the append-only audit log in either direction.
+
+        ``after``/``before`` bound an exclusive ``(after, before)`` id window;
+        ``before=0`` keeps the historical forward-only behavior (ascending from
+        ``after``). With ``before`` set, the window returns the ``limit``
+        events closest below ``before`` in ascending order, so clients can
+        load earlier pages without losing their position. ``has_older`` and
+        ``has_newer`` report continuation under the same filters.
+        """
         limit = max(1, min(limit, 1000))
-        clauses = ["project_id = ?", "id > ?"]
-        parameters: list[Any] = [project_id, after]
+        after = max(0, int(after or 0))
+        before = max(0, int(before or 0))
+        if after and before and after >= before:
+            raise DomainError(
+                "conflicting_audit_window",
+                "after must be below before when both bounds are provided",
+                status_code=422,
+            )
+        clauses = ["project_id = ?"]
+        parameters: list[Any] = [project_id]
         if event_type:
             clauses.append("event_type = ?")
             parameters.append(event_type)
@@ -2751,24 +2769,59 @@ class AgentChatRoomService:
         if task_id:
             clauses.append("task_id = ?")
             parameters.append(task_id)
-        parameters.append(limit)
+        base_where = " AND ".join(clauses)
+        forward_where = f"{base_where} AND id > ?"
+        backward_where = f"{base_where} AND id > ? AND id < ?"
         with self.database.connect() as connection:
             self._require_project(connection, project_id)
-            rows = connection.execute(
-                f"""
-                SELECT * FROM events
-                WHERE {' AND '.join(clauses)}
-                ORDER BY id ASC LIMIT ?
-                """,
-                parameters,
-            ).fetchall()
+            if before:
+                rows = connection.execute(
+                    f"""
+                    SELECT * FROM events
+                    WHERE {backward_where}
+                    ORDER BY id DESC LIMIT ?
+                    """,
+                    [*parameters, after, before, limit],
+                ).fetchall()
+                rows = list(reversed(rows))
+                older_where, older_params = backward_where, [*parameters, after, before]
+            else:
+                rows = connection.execute(
+                    f"""
+                    SELECT * FROM events
+                    WHERE {forward_where}
+                    ORDER BY id ASC LIMIT ?
+                    """,
+                    [*parameters, after, limit],
+                ).fetchall()
+                older_where, older_params = forward_where, [*parameters, after]
             events = [self._event_dict(row, connection) for row in rows]
             cursor = events[-1]["id"] if events else after
+            first_id = events[0]["id"] if events else None
+            has_newer = False
+            has_older = False
+            if events:
+                has_newer = (
+                    connection.execute(
+                        f"SELECT 1 FROM events WHERE {base_where} AND id > ? LIMIT 1",
+                        [*parameters, cursor],
+                    ).fetchone()
+                    is not None
+                )
+                has_older = (
+                    connection.execute(
+                        f"SELECT 1 FROM events WHERE {older_where} AND id < ? LIMIT 1",
+                        [*older_params, first_id],
+                    ).fetchone()
+                    is not None
+                )
             latest = self.latest_cursor(connection, project_id)
             return {
                 "events": events,
                 "cursor": cursor,
                 "latest_cursor": latest,
+                "has_older": has_older,
+                "has_newer": has_newer,
                 "filters": {
                     "event_type": event_type,
                     "actor_session_id": actor_session_id,

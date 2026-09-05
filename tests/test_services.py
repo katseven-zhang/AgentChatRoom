@@ -3267,3 +3267,45 @@ def test_reassignment_supersedes_stale_pending_assignment_atomically(
     )
     assert accepted["assignment"]["status"] == "accepted"
     assert accepted["task"]["owner_session_id"] == second_target["agent"]["id"]
+
+
+def test_query_audit_supports_backward_paging_with_filters(service, project):
+    for number in range(6):
+        service.post_message(project["id"], body=f"audit paging {number}")
+
+    latest = service.query_audit(project["id"], limit=1)["latest_cursor"]
+    forward = service.query_audit(project["id"], limit=2)
+    assert forward["has_newer"] is True
+    assert forward["has_older"] is False
+    assert len(forward["events"]) == 2
+
+    tail = service.query_audit(project["id"], before=latest + 1, limit=3)
+    assert [event["id"] for event in tail["events"]] == sorted(
+        event["id"] for event in tail["events"]
+    )
+    assert tail["events"][-1]["id"] == latest
+    assert tail["has_newer"] is False
+    assert tail["has_older"] is True
+
+    earlier = service.query_audit(
+        project["id"], before=tail["events"][0]["id"], limit=3
+    )
+    assert earlier["events"] and earlier["events"][-1]["id"] < tail["events"][0]["id"]
+    assert earlier["has_newer"] is True
+
+    window = service.query_audit(
+        project["id"], after=earlier["events"][-1]["id"], before=latest + 1, limit=100
+    )
+    merged = [event["id"] for event in window["events"]]
+    assert merged == sorted(set(merged))
+    assert window["events"][0]["id"] == earlier["events"][-1]["id"] + 1
+
+    with pytest.raises(DomainError) as conflicted:
+        service.query_audit(project["id"], after=5, before=5)
+    assert conflicted.value.code == "conflicting_audit_window"
+
+    typed = service.query_audit(
+        project["id"], before=latest + 1, limit=10, event_type="message.message"
+    )
+    assert typed["events"]
+    assert all(event["event_type"] == "message.message" for event in typed["events"])

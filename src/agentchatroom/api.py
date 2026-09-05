@@ -1415,6 +1415,7 @@ def create_app(
     def query_audit(
         project_id: str,
         after: int = Query(0, ge=0),
+        before: int = Query(0, ge=0),
         limit: int = Query(200, ge=1, le=1000),
         event_type: str | None = None,
         actor_session_id: str | None = None,
@@ -1423,6 +1424,7 @@ def create_app(
         return service.query_audit(
             project_id,
             after=after,
+            before=before,
             limit=limit,
             event_type=event_type,
             actor_session_id=actor_session_id,

@@ -27,11 +27,13 @@ const state = {
   taskIntakeTargets: [],
   taskIntakes: [],
   editingTaskId: null,
-  editingMemberId: null,
   members: [],
   credentials: [],
   workspaces: [],
   auditEvents: [],
+  auditHasOlder: false,
+  auditHasNewer: false,
+  auditFilter: "",
   runtime: null,
   expandedEvents: new Set(),
   collapsedGroups: new Set(),
@@ -72,16 +74,12 @@ const elements = Object.fromEntries(
     "integration-local-path", "integration-local-message", "integration-local-changes",
     "integration-local-reload", "integration-local-facts", "integration-local-backup",
     "integration-local-refresh", "integration-local-apply",
-    "create-member-button", "member-list", "refresh-audit-button", "audit-event-filter",
-    "create-token-button", "register-workspace-button", "token-list", "workspace-list", "audit-list",
+    "member-list", "refresh-audit-button", "audit-event-filter",
+    "create-token-button", "token-list", "workspace-list", "audit-list",
     "refresh-runtime-button", "runtime-status", "runtime-config", "runtime-config-raw", "runtime-log",
     "login-dialog", "login-form", "login-token", "login-error",
-    "member-dialog", "member-form", "member-dialog-title", "member-id", "member-key", "member-name",
-    "member-kind", "member-role", "member-status", "member-metadata", "member-submit",
     "token-dialog", "token-form", "token-name", "token-member", "token-days", "token-permissions",
     "token-secret-dialog", "token-secret-value", "token-secret-close",
-    "workspace-dialog", "workspace-form", "workspace-host-name", "workspace-host-key",
-    "workspace-local-path", "workspace-branch", "workspace-worktree", "workspace-git-remote",
   ].map((id) => [id, document.getElementById(id)])
 );
 
@@ -691,7 +689,6 @@ function clearDialogDrafts(dialog) {
   // 嵌套弹窗（如指定 Agent）关闭时不能清掉外层任务详情仍需要的编辑上下文。
   if (["login-dialog", "token-secret-dialog"].includes(dialog.id)) return;
   if (dialog.id === "task-edit-dialog") state.editingTaskId = null;
-  if (dialog.id === "member-dialog") state.editingMemberId = null;
 }
 
 function refreshSnapshot(projectId) {
@@ -765,7 +762,6 @@ async function loadProjects(preferredId) {
 }
 
 const EVENT_WINDOW_SIZE = 500;
-const AUDIT_WINDOW_SIZE = 100;
 
 async function loadEventWindow(buildPage, windowSize, { tailJump = true, maxPages = 40 } = {}) {
   let after = 0;
@@ -789,13 +785,58 @@ async function loadRecentEvents(projectId) {
   );
 }
 
-async function loadRecentAuditEvents(projectId, eventType) {
+function auditPageSize() {
+  const configured = Number(state.runtime?.settings?.audit_window_size);
+  return Number.isFinite(configured) && configured > 0 ? configured : 100;
+}
+
+function auditQueryUrl(projectId, { after = 0, before = 0, eventType = "" } = {}) {
   const filter = eventType ? `&event_type=${encodeURIComponent(eventType)}` : "";
-  return loadEventWindow(
-    (after, limit) => `/api/v1/projects/${projectId}/audit?after=${after}&limit=${limit}${filter}`,
-    AUDIT_WINDOW_SIZE,
-    { tailJump: !eventType },
-  );
+  return `/api/v1/projects/${projectId}/audit?after=${after}&before=${before}&limit=${auditPageSize()}${filter}`;
+}
+
+async function fetchAuditTail(projectId, eventType) {
+  const filter = eventType ? `&event_type=${encodeURIComponent(eventType)}` : "";
+  const probe = await api(`/api/v1/projects/${projectId}/audit?after=0&limit=1${filter}`);
+  return api(auditQueryUrl(projectId, { before: (probe.latest_cursor || 0) + 1, eventType }));
+}
+
+function mergeAuditEvents(existing, incoming) {
+  const seen = new Set(existing.map((event) => event.id));
+  return [...existing, ...incoming.filter((event) => !seen.has(event.id))]
+    .sort((a, b) => a.id - b.id);
+}
+
+async function resetAuditBuffer(projectId, eventType) {
+  const page = await fetchAuditTail(projectId, eventType);
+  state.auditEvents = page.events;
+  state.auditHasOlder = page.has_older;
+  state.auditHasNewer = page.has_newer;
+  state.auditFilter = eventType;
+}
+
+async function loadOlderAuditEvents() {
+  if (!state.projectId || !state.auditHasOlder || !state.auditEvents.length) return;
+  const eventType = elements["audit-event-filter"].value;
+  const page = await api(auditQueryUrl(state.projectId, {
+    before: state.auditEvents[0].id,
+    eventType,
+  }));
+  state.auditEvents = mergeAuditEvents(state.auditEvents, page.events);
+  if (page.events.length) state.auditHasOlder = page.has_older;
+  renderAudit();
+}
+
+async function loadNewerAuditEvents() {
+  if (!state.projectId) return;
+  const eventType = elements["audit-event-filter"].value;
+  const newest = state.auditEvents[state.auditEvents.length - 1];
+  const page = newest
+    ? await api(auditQueryUrl(state.projectId, { after: newest.id, eventType }))
+    : await fetchAuditTail(state.projectId, eventType);
+  state.auditEvents = mergeAuditEvents(state.auditEvents, page.events);
+  if (page.events.length) state.auditHasNewer = page.has_newer;
+  renderAudit();
 }
 
 async function selectProject(projectId) {
@@ -810,7 +851,7 @@ async function selectProject(projectId) {
       api(`/api/v1/projects/${projectId}/members`),
       api(`/api/v1/projects/${projectId}/agent-tokens`),
       api(`/api/v1/projects/${projectId}/workspaces`),
-      loadRecentAuditEvents(projectId),
+      fetchAuditTail(projectId, ""),
       api("/api/v1/admin/runtime?lines=80"),
       api(`/api/v1/projects/${projectId}/task-intakes/targets`),
       api(`/api/v1/projects/${projectId}/task-intakes`),
@@ -828,7 +869,10 @@ async function selectProject(projectId) {
     state.workspaces = workspaces.workspaces;
     state.taskIntakeTargets = intakeTargets.targets || [];
     state.taskIntakes = intakes.intakes || [];
-    state.auditEvents = audit.events.slice(-AUDIT_WINDOW_SIZE);
+    state.auditEvents = audit.events;
+    state.auditHasOlder = audit.has_older;
+    state.auditHasNewer = audit.has_newer;
+    state.auditFilter = "";
     state.runtime = runtime;
     mergeEvents(eventPage.events);
     renderProjects();
@@ -1044,7 +1088,7 @@ function renderEmptyRoom() {
   elements["chat-subtitle"].textContent = "等待选择项目";
   elements["onboarding"].classList.remove("is-hidden");
   ["create-task-button", "archive-project-button", "project-settings-button", "export-project-button", "connect-agent-button",
-    "create-member-button", "create-token-button", "register-workspace-button", "refresh-audit-button", "audit-event-filter",
+    "create-token-button", "refresh-audit-button", "audit-event-filter",
     "event-filter", "message-input", "message-kind", "message-channel", "message-task", "message-priority",
     "message-requires-ack", "send-message-button"]
     .forEach((id) => { elements[id].disabled = true; });
@@ -1070,7 +1114,7 @@ function renderAll() {
   elements["chat-subtitle"].textContent = `${connectedAgentCount(agentIdentities)} 当前连接 / ${agentIdentities.length} 个 Agent / 累计 ${agents.length} 次接入 · 游标 ${state.snapshot.cursor}`;
   elements["onboarding"].classList.add("is-hidden");
   ["create-task-button", "archive-project-button", "project-settings-button", "export-project-button", "connect-agent-button",
-    "create-member-button", "create-token-button", "register-workspace-button", "refresh-audit-button", "audit-event-filter",
+    "create-token-button", "refresh-audit-button", "audit-event-filter",
     "event-filter", "message-input", "message-kind", "message-channel", "message-task", "message-priority",
     "message-requires-ack", "send-message-button"]
     .forEach((id) => { elements[id].disabled = false; });
@@ -1523,7 +1567,6 @@ function renderMembers() {
           <p>${member.credential_count || 0} 个 Token · 累计接入 ${member.session_count || 0} 次 · 更新于 ${escapeHtml(formatTime(member.updated_at))}</p>
         </div>
         <div class="management-actions">
-          <button type="button" class="secondary-button" data-member-action="edit" data-member-id="${escapeHtml(member.id)}">编辑</button>
           ${member.status !== "revoked" ? `<button type="button" class="danger-button" data-member-action="revoke" data-member-id="${escapeHtml(member.id)}">吊销</button>` : ""}
         </div>
       </article>`).join("")
@@ -1562,33 +1605,52 @@ function renderWorkspaces() {
     : '<div class="empty-state">Agent 远程加入后会自动登记 Workspace</div>';
 }
 
+function auditPagerButton(action, label, visible) {
+  return visible
+    ? `<div class="audit-pager"><button type="button" class="secondary-button" data-audit-action="${action}">${label}</button></div>`
+    : "";
+}
+
 function renderAudit() {
   elements["audit-list"].innerHTML = state.auditEvents.length
-    ? state.auditEvents.slice().reverse().map((event) => `
+    ? `${auditPagerButton("older", "加载更早", state.auditHasOlder)}${state.auditEvents.slice().reverse().map((event) => `
       <article class="management-item">
         <time class="audit-time">${escapeHtml(formatTime(event.created_at))}</time>
         <div>
           <h4>${escapeHtml(eventLabel(event.event_type))} ${eventIdBadge(event.id)}</h4>
           <p>${escapeHtml(event.task_id ? `任务 ${shortId(event.task_id)}` : event.actor_session_id ? `接入 ${shortId(event.actor_session_id)}` : "管理主体")}</p>
         </div>
-      </article>`).join("")
-    : '<div class="empty-state">当前筛选下没有审计事件</div>';
+      </article>`).join("")}${auditPagerButton("newer", "加载更新", state.auditHasNewer)}`
+    : `${auditPagerButton("older", "加载更早", state.auditHasOlder)}<div class="empty-state">当前筛选下没有审计事件</div>${auditPagerButton("newer", "加载更新", state.auditHasNewer)}`;
 }
 
 async function refreshManagement() {
   if (!state.projectId) return;
   const eventType = elements["audit-event-filter"].value;
+  const auditRefresh = eventType === state.auditFilter
+    ? (state.auditEvents.length
+        ? api(auditQueryUrl(state.projectId, { after: state.auditEvents[state.auditEvents.length - 1].id, eventType }))
+        : fetchAuditTail(state.projectId, eventType))
+    : fetchAuditTail(state.projectId, eventType);
   const [members, credentials, workspaces, audit, runtime] = await Promise.all([
     api(`/api/v1/projects/${state.projectId}/members`),
     api(`/api/v1/projects/${state.projectId}/agent-tokens`),
     api(`/api/v1/projects/${state.projectId}/workspaces`),
-    loadRecentAuditEvents(state.projectId, eventType),
+    auditRefresh,
     api("/api/v1/admin/runtime?lines=80"),
   ]);
   state.members = members.members;
   state.credentials = credentials.credentials;
   state.workspaces = workspaces.workspaces;
-  state.auditEvents = audit.events.slice(-AUDIT_WINDOW_SIZE);
+  if (eventType === state.auditFilter) {
+    state.auditEvents = mergeAuditEvents(state.auditEvents, audit.events);
+    if (audit.events.length) state.auditHasNewer = audit.has_newer;
+  } else {
+    state.auditEvents = audit.events;
+    state.auditHasOlder = audit.has_older;
+    state.auditHasNewer = audit.has_newer;
+    state.auditFilter = eventType;
+  }
   state.runtime = runtime;
   renderManagement();
 }
@@ -1731,17 +1793,6 @@ elements["logout-button"].addEventListener("click", async () => {
     showLoginDialog();
   }
 });
-elements["create-member-button"].addEventListener("click", () => {
-  state.editingMemberId = null;
-  elements["member-form"].reset();
-  elements["member-id"].value = "";
-  elements["member-key"].disabled = false;
-  elements["member-status"].value = "active";
-  elements["member-metadata"].value = "{}";
-  elements["member-dialog-title"].textContent = "添加项目成员";
-  elements["member-submit"].textContent = "保存";
-  elements["member-dialog"].showModal();
-});
 elements["create-token-button"].addEventListener("click", () => {
   const permissions = state.config?.domain?.agent_permissions || [];
   const defaults = new Set(permissions.filter((permission) => permission !== "audit:read"));
@@ -1755,12 +1806,14 @@ elements["create-token-button"].addEventListener("click", () => {
   elements["token-days"].value = "30";
   elements["token-dialog"].showModal();
 });
-elements["register-workspace-button"].addEventListener("click", () => {
-  elements["workspace-form"].reset();
-  elements["workspace-dialog"].showModal();
-});
 elements["refresh-audit-button"].addEventListener("click", () => refreshManagement().catch(handleError));
 elements["audit-event-filter"].addEventListener("change", () => refreshManagement().catch(handleError));
+elements["audit-list"].addEventListener("click", (event) => {
+  const button = event.target.closest("[data-audit-action]");
+  if (!button) return;
+  (button.dataset.auditAction === "older" ? loadOlderAuditEvents() : loadNewerAuditEvents())
+    .catch(handleError);
+});
 elements["refresh-runtime-button"].addEventListener("click", () => refreshManagement().catch(handleError));
 elements["task-assign-button"].addEventListener("click", () => openTaskAssignmentDialog().catch(handleError));
 
@@ -1956,21 +2009,6 @@ elements["member-list"].addEventListener("click", async (event) => {
   const member = state.members.find((item) => item.id === button.dataset.memberId);
   if (!member) return;
   try {
-    if (button.dataset.memberAction === "edit") {
-      state.editingMemberId = member.id;
-      elements["member-id"].value = member.id;
-      elements["member-key"].value = member.member_key;
-      elements["member-key"].disabled = true;
-      elements["member-name"].value = member.name;
-      elements["member-kind"].value = member.kind;
-      elements["member-role"].value = member.role || "";
-      elements["member-status"].value = member.status;
-      elements["member-metadata"].value = JSON.stringify(member.metadata || {}, null, 2);
-      elements["member-dialog-title"].textContent = "编辑项目成员";
-      elements["member-submit"].textContent = "保存修改";
-      elements["member-dialog"].showModal();
-      return;
-    }
     if (button.dataset.memberAction === "revoke") {
       if (!window.confirm(`吊销成员“${member.name}”后，关联 Token 将不能再用于新连接，确定继续吗？`)) return;
       await api(`/api/v1/projects/${state.projectId}/members/${member.id}`, { method: "DELETE" });
@@ -2258,47 +2296,6 @@ elements["login-form"].addEventListener("submit", async (event) => {
   }
 });
 
-elements["member-form"].addEventListener("submit", async (event) => {
-  event.preventDefault();
-  if (!state.projectId) return;
-  let metadata;
-  try {
-    metadata = JSON.parse(elements["member-metadata"].value.trim() || "{}");
-  } catch (_error) {
-    showToast("元数据必须是合法 JSON", "error");
-    return;
-  }
-  if (!metadata || Array.isArray(metadata) || typeof metadata !== "object") {
-    showToast("元数据必须是 JSON 对象", "error");
-    return;
-  }
-  const body = {
-    name: elements["member-name"].value.trim(),
-    kind: elements["member-kind"].value.trim(),
-    role: elements["member-role"].value.trim(),
-    status: elements["member-status"].value,
-    metadata,
-  };
-  if (!state.editingMemberId) body.member_key = elements["member-key"].value.trim();
-  try {
-    await api(
-      state.editingMemberId
-        ? `/api/v1/projects/${state.projectId}/members/${state.editingMemberId}`
-        : `/api/v1/projects/${state.projectId}/members`,
-      {
-        method: state.editingMemberId ? "PATCH" : "POST",
-        body: JSON.stringify(body),
-      },
-    );
-    elements["member-dialog"].close();
-    showToast(state.editingMemberId ? "项目成员已更新" : "项目成员已创建");
-    state.editingMemberId = null;
-    await refreshManagement();
-  } catch (error) {
-    handleError(error);
-  }
-});
-
 elements["token-form"].addEventListener("submit", async (event) => {
   event.preventDefault();
   if (!state.projectId) return;
@@ -2321,29 +2318,6 @@ elements["token-form"].addEventListener("submit", async (event) => {
     elements["token-dialog"].close();
     showTokenSecret(result.token);
     await refreshManagement();
-  } catch (error) {
-    handleError(error);
-  }
-});
-
-elements["workspace-form"].addEventListener("submit", async (event) => {
-  event.preventDefault();
-  if (!state.projectId) return;
-  try {
-    await api(`/api/v1/projects/${state.projectId}/workspaces`, {
-      method: "POST",
-      body: JSON.stringify({
-        host_key: elements["workspace-host-key"].value.trim(),
-        host_name: elements["workspace-host-name"].value.trim(),
-        local_path: elements["workspace-local-path"].value.trim(),
-        branch: elements["workspace-branch"].value.trim(),
-        worktree: elements["workspace-worktree"].value.trim(),
-        git_remote: elements["workspace-git-remote"].value.trim(),
-      }),
-    });
-    elements["workspace-dialog"].close();
-    await refreshManagement();
-    showToast("Workspace 已登记");
   } catch (error) {
     handleError(error);
   }
@@ -2413,7 +2387,7 @@ function renderMessageTaskOptions(tasks) {
 async function loadTaskEvents(projectId, taskId) {
   return loadEventWindow(
     (after, limit) => `/api/v1/projects/${projectId}/audit?after=${after}&limit=${limit}&task_id=${encodeURIComponent(taskId)}`,
-    AUDIT_WINDOW_SIZE,
+    auditPageSize(),
     { tailJump: false },
   );
 }
@@ -3055,10 +3029,6 @@ function populateDomainOptions() {
   const channels = state.config?.domain?.message_channels || ["public", "task", "review", "system"];
   elements["message-channel"].innerHTML = channels.map((channel) => `<option value="${escapeHtml(channel)}">${escapeHtml(messageChannel(channel))}频道</option>`).join("");
   if (channels.includes("public")) elements["message-channel"].value = "public";
-  const memberStatuses = state.config?.domain?.project_member_statuses || ["invited", "active", "suspended", "revoked"];
-  elements["member-status"].innerHTML = memberStatuses.map((status) =>
-    `<option value="${escapeHtml(status)}">${escapeHtml(memberStatusLabel(status))}</option>`
-  ).join("");
 }
 
 function applyPublicConfig() {

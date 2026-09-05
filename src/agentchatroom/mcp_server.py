@@ -908,6 +908,7 @@ def task_define_from_intake(
 def audit_query(
     project_id: str = "",
     after: int = 0,
+    before: int = 0,
     limit: int = 200,
     event_type: str = "",
     actor_session_id: str = "",
@@ -922,6 +923,7 @@ def audit_query(
         get_service().query_audit,
         project_id,
         after=after,
+        before=before,
         limit=limit,
         event_type=event_type or None,
         actor_session_id=actor_session_id or None,

@@ -1029,6 +1029,12 @@ body.is-resizing-panels {
   font-weight: 400;
 }
 
+.audit-pager {
+  display: flex;
+  justify-content: center;
+  padding: 8px 0;
+}
+
 .runtime-code,
 .runtime-log {
   max-height: 260px;

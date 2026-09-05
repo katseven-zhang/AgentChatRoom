@@ -188,9 +188,8 @@
               <div class="section-heading">
                 <div>
                   <h3>项目成员</h3>
-                  <p class="secondary-text">版本化身份、角色和接入关联</p>
+                  <p class="secondary-text">Agent 接入时自动创建，无需手工添加或编辑</p>
                 </div>
-                <button class="primary-button" id="create-member-button" type="button" disabled>添加成员</button>
               </div>
               <div id="member-list" class="management-list"></div>
             </section>
@@ -199,7 +198,7 @@
               <div class="section-heading">
                 <div>
                   <h3>Agent Token</h3>
-                  <p class="secondary-text">项目级接入凭据</p>
+                  <p class="secondary-text">仅当 Agent 无法经自身软件身份接入（如远程部署、无本地 MCP）时才需要签发</p>
                 </div>
                 <button class="primary-button" id="create-token-button" type="button" disabled>签发 Token</button>
               </div>
@@ -210,9 +209,8 @@
               <div class="section-heading">
                 <div>
                   <h3>Host 与 Workspace</h3>
-                  <p class="secondary-text">跨电脑项目路径</p>
+                  <p class="secondary-text">只读列表：Agent 通过 room_join 自动登记</p>
                 </div>
-                <button class="secondary-button" id="register-workspace-button" type="button" disabled>登记 Workspace</button>
               </div>
               <div id="workspace-list" class="management-list"></div>
             </section>
@@ -634,41 +632,6 @@
       </form>
     </dialog>
 
-    <dialog id="member-dialog">
-      <form method="dialog" class="dialog-form" id="member-form">
-        <div class="dialog-header">
-          <div>
-            <p class="context-label">项目身份</p>
-            <h2 id="member-dialog-title">添加项目成员</h2>
-          </div>
-          <button type="button" class="icon-button dialog-close" title="关闭" aria-label="关闭">×</button>
-        </div>
-        <input id="member-id" type="hidden">
-        <label>成员标识 <input id="member-key" autocomplete="off" required></label>
-        <div class="form-grid">
-          <label>名称 <input id="member-name" autocomplete="off" required></label>
-          <label>类型 <input id="member-kind" autocomplete="off" value="agent" required></label>
-        </div>
-        <div class="form-grid">
-          <label>角色 <input id="member-role" autocomplete="off" placeholder="例如 executor"></label>
-          <label>状态
-            <select id="member-status" required>
-              <option value="invited">待邀请</option>
-              <option value="active">有效</option>
-              <option value="suspended">已暂停</option>
-              <option value="revoked">已吊销</option>
-            </select>
-          </label>
-        </div>
-        <label>元数据 JSON <textarea id="member-metadata" rows="3" placeholder="{}"></textarea></label>
-        <p class="form-hint">成员标识创建后不可修改；吊销只改变派生状态，不删除历史事件。</p>
-        <div class="dialog-actions">
-          <button type="button" class="secondary-button dialog-close">取消</button>
-          <button type="submit" class="primary-button" id="member-submit">保存</button>
-        </div>
-      </form>
-    </dialog>
-
     <dialog id="token-dialog">
       <form method="dialog" class="dialog-form" id="token-form">
         <div class="dialog-header">
@@ -711,32 +674,6 @@
           <button type="button" class="primary-button" id="token-secret-close">完成</button>
         </div>
       </div>
-    </dialog>
-
-    <dialog id="workspace-dialog">
-      <form method="dialog" class="dialog-form" id="workspace-form">
-        <div class="dialog-header">
-          <div>
-            <p class="context-label">跨电脑关联</p>
-            <h2>登记 Workspace</h2>
-          </div>
-          <button type="button" class="icon-button dialog-close" title="关闭" aria-label="关闭">×</button>
-        </div>
-        <div class="form-grid">
-          <label>Host 名称 <input id="workspace-host-name" autocomplete="off" required></label>
-          <label>Host Key <input id="workspace-host-key" autocomplete="off" required></label>
-        </div>
-        <label>本地项目路径 <input id="workspace-local-path" autocomplete="off" required></label>
-        <div class="form-grid">
-          <label>分支 <input id="workspace-branch" autocomplete="off"></label>
-          <label>Worktree <input id="workspace-worktree" autocomplete="off"></label>
-        </div>
-        <label>Git Remote <input id="workspace-git-remote" autocomplete="off"></label>
-        <div class="dialog-actions">
-          <button type="button" class="secondary-button dialog-close">取消</button>
-          <button type="submit" class="primary-button">登记</button>
-        </div>
-      </form>
     </dialog>
 
     <div class="toast-region" id="toast-region" aria-live="polite"></div>

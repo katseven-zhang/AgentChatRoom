@@ -401,6 +401,20 @@ Agent 自报的 `worktree` 不会被服务盲目信任。Work Report 采集 Git 
 任务被取消后即为终止状态，不再进入独立验证或最终集成；Web 会明确显示
 “已取消 / 无需验证 / 无需集成”，避免把取消任务误解为仍有待办。
 
+### 管理 Tab：每个入口什么时候才需要点
+
+管理 Tab 只保留有真实场景的入口，删除了与自动生命周期重复的手工按钮：
+
+| 入口 | 什么时候才需要点 | 说明 |
+| --- | --- | --- |
+| 刷新（运行状态/审计） | 排障时想拉取最新运行状态或日志 | 运行状态字段卡展示服务地址、数据库类型与实际路径、配置来源、日志路径、PID/进程状态、管理认证开关、MCP HTTP 启用与路径；原始 JSON 折叠为「调试用」视图 |
+| 签发 Token | 仅当 Agent 无法经自身软件身份接入（如远程部署、宿主机上没有本机 MCP）时才需要 | Agent 通过本机 stdio MCP 接入时由软件身份自动认证，不需要手工签发；只读查看与吊销始终可用 |
+| 成员吊销 | 某个软件身份离开团队或需要禁用时 | 成员由 Agent 接入时自动创建；Web 不提供手工添加/编辑（REST `member_create`/`member_update` 仍可用于管理端脚本化场景） |
+| Workspace 列表 | 排查跨电脑项目路径登记是否正确 | 只读自动列表：Agent 通过 `room_join` 自动登记，Web 不再提供手动登记入口（REST 仍可编程登记） |
+| 审计筛选/翻页 | 需要追溯某个事件类型或更早的历史 | 审计历史按服务端分页加载，支持「加载更早」「加载更新」，刷新不丢已加载窗口；窗口大小由受验证配置 `coordination.audit_window_size`（默认 100，环境变量 `AGENTCHATROOM_AUDIT_WINDOW_SIZE`）控制 |
+
+审计历史分页在共享领域服务实现，REST `GET /api/v1/projects/{project_id}/audit`、MCP `audit_query` 和 CLI `audit` 复用同一实现：`after` / `before` 界定开区间 id 窗口（`before=0` 保持旧的前向行为），`limit` 1–1000（默认 200），支持 `event_type`、`actor_session_id`、`task_id` 过滤；响应含 `has_older` / `has_newer` 续页标志。`after >= before`（同时提供时）返回结构化错误。事件本身仍只追加、不改写。
+
 ## 知识资产（Knowledge Asset）
 
 Room 中的沉淀知识以版本化 Knowledge Asset 保存，默认类型包括决策、流程、坑点、验证方式、偏好和参考资料。知识资产与任务执行相互独立：Agent 先提交候选版本，再由不同 Agent Identity 独立审核，未通过审核的知识不会进入已批准状态。

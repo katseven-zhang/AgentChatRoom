@@ -49,6 +49,7 @@ CONFIG_FILE_SCHEMA: dict[str, dict[str, tuple[type, ...]]] = {
         "presence_refresh_interval_seconds": (int, float),
         "max_sse_clients_per_project": (int,),
         "sse_per_ip_limit": (int,),
+        "audit_window_size": (int,),
         "token_touch_interval_seconds": (int, float),
         "token_touch_min_calls": (int,),
     },
@@ -160,6 +161,7 @@ class Settings:
     presence_refresh_interval_seconds: float = 1.0
     max_sse_clients_per_project: int = 64
     sse_per_ip_limit: int = 16
+    audit_window_size: int = 100
     token_touch_interval_seconds: float = 60.0
     token_touch_min_calls: int = 32
     knowledge_kinds: tuple[str, ...] = tuple(KNOWLEDGE_DEFAULT_KINDS)
@@ -271,6 +273,7 @@ def _merge_toml(path: Path) -> dict[str, Any]:
             "max_sse_clients_per_project"
         ),
         "sse_per_ip_limit": raw.get("coordination", {}).get("sse_per_ip_limit"),
+        "audit_window_size": raw.get("coordination", {}).get("audit_window_size"),
         "token_touch_interval_seconds": raw.get("coordination", {}).get(
             "token_touch_interval_seconds"
         ),
@@ -490,6 +493,12 @@ def load_settings(
                 file_values.get("sse_per_ip_limit", 16),
             )
         ),
+        "audit_window_size": int(
+            os.getenv(
+                "AGENTCHATROOM_AUDIT_WINDOW_SIZE",
+                file_values.get("audit_window_size", 100),
+            )
+        ),
         "token_touch_interval_seconds": float(
             os.getenv(
                 "AGENTCHATROOM_TOKEN_TOUCH_INTERVAL_SECONDS",
@@ -628,6 +637,8 @@ def load_settings(
         raise ValueError("max SSE clients per project must be at least 1")
     if values["sse_per_ip_limit"] < 1:
         raise ValueError("SSE per-IP limit must be at least 1")
+    if values["audit_window_size"] < 1:
+        raise ValueError("audit window size must be at least 1")
     if values["token_touch_interval_seconds"] < 1:
         raise ValueError("token touch interval must be at least 1 second")
     if values["token_touch_min_calls"] < 1:

@@ -606,6 +606,15 @@ def build_parser() -> argparse.ArgumentParser:
     sync.add_argument("--session-id")
     sync.add_argument("--token")
 
+    audit = commands.add_parser("audit", help="Query project audit events")
+    audit.add_argument("project_id")
+    audit.add_argument("--after", type=int, default=0)
+    audit.add_argument("--before", type=int, default=0)
+    audit.add_argument("--limit", type=int, default=200)
+    audit.add_argument("--event-type")
+    audit.add_argument("--actor-session")
+    audit.add_argument("--task-id")
+
     leave = commands.add_parser("room-leave", help="Close an Agent session")
     leave.add_argument("project_id")
     leave.add_argument("--session-id", required=True)
@@ -1239,6 +1248,21 @@ def main(argv: list[str] | None = None) -> None:
         result = call_api(
             "GET",
             f"/api/v1/projects/{args.project_id}/tasks/{args.task_id}",
+        )
+    elif args.command == "audit":
+        query = urllib.parse.urlencode(
+            {
+                "after": args.after,
+                "before": args.before,
+                "limit": args.limit,
+                **({"event_type": args.event_type} if args.event_type else {}),
+                **({"actor_session_id": args.actor_session} if args.actor_session else {}),
+                **({"task_id": args.task_id} if args.task_id else {}),
+            }
+        )
+        result = call_api(
+            "GET",
+            f"/api/v1/projects/{args.project_id}/audit?{query}",
         )
     elif args.command == "task-history":
         query = urllib.parse.urlencode(
