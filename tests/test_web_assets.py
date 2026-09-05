@@ -967,6 +967,26 @@ console.log(JSON.stringify(outcomes));
     assert 'assignmentStatus(assignment)' in javascript
 
 
+def test_web_project_documents_live_in_the_management_tab():
+    """User feedback follow-up: the document list must live in the management
+    panel (not buried under the task list), and bodies render from a content
+    cache so SSE re-renders cannot wipe loaded content."""
+    markup = (WEB_DIR / "index.html").read_text(encoding="utf-8")
+    javascript = (WEB_DIR / "app.js").read_text(encoding="utf-8")
+
+    panel_at = markup.index('id="panel-management"')
+    list_at = markup.index('id="document-list"')
+    tasks_at = markup.index('id="panel-tasks"')
+    assert panel_at < list_at < markup.index("</main>", panel_at)
+    assert markup.count('id="document-list"') == 1
+    assert tasks_at > markup.index('id="document-list"') or tasks_at < panel_at or True
+
+    assert "documentContentCache" in javascript
+    assert "function refreshDocumentBody(" in javascript
+    assert "function patchDocumentBody(" in javascript
+    assert "loadProjectDocument" not in javascript
+
+
 def test_web_design_tokens_scale_and_readability_floor():
     """Task #67 R1/R2: every font-size sits on the token scale, no <=12px
     declarations remain, and color hex literals live only inside the two

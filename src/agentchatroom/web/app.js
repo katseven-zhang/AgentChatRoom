@@ -32,6 +32,7 @@ const state = {
   workspaces: [],
   managedBackups: [],
   autoBackupInfo: null,
+  documentContentCache: {},
   auditEvents: [],
   auditHasOlder: false,
   auditHasNewer: false,
@@ -1130,7 +1131,6 @@ function renderAll() {
   renderMetrics(agentIdentities, tasks, leases);
   renderTasks(tasks);
   renderTaskIntakes();
-  renderDocuments();
   renderLeases(leases, agents);
   renderReviews(tasks, agents);
   renderEvents(agents, tasks);
@@ -1507,6 +1507,7 @@ function renderManagement() {
   renderCredentials();
   renderWorkspaces();
   renderBackups();
+  renderDocuments();
   renderAudit();
 }
 
@@ -1678,6 +1679,25 @@ function renderWorkspaces() {
     : '<div class="empty-state">Agent 远程加入后会自动登记 Workspace</div>';
 }
 
+function documentCacheEntry(docKey, version) {
+  const cached = state.documentContentCache[docKey];
+  return cached && String(cached.version) === String(version) ? cached : null;
+}
+
+function documentBodyHtml(doc) {
+  const cached = documentCacheEntry(doc.doc_key, doc.version);
+  if (cached) {
+    return `<pre class="code-block project-doc-content" data-doc-content="${escapeHtml(doc.doc_key)}">${escapeHtml(cached.content)}</pre>`;
+  }
+  return `<div class="loading-state" data-doc-content="${escapeHtml(doc.doc_key)}">正在加载文档…</div>`;
+}
+
+function documentHistoryText(loaded) {
+  return loaded.history && loaded.history.length
+    ? `版本历史：${loaded.history.map((item) => `v${item.version}（${formatTime(item.created_at)}）`).join(" · ")}`
+    : "";
+}
+
 function renderDocuments() {
   const docs = state.snapshot?.documents || [];
   elements["document-list"].innerHTML = docs.length
@@ -1689,7 +1709,7 @@ function renderDocuments() {
           <span class="secondary-text">v${escapeHtml(String(doc.version))} · ${escapeHtml(String(doc.size))}B</span>
         </summary>
         <div class="project-doc-body">
-          <div class="loading-state" data-doc-content="${escapeHtml(doc.doc_key)}">正在加载文档…</div>
+          ${documentBodyHtml(doc)}
           <div class="management-actions">
             <button type="button" class="secondary-button" data-doc-edit="${escapeHtml(doc.doc_key)}">编辑为新版本</button>
           </div>
@@ -1704,35 +1724,45 @@ function renderDocuments() {
             <textarea name="content" rows="10" required></textarea>
             <button type="submit" class="primary-button">保存新版本（旧版本不可变）</button>
           </form>
-          <div class="doc-history secondary-text"></div>
+          <div class="doc-history secondary-text">${escapeHtml(documentHistoryText(documentCacheEntry(doc.doc_key, doc.version) || {}))}</div>
         </div>
       </details>`).join("")
     : '<div class="empty-state">还没有项目文档。规范（binding）会在 Agent 认领任务时自动注入上下文并盖版本回执。</div>';
+  docs.forEach((doc) => {
+    if (!documentCacheEntry(doc.doc_key, doc.version)) refreshDocumentBody(doc).catch(() => {});
+  });
 }
 
-async function loadProjectDocument(docKey, container) {
-  try {
-    const result = await api(`/api/v1/projects/${state.projectId}/documents/${encodeURIComponent(docKey)}`);
-    const doc = result.document;
-    const content = document.createElement("pre");
-    content.className = "code-block project-doc-content";
-    content.dataset.docContent = docKey;
-    content.textContent = doc.content;
-    container.replaceWith(content);
-    const details = content.closest(".project-doc");
-    const history = details?.querySelector(".doc-history");
-    if (history) {
-      history.textContent = `版本历史：${doc.history.map((item) => `v${item.version}（${formatTime(item.created_at)}）`).join(" · ")}`;
-    }
-    return doc;
-  } catch (error) {
-    const box = document.createElement("div");
-    box.className = "state-box error-state";
-    box.dataset.docContent = docKey;
-    box.innerHTML = `<span class="state-title">文档加载失败</span><span>${escapeHtml(error.message || "未知错误")}</span><button type="button" class="secondary-button state-retry" data-doc-retry="${escapeHtml(docKey)}">重试</button>`;
-    container.replaceWith(box);
-    throw error;
+function patchDocumentBody(loaded) {
+  const container = elements["document-list"].querySelector(`[data-doc-content="${loaded.doc_key}"]`);
+  if (!container) return;
+  if (!container.classList.contains("project-doc-content")) {
+    const pre = document.createElement("pre");
+    pre.className = "code-block project-doc-content";
+    pre.dataset.docContent = loaded.doc_key;
+    pre.textContent = loaded.content;
+    container.replaceWith(pre);
   }
+  const history = container.closest(".project-doc")?.querySelector(".doc-history");
+  if (history) history.textContent = documentHistoryText(loaded);
+}
+
+async function refreshDocumentBody(doc) {
+  const result = await api(`/api/v1/projects/${state.projectId}/documents/${encodeURIComponent(doc.doc_key)}`);
+  const loaded = result.document;
+  state.documentContentCache[doc.doc_key] = loaded;
+  patchDocumentBody(loaded);
+  return loaded;
+}
+
+function showDocumentError(docKey, error) {
+  const container = elements["document-list"].querySelector(`[data-doc-content="${docKey}"]`);
+  if (!container) return;
+  const box = document.createElement("div");
+  box.className = "state-box error-state";
+  box.dataset.docContent = docKey;
+  box.innerHTML = `<span class="state-title">文档加载失败</span><span>${escapeHtml(error.message || "未知错误")}</span><button type="button" class="secondary-button state-retry" data-doc-retry="${escapeHtml(docKey)}">重试</button>`;
+  container.replaceWith(box);
 }
 
 async function saveProjectDocument(form, docKey) {
@@ -1747,6 +1777,7 @@ async function saveProjectDocument(form, docKey) {
     }),
   });
   showToast(`文档 ${docKey} 已保存为新版本`);
+  delete state.documentContentCache[docKey];
   await refreshSnapshot(state.projectId);
   renderDocuments();
 }
@@ -1756,37 +1787,32 @@ function wireDocumentList() {
     const retryButton = event.target.closest("[data-doc-retry]");
     if (retryButton) {
       const docKey = retryButton.dataset.docRetry;
+      const doc = (state.snapshot?.documents || []).find((item) => item.doc_key === docKey);
       const loading = document.createElement("div");
       loading.className = "loading-state";
       loading.dataset.docContent = docKey;
       loading.textContent = "正在加载文档…";
       retryButton.closest(".state-box").replaceWith(loading);
-      loadProjectDocument(docKey, loading).catch(handleError);
+      if (doc) refreshDocumentBody(doc).catch((error) => showDocumentError(docKey, error));
       return;
     }
     const editButton = event.target.closest("[data-doc-edit]");
-    const summary = event.target.closest("summary");
     const details = event.target.closest(".project-doc");
-    if (!details) return;
+    if (!editButton || !details) return;
     const docKey = details.dataset.docKey;
-    if (editButton) {
-      const form = details.querySelector(".doc-edit-form");
-      if (form.hidden) {
-        const target = details.querySelector("[data-doc-content]");
-        const doc = target ? await loadProjectDocument(docKey, target) : await api(`/api/v1/projects/${state.projectId}/documents/${encodeURIComponent(docKey)}`).then((item) => item.document);
-        form.elements["title"].value = doc.title;
-        form.elements["kind"].value = doc.kind;
-        form.elements["content"].value = doc.content;
-        form.hidden = false;
-      } else {
-        form.hidden = true;
-      }
+    const form = details.querySelector(".doc-edit-form");
+    if (!form.hidden) {
+      form.hidden = true;
       return;
     }
-    if (summary && !details.dataset.loaded) {
-      details.dataset.loaded = "1";
-      loadProjectDocument(docKey, details.querySelector(".project-doc-content")).catch(handleError);
-    }
+    const manifest = (state.snapshot?.documents || []).find((item) => item.doc_key === docKey);
+    let doc = manifest ? documentCacheEntry(docKey, manifest.version) : null;
+    if (!doc && manifest) doc = await refreshDocumentBody(manifest);
+    if (!doc) return;
+    form.elements["title"].value = doc.title;
+    form.elements["kind"].value = doc.kind;
+    form.elements["content"].value = doc.content;
+    form.hidden = false;
   });
   elements["document-list"].addEventListener("submit", async (event) => {
     const form = event.target.closest(".doc-edit-form");
