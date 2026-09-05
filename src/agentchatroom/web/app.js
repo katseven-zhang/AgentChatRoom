@@ -1689,7 +1689,7 @@ function renderDocuments() {
           <span class="secondary-text">v${escapeHtml(String(doc.version))} · ${escapeHtml(String(doc.size))}B</span>
         </summary>
         <div class="project-doc-body">
-          <pre class="code-block project-doc-content" data-doc-content="${escapeHtml(doc.doc_key)}">加载中…</pre>
+          <div class="loading-state" data-doc-content="${escapeHtml(doc.doc_key)}">正在加载文档…</div>
           <div class="management-actions">
             <button type="button" class="secondary-button" data-doc-edit="${escapeHtml(doc.doc_key)}">编辑为新版本</button>
           </div>
@@ -1711,15 +1711,28 @@ function renderDocuments() {
 }
 
 async function loadProjectDocument(docKey, container) {
-  const result = await api(`/api/v1/projects/${state.projectId}/documents/${encodeURIComponent(docKey)}`);
-  const doc = result.document;
-  container.textContent = doc.content;
-  const details = container.closest(".project-doc");
-  const history = details?.querySelector(".doc-history");
-  if (history) {
-    history.textContent = `版本历史：${doc.history.map((item) => `v${item.version}（${formatTime(item.created_at)}）`).join(" · ")}`;
+  try {
+    const result = await api(`/api/v1/projects/${state.projectId}/documents/${encodeURIComponent(docKey)}`);
+    const doc = result.document;
+    const content = document.createElement("pre");
+    content.className = "code-block project-doc-content";
+    content.dataset.docContent = docKey;
+    content.textContent = doc.content;
+    container.replaceWith(content);
+    const details = content.closest(".project-doc");
+    const history = details?.querySelector(".doc-history");
+    if (history) {
+      history.textContent = `版本历史：${doc.history.map((item) => `v${item.version}（${formatTime(item.created_at)}）`).join(" · ")}`;
+    }
+    return doc;
+  } catch (error) {
+    const box = document.createElement("div");
+    box.className = "state-box error-state";
+    box.dataset.docContent = docKey;
+    box.innerHTML = `<span class="state-title">文档加载失败</span><span>${escapeHtml(error.message || "未知错误")}</span><button type="button" class="secondary-button state-retry" data-doc-retry="${escapeHtml(docKey)}">重试</button>`;
+    container.replaceWith(box);
+    throw error;
   }
-  return doc;
 }
 
 async function saveProjectDocument(form, docKey) {
@@ -1740,6 +1753,17 @@ async function saveProjectDocument(form, docKey) {
 
 function wireDocumentList() {
   elements["document-list"].addEventListener("click", async (event) => {
+    const retryButton = event.target.closest("[data-doc-retry]");
+    if (retryButton) {
+      const docKey = retryButton.dataset.docRetry;
+      const loading = document.createElement("div");
+      loading.className = "loading-state";
+      loading.dataset.docContent = docKey;
+      loading.textContent = "正在加载文档…";
+      retryButton.closest(".state-box").replaceWith(loading);
+      loadProjectDocument(docKey, loading).catch(handleError);
+      return;
+    }
     const editButton = event.target.closest("[data-doc-edit]");
     const summary = event.target.closest("summary");
     const details = event.target.closest(".project-doc");
@@ -1748,7 +1772,8 @@ function wireDocumentList() {
     if (editButton) {
       const form = details.querySelector(".doc-edit-form");
       if (form.hidden) {
-        const doc = await loadProjectDocument(docKey, details.querySelector(".project-doc-content"));
+        const target = details.querySelector("[data-doc-content]");
+        const doc = target ? await loadProjectDocument(docKey, target) : await api(`/api/v1/projects/${state.projectId}/documents/${encodeURIComponent(docKey)}`).then((item) => item.document);
         form.elements["title"].value = doc.title;
         form.elements["kind"].value = doc.kind;
         form.elements["content"].value = doc.content;

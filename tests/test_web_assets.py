@@ -873,7 +873,8 @@ def test_web_typography_baseline_wraps_long_content_and_narrow_selects():
     # 选择器列表聚合声明：一条声明覆盖全部容器。
     assert baseline.count("overflow-wrap: anywhere;") == 1
     assert baseline.count(",") >= 7
-    assert "line-height: 1.5;" in baseline
+    # #67 令牌化：基线块行高统一走 --lh-body 刻度令牌。
+    assert "line-height: var(--lh-body);" in baseline
     # 窄屏下 composer 下拉收缩，不再撑出横向滚动。
     assert ".composer-options select {" in stylesheet
     assert "flex: 1 1 auto;" in stylesheet
@@ -964,3 +965,54 @@ console.log(JSON.stringify(outcomes));
     assert '"未填写说明"' in javascript
     assert "等待目标 Agent 确认" in javascript
     assert 'assignmentStatus(assignment)' in javascript
+
+
+def test_web_design_tokens_scale_and_readability_floor():
+    """Task #67 R1/R2: every font-size sits on the token scale, no <=12px
+    declarations remain, and color hex literals live only inside the two
+    theme blocks."""
+    stylesheet = (WEB_DIR / "app.css").read_text(encoding="utf-8")
+
+    # R1: 字号全部走刻度令牌。
+    assert "--fs-xs: 13px;" in stylesheet
+    assert "--fs-sm: 14px;" in stylesheet
+    assert "--fs-md: 16px;" in stylesheet
+    assert "--fs-lg: 18px;" in stylesheet
+    assert "--fs-xl: 20px;" in stylesheet
+    assert "--fs-2xl: 24px;" in stylesheet
+    import re
+
+    raw_sizes = re.findall(r"font-size:\s*([^;]+);", stylesheet)
+    assert raw_sizes, "font-size declarations must exist"
+    assert all(value.strip().startswith("var(--fs-") for value in raw_sizes), sorted(set(raw_sizes))
+
+    # R1: 十六进制颜色字面量仅出现在两个主题块内。
+    root_start = stylesheet.index(":root {")
+    dark_start = stylesheet.index(':root[data-theme="dark"]')
+    dark_end = stylesheet.index("}", stylesheet.index("--shadow-pop", dark_start))
+    outside = (
+        stylesheet[:root_start]
+        + stylesheet[stylesheet.index("}", root_start) + 1 : dark_start]
+        + stylesheet[dark_end + 1 :]
+    )
+    stray_hex = re.findall(r"#[0-9a-fA-F]{6}", outside)
+    assert not stray_hex, stray_hex[:5]
+
+    # R2: 不再有 ≤12px 字号；行高与间距/字重/z-index/时长刻度入令牌。
+    assert not re.search(r"font-size:\s*(?:[0-9]|1[0-2])px", stylesheet)
+    for token in (
+        "--lh-body: 1.6;",
+        "--sp-1: 4px;",
+        "--sp-8: 32px;",
+        "--weight-semibold: 600;",
+        "--z-dialog: 100;",
+        "--duration: 180ms;",
+        "--on-accent:",
+    ):
+        assert token in stylesheet, token
+
+    # R3: 四态全局组件存在。
+    assert ".loading-state" in stylesheet
+    assert ".error-state" in stylesheet
+    assert ".state-box" in stylesheet
+    assert "button:disabled," in stylesheet
