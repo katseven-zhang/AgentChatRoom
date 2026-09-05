@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping
 
 from .config import Settings
+from .backup import backup_postgresql, backup_sqlite, restore_postgresql
 from .contracts import (
     ASSIGNMENT_RESPONSES,
     ASSIGNMENT_STATUSES,
@@ -54,7 +55,7 @@ from .contracts import (
     task_state_for_legacy_status,
     task_view,
 )
-from .database import DatabaseBackend
+from .database import SCHEMA_VERSION, DatabaseBackend
 from .errors import DomainError
 from .project_registration import derive_logical_path
 from .task_history import (
@@ -6909,3 +6910,250 @@ class AgentChatRoomService:
             "knowledge_assets": self._export_knowledge_assets(project_id),
             "events": events,
         }
+
+    # ------------------------------------------------------------------
+    # Database backup / restore (product-level wrappers around backup.py)
+    # ------------------------------------------------------------------
+
+    def _backup_directory(self) -> Path:
+        return Path(self.settings.data_dir) / "backups"
+
+    def _backup_targets(self, connection: Any) -> list[str]:
+        rows = connection.execute(
+            "SELECT id FROM projects WHERE archived_at IS NULL"
+        ).fetchall()
+        return [str(row["id"]) for row in rows]
+
+    def _emit_backup_event(
+        self,
+        event_type: str,
+        *,
+        payload: dict[str, Any],
+        actor_session_id: str | None = None,
+    ) -> None:
+        with self.database.connect(write=True) as connection:
+            for project_id in self._backup_targets(connection):
+                self._emit(
+                    connection,
+                    project_id,
+                    event_type,
+                    actor_session_id=actor_session_id,
+                    payload=payload,
+                )
+
+    def create_backup(self, *, actor_session_id: str | None = None, source: str = "management") -> dict[str, Any]:
+        """Snapshot the live database into the managed backups directory."""
+        directory = self._backup_directory()
+        directory.mkdir(parents=True, exist_ok=True)
+        stamp = iso_now().replace(":", "").replace("-", "")
+        target = directory / f"backup-{stamp}.sqlite"
+        backend = self.settings.database_backend
+        if backend == "sqlite":
+            result = backup_sqlite(self.database.path, target)
+        elif backend == "postgresql":
+            database_url = os.getenv(self.settings.database_url_env, "")
+            result = backup_postgresql(database_url, target)
+        else:
+            raise DomainError(
+                "backup_backend_unsupported",
+                f"Backups are not supported for backend {backend}",
+                status_code=422,
+            )
+        latest_event_id = self._latest_event_id()
+        manifest_path = Path(result["manifest"])
+        manifest = json_load(manifest_path.read_text(encoding="utf-8"), {})
+        manifest["latest_event_id"] = latest_event_id
+        manifest["source"] = source
+        manifest_path.write_text(
+            json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        self._emit_backup_event(
+            "backup.created",
+            payload={
+                "backend": backend,
+                "output": result["output"],
+                "manifest": str(manifest_path),
+                "latest_event_id": latest_event_id,
+                "source": source,
+            },
+            actor_session_id=actor_session_id,
+        )
+        # The audit event about this backup is part of the protected history:
+        # record the cursor again so a fresh backup is never "stale".
+        latest_event_id = self._latest_event_id()
+        manifest["latest_event_id"] = latest_event_id
+        manifest_path.write_text(
+            json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        kept = self._prune_backups()
+        return {**result, "latest_event_id": latest_event_id, "pruned": kept}
+
+    def list_backups(self) -> list[dict[str, Any]]:
+        directory = self._backup_directory()
+        if not directory.is_dir():
+            return []
+        backups: list[dict[str, Any]] = []
+        for manifest_path in sorted(directory.glob("*.manifest.json")):
+            data = json_load(manifest_path.read_text(encoding="utf-8"), {})
+            target = manifest_path.with_name(manifest_path.name[: -len(".manifest.json")])
+            backups.append(
+                {
+                    "file": str(target),
+                    "size": target.stat().st_size if target.is_file() else 0,
+                    "created_at": data.get("created_at"),
+                    "backend": data.get("backend"),
+                    "schema_version": data.get("database_schema_version"),
+                    "latest_event_id": data.get("latest_event_id"),
+                    "source": data.get("source"),
+                }
+            )
+        backups.sort(key=lambda item: str(item.get("created_at") or ""), reverse=True)
+        return backups
+
+    def _prune_backups(self) -> list[str]:
+        kept_max = int(getattr(self.settings, "auto_backup_max_kept", 10))
+        if kept_max < 0:
+            kept_max = 0
+        backups = self.list_backups()
+        removed: list[str] = []
+        for stale in backups[kept_max:]:
+            target = Path(stale["file"])
+            target.unlink(missing_ok=True)
+            target.with_name(target.name + ".manifest.json").unlink(missing_ok=True)
+            removed.append(str(target))
+        return removed
+
+    def _latest_event_id(self) -> int:
+        with self.database.connect() as connection:
+            row = connection.execute("SELECT COALESCE(MAX(id), 0) AS latest FROM events").fetchone()
+            return int(row["latest"])
+
+    def restore_backup(
+        self,
+        backup_path: str,
+        *,
+        confirm: str = "",
+        allow_data_loss: bool = False,
+        actor_session_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Restore a managed backup after explicit safety checks.
+
+        Rejections and completions are audited. A successful restore rewinds
+        the shared database to the snapshot; audit events written after the
+        backup stop existing, which is why data-loss acknowledgement and the
+        typed confirmation are mandatory.
+        """
+        if confirm != "REPLACE":
+            raise DomainError(
+                "backup_confirm_required",
+                'Restore requires the typed confirmation confirm="REPLACE"',
+                status_code=422,
+            )
+        target = Path(backup_path).expanduser().resolve()
+        manifest_path = target.with_name(target.name + ".manifest.json")
+        if not target.is_file() or not manifest_path.is_file():
+            self._emit_backup_event(
+                "backup.restore_rejected",
+                payload={"file": str(target), "reason": "backup_not_found"},
+                actor_session_id=actor_session_id,
+            )
+            raise DomainError(
+                "backup_not_found",
+                f"Backup or manifest does not exist: {target}",
+                status_code=404,
+            )
+        manifest = json_load(manifest_path.read_text(encoding="utf-8"), {})
+        current_schema = SCHEMA_VERSION
+        if int(manifest.get("database_schema_version") or 0) != current_schema:
+            self._emit_backup_event(
+                "backup.restore_rejected",
+                payload={
+                    "file": str(target),
+                    "reason": "backup_schema_mismatch",
+                    "backup_schema": manifest.get("database_schema_version"),
+                    "current_schema": current_schema,
+                },
+                actor_session_id=actor_session_id,
+            )
+            raise DomainError(
+                "backup_schema_mismatch",
+                "Backup schema version does not match the current schema",
+                status_code=409,
+                details={"backup_schema": manifest.get("database_schema_version"), "current_schema": current_schema},
+            )
+        if self.settings.database_backend == "sqlite":
+            self._ensure_sqlite_restorable(target)
+        latest_event_id = self._latest_event_id()
+        backup_event_id = int(manifest.get("latest_event_id") or 0)
+        stale = backup_event_id < latest_event_id
+        if stale and not allow_data_loss:
+            self._emit_backup_event(
+                "backup.restore_rejected",
+                payload={
+                    "file": str(target),
+                    "reason": "backup_stale",
+                    "backup_latest_event_id": backup_event_id,
+                    "current_latest_event_id": latest_event_id,
+                },
+                actor_session_id=actor_session_id,
+            )
+            raise DomainError(
+                "backup_stale",
+                "The backup is older than the current database; pass allow_data_loss "
+                "to accept losing newer events",
+                status_code=409,
+                details={
+                    "backup_latest_event_id": backup_event_id,
+                    "current_latest_event_id": latest_event_id,
+                },
+            )
+        self._emit_backup_event(
+            "backup.restore_started",
+            payload={"file": str(target), "stale": stale},
+            actor_session_id=actor_session_id,
+        )
+        if self.settings.database_backend == "sqlite":
+            source_connection = sqlite3.connect(
+                f"file:{target.as_posix()}?mode=ro", uri=True
+            )
+            try:
+                # The sqlite backup API requires a destination connection with
+                # no active transaction, so bypass the pooled writer here.
+                live_connection = sqlite3.connect(self.database.path)
+                try:
+                    source_connection.backup(live_connection)
+                finally:
+                    live_connection.close()
+            finally:
+                source_connection.close()
+        else:
+            database_url = os.getenv(self.settings.database_url_env, "")
+            restore_postgresql(database_url, target)
+        self._emit_backup_event(
+            "backup.restore_completed",
+            payload={"file": str(target), "restored_latest_event_id": backup_event_id},
+            actor_session_id=actor_session_id,
+        )
+        return {
+            "backend": self.settings.database_backend,
+            "input": str(target),
+            "restored": True,
+            "data_loss": stale,
+        }
+
+    def _ensure_sqlite_restorable(self, backup_path: Path) -> None:
+        """Fail loudly when the live SQLite database cannot take a restore."""
+        probe = sqlite3.connect(self.database.path, timeout=0.5)
+        try:
+            probe.execute("BEGIN IMMEDIATE")
+            probe.execute("ROLLBACK")
+        except sqlite3.Error as error:
+            raise DomainError(
+                "database_busy",
+                f"The live database is busy; stop writers before restoring: {error}",
+                status_code=409,
+            ) from error
+        finally:
+            probe.close()

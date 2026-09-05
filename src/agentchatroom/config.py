@@ -62,6 +62,11 @@ CONFIG_FILE_SCHEMA: dict[str, dict[str, tuple[type, ...]]] = {
         "management_session_ttl_seconds": (int,),
         "management_cookie_name": (str,),
     },
+    "backup": {
+        "auto_backup_enabled": (bool,),
+        "auto_backup_interval_seconds": (int,),
+        "auto_backup_max_kept": (int,),
+    },
     "interface": {"product_name": (str,), "default_theme": (str,)},
 }
 
@@ -164,6 +169,9 @@ class Settings:
     audit_window_size: int = 100
     token_touch_interval_seconds: float = 60.0
     token_touch_min_calls: int = 32
+    auto_backup_enabled: bool = False
+    auto_backup_interval_seconds: int = 3600
+    auto_backup_max_kept: int = 10
     knowledge_kinds: tuple[str, ...] = tuple(KNOWLEDGE_DEFAULT_KINDS)
     knowledge_require_verified_task: bool = True
     product_name: str = "AgentChatRoom"
@@ -280,6 +288,11 @@ def _merge_toml(path: Path) -> dict[str, Any]:
         "token_touch_min_calls": raw.get("coordination", {}).get(
             "token_touch_min_calls"
         ),
+        "auto_backup_enabled": raw.get("backup", {}).get("auto_backup_enabled"),
+        "auto_backup_interval_seconds": raw.get("backup", {}).get(
+            "auto_backup_interval_seconds"
+        ),
+        "auto_backup_max_kept": raw.get("backup", {}).get("auto_backup_max_kept"),
         "agent_token_ttl_seconds": raw.get("security", {}).get(
             "agent_token_ttl_seconds"
         ),
@@ -511,6 +524,22 @@ def load_settings(
                 file_values.get("token_touch_min_calls", 32),
             )
         ),
+        "auto_backup_enabled": environment_bool(
+            "AGENTCHATROOM_AUTO_BACKUP_ENABLED",
+            file_values.get("auto_backup_enabled", False),
+        ),
+        "auto_backup_interval_seconds": int(
+            os.getenv(
+                "AGENTCHATROOM_AUTO_BACKUP_INTERVAL_SECONDS",
+                file_values.get("auto_backup_interval_seconds", 3600),
+            )
+        ),
+        "auto_backup_max_kept": int(
+            os.getenv(
+                "AGENTCHATROOM_AUTO_BACKUP_MAX_KEPT",
+                file_values.get("auto_backup_max_kept", 10),
+            )
+        ),
         "knowledge_kinds": normalize_knowledge_kinds(
             os.getenv("AGENTCHATROOM_KNOWLEDGE_KINDS")
             if os.getenv("AGENTCHATROOM_KNOWLEDGE_KINDS") is not None
@@ -639,6 +668,10 @@ def load_settings(
         raise ValueError("SSE per-IP limit must be at least 1")
     if values["audit_window_size"] < 1:
         raise ValueError("audit window size must be at least 1")
+    if values["auto_backup_interval_seconds"] < 60:
+        raise ValueError("auto backup interval must be at least 60 seconds")
+    if values["auto_backup_max_kept"] < 1:
+        raise ValueError("auto backup max kept must be at least 1")
     if values["token_touch_interval_seconds"] < 1:
         raise ValueError("token touch interval must be at least 1 second")
     if values["token_touch_min_calls"] < 1:

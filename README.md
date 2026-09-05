@@ -415,6 +415,15 @@ Agent 自报的 `worktree` 不会被服务盲目信任。Work Report 采集 Git 
 
 审计历史分页在共享领域服务实现，REST `GET /api/v1/projects/{project_id}/audit`、MCP `audit_query` 和 CLI `audit` 复用同一实现：`after` / `before` 界定开区间 id 窗口（`before=0` 保持旧的前向行为），`limit` 1–1000（默认 200），支持 `event_type`、`actor_session_id`、`task_id` 过滤；响应含 `has_older` / `has_newer` 续页标志。`after >= before`（同时提供时）返回结构化错误。事件本身仍只追加、不改写。
 
+### 数据库备份与回滚
+
+数据库承载全部协作历史与审计。管理 Tab 的「数据库与备份」区块与管理端 REST 暴露产品级备份能力，底层复用 `backup_sqlite` / `backup_postgresql`：
+
+- **位置可见性**：运行状态字段卡展示数据库类型、SQLite 绝对路径（PostgreSQL 显示脱敏 DSN 指向）、数据目录与日志路径，值全部来自运行时配置。
+- **立即备份**：`POST /api/v1/admin/backups`（管理认证）把数据库快照写入 `<数据目录>/backups/`，返回备份文件绝对路径（界面可复制）；备份清单记录 schema 版本与事件游标，操作写入审计事件 `backup.created`。
+- **从备份回滚**：`POST /api/v1/admin/backups/restore` 要求键入确认 `confirm="REPLACE"`（界面为二次确认弹窗）；安全校验包括 schema 版本一致（`backup_schema_mismatch`）、备份是否落后于当前最新写入（`backup_stale`，必须显式 `allow_data_loss=true` 接受丢弃较新数据）、数据库是否可写（`database_busy`）。拒绝与完成均写审计事件。回滚会丢弃备份之后的数据，请先确认没有任何 Agent 正在写入。
+- **自动备份**：受验证配置 `[backup]`：`auto_backup_enabled`（默认关闭）、`auto_backup_interval_seconds`（默认 3600，最小 60）、`auto_backup_max_kept`（默认 10，超出自动清理最旧备份），环境变量 `AGENTCHATROOM_AUTO_BACKUP_*` 可覆盖。项目设置对话框（项目设置重设计任务）接线同一配置，无第二套事实来源。
+
 ## 知识资产（Knowledge Asset）
 
 Room 中的沉淀知识以版本化 Knowledge Asset 保存，默认类型包括决策、流程、坑点、验证方式、偏好和参考资料。知识资产与任务执行相互独立：Agent 先提交候选版本，再由不同 Agent Identity 独立审核，未通过审核的知识不会进入已批准状态。

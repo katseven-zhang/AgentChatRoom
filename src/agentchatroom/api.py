@@ -284,6 +284,12 @@ class AdminLogin(StrictModel):
     token: str
 
 
+class BackupRestoreRequest(StrictModel):
+    backup_path: str
+    confirm: str
+    allow_data_loss: bool = False
+
+
 _CREDENTIAL_VALUE = r"[^\s,;}\]&\"']+"
 
 
@@ -751,8 +757,26 @@ def create_app(
         mcp_server.streamable_http_app() if resolved.mcp_http_enabled else None
     )
 
+    auto_backup_stop = threading.Event()
+
+    def _auto_backup_loop() -> None:
+        interval = max(60, resolved.auto_backup_interval_seconds)
+        while not auto_backup_stop.wait(timeout=interval):
+            try:
+                service.create_backup(source="auto")
+            except Exception:
+                logging.getLogger(__name__).exception("automatic backup failed")
+
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
+        auto_backup_worker: threading.Thread | None = None
+        if resolved.auto_backup_enabled:
+            auto_backup_worker = threading.Thread(
+                target=_auto_backup_loop,
+                name="agentchatroom-auto-backup",
+                daemon=True,
+            )
+            auto_backup_worker.start()
         try:
             if mcp_http_app is None:
                 yield
@@ -760,6 +784,9 @@ def create_app(
                 async with mcp_server.session_manager.run():
                     yield
         finally:
+            auto_backup_stop.set()
+            if auto_backup_worker is not None:
+                auto_backup_worker.join(timeout=5)
             service.close()
 
     app = FastAPI(
@@ -1164,6 +1191,40 @@ def create_app(
             "paths": runtime["paths"],
             "process": runtime["process"],
         }
+
+    def _require_management(request: Request) -> None:
+        if not management_authenticated(request):
+            raise DomainError(
+                "management_auth_required",
+                "Management authentication is required for this endpoint",
+                status_code=401,
+            )
+
+    @app.get("/api/v1/admin/backups")
+    def list_managed_backups(request: Request) -> dict[str, Any]:
+        _require_management(request)
+        return {
+            "backups": service.list_backups(),
+            "auto_backup": {
+                "enabled": resolved.auto_backup_enabled,
+                "interval_seconds": resolved.auto_backup_interval_seconds,
+                "max_kept": resolved.auto_backup_max_kept,
+            },
+        }
+
+    @app.post("/api/v1/admin/backups")
+    def create_managed_backup(request: Request) -> dict[str, Any]:
+        _require_management(request)
+        return service.create_backup(source="management")
+
+    @app.post("/api/v1/admin/backups/restore")
+    def restore_managed_backup(request: Request, body: BackupRestoreRequest) -> dict[str, Any]:
+        _require_management(request)
+        return service.restore_backup(
+            body.backup_path,
+            confirm=body.confirm,
+            allow_data_loss=body.allow_data_loss,
+        )
 
     @app.get("/api/v1/projects")
     def list_projects() -> dict[str, Any]:

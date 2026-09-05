@@ -30,6 +30,8 @@ const state = {
   members: [],
   credentials: [],
   workspaces: [],
+  managedBackups: [],
+  autoBackupInfo: null,
   auditEvents: [],
   auditHasOlder: false,
   auditHasNewer: false,
@@ -76,6 +78,7 @@ const elements = Object.fromEntries(
     "integration-local-refresh", "integration-local-apply",
     "member-list", "refresh-audit-button", "audit-event-filter",
     "create-token-button", "token-list", "workspace-list", "audit-list",
+    "create-backup-button", "backup-list",
     "refresh-runtime-button", "runtime-status", "runtime-config", "runtime-config-raw", "runtime-log",
     "login-dialog", "login-form", "login-token", "login-error",
     "token-dialog", "token-form", "token-name", "token-member", "token-days", "token-permissions",
@@ -845,7 +848,7 @@ async function selectProject(projectId) {
   closeEventSource();
   stopPresenceRefresh();
   try {
-    const [snapshot, eventPage, members, credentials, workspaces, audit, runtime, intakeTargets, intakes] = await Promise.all([
+    const [snapshot, eventPage, members, credentials, workspaces, audit, runtime, backups, intakeTargets, intakes] = await Promise.all([
       refreshSnapshot(projectId),
       loadRecentEvents(projectId),
       api(`/api/v1/projects/${projectId}/members`),
@@ -853,6 +856,7 @@ async function selectProject(projectId) {
       api(`/api/v1/projects/${projectId}/workspaces`),
       fetchAuditTail(projectId, ""),
       api("/api/v1/admin/runtime?lines=80"),
+      api("/api/v1/admin/backups"),
       api(`/api/v1/projects/${projectId}/task-intakes/targets`),
       api(`/api/v1/projects/${projectId}/task-intakes`),
     ]);
@@ -874,6 +878,8 @@ async function selectProject(projectId) {
     state.auditHasNewer = audit.has_newer;
     state.auditFilter = "";
     state.runtime = runtime;
+    state.managedBackups = backups.backups || [];
+    state.autoBackupInfo = backups.auto_backup || null;
     mergeEvents(eventPage.events);
     renderProjects();
     renderAll();
@@ -1088,7 +1094,7 @@ function renderEmptyRoom() {
   elements["chat-subtitle"].textContent = "等待选择项目";
   elements["onboarding"].classList.remove("is-hidden");
   ["create-task-button", "archive-project-button", "project-settings-button", "export-project-button", "connect-agent-button",
-    "create-token-button", "refresh-audit-button", "audit-event-filter",
+    "create-token-button", "refresh-audit-button", "audit-event-filter", "create-backup-button",
     "event-filter", "message-input", "message-kind", "message-channel", "message-task", "message-priority",
     "message-requires-ack", "send-message-button"]
     .forEach((id) => { elements[id].disabled = true; });
@@ -1114,7 +1120,7 @@ function renderAll() {
   elements["chat-subtitle"].textContent = `${connectedAgentCount(agentIdentities)} 当前连接 / ${agentIdentities.length} 个 Agent / 累计 ${agents.length} 次接入 · 游标 ${state.snapshot.cursor}`;
   elements["onboarding"].classList.add("is-hidden");
   ["create-task-button", "archive-project-button", "project-settings-button", "export-project-button", "connect-agent-button",
-    "create-token-button", "refresh-audit-button", "audit-event-filter",
+    "create-token-button", "refresh-audit-button", "audit-event-filter", "create-backup-button",
     "event-filter", "message-input", "message-kind", "message-channel", "message-task", "message-priority",
     "message-requires-ack", "send-message-button"]
     .forEach((id) => { elements[id].disabled = false; });
@@ -1495,7 +1501,69 @@ function renderManagement() {
   renderMembers();
   renderCredentials();
   renderWorkspaces();
+  renderBackups();
   renderAudit();
+}
+
+function backupSizeLabel(size) {
+  const kb = Number(size) / 1024;
+  if (!Number.isFinite(kb) || kb <= 0) return "-";
+  return `${kb.toFixed(kb >= 1024 ? 0 : 1)} KB`;
+}
+
+function renderBackups() {
+  const autoBackup = state.autoBackupInfo;
+  const autoSummary = autoBackup
+    ? `自动备份：${autoBackup.enabled ? `已开启 · 每 ${Math.round(autoBackup.interval_seconds / 60)} 分钟 · 保留 ${autoBackup.max_kept} 份` : "未开启（可用配置 [backup] 开启）"}`
+    : "";
+  elements["backup-list"].innerHTML = state.managedBackups.length
+    ? `${autoSummary ? `<p class="secondary-text" style="margin: 0 0 8px;">${escapeHtml(autoSummary)}</p>` : ""}${state.managedBackups.map((backup) => `
+      <article class="management-item">
+        <time class="audit-time">${escapeHtml(formatTime(backup.created_at))}</time>
+        <div>
+          <h4>${escapeHtml(backup.file)}</h4>
+          <p>${escapeHtml(`${backup.backend || "-"} · schema v${backup.schema_version ?? "-"} · ${backupSizeLabel(backup.size)} · ${backup.source === "auto" ? "自动" : "手动"}`)}</p>
+        </div>
+        <div class="management-actions">
+          <button type="button" class="secondary-button" data-backup-copy="${escapeHtml(backup.file)}">复制路径</button>
+          <button type="button" class="danger-button" data-backup-restore="${escapeHtml(backup.file)}">回滚</button>
+        </div>
+      </article>`).join("")}`
+    : `${autoSummary ? `<p class="secondary-text" style="margin: 0 0 8px;">${escapeHtml(autoSummary)}</p>` : ""}<div class="empty-state">还没有备份。点「立即备份」把当前协作数据库另存为快照。</div>`;
+}
+
+async function createManagedBackup() {
+  if (!state.projectId) return;
+  const result = await api("/api/v1/admin/backups", { method: "POST", body: "{}" });
+  showToast(`备份已创建：${result.output}`);
+  await refreshManagement();
+}
+
+async function restoreManagedBackup(backupFile) {
+  const first = window.confirm(
+    `确定要把整个协作数据库回滚到这份备份吗？\n\n${backupFile}\n\n回滚会丢弃备份之后的所有消息、任务与审计事件，且无法撤销。`
+  );
+  if (!first) return;
+  try {
+    await api("/api/v1/admin/backups/restore", {
+      method: "POST",
+      body: JSON.stringify({ backup_path: backupFile, confirm: "REPLACE" }),
+    });
+  } catch (error) {
+    if (error?.code !== "backup_stale") {
+      throw error;
+    }
+    const second = window.confirm(
+      "这份备份落后于当前数据库，回滚将丢失较新的数据。\n\n再次确认：放弃备份之后的全部数据并继续回滚？"
+    );
+    if (!second) return;
+    await api("/api/v1/admin/backups/restore", {
+      method: "POST",
+      body: JSON.stringify({ backup_path: backupFile, confirm: "REPLACE", allow_data_loss: true }),
+    });
+  }
+  showToast("数据库已回滚，页面将刷新");
+  window.setTimeout(() => window.location.reload(), 1200);
 }
 
 function runtimeConfigCards(runtime) {
@@ -1632,12 +1700,13 @@ async function refreshManagement() {
         ? api(auditQueryUrl(state.projectId, { after: state.auditEvents[state.auditEvents.length - 1].id, eventType }))
         : fetchAuditTail(state.projectId, eventType))
     : fetchAuditTail(state.projectId, eventType);
-  const [members, credentials, workspaces, audit, runtime] = await Promise.all([
+  const [members, credentials, workspaces, audit, runtime, backups] = await Promise.all([
     api(`/api/v1/projects/${state.projectId}/members`),
     api(`/api/v1/projects/${state.projectId}/agent-tokens`),
     api(`/api/v1/projects/${state.projectId}/workspaces`),
     auditRefresh,
     api("/api/v1/admin/runtime?lines=80"),
+    api("/api/v1/admin/backups"),
   ]);
   state.members = members.members;
   state.credentials = credentials.credentials;
@@ -1652,6 +1721,8 @@ async function refreshManagement() {
     state.auditFilter = eventType;
   }
   state.runtime = runtime;
+  state.managedBackups = backups.backups || [];
+  state.autoBackupInfo = backups.auto_backup || null;
   renderManagement();
 }
 
@@ -1815,6 +1886,16 @@ elements["audit-list"].addEventListener("click", (event) => {
     .catch(handleError);
 });
 elements["refresh-runtime-button"].addEventListener("click", () => refreshManagement().catch(handleError));
+elements["create-backup-button"].addEventListener("click", () => createManagedBackup().catch(handleError));
+elements["backup-list"].addEventListener("click", (event) => {
+  const copy = event.target.closest("[data-backup-copy]");
+  if (copy) {
+    copyText(copy.dataset.backupCopy).then(() => showToast("备份路径已复制")).catch(handleError);
+    return;
+  }
+  const restore = event.target.closest("[data-backup-restore]");
+  if (restore) restoreManagedBackup(restore.dataset.backupRestore).catch(handleError);
+});
 elements["task-assign-button"].addEventListener("click", () => openTaskAssignmentDialog().catch(handleError));
 
 elements["task-release-button"].addEventListener("click", () => {

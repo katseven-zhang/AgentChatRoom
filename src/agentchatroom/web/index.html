@@ -187,6 +187,17 @@
             <section class="data-section unframed management-section">
               <div class="section-heading">
                 <div>
+                  <h3>数据库与备份</h3>
+                  <p class="secondary-text">备份会另存整个协作数据库；回滚会丢弃备份之后的数据，需二次确认</p>
+                </div>
+                <button class="secondary-button" id="create-backup-button" type="button" disabled>立即备份</button>
+              </div>
+              <div id="backup-list" class="management-list"></div>
+            </section>
+
+            <section class="data-section unframed management-section">
+              <div class="section-heading">
+                <div>
                   <h3>项目成员</h3>
                   <p class="secondary-text">Agent 接入时自动创建，无需手工添加或编辑</p>
                 </div>
