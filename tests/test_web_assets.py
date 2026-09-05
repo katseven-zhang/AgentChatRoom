@@ -205,19 +205,24 @@ def test_web_event_and_audit_panels_catch_up_to_latest_cursor():
 
     assert "function loadEventWindow(" in javascript
     assert "function loadRecentEvents(" in javascript
-    assert "function loadRecentAuditEvents(" in javascript
+    assert "function fetchAuditTail(" in javascript
+    assert "function auditQueryUrl(" in javascript
+    assert "async function loadOlderAuditEvents(" in javascript
+    assert "async function loadNewerAuditEvents(" in javascript
     assert "loadRecentEvents(projectId)" in javascript
-    assert "loadRecentAuditEvents(state.projectId, eventType)" in javascript
+    assert 'fetchAuditTail(projectId, "")' in javascript
     assert "connectEvents(eventPage.cursor)" in javascript
-    assert "audit.events.slice(-AUDIT_WINDOW_SIZE)" in javascript
+    assert "state.auditHasOlder" in javascript
+    assert "state.auditHasNewer" in javascript
+    assert "mergeAuditEvents(state.auditEvents, audit.events)" in javascript
     assert "const EVENT_WINDOW_SIZE = 500;" in javascript
-    assert "const AUDIT_WINDOW_SIZE = 100;" in javascript
+    assert "settings?.audit_window_size" in javascript
+    assert "AUDIT_WINDOW_SIZE" not in javascript
+    assert "loadRecentAuditEvents" not in javascript
     assert "result.events.length < windowSize || after >= latest" in javascript
     assert "result.latest_cursor" in javascript
     assert "tailJump && latest - after > windowSize" in javascript
-    assert "{ tailJump: !eventType }" in javascript
     assert "events?after=0&limit=500" not in javascript
-    assert "audit?after=0&limit=100" not in javascript
     assert "connectEvents(snapshot.cursor)" not in javascript
 
 
@@ -512,12 +517,12 @@ def test_web_dialog_close_scopes_draft_cleanup_to_owner_dialog(tmp_path):
     """
     javascript = (WEB_DIR / "app.js").read_text(encoding="utf-8")
     start = javascript.index("function clearDialogDrafts(dialog)")
-    end_marker = 'if (dialog.id === "member-dialog") state.editingMemberId = null;\n}'
+    end_marker = 'if (dialog.id === "task-edit-dialog") state.editingTaskId = null;\n}'
     end = javascript.index(end_marker) + len(end_marker)
 
     harness = tmp_path / "dialog_cleanup_harness.js"
     harness.write_text(
-        "const state = { editingTaskId: 'task_abc', editingMemberId: null };\n"
+        "const state = { editingTaskId: 'task_abc' };\n"
         + javascript[start:end]
         + "\n"
         + r"""
@@ -530,20 +535,15 @@ clearDialogDrafts({ id: 'task-release-dialog' });
 outcomes.releaseCloseKeepsTaskContext = state.editingTaskId === 'task_abc';
 // Unknown dialogs never mutate draft state.
 clearDialogDrafts({ id: 'workspace-dialog' });
-outcomes.unknownCloseIsInert = state.editingTaskId === 'task_abc' && state.editingMemberId === null;
+outcomes.unknownCloseIsInert = state.editingTaskId === 'task_abc';
 // Auth dialogs are exempt and never clear anything.
-state.editingMemberId = 'member_1';
 clearDialogDrafts({ id: 'login-dialog' });
-outcomes.loginCloseIsExempt = state.editingMemberId === 'member_1';
+outcomes.loginCloseIsExempt = state.editingTaskId === 'task_abc';
 clearDialogDrafts({ id: 'token-secret-dialog' });
-outcomes.tokenSecretCloseIsExempt = state.editingMemberId === 'member_1';
+outcomes.tokenSecretCloseIsExempt = state.editingTaskId === 'task_abc';
 // Closing the task detail dialog itself still hands the context back.
 clearDialogDrafts({ id: 'task-edit-dialog' });
 outcomes.taskDetailCloseClearsTaskContext = state.editingTaskId === null;
-// Closing the member dialog clears only its own draft.
-clearDialogDrafts({ id: 'member-dialog' });
-outcomes.memberDialogCloseClearsMemberContext =
-  state.editingMemberId === null && state.editingTaskId === null;
 console.log(JSON.stringify(outcomes));
 """,
         encoding="utf-8",
@@ -557,7 +557,6 @@ console.log(JSON.stringify(outcomes));
         "loginCloseIsExempt": True,
         "tokenSecretCloseIsExempt": True,
         "taskDetailCloseClearsTaskContext": True,
-        "memberDialogCloseClearsMemberContext": True,
     }
 
 
