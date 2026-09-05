@@ -1334,16 +1334,36 @@ function taskIntakeStatus(status) {
   }[status] || status;
 }
 
+function taskIntakeTaskReference(intake) {
+  if (intake.status !== "defined" || !intake.formal_task_id) return "";
+  const task = (state.snapshot?.tasks || []).find((item) => item.id === intake.formal_task_id);
+  if (task?.task_number) {
+    return `<button class="task-intake-task-ref" type="button" data-task-id="${escapeHtml(intake.formal_task_id)}">正式任务 #${escapeHtml(String(task.task_number))} · ${escapeHtml(task.title)}</button>`;
+  }
+  return `<span class="task-intake-task-ref secondary-text">正式任务 ${escapeHtml(intake.formal_task_id)}</span>`;
+}
+
 function renderTaskIntakes() {
-  const active = state.taskIntakes.filter((intake) => intake.status !== "defined");
-  elements["task-intake-list"].innerHTML = active.length
-    ? `<div class="task-intake-heading"><h3>待受理任务意图</h3><span class="secondary-text">正式标题、优先级、验收条件和依赖由 Agent 定义</span></div>${active.map((intake) => `
+  const activeStatuses = new Set(["pending", "accepted"]);
+  const active = state.taskIntakes.filter((intake) => activeStatuses.has(intake.status));
+  const archived = state.taskIntakes.filter((intake) => !activeStatuses.has(intake.status));
+  const renderItem = (intake) => `
       <article class="task-intake-item">
         <div class="task-intake-meta"><span class="status-badge ${escapeHtml(intake.status)}">${escapeHtml(taskIntakeStatus(intake.status))}</span><span class="secondary-text">受理 Agent：${escapeHtml(intakeTargetName(intake))}</span></div>
         <p>${escapeHtml(intake.raw_description)}</p>
         ${intake.note ? `<small>${escapeHtml(intake.note)}</small>` : ""}
-      </article>`).join("")}`
-    : "";
+        ${taskIntakeTaskReference(intake)}
+      </article>`;
+  const heading = '<div class="task-intake-heading"><h3>待受理任务意图</h3><span class="secondary-text">正式标题、优先级、验收条件和依赖由 Agent 定义</span></div>';
+  elements["task-intake-list"].innerHTML = [
+    heading,
+    active.length
+      ? active.map(renderItem).join("")
+      : '<div class="empty-state">当前没有待受理的任务意图。提交新意图后，目标 Agent 会在这里受理并补全正式任务合同。</div>',
+    archived.length
+      ? `<details class="task-intake-archive"><summary>意图留档（${archived.length}）· 已定义 / 已拒绝 / 已取消</summary>${archived.map(renderItem).join("")}</details>`
+      : "",
+  ].join("");
 }
 
 function renderLeases(leases, agents) {
@@ -1856,6 +1876,11 @@ document.querySelectorAll("dialog").forEach((dialog) => {
 });
 
 elements["task-table"].addEventListener("click", (event) => {
+  const button = event.target.closest("[data-task-id]");
+  if (button) openTaskDetails(button.dataset.taskId).catch(handleError);
+});
+
+elements["task-intake-list"].addEventListener("click", (event) => {
   const button = event.target.closest("[data-task-id]");
   if (button) openTaskDetails(button.dataset.taskId).catch(handleError);
 });

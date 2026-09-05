@@ -1373,6 +1373,54 @@ body.is-resizing-panels {
   font-size: 11px;
 }
 
+.task-intake-archive {
+  margin-top: 14px;
+  border-top: 1px solid var(--border);
+}
+
+.task-intake-archive > summary {
+  cursor: pointer;
+  padding: 10px 0;
+  color: var(--text-muted);
+  font-size: 13px;
+  font-weight: 700;
+  user-select: none;
+}
+
+.task-intake-archive > summary:hover {
+  color: var(--text);
+}
+
+.task-intake-archive[open] > summary {
+  padding-bottom: 14px;
+}
+
+.task-intake-archive .task-intake-item {
+  margin-top: 10px;
+  border-color: var(--border);
+  border-left: 3px solid var(--border-strong);
+  background: var(--surface-muted);
+}
+
+.task-intake-task-ref {
+  display: inline-block;
+  margin: 8px 0 0;
+  padding: 0;
+  border: none;
+  background: none;
+  color: var(--blue);
+  font: inherit;
+  font-size: 13px;
+  font-weight: 700;
+  text-align: left;
+  cursor: pointer;
+  overflow-wrap: anywhere;
+}
+
+button.task-intake-task-ref:hover {
+  text-decoration: underline;
+}
+
 .task-detail-dialog {
   width: min(760px, calc(100vw - 24px));
 }
