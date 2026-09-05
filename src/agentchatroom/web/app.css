@@ -1116,7 +1116,7 @@ body.is-resizing-panels {
 .compact-item,
 .lease-item,
 .review-item {
-  padding: 11px 12px;
+  padding: 14px 16px;
   border: 1px solid var(--border);
   border-radius: var(--radius-lg);
   background: var(--surface-muted);
@@ -1125,23 +1125,24 @@ body.is-resizing-panels {
 .compact-item strong,
 .lease-item strong,
 .review-item strong {
-  font-size: 13px;
+  font-size: 15px;
+  line-height: 1.4;
 }
 
 .compact-item p,
 .lease-item p,
 .review-item p {
-  margin: 5px 0 0;
+  margin: 6px 0 0;
   color: var(--text-muted);
-  font-size: 11px;
-  line-height: 1.45;
+  font-size: 13px;
+  line-height: 1.6;
 }
 
 .compact-body {
-  margin-top: 5px;
+  margin-top: 6px;
   color: var(--text-muted);
-  font-size: 11.5px;
-  line-height: 1.55;
+  font-size: 13px;
+  line-height: 1.6;
   overflow-wrap: anywhere;
 }
 
@@ -1662,16 +1663,17 @@ button.event-id {
 .criteria-list {
   display: flex;
   flex-wrap: wrap;
-  gap: 5px;
-  margin-top: 9px;
+  gap: 8px;
+  margin-top: 12px;
 }
 
 .criterion {
-  padding: 3px 6px;
-  border-radius: 4px;
+  padding: 4px 9px;
+  border-radius: 6px;
   background: var(--surface);
   color: var(--text-muted);
-  font-size: 10px;
+  font-size: 12px;
+  line-height: 1.6;
 }
 
 .criterion.passed {
@@ -1687,7 +1689,7 @@ button.event-id {
 
 .criterion-evidence {
   display: block;
-  margin-top: 3px;
+  margin-top: 4px;
   white-space: pre-wrap;
   word-break: break-word;
   color: inherit;
@@ -1695,10 +1697,11 @@ button.event-id {
 }
 
 .evidence-block {
-  margin-top: 10px;
-  padding-top: 9px;
+  margin-top: 12px;
+  padding-top: 10px;
   border-top: 1px solid var(--border);
-  font-size: 11px;
+  font-size: 13px;
+  line-height: 1.6;
 }
 
 .evidence-block summary {
@@ -1709,6 +1712,27 @@ button.event-id {
 
 .evidence-block p {
   overflow-wrap: anywhere;
+}
+
+#panel-reviews .section-heading h3 {
+  font-size: 17px;
+  line-height: 1.3;
+}
+
+#panel-reviews .section-heading .secondary-text {
+  margin: 4px 0 0;
+  font-size: 13px;
+  line-height: 1.6;
+}
+
+#panel-reviews .scope-status {
+  font-size: 13px;
+  line-height: 1.6;
+}
+
+#panel-reviews .empty-state {
+  font-size: 14px;
+  line-height: 1.7;
 }
 
 .chat-panel {
