@@ -1366,7 +1366,7 @@ function renderLeases(leases, agents) {
         <p>${holder} · TTL ${lease.ttl_seconds}s · 到期 ${escapeHtml(formatTime(lease.expires_at))}${lease.renewed_at ? ` · 续于 ${escapeHtml(formatTime(lease.renewed_at))}` : ""}${lease.reason ? ` · ${escapeHtml(lease.reason)}` : ""}</p>
       </article>`;
     }).join("")
-    : '<div class="empty-state">当前没有活跃文件占用。Agent 编辑文件前会在这里声明路径范围，避免两个人同时改同一文件。</div>';
+    : '<div class="empty-state">当前没有活跃文件占用。Agent 编辑文件前会在这里声明路径范围，避免两个 Agent 同时改同一文件。</div>';
 }
 
 function renderReviews(tasks, agents) {
