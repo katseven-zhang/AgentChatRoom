@@ -864,6 +864,38 @@ def test_mcp_room_join_uses_unique_existing_room_without_project_key(
     assert len(service.list_projects()) == 1
 
 
+def test_mcp_room_join_returns_document_manifest(
+    monkeypatch, service, project_dir
+):
+    service.upsert_project_document(
+        existing_id := service.create_project(root_path=str(project_dir))["id"],
+        doc_key="standards",
+        kind="binding",
+        title="工程规范",
+        content="先取租约",
+        actor="management",
+    )
+    monkeypatch.setattr(mcp_server, "service", service)
+    _configure_local_software(
+        monkeypatch, key="trae", name="Trae", client="trae"
+    )
+
+    response = mcp_server.room_join(
+        project_path=str(project_dir),
+        model="unknown",
+        agent_key="trae-main",
+        agent_name="Trae",
+        client="trae",
+    )
+
+    assert response["ok"] is True
+    manifest = response["result"]["project_documents"]
+    assert manifest and manifest[0]["doc_key"] == "standards"
+    assert manifest[0]["kind"] == "binding"
+    assert manifest[0]["version"] == 1
+    assert "content" not in manifest[0]
+
+
 @pytest.mark.asyncio
 async def test_mcp_compatibility_is_schema_directed(monkeypatch, service, project_dir):
     monkeypatch.setattr(mcp_server, "service", service)

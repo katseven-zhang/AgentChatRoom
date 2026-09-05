@@ -727,6 +727,39 @@ class SSELimiter:
                 self._ip_counts.pop(client_ip, None)
 
 
+def run_auto_backup_cycle(service: Any) -> dict[str, Any] | None:
+    """Run one automatic-backup cycle; failures are logged, never raised."""
+    try:
+        return service.create_backup(source="auto")
+    except Exception:
+        logging.getLogger(__name__).exception("automatic backup failed")
+        return None
+
+
+def auto_backup_worker(
+    service: Any, interval_seconds: int, stop_event: "threading.Event"
+) -> None:
+    interval = max(60, int(interval_seconds))
+    while not stop_event.wait(timeout=interval):
+        run_auto_backup_cycle(service)
+
+
+def start_auto_backup_worker(
+    service: Any, settings: Any, stop_event: "threading.Event"
+) -> "threading.Thread | None":
+    """Start the daemon backup worker when enabled; None when disabled."""
+    if not settings.auto_backup_enabled:
+        return None
+    worker = threading.Thread(
+        target=auto_backup_worker,
+        args=(service, settings.auto_backup_interval_seconds, stop_event),
+        name="agentchatroom-auto-backup",
+        daemon=True,
+    )
+    worker.start()
+    return worker
+
+
 def create_app(
     settings: Settings | None = None,
     *,
@@ -766,24 +799,11 @@ def create_app(
 
     auto_backup_stop = threading.Event()
 
-    def _auto_backup_loop() -> None:
-        interval = max(60, resolved.auto_backup_interval_seconds)
-        while not auto_backup_stop.wait(timeout=interval):
-            try:
-                service.create_backup(source="auto")
-            except Exception:
-                logging.getLogger(__name__).exception("automatic backup failed")
-
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
-        auto_backup_worker: threading.Thread | None = None
-        if resolved.auto_backup_enabled:
-            auto_backup_worker = threading.Thread(
-                target=_auto_backup_loop,
-                name="agentchatroom-auto-backup",
-                daemon=True,
-            )
-            auto_backup_worker.start()
+        auto_backup_worker = start_auto_backup_worker(
+            service, resolved, auto_backup_stop
+        )
         try:
             if mcp_http_app is None:
                 yield

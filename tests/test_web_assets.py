@@ -226,6 +226,17 @@ def test_web_event_and_audit_panels_catch_up_to_latest_cursor():
     assert "connectEvents(snapshot.cursor)" not in javascript
 
 
+def test_web_task_detail_and_review_render_spec_receipt():
+    """Task #65: the claim-time spec version receipt must be visible in the
+    task contract and the review queue (source-level regression)."""
+    javascript = (WEB_DIR / "app.js").read_text(encoding="utf-8")
+
+    assert "function formatSpecReceipt(" in javascript
+    assert "适用规范（认领时版本回执）" in javascript
+    assert javascript.count("formatSpecReceipt(item.task.spec_receipt)") >= 1
+    assert "task.spec_receipt" in javascript
+
+
 def test_web_project_creation_uses_the_real_folder_and_local_picker():
     javascript = (WEB_DIR / "app.js").read_text(encoding="utf-8")
     markup = (WEB_DIR / "index.html").read_text(encoding="utf-8")

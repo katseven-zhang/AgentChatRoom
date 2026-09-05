@@ -1297,6 +1297,24 @@ class AgentChatRoomService:
             integrations_by_task[str(integration["task_id"])].append(
                 self._integration_dict(integration)
             )
+        spec_receipts: dict[str, dict[str, int]] = {
+            str(row["id"]): {} for row in materialized
+        }
+        project_id = str(materialized[0]["project_id"])
+        for claim_event in connection.execute(
+            f"""
+            SELECT task_id, payload_json FROM events
+            WHERE project_id = ? AND event_type = 'task.claimed'
+              AND task_id IN ({placeholders})
+            ORDER BY id ASC
+            """,
+            [project_id, *task_ids],
+        ):
+            snapshot = json_load(claim_event["payload_json"], {}).get(
+                "project_documents"
+            )
+            if snapshot:
+                spec_receipts[str(claim_event["task_id"])] = snapshot
         assembled: list[dict[str, Any]] = []
         for row in materialized:
             data = self._task_dict(row)
@@ -1317,6 +1335,7 @@ class AgentChatRoomService:
             data["assignments"] = assignments_by_task.get(row["id"], [])
             data["handoffs"] = handoffs_by_task.get(row["id"], [])
             data["integrations"] = integrations_by_task.get(row["id"], [])
+            data["spec_receipt"] = spec_receipts.get(str(row["id"]), {})
             assembled.append(data)
         return assembled
 

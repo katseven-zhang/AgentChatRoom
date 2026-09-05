@@ -76,6 +76,13 @@ def test_task_claim_injects_binding_documents_and_stamps_receipt(service, projec
     )["events"][-1]
     assert report_event["payload"]["spec_receipt"] == {"standards": 1}
 
+    # The task object itself carries the receipt so Web surfaces can render it.
+    fetched = service.get_task(project["id"], task["id"])
+    assert fetched["spec_receipt"] == {"standards": 1}
+    board = service.list_tasks(project["id"])
+    board_task = next(item for item in board if item["id"] == task["id"])
+    assert board_task["spec_receipt"] == {"standards": 1}
+
 
 def test_inject_limit_degrades_large_documents(service, project):
     service.upsert_project_document(

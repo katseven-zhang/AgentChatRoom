@@ -1454,11 +1454,13 @@ function renderReviews(tasks, agents) {
       <article class="review-item">
         <div class="task-meta"><span class="status-badge ${escapeHtml(taskPhaseClass(item.task))}">${escapeHtml(taskPhaseLabel(item.task))}</span><strong>${escapeHtml(item.task.title)}</strong></div>
         <p>等待独立 Agent 检查 ${item.task.acceptance_criteria.length} 条验收条件</p>
+        ${formatSpecReceipt(item.task.spec_receipt) ? `<p>适用规范（认领时版本回执）：${escapeHtml(formatSpecReceipt(item.task.spec_receipt))}</p>` : ""}
         ${renderReportEvidence(item.task.id)}
       </article>` : `
       <article class="review-item">
         <div class="task-meta"><span class="status-badge ${item.review.verdict === "approved" ? "verified" : "blocked"}">${item.review.verdict === "approved" ? "通过" : "退回"}</span><strong>${escapeHtml(item.task?.title || shortId(item.review.task_id))}</strong></div>
         <p>${escapeHtml(names[item.review.reviewer_session_id] || shortId(item.review.reviewer_session_id))} · ${escapeHtml(item.review.notes || `${item.review.criteria.length} 条验收记录`)}</p>
+        ${item.task && formatSpecReceipt(item.task.spec_receipt) ? `<p>适用规范（认领时版本回执）：${escapeHtml(formatSpecReceipt(item.task.spec_receipt))}</p>` : ""}
         <div class="criteria-list">${item.review.criteria.map((criterion) => `<span class="criterion ${escapeHtml(criterion.status)}" title="${escapeHtml(criterion.evidence || "")}">${escapeHtml(criterion.status)} · ${escapeHtml(criterion.criterion)}${criterion.evidence ? `<span class="criterion-evidence">证据：${escapeHtml(criterion.evidence)}</span>` : ""}</span>`).join("")}</div>
         ${renderReportEvidence(item.review.task_id)}
       </article>`).join("")
@@ -2762,6 +2764,17 @@ async function loadTaskHistory(taskId, { direction } = {}) {
   };
 }
 
+function formatSpecReceipt(receipt) {
+  const entries = Object.entries(receipt || {});
+  if (!entries.length) return "";
+  const titles = Object.fromEntries(
+    (state.snapshot?.documents || []).map((doc) => [doc.doc_key, doc.title]),
+  );
+  return entries
+    .map(([docKey, version]) => `${titles[docKey] || docKey} v${version}`)
+    .join(" · ");
+}
+
 function renderTaskContract(task) {
   const dependencies = task.dependency_details || [];
   const criteria = task.acceptance_criteria || [];
@@ -2771,6 +2784,7 @@ function renderTaskContract(task) {
     view.group !== view.phase ? `分组：${viewGroupLabel(view.group)}` : "",
     view.needs_attention ? "已进入需要处理收件箱" : "",
   ].filter(Boolean).join(" · ");
+  const specReceipt = formatSpecReceipt(task.spec_receipt);
   elements["task-detail-heading"].textContent = `任务 #${task.task_number} · ${task.title}`;
   elements["task-detail-contract"].innerHTML = `
     <div class="task-contract-header">
@@ -2785,6 +2799,7 @@ function renderTaskContract(task) {
       <div><dt>完成度</dt><dd>${escapeHtml(`${task.progress_percent}%`)}</dd></div>
       <div><dt>当前步骤</dt><dd>${escapeHtml(task.current_step || "暂无")}</dd></div>
       <div><dt>下一步</dt><dd>${escapeHtml(task.next_step || "暂无")}</dd></div>
+      ${specReceipt ? `<div class="task-contract-wide"><dt>适用规范（认领时版本回执）</dt><dd>${escapeHtml(specReceipt)}</dd></div>` : ""}
       ${task.blocker_reason ? `<div class="task-contract-wide"><dt>阻塞原因</dt><dd>${escapeHtml(task.blocker_reason)}</dd></div>` : ""}
       <div class="task-contract-wide"><dt>正式说明</dt><dd class="task-contract-description">${escapeHtml(task.description || "暂无正式说明")}</dd></div>
       <div class="task-contract-wide"><dt>验收条件</dt><dd>${criteria.length ? `<ul class="readonly-list">${criteria.map((criterion) => `<li>${escapeHtml(criterion)}</li>`).join("")}</ul>` : "暂无验收条件"}</dd></div>

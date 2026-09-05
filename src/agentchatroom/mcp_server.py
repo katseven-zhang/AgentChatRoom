@@ -490,6 +490,9 @@ def room_join(
                 capabilities=capabilities or {"mcp": True},
             )
             payload = {"project": room_service.get_project(project_id), **joined}
+            payload["project_documents"] = room_service.list_project_documents(
+                project_id
+            )["documents"]
             _register_local_presence(payload)
             return {"ok": True, "result": payload}
         configured_identity = _configured_local_identity()
@@ -535,6 +538,9 @@ def room_join(
             workspace_id=registered["workspace"]["id"],
         )
         payload = {"project": project, **joined}
+        payload["project_documents"] = room_service.list_project_documents(
+            project["id"]
+        )["documents"]
         _register_local_presence(payload)
         return {"ok": True, "result": payload}
     except DomainError as error:
