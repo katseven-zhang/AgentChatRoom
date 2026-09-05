@@ -74,7 +74,7 @@ const elements = Object.fromEntries(
     "integration-local-refresh", "integration-local-apply",
     "create-member-button", "member-list", "refresh-audit-button", "audit-event-filter",
     "create-token-button", "register-workspace-button", "token-list", "workspace-list", "audit-list",
-    "refresh-runtime-button", "runtime-status", "runtime-config", "runtime-log",
+    "refresh-runtime-button", "runtime-status", "runtime-config", "runtime-config-raw", "runtime-log",
     "login-dialog", "login-form", "login-token", "login-error",
     "member-dialog", "member-form", "member-dialog-title", "member-id", "member-key", "member-name",
     "member-kind", "member-role", "member-status", "member-metadata", "member-submit",
@@ -1454,11 +1454,46 @@ function renderManagement() {
   renderAudit();
 }
 
+function runtimeConfigCards(runtime) {
+  const settings = runtime.settings || {};
+  const paths = runtime.paths || {};
+  const processInfo = runtime.process || {};
+  const yesNo = (value) => (value ? "已开启" : "未开启");
+  const databaseValue = settings.database_path
+    || (settings.database_backend === "postgresql" && settings.database_url_env
+      ? `连接串经环境变量 ${settings.database_url_env} 注入（已脱敏）`
+      : settings.database_backend || "-");
+  const configSource = paths.config_path || settings.config_path
+    || "未提供配置文件，使用内置默认值";
+  const mcpValue = settings.mcp_http_enabled
+    ? `已启用 · ${settings.mcp_http_path || "-"}`
+    : "未启用";
+  const cards = [
+    ["服务地址", settings.host && settings.port ? `${settings.host}:${settings.port}` : "-", `部署形态 ${settings.deployment_profile || "-"}`],
+    ["数据库", databaseValue, `类型 ${settings.database_backend || "-"}`],
+    ["配置来源", configSource, settings.config_schema_version ? `schema v${settings.config_schema_version}` : ""],
+    ["数据目录", paths.data_dir || settings.data_dir || "-"],
+    ["日志文件", paths.log_path || "-"],
+    ["进程", processInfo.pid ? `PID ${processInfo.pid}${processInfo.managed ? " · 受管" : ""}` : "前台运行（无 PID 文件）"],
+    ["管理认证", yesNo(settings.management_auth_required), settings.management_token_env ? `令牌环境变量 ${settings.management_token_env}` : ""],
+    ["MCP HTTP", mcpValue, `认证 ${yesNo(settings.mcp_http_auth_required)}`],
+  ];
+  return cards
+    .map(([label, value, hint]) => `
+      <div class="config-card">
+        <span>${escapeHtml(label)}</span>
+        <strong>${escapeHtml(String(value ?? "-"))}</strong>
+        ${hint ? `<small>${escapeHtml(hint)}</small>` : ""}
+      </div>`)
+    .join("");
+}
+
 function renderRuntime() {
   const runtime = state.runtime;
   if (!runtime) {
     elements["runtime-status"].innerHTML = '<div class="empty-state">暂无运行状态</div>';
-    elements["runtime-config"].textContent = "";
+    elements["runtime-config"].innerHTML = "";
+    elements["runtime-config-raw"].textContent = "";
     elements["runtime-log"].textContent = "";
     return;
   }
@@ -1470,7 +1505,8 @@ function renderRuntime() {
     <div class="runtime-metric"><span>MCP</span><strong>${escapeHtml(settings.mcp_http_path || "-")}</strong></div>
     <div class="runtime-metric"><span>管理认证</span><strong>${settings.management_auth_required ? "已开启" : "未开启"}</strong></div>
     <div class="runtime-metric"><span>进程</span><strong>${escapeHtml(processInfo.pid || "前台运行")}</strong></div>`;
-  elements["runtime-config"].textContent = JSON.stringify({
+  elements["runtime-config"].innerHTML = runtimeConfigCards(runtime);
+  elements["runtime-config-raw"].textContent = JSON.stringify({
     settings,
     paths: runtime.paths,
   }, null, 2);

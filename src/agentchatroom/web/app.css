@@ -979,6 +979,56 @@ body.is-resizing-panels {
   font-size: 12px;
 }
 
+.runtime-config-cards {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(230px, 1fr));
+  gap: 10px;
+  margin-top: 12px;
+}
+
+.config-card {
+  min-width: 0;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface-muted);
+}
+
+.config-card span,
+.config-card strong,
+.config-card small {
+  display: block;
+  overflow-wrap: anywhere;
+}
+
+.config-card span {
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+.config-card strong {
+  margin-top: 3px;
+  font-size: 13px;
+  line-height: 1.6;
+}
+
+.config-card small {
+  margin-top: 3px;
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+.runtime-debug {
+  margin-top: 12px;
+  padding-top: 10px;
+  border-top: 1px dashed var(--border);
+}
+
+.runtime-debug > summary {
+  color: var(--text-muted);
+  font-weight: 400;
+}
+
 .runtime-code,
 .runtime-log {
   max-height: 260px;
