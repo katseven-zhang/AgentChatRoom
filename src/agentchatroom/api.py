@@ -284,6 +284,13 @@ class AdminLogin(StrictModel):
     token: str
 
 
+class ProjectDocumentUpsert(StrictModel):
+    doc_key: str
+    kind: str
+    title: str
+    content: str
+
+
 class BackupRestoreRequest(StrictModel):
     backup_path: str
     confirm: str
@@ -1472,6 +1479,39 @@ def create_app(
     ) -> dict[str, Any]:
         return service.register_workspace(project_id, **body.model_dump())
 
+    @app.get("/api/v1/projects/{project_id}/documents")
+    def list_documents(project_id: str, include_archived: bool = False) -> dict[str, Any]:
+        return service.list_project_documents(project_id, include_archived=include_archived)
+
+    @app.get("/api/v1/projects/{project_id}/documents/{doc_key}")
+    def get_document(
+        project_id: str,
+        doc_key: str,
+        version: int | None = None,
+    ) -> dict[str, Any]:
+        return service.get_project_document(project_id, doc_key, version=version)
+
+    @app.post("/api/v1/projects/{project_id}/documents")
+    def upsert_document(
+        project_id: str, body: ProjectDocumentUpsert, request: Request
+    ) -> dict[str, Any]:
+        _require_management(request)
+        return service.upsert_project_document(
+            project_id,
+            doc_key=body.doc_key,
+            kind=body.kind,
+            title=body.title,
+            content=body.content,
+            actor="management",
+        )
+
+    @app.post("/api/v1/projects/{project_id}/documents/{doc_key}/archive")
+    def archive_document(
+        project_id: str, doc_key: str, request: Request
+    ) -> dict[str, Any]:
+        _require_management(request)
+        return service.archive_project_document(project_id, doc_key, actor="management")
+
     @app.get("/api/v1/projects/{project_id}/audit")
     def query_audit(
         project_id: str,
@@ -1565,7 +1605,11 @@ def create_app(
 
     @app.get("/api/v1/projects/{project_id}/tasks/{task_id}")
     def get_task(project_id: str, task_id: str) -> dict[str, Any]:
-        return {"task": service.get_task(project_id, task_id)}
+        task = service.get_task(project_id, task_id)
+        # Additive injection keeps the historical {"task": ...} response intact
+        # while surfacing current binding documents for the caller.
+        task["project_documents"] = service.injectable_project_documents(project_id)
+        return {"task": task}
 
     @app.get("/api/v1/projects/{project_id}/tasks/{task_id}/history")
     def list_task_history(

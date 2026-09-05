@@ -221,6 +221,17 @@ def compact_room_snapshot(snapshot: Mapping[str, Any], *, cursor: int) -> dict[s
                 if identity.get("connection_status") == "connected"
             ),
             "agent_count": len(identities),
+            "documents": [
+                {
+                    "doc_key": doc.get("doc_key"),
+                    "kind": doc.get("kind"),
+                    "title": doc.get("title"),
+                    "version": doc.get("version"),
+                    "size": doc.get("size"),
+                    "archived_at": doc.get("archived_at"),
+                }
+                for doc in (snapshot.get("documents") or [])
+            ],
             "open_task_count": sum(
                 1
                 for task in tasks

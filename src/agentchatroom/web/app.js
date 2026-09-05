@@ -60,6 +60,7 @@ const elements = Object.fromEntries(
     "project-folder-picker-button",
     "task-dialog", "task-form", "task-raw-description-input", "task-target-agent-input",
     "task-target-agent-empty", "task-intake-submit", "task-intake-list", "task-table",
+    "document-list",
     "task-edit-dialog", "task-detail-heading", "task-detail-contract", "task-timeline",
     "task-history-filter", "task-history-load-earlier", "task-history-load-later",
     "task-assign-button", "task-assignment-list", "task-assign-dialog", "task-assign-form",
@@ -1128,6 +1129,7 @@ function renderAll() {
   renderMetrics(agentIdentities, tasks, leases);
   renderTasks(tasks);
   renderTaskIntakes();
+  renderDocuments();
   renderLeases(leases, agents);
   renderReviews(tasks, agents);
   renderEvents(agents, tasks);
@@ -1673,8 +1675,100 @@ function renderWorkspaces() {
     : '<div class="empty-state">Agent 远程加入后会自动登记 Workspace</div>';
 }
 
-function auditPagerButton(action, label, visible) {
-  return visible
+function renderDocuments() {
+  const docs = state.snapshot?.documents || [];
+  elements["document-list"].innerHTML = docs.length
+    ? docs.map((doc) => `
+      <details class="project-doc" data-doc-key="${escapeHtml(doc.doc_key)}">
+        <summary>
+          <span class="type-badge ${doc.kind === "binding" ? "verified" : ""}">${doc.kind === "binding" ? "规范" : "参考"}</span>
+          <strong>${escapeHtml(doc.title)}</strong>
+          <span class="secondary-text">v${escapeHtml(String(doc.version))} · ${escapeHtml(String(doc.size))}B</span>
+        </summary>
+        <div class="project-doc-body">
+          <pre class="code-block project-doc-content" data-doc-content="${escapeHtml(doc.doc_key)}">加载中…</pre>
+          <div class="management-actions">
+            <button type="button" class="secondary-button" data-doc-edit="${escapeHtml(doc.doc_key)}">编辑为新版本</button>
+          </div>
+          <form class="doc-edit-form" data-doc-form="${escapeHtml(doc.doc_key)}" hidden>
+            <label>标题 <input name="title" required></label>
+            <label>类型
+              <select name="kind">
+                <option value="binding">规范（binding，必须遵循）</option>
+                <option value="reference">参考（reference）</option>
+              </select>
+            </label>
+            <textarea name="content" rows="10" required></textarea>
+            <button type="submit" class="primary-button">保存新版本（旧版本不可变）</button>
+          </form>
+          <div class="doc-history secondary-text"></div>
+        </div>
+      </details>`).join("")
+    : '<div class="empty-state">还没有项目文档。规范（binding）会在 Agent 认领任务时自动注入上下文并盖版本回执。</div>';
+}
+
+async function loadProjectDocument(docKey, container) {
+  const result = await api(`/api/v1/projects/${state.projectId}/documents/${encodeURIComponent(docKey)}`);
+  const doc = result.document;
+  container.textContent = doc.content;
+  const details = container.closest(".project-doc");
+  const history = details?.querySelector(".doc-history");
+  if (history) {
+    history.textContent = `版本历史：${doc.history.map((item) => `v${item.version}（${formatTime(item.created_at)}）`).join(" · ")}`;
+  }
+  return doc;
+}
+
+async function saveProjectDocument(form, docKey) {
+  const data = new FormData(form);
+  await api(`/api/v1/projects/${state.projectId}/documents`, {
+    method: "POST",
+    body: JSON.stringify({
+      doc_key: docKey,
+      kind: data.get("kind"),
+      title: data.get("title"),
+      content: String(data.get("content") || ""),
+    }),
+  });
+  showToast(`文档 ${docKey} 已保存为新版本`);
+  await refreshSnapshot(state.projectId);
+  renderDocuments();
+}
+
+function wireDocumentList() {
+  elements["document-list"].addEventListener("click", async (event) => {
+    const editButton = event.target.closest("[data-doc-edit]");
+    const summary = event.target.closest("summary");
+    const details = event.target.closest(".project-doc");
+    if (!details) return;
+    const docKey = details.dataset.docKey;
+    if (editButton) {
+      const form = details.querySelector(".doc-edit-form");
+      if (form.hidden) {
+        const doc = await loadProjectDocument(docKey, details.querySelector(".project-doc-content"));
+        form.elements["title"].value = doc.title;
+        form.elements["kind"].value = doc.kind;
+        form.elements["content"].value = doc.content;
+        form.hidden = false;
+      } else {
+        form.hidden = true;
+      }
+      return;
+    }
+    if (summary && !details.dataset.loaded) {
+      details.dataset.loaded = "1";
+      loadProjectDocument(docKey, details.querySelector(".project-doc-content")).catch(handleError);
+    }
+  });
+  elements["document-list"].addEventListener("submit", async (event) => {
+    const form = event.target.closest(".doc-edit-form");
+    if (!form) return;
+    event.preventDefault();
+    await saveProjectDocument(form, form.dataset.docForm);
+  });
+}
+
+function auditPagerButton(action, label, visible) {  return visible
     ? `<div class="audit-pager"><button type="button" class="secondary-button" data-audit-action="${action}">${label}</button></div>`
     : "";
 }
@@ -1886,6 +1980,7 @@ elements["audit-list"].addEventListener("click", (event) => {
     .catch(handleError);
 });
 elements["refresh-runtime-button"].addEventListener("click", () => refreshManagement().catch(handleError));
+wireDocumentList();
 elements["create-backup-button"].addEventListener("click", () => createManagedBackup().catch(handleError));
 elements["backup-list"].addEventListener("click", (event) => {
   const copy = event.target.closest("[data-backup-copy]");

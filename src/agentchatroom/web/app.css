@@ -3059,10 +3059,52 @@ dialog::backdrop {
 .review-item,
 .criteria-list,
 .readonly-list,
+.project-doc-content,
 dd {
   overflow-wrap: anywhere;
   min-width: 0;
 }
 .event-body {
   line-height: 1.5;
+}
+
+.project-doc {
+  margin-top: 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface-muted);
+}
+
+.project-doc > summary {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  cursor: pointer;
+  padding: 10px 12px;
+  user-select: none;
+}
+
+.project-doc-body {
+  padding: 0 12px 12px;
+}
+
+.project-doc-content {
+  max-height: 320px;
+  overflow: auto;
+  white-space: pre-wrap;
+}
+
+.doc-edit-form {
+  margin-top: 10px;
+  display: grid;
+  gap: 8px;
+}
+
+.doc-edit-form[hidden] {
+  display: none;
+}
+
+.doc-history {
+  margin-top: 8px;
+  font-size: 12px;
 }

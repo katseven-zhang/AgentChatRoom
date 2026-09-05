@@ -11,7 +11,7 @@ if TYPE_CHECKING:
     from .config import Settings
 
 
-SCHEMA_VERSION = 18
+SCHEMA_VERSION = 19
 
 
 class DatabaseBackend(Protocol):
@@ -391,6 +391,33 @@ CREATE TABLE IF NOT EXISTS knowledge_reviews (
 
 CREATE INDEX IF NOT EXISTS idx_knowledge_reviews_asset
 ON knowledge_reviews(project_id, asset_id, created_at);
+
+CREATE TABLE IF NOT EXISTS project_documents (
+    id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    doc_key TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    title TEXT NOT NULL,
+    version INTEGER NOT NULL,
+    content TEXT NOT NULL,
+    size INTEGER NOT NULL,
+    created_by TEXT,
+    created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_project_documents_project
+ON project_documents(project_id, doc_key, version DESC);
+
+CREATE TABLE IF NOT EXISTS project_document_heads (
+    project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    doc_key TEXT NOT NULL,
+    current_version INTEGER NOT NULL,
+    kind TEXT NOT NULL,
+    title TEXT NOT NULL,
+    archived_at TEXT,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY(project_id, doc_key)
+);
 """
 
 MIGRATIONS = {
@@ -695,6 +722,34 @@ MIGRATIONS = {
         SELECT project_id, COALESCE(MAX(task_number), 0) + 1
         FROM tasks
         GROUP BY project_id;
+    """,
+    19: """
+        CREATE TABLE IF NOT EXISTS project_documents (
+            id TEXT PRIMARY KEY,
+            project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+            doc_key TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            title TEXT NOT NULL,
+            version INTEGER NOT NULL,
+            content TEXT NOT NULL,
+            size INTEGER NOT NULL,
+            created_by TEXT,
+            created_at TEXT NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_project_documents_project
+        ON project_documents(project_id, doc_key, version DESC);
+
+        CREATE TABLE IF NOT EXISTS project_document_heads (
+            project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+            doc_key TEXT NOT NULL,
+            current_version INTEGER NOT NULL,
+            kind TEXT NOT NULL,
+            title TEXT NOT NULL,
+            archived_at TEXT,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY(project_id, doc_key)
+        );
     """,
 }
 

@@ -606,6 +606,15 @@ def build_parser() -> argparse.ArgumentParser:
     sync.add_argument("--session-id")
     sync.add_argument("--token")
 
+    doc_list = commands.add_parser("doc-list", help="List project documents")
+    doc_list.add_argument("project_id")
+    doc_list.add_argument("--include-archived", action="store_true")
+
+    doc_get = commands.add_parser("doc-get", help="Read one project document")
+    doc_get.add_argument("project_id")
+    doc_get.add_argument("doc_key")
+    doc_get.add_argument("--version", type=int, default=None)
+
     audit = commands.add_parser("audit", help="Query project audit events")
     audit.add_argument("project_id")
     audit.add_argument("--after", type=int, default=0)
@@ -1248,6 +1257,17 @@ def main(argv: list[str] | None = None) -> None:
         result = call_api(
             "GET",
             f"/api/v1/projects/{args.project_id}/tasks/{args.task_id}",
+        )
+    elif args.command == "doc-list":
+        query = "?include_archived=true" if args.include_archived else ""
+        result = call_api(
+            "GET", f"/api/v1/projects/{args.project_id}/documents{query}"
+        )
+    elif args.command == "doc-get":
+        suffix = f"?version={args.version}" if args.version else ""
+        result = call_api(
+            "GET",
+            f"/api/v1/projects/{args.project_id}/documents/{args.doc_key}{suffix}",
         )
     elif args.command == "audit":
         query = urllib.parse.urlencode(

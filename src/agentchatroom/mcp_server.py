@@ -706,13 +706,51 @@ def task_list(
 
 
 @mcp.tool()
+def project_document_list(project_id: str = "") -> dict[str, Any]:
+    """List versioned project documents (manifest only; use project_document_get for content)."""
+    try:
+        _authorize_remote(project_id, "room:read")
+    except DomainError as error:
+        return {"ok": False, **error.as_dict()}
+    return _tool_result(get_service().list_project_documents, project_id)
+
+
+@mcp.tool()
+def project_document_get(
+    project_id: str = "",
+    doc_key: str = "",
+    version: int = 0,
+) -> dict[str, Any]:
+    """Fetch full content of one versioned project document (default: current version)."""
+    try:
+        _authorize_remote(project_id, "room:read")
+    except DomainError as error:
+        return {"ok": False, **error.as_dict()}
+    if not doc_key.strip():
+        return {"ok": False, "error": {"code": "invalid_project_document", "message": "doc_key is required"}}
+    return _tool_result(
+        get_service().get_project_document,
+        project_id,
+        doc_key,
+        version=version or None,
+    )
+
+
+@mcp.tool()
 def task_get(project_id: str = "", task_id: str = "") -> dict[str, Any]:
     """Return one complete task by ID without expanding the whole project board."""
     try:
         _authorize_remote(project_id, "room:read")
     except DomainError as error:
         return {"ok": False, **error.as_dict()}
-    return _tool_result(get_service().get_task, project_id, task_id)
+    def _get_with_documents(pid: str, tid: str) -> dict[str, Any]:
+        service = get_service()
+        task = service.get_task(pid, tid)
+        # Additive injection: keeps the historical task-object contract intact.
+        task["project_documents"] = service.injectable_project_documents(pid)
+        return task
+
+    return _tool_result(_get_with_documents, project_id, task_id)
 
 
 @mcp.tool()

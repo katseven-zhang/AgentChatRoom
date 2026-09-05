@@ -67,6 +67,9 @@ CONFIG_FILE_SCHEMA: dict[str, dict[str, tuple[type, ...]]] = {
         "auto_backup_interval_seconds": (int,),
         "auto_backup_max_kept": (int,),
     },
+    "documents": {
+        "inject_max_chars": (int,),
+    },
     "interface": {"product_name": (str,), "default_theme": (str,)},
 }
 
@@ -172,6 +175,7 @@ class Settings:
     auto_backup_enabled: bool = False
     auto_backup_interval_seconds: int = 3600
     auto_backup_max_kept: int = 10
+    project_doc_inject_max_chars: int = 12000
     knowledge_kinds: tuple[str, ...] = tuple(KNOWLEDGE_DEFAULT_KINDS)
     knowledge_require_verified_task: bool = True
     product_name: str = "AgentChatRoom"
@@ -293,6 +297,7 @@ def _merge_toml(path: Path) -> dict[str, Any]:
             "auto_backup_interval_seconds"
         ),
         "auto_backup_max_kept": raw.get("backup", {}).get("auto_backup_max_kept"),
+        "project_doc_inject_max_chars": raw.get("documents", {}).get("inject_max_chars"),
         "agent_token_ttl_seconds": raw.get("security", {}).get(
             "agent_token_ttl_seconds"
         ),
@@ -540,6 +545,12 @@ def load_settings(
                 file_values.get("auto_backup_max_kept", 10),
             )
         ),
+        "project_doc_inject_max_chars": int(
+            os.getenv(
+                "AGENTCHATROOM_PROJECT_DOC_INJECT_MAX_CHARS",
+                file_values.get("inject_max_chars", 12000),
+            )
+        ),
         "knowledge_kinds": normalize_knowledge_kinds(
             os.getenv("AGENTCHATROOM_KNOWLEDGE_KINDS")
             if os.getenv("AGENTCHATROOM_KNOWLEDGE_KINDS") is not None
@@ -672,6 +683,8 @@ def load_settings(
         raise ValueError("auto backup interval must be at least 60 seconds")
     if values["auto_backup_max_kept"] < 1:
         raise ValueError("auto backup max kept must be at least 1")
+    if values["project_doc_inject_max_chars"] < 200:
+        raise ValueError("project doc inject max chars must be at least 200")
     if values["token_touch_interval_seconds"] < 1:
         raise ValueError("token touch interval must be at least 1 second")
     if values["token_touch_min_calls"] < 1:

@@ -424,6 +424,19 @@ Agent 自报的 `worktree` 不会被服务盲目信任。Work Report 采集 Git 
 - **从备份回滚**：`POST /api/v1/admin/backups/restore` 要求键入确认 `confirm="REPLACE"`（界面为二次确认弹窗）；安全校验包括 schema 版本一致（`backup_schema_mismatch`）、备份是否落后于当前最新写入（`backup_stale`，必须显式 `allow_data_loss=true` 接受丢弃较新数据）、数据库是否可写（`database_busy`）。拒绝与完成均写审计事件。回滚会丢弃备份之后的数据，请先确认没有任何 Agent 正在写入。
 - **自动备份**：受验证配置 `[backup]`：`auto_backup_enabled`（默认关闭）、`auto_backup_interval_seconds`（默认 3600，最小 60）、`auto_backup_max_kept`（默认 10，超出自动清理最旧备份），环境变量 `AGENTCHATROOM_AUTO_BACKUP_*` 可覆盖。项目设置对话框（项目设置重设计任务）接线同一配置，无第二套事实来源。
 
+### 项目文档：规范注入与回执闭环
+
+每个 Project 可以维护版本化的「项目文档」，kind 分为两类：
+
+- **规范（binding）**：必须遵循的工程规范。Agent 每次通过 `task_claim` 认领任务时，响应自动附带当前 binding 文档内容（受 `documents.inject_max_chars` 配置限制，默认 12000 字符，超出部分降级为摘要与按需获取指引）；服务端在 `task.claimed` 事件中记录本次认领适用的规范版本快照。
+- **参考（reference）**：设计/架构文档，进入文档清单（manifest），按需获取，不强制注入。
+
+回执闭环：`work_report` 时服务端从认领事件自动读取该快照并写入 `work.reported` 事件的 `spec_receipt` 字段（不依赖 Agent 自觉填写）；任务详情与验收界面按该版本对照判定合规。后端只负责注入、留痕与展示，不做合规性自动判定——独立验收才是执法环节。
+
+- 存储：文档是 Room 数据（数据库表 `project_documents`，schema v19），每次编辑生成不可变新版本，当前版本为指针；历史版本可查、绝不改写或删除。文档增删改全部写审计事件（`document.created` / `document.updated` / `document.archived`），文档更新随 Room 事件流增量可见，不做全量内容推送。
+- 读写权限：REST `GET /api/v1/projects/{id}/documents`（清单）与 `GET .../documents/{doc_key}`（含历史）为只读；创建新版本与归档（`POST .../documents`、`POST .../documents/{doc_key}/archive`）走管理认证，Agent 侧只读，修改规范请走任务流程提案。MCP 提供 `project_document_list` 与 `project_document_get`（按 kind/version 取全文）；CLI 提供 `doc-list` / `doc-get`。
+- 三者分工：仓库 `AGENTS.md` 定义协作流程，`README.md` 是产品公共契约，项目文档承载**本项目**的架构与工程规范，互不同步复制。
+
 ## 知识资产（Knowledge Asset）
 
 Room 中的沉淀知识以版本化 Knowledge Asset 保存，默认类型包括决策、流程、坑点、验证方式、偏好和参考资料。知识资产与任务执行相互独立：Agent 先提交候选版本，再由不同 Agent Identity 独立审核，未通过审核的知识不会进入已批准状态。

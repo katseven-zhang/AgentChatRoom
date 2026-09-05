@@ -3814,6 +3814,18 @@ class AgentChatRoomService:
             task = self._require_task(connection, project_id, task_id)
             return self._task_with_dependencies(connection, task)
 
+    def get_task_with_documents(self, project_id: str, task_id: str) -> dict[str, Any]:
+        """Task contract plus the current binding-document injection payload."""
+        with self.database.connect() as connection:
+            self._require_project(connection, project_id)
+            task = self._require_task(connection, project_id, task_id)
+            return {
+                "task": self._task_with_dependencies(connection, task),
+                "project_documents": self.injectable_project_documents(
+                    project_id, connection=connection
+                ),
+            }
+
     def get_task_by_number(self, project_id: str, task_number: int) -> dict[str, Any]:
         """Resolve a human-readable Project task number to the full task."""
         with self.database.connect() as connection:
@@ -3896,6 +3908,9 @@ class AgentChatRoomService:
                     "from_execution_status": task["execution_status"],
                     "execution_status": "claimed",
                     "from_verification_status": task["verification_status"],
+                    "project_documents": self._binding_document_snapshot(
+                        connection, project_id
+                    ),
                     "verification_status": task["verification_status"],
                     "from_integration_status": task["integration_status"],
                     "integration_status": task["integration_status"],
@@ -3904,6 +3919,9 @@ class AgentChatRoomService:
             row = connection.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
             return {
                 "task": self._task_with_dependencies(connection, row),
+                "project_documents": self.injectable_project_documents(
+                    project_id, connection=connection
+                ),
                 "event_id": event_id,
                 "cursor": event_id,
             }
@@ -5601,6 +5619,9 @@ class AgentChatRoomService:
                     "tests": tests,
                     "system_evidence": system_evidence,
                     "released_lease_ids": released_lease_ids,
+                    "spec_receipt": self._latest_claim_document_snapshot(
+                        connection, project_id, task_id
+                    ),
                 },
             )
             completion_event_id = self._emit(
@@ -6848,6 +6869,7 @@ class AgentChatRoomService:
                 "reports": reports,
                 "reviews": reviews,
                 "acknowledgements": acknowledgements,
+                "documents": self.list_project_documents(project_id)["documents"],
                 "cursor": cursor,
             }
 
@@ -7157,3 +7179,310 @@ class AgentChatRoomService:
             ) from error
         finally:
             probe.close()
+
+    # ------------------------------------------------------------------
+    # Project documents: versioned binding/reference docs injected to Agents
+    # ------------------------------------------------------------------
+
+    PROJECT_DOCUMENT_KINDS = ("binding", "reference")
+
+    def list_project_documents(self, project_id: str, *, include_archived: bool = False) -> dict[str, Any]:
+        clause = "" if include_archived else "AND h.archived_at IS NULL"
+        with self.database.connect() as connection:
+            self._require_project(connection, project_id)
+            rows = connection.execute(
+                f"""
+                SELECT h.doc_key, h.kind, h.title, h.current_version, h.archived_at,
+                       h.updated_at, d.size
+                FROM project_document_heads h
+                JOIN project_documents d
+                  ON d.project_id = h.project_id AND d.doc_key = h.doc_key
+                 AND d.version = h.current_version
+                WHERE h.project_id = ? {clause}
+                ORDER BY h.kind, h.doc_key
+                """,
+                (project_id,),
+            ).fetchall()
+            return {
+                "documents": [
+                    {
+                        "doc_key": row["doc_key"],
+                        "kind": row["kind"],
+                        "title": row["title"],
+                        "version": row["current_version"],
+                        "size": row["size"],
+                        "archived_at": row["archived_at"],
+                        "updated_at": row["updated_at"],
+                    }
+                    for row in rows
+                ]
+            }
+
+    def get_project_document(
+        self, project_id: str, doc_key: str, *, version: int | None = None
+    ) -> dict[str, Any]:
+        with self.database.connect() as connection:
+            self._require_project(connection, project_id)
+            head = connection.execute(
+                "SELECT * FROM project_document_heads WHERE project_id = ? AND doc_key = ?",
+                (project_id, doc_key),
+            ).fetchone()
+            if head is None:
+                raise DomainError(
+                    "project_document_not_found",
+                    "Project document does not exist",
+                    status_code=404,
+                )
+            wanted = int(version) if version else int(head["current_version"])
+            row = connection.execute(
+                """
+                SELECT * FROM project_documents
+                WHERE project_id = ? AND doc_key = ? AND version = ?
+                """,
+                (project_id, doc_key, wanted),
+            ).fetchone()
+            if row is None:
+                raise DomainError(
+                    "project_document_not_found",
+                    "Requested document version does not exist",
+                    status_code=404,
+                )
+            history = connection.execute(
+                """
+                SELECT version, size, created_at, created_by
+                FROM project_documents
+                WHERE project_id = ? AND doc_key = ?
+                ORDER BY version DESC
+                """,
+                (project_id, doc_key),
+            ).fetchall()
+            return {
+                "document": {
+                    "doc_key": doc_key,
+                    "kind": row["kind"],
+                    "title": row["title"],
+                    "version": row["version"],
+                    "content": row["content"],
+                    "size": row["size"],
+                    "created_at": row["created_at"],
+                    "created_by": row["created_by"],
+                    "current_version": head["current_version"],
+                    "archived_at": head["archived_at"],
+                    "history": [dict(item) for item in history],
+                }
+            }
+
+    def upsert_project_document(
+        self,
+        project_id: str,
+        *,
+        doc_key: str,
+        kind: str,
+        title: str,
+        content: str,
+        actor: str | None = None,
+    ) -> dict[str, Any]:
+        key = str(doc_key or "").strip()
+        if not re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,63}", key):
+            raise DomainError(
+                "invalid_project_document_key",
+                "doc_key must match ^[a-z0-9][a-z0-9_-]{0,63}$",
+                status_code=422,
+            )
+        if kind not in self.PROJECT_DOCUMENT_KINDS:
+            raise DomainError(
+                "invalid_project_document_kind",
+                "kind must be one of: " + ", ".join(self.PROJECT_DOCUMENT_KINDS),
+                status_code=422,
+            )
+        clean_title = str(title or "").strip()
+        clean_content = str(content or "")
+        if not clean_title:
+            raise DomainError(
+                "invalid_project_document", "Document title is required", status_code=422
+            )
+        if not clean_content.strip():
+            raise DomainError(
+                "invalid_project_document", "Document content is required", status_code=422
+            )
+        now = iso_now()
+        with self.database.connect(write=True) as connection:
+            self._require_project(connection, project_id)
+            head = connection.execute(
+                "SELECT * FROM project_document_heads WHERE project_id = ? AND doc_key = ?",
+                (project_id, key),
+            ).fetchone()
+            created = head is None
+            next_version = int(head["current_version"]) + 1 if head else 1
+            document_id = new_id("doc")
+            connection.execute(
+                """
+                INSERT INTO project_documents(
+                    id, project_id, doc_key, kind, title, version, content, size,
+                    created_by, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    document_id,
+                    project_id,
+                    key,
+                    kind,
+                    clean_title,
+                    next_version,
+                    clean_content,
+                    len(clean_content.encode("utf-8")),
+                    actor,
+                    now,
+                ),
+            )
+            if head is None:
+                connection.execute(
+                    """
+                    INSERT INTO project_document_heads(
+                        project_id, doc_key, current_version, kind, title, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (project_id, key, next_version, kind, clean_title, now),
+                )
+            else:
+                connection.execute(
+                    """
+                    UPDATE project_document_heads
+                    SET current_version = ?, kind = ?, title = ?, updated_at = ?
+                    WHERE project_id = ? AND doc_key = ?
+                    """,
+                    (next_version, kind, clean_title, now, project_id, key),
+                )
+            self._emit(
+                connection,
+                project_id,
+                "document.created" if created else "document.updated",
+                payload={
+                    "doc_key": key,
+                    "kind": kind,
+                    "title": clean_title,
+                    "version": next_version,
+                    "size": len(clean_content.encode("utf-8")),
+                    "actor": actor,
+                },
+            )
+            return self.get_project_document(project_id, key)
+
+    def archive_project_document(
+        self, project_id: str, doc_key: str, *, actor: str | None = None
+    ) -> dict[str, Any]:
+        now = iso_now()
+        with self.database.connect(write=True) as connection:
+            head = connection.execute(
+                "SELECT * FROM project_document_heads WHERE project_id = ? AND doc_key = ?",
+                (project_id, doc_key),
+            ).fetchone()
+            if head is None:
+                raise DomainError(
+                    "project_document_not_found",
+                    "Project document does not exist",
+                    status_code=404,
+                )
+            connection.execute(
+                """
+                UPDATE project_document_heads
+                SET archived_at = ?, updated_at = ?
+                WHERE project_id = ? AND doc_key = ?
+                """,
+                (now, now, project_id, doc_key),
+            )
+            self._emit(
+                connection,
+                project_id,
+                "document.archived",
+                payload={"doc_key": doc_key, "actor": actor},
+            )
+        return self.get_project_document(project_id, doc_key)
+
+    def _binding_document_snapshot(self, connection: Any, project_id: str) -> dict[str, int]:
+        """Versions of active binding documents, recorded on task claim."""
+        rows = connection.execute(
+            """
+            SELECT doc_key, current_version FROM project_document_heads
+            WHERE project_id = ? AND kind = 'binding' AND archived_at IS NULL
+            ORDER BY doc_key
+            """,
+            (project_id,),
+        ).fetchall()
+        return {row["doc_key"]: row["current_version"] for row in rows}
+
+    def _latest_claim_document_snapshot(
+        self, connection: Any, project_id: str, task_id: str
+    ) -> dict[str, int]:
+        row = connection.execute(
+            """
+            SELECT payload_json FROM events
+            WHERE project_id = ? AND task_id = ? AND event_type = 'task.claimed'
+            ORDER BY id DESC LIMIT 1
+            """,
+            (project_id, task_id),
+        ).fetchone()
+        if row is None:
+            return {}
+        return json_load(row["payload_json"], {}).get("project_documents") or {}
+
+    def injectable_project_documents(
+        self, project_id: str, *, connection: Any = None
+    ) -> dict[str, Any]:
+        """Binding documents for claim/get responses, capped by configuration.
+
+        Content is included while the aggregate stays under the configured
+        inject limit; remaining documents degrade to manifest entries with a
+        fetch hint so Agents can pull them on demand via project_document_get.
+        """
+        limit = int(self.settings.project_doc_inject_max_chars)
+        if connection is not None:
+            rows = connection.execute(
+                """
+                SELECT d.doc_key, d.kind, d.title, d.version, d.content, d.size
+                FROM project_document_heads h
+                JOIN project_documents d
+                  ON d.project_id = h.project_id AND d.doc_key = h.doc_key
+                 AND d.version = h.current_version
+                WHERE h.project_id = ? AND h.kind = 'binding' AND h.archived_at IS NULL
+                ORDER BY d.size
+                """,
+                (project_id,),
+            ).fetchall()
+        else:
+            with self.database.connect() as standalone:
+                rows = standalone.execute(
+                    """
+                    SELECT d.doc_key, d.kind, d.title, d.version, d.content, d.size
+                    FROM project_document_heads h
+                    JOIN project_documents d
+                      ON d.project_id = h.project_id AND d.doc_key = h.doc_key
+                     AND d.version = h.current_version
+                    WHERE h.project_id = ? AND h.kind = 'binding' AND h.archived_at IS NULL
+                    ORDER BY d.size
+                    """,
+                    (project_id,),
+                ).fetchall()
+        documents = []
+        budget = limit
+        truncated = False
+        for row in rows:
+            entry = {
+                "doc_key": row["doc_key"],
+                "kind": row["kind"],
+                "title": row["title"],
+                "version": row["version"],
+                "size": row["size"],
+            }
+            if not truncated and row["size"] <= budget:
+                entry["content"] = row["content"]
+                budget -= row["size"]
+            else:
+                truncated = True
+                entry["content"] = None
+                entry["hint"] = (
+                    "content omitted (inject budget); call project_document_get "
+                    f"for doc_key={row['doc_key']}"
+                )
+            documents.append(entry)
+        return {"documents": documents, "inject_limit_chars": limit}

@@ -51,6 +51,8 @@ def test_mcp_exposes_standard_tool_set():
         "message_acknowledge",
         "task_list",
         "task_get",
+        "project_document_list",
+        "project_document_get",
         "task_history",
         "task_get_by_number",
         "task_intake_targets",
