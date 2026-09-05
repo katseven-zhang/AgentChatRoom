@@ -92,6 +92,8 @@ PROJECT_SETTINGS_DEFAULTS: dict[str, Any] = {
     "lease_conflict_policy": "advisory",
     "roles": [],
     "extensions": {},
+    "default_task_priority": 2,
+    "audit_retention_days": 0,
 }
 SOFTWARE_MEMBER_PREFIX = "software:"
 REQUEST_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
@@ -328,6 +330,24 @@ def normalize_project_settings(settings: dict[str, Any] | None) -> dict[str, Any
             "invalid_project_settings",
             "lease_conflict_policy must be advisory or pre_commit_block",
         )
+    default_priority = values.get(
+        "default_task_priority",
+        PROJECT_SETTINGS_DEFAULTS["default_task_priority"],
+    )
+    if not isinstance(default_priority, int) or isinstance(default_priority, bool) or not 0 <= default_priority <= 4:
+        raise DomainError(
+            "invalid_project_settings",
+            "default_task_priority must be an integer between 0 and 4",
+        )
+    retention = values.get(
+        "audit_retention_days",
+        PROJECT_SETTINGS_DEFAULTS["audit_retention_days"],
+    )
+    if not isinstance(retention, int) or isinstance(retention, bool) or retention not in {0, 30, 90}:
+        raise DomainError(
+            "invalid_project_settings",
+            "audit_retention_days must be 0 (permanent), 30, or 90",
+        )
     roles = values.get("roles", PROJECT_SETTINGS_DEFAULTS["roles"])
     if not isinstance(roles, list) or any(
         not isinstance(role, str) or not role.strip() for role in roles
@@ -343,6 +363,8 @@ def normalize_project_settings(settings: dict[str, Any] | None) -> dict[str, Any
         "lease_conflict_policy": policy,
         "roles": list(dict.fromkeys(role.strip() for role in roles)),
         "extensions": extensions,
+        "default_task_priority": default_priority,
+        "audit_retention_days": retention,
     }
 
 
@@ -436,6 +458,7 @@ class AgentChatRoomService:
     def __init__(self, database: DatabaseBackend, settings: Settings) -> None:
         self.database = database
         self.settings = settings
+        self._retention_last_run: dict[str, float] = {}
         self._token_touch = TokenTouchBuffer(
             self,
             interval_seconds=settings.token_touch_interval_seconds,
@@ -1631,11 +1654,15 @@ class AgentChatRoomService:
             row = connection.execute(
                 "SELECT * FROM projects WHERE id = ?", (project_id,)
             ).fetchone()
-            return {
+            result = {
                 "project": self._project_dict(row),
                 "event_id": event_id if changed_fields else None,
                 "cursor": event_id,
             }
+        if changed_fields:
+            # 保留策略可能刚被修改：保存设置后立即按新策略清理一次。
+            result["audit_retention"] = self.enforce_audit_retention(project_id)
+        return result
 
     def _require_member(
         self, connection: Any, project_id: str, member_id: str
@@ -2769,6 +2796,7 @@ class AgentChatRoomService:
         load earlier pages without losing their position. ``has_older`` and
         ``has_newer`` report continuation under the same filters.
         """
+        self.enforce_audit_retention_throttled(project_id)
         limit = max(1, min(limit, 1000))
         after = max(0, int(after or 0))
         before = max(0, int(before or 0))
@@ -3616,7 +3644,7 @@ class AgentChatRoomService:
         description: str = "",
         acceptance_criteria: list[str] | None = None,
         depends_on: list[str] | None = None,
-        priority: int = 2,
+        priority: int | None = None,
         note: str = "",
     ) -> dict[str, Any]:
         with self.database.connect(write=True) as connection:
@@ -3692,13 +3720,13 @@ class AgentChatRoomService:
         description: str = "",
         acceptance_criteria: list[str] | None = None,
         depends_on: list[str] | None = None,
-        priority: int = 2,
+        priority: int | None = None,
         actor_session_id: str | None = None,
         token: str | None = None,
     ) -> dict[str, Any]:
         if not title.strip():
             raise DomainError("invalid_task", "Task title is required")
-        if not 0 <= priority <= 4:
+        if priority is not None and not 0 <= priority <= 4:
             raise DomainError("invalid_priority", "Priority must be between 0 and 4")
         criteria = [item.strip() for item in (acceptance_criteria or []) if item.strip()]
         if not criteria:
@@ -3710,7 +3738,18 @@ class AgentChatRoomService:
         now = iso_now()
         task_id = new_id("task")
         with self.database.connect(write=True) as connection:
-            self._require_project(connection, project_id)
+            project_row = self._require_project(connection, project_id)
+            if priority is None:
+                # 未显式指定时取项目设置的默认任务优先级（default_task_priority）。
+                settings = json_load(project_row["settings_json"], {})
+                priority = int(
+                    (settings or {}).get(
+                        "default_task_priority",
+                        PROJECT_SETTINGS_DEFAULTS["default_task_priority"],
+                    )
+                )
+                if not 0 <= priority <= 4:
+                    priority = PROJECT_SETTINGS_DEFAULTS["default_task_priority"]
             if actor_session_id:
                 self._authenticate(connection, project_id, actor_session_id, token or "")
             for dependency_id in dependencies:
@@ -7505,3 +7544,58 @@ class AgentChatRoomService:
                 )
             documents.append(entry)
         return {"documents": documents, "inject_limit_chars": limit}
+
+    # ------------------------------------------------------------------
+    # Audit retention (project setting audit_retention_days; 0 = permanent)
+    # ------------------------------------------------------------------
+
+    def _project_retention_days(self, row: Mapping[str, Any]) -> int:
+        settings = json_load(row["settings_json"], {}) or {}
+        return int(
+            settings.get(
+                "audit_retention_days",
+                PROJECT_SETTINGS_DEFAULTS["audit_retention_days"],
+            )
+        )
+
+    def enforce_audit_retention(self, project_id: str) -> dict[str, Any]:
+        """Delete audit events older than the project retention policy.
+
+        Only whole expired events are removed by created_at; retained events
+        are never rewritten or reordered. The purge itself is audited after
+        the deletion so the cleanup leaves a surviving trace.
+        """
+        with self.database.connect(write=True) as connection:
+            row = self._require_project(connection, project_id)
+            retention_days = self._project_retention_days(row)
+            if retention_days <= 0:
+                return {"purged": 0, "retention_days": 0}
+            cutoff = (utc_now() - timedelta(days=retention_days)).isoformat().replace(
+                "+00:00", "Z"
+            )
+            cursor = connection.execute(
+                "DELETE FROM events WHERE project_id = ? AND created_at < ?",
+                (project_id, cutoff),
+            )
+            purged = max(0, int(cursor.rowcount))
+            if purged:
+                self._emit(
+                    connection,
+                    project_id,
+                    "audit.purged",
+                    payload={
+                        "retention_days": retention_days,
+                        "cutoff": cutoff,
+                        "deleted_events": purged,
+                    },
+                )
+            return {"purged": purged, "retention_days": retention_days}
+
+    def enforce_audit_retention_throttled(self, project_id: str) -> dict[str, Any]:
+        """Retention sweep for read paths: at most once per hour per project."""
+        now = time.time()
+        last = self._retention_last_run.get(project_id, 0.0)
+        if now - last < 3600:
+            return {"purged": 0, "retention_days": None, "skipped": True}
+        self._retention_last_run[project_id] = now
+        return self.enforce_audit_retention(project_id)

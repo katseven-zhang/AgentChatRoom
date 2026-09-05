@@ -494,15 +494,35 @@
           </div>
           <button type="button" class="icon-button dialog-close" title="关闭" aria-label="关闭">×</button>
         </div>
-        <label>项目名称 <input id="settings-project-name" autocomplete="off" required></label>
+        <label>项目名称 <input id="settings-project-name" autocomplete="off" required>
+          <small class="form-hint">生效时机：保存后立即生效 · 对谁生效：Room 内所有页面与导出数据</small></label>
         <label>租约冲突策略
           <select id="settings-lease-policy" title="作用于提交前检查（lease check）：「提示并记录」返回冲突清单由调用方决定；「提交前阻断」直接拒绝并写入审计事件。申请租约时的冲突始终拒绝，与本设置无关。">
             <option value="advisory">提示并记录</option>
             <option value="pre_commit_block">提交前阻断</option>
           </select>
-        </label>
-        <label>协作角色约定（仅记录，不控制权限） <textarea id="settings-roles" rows="4" title="每行一个角色名称，自动去重去空。这是团队协作约定清单：不限制 Agent 能做什么，权限由成员权限与项目成员管理决定。" placeholder="每行一个角色名称"></textarea></label>
-        <p class="form-hint">角色列表是协作约定的可读记录（自动去重去空），不参与权限控制；Agent 的实际职责由会话角色与任务分工决定。</p>
+          <small class="form-hint">生效时机：保存后立即生效 · 对谁生效：本项目的文件租约提交前检查（Agent 与管理端均适用）</small></label>
+        <label>默认任务优先级
+          <select id="settings-default-priority" title="创建任务时未显式指定优先级时使用的默认值。">
+            <option value="0">P0 · 紧急</option>
+            <option value="1">P1 · 重要</option>
+            <option value="2">P2 · 普通</option>
+            <option value="3">P3 · 低</option>
+            <option value="4">P4 · 最低</option>
+          </select>
+          <small class="form-hint">生效时机：保存后立即生效 · 对谁生效：本项目后续创建且未显式指定优先级的任务（Web/MCP/CLI 一致）</small></label>
+        <label>团队约定（仅记录，无控制作用） <textarea id="settings-roles" rows="4" title="每行一个角色名称，自动去重去空。这是团队协作约定清单：不限制 Agent 能做什么，权限由成员权限与项目成员管理决定。" placeholder="每行一个角色名称"></textarea>
+          <small class="form-hint">仅是可读的协作约定记录，不控制任何权限 · 生效时机：保存后立即对 Room 内所有成员可见</small></label>
+        <label>审计历史保留策略
+          <select id="settings-audit-retention" title="审计事件的保留时长。0 = 永久保留。清理只按时间整条删除到期事件，绝不改写或重排保留事件，清理动作本身写审计。">
+            <option value="0">永久保留（默认）</option>
+            <option value="30">保留 30 天</option>
+            <option value="90">保留 90 天</option>
+          </select>
+          <small class="form-hint">生效时机：保存后立即清理一次，此后随审计读取每小时至多清理一次 · 对谁生效：本项目的审计历史；删除不可恢复</small></label>
+        <label class="check-control"><input id="settings-auto-backup" type="checkbox"> 开启自动备份（全局配置，所有项目共用）</label>
+        <label>备份保留份数 <input id="settings-backup-max-kept" type="number" min="1" step="1">
+          <small class="form-hint" id="settings-backup-hint">生效时机：保存即写入配置文件 [backup]（与手动备份/回滚共用同一来源，重启服务后调度按新配置执行） · 对谁生效：整个数据库的自动备份调度</small></label>
         <div class="dialog-actions">
           <button type="button" class="secondary-button dialog-close">取消</button>
           <button type="submit" class="primary-button">保存设置</button>

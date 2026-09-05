@@ -68,6 +68,7 @@ const elements = Object.fromEntries(
     "task-release-reason", "task-release-reason-text", "task-release-submit",
     "task-assign-title", "task-assign-agent", "task-assign-agent-empty", "task-assign-note", "task-assign-submit",
     "settings-dialog", "settings-form", "settings-project-name", "settings-lease-policy", "settings-roles",
+    "settings-default-priority", "settings-audit-retention", "settings-auto-backup", "settings-backup-max-kept", "settings-backup-hint",
     "archive-dialog", "archive-form", "archive-project-name", "permanent-delete-input",
     "remove-project-hint", "remove-project-submit",
     "integration-dialog", "integration-data-dir", "integration-log-path",
@@ -1945,7 +1946,18 @@ document.getElementById("project-settings-button").addEventListener("click", () 
   elements["settings-project-name"].value = project.name;
   elements["settings-lease-policy"].value = project.settings.lease_conflict_policy;
   elements["settings-roles"].value = project.settings.roles.join("\n");
+  elements["settings-default-priority"].value = String(
+    project.settings.default_task_priority ?? 2,
+  );
+  elements["settings-audit-retention"].value = String(
+    project.settings.audit_retention_days ?? 0,
+  );
   elements["settings-dialog"].showModal();
+  api("/api/v1/admin/backup-settings").then((settings) => {
+    elements["settings-auto-backup"].checked = !!settings.auto_backup_enabled;
+    elements["settings-backup-max-kept"].value = settings.auto_backup_max_kept ?? 10;
+    elements["settings-backup-hint"].textContent = `${settings.effective || ""} · 配置文件：${settings.config_path || "-"}`;
+  }).catch(handleError);
 });
 document.getElementById("export-project-button").addEventListener("click", () => downloadProjectExport().catch(handleError));
 document.getElementById("refresh-button").addEventListener("click", () => {
@@ -2371,11 +2383,21 @@ elements["settings-form"].addEventListener("submit", async (event) => {
           lease_conflict_policy: elements["settings-lease-policy"].value,
           roles: elements["settings-roles"].value.split("\n").map((item) => item.trim()).filter(Boolean),
           extensions: state.snapshot.project.settings.extensions || {},
+          default_task_priority: Number(elements["settings-default-priority"].value),
+          audit_retention_days: Number(elements["settings-audit-retention"].value),
         },
+      }),
+    });
+    await api("/api/v1/admin/backup-settings", {
+      method: "PUT",
+      body: JSON.stringify({
+        auto_backup_enabled: elements["settings-auto-backup"].checked,
+        auto_backup_max_kept: Number(elements["settings-backup-max-kept"].value),
       }),
     });
     elements["settings-dialog"].close();
     showToast("项目设置已保存");
+    await refreshSnapshot(state.projectId);
   } catch (error) {
     handleError(error);
   }

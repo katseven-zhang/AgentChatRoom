@@ -291,6 +291,12 @@ class ProjectDocumentUpsert(StrictModel):
     content: str
 
 
+class BackupSettingsUpdate(StrictModel):
+    auto_backup_enabled: bool | None = None
+    auto_backup_interval_seconds: int | None = None
+    auto_backup_max_kept: int | None = None
+
+
 class BackupRestoreRequest(StrictModel):
     backup_path: str
     confirm: str
@@ -493,7 +499,7 @@ class TaskCreate(StrictModel):
     description: str = ""
     acceptance_criteria: list[str] = Field(default_factory=list)
     depends_on: list[str] = Field(default_factory=list)
-    priority: int = 2
+    priority: int | None = None
     actor_session_id: str | None = None
     token: str | None = None
 
@@ -725,6 +731,40 @@ class SSELimiter:
                 self._ip_counts[client_ip] = ip_count
             else:
                 self._ip_counts.pop(client_ip, None)
+
+
+_BACKUP_SETTINGS_OVERRIDE: dict[str, Any] = {}
+
+
+def upsert_toml_section(text: str, section: str, values: dict[str, Any]) -> str:
+    """Insert or replace key/value pairs inside one ``[section]`` block.
+
+    Only bool/int/str scalars are produced by the management settings writer;
+    unknown sections and unrelated content are preserved verbatim.
+    """
+    if not values:
+        return text
+    lines = text.splitlines()
+    header = f"[{section}]"
+    start = next((index for index, line in enumerate(lines) if line.strip() == header), None)
+    rendered = [
+        f"{key} = {str(value).lower() if isinstance(value, bool) else value}"
+        for key, value in values.items()
+    ]
+    if start is None:
+        block = [header, *rendered]
+        prefix = "\n".join(lines) + "\n" if lines else ""
+        return prefix + "\n".join(block) + "\n"
+    end = start + 1
+    while end < len(lines) and not (lines[end].startswith("[") and lines[end].rstrip().endswith("]")):
+        end += 1
+    body = lines[start + 1 : end]
+    kept = [
+        line
+        for line in body
+        if line.strip() and not line.split("=")[0].strip() in {key for key in values}
+    ]
+    return "\n".join([*lines[: start + 1], *kept, *rendered, *lines[end :]]) + "\n"
 
 
 def run_auto_backup_cycle(service: Any) -> dict[str, Any] | None:
@@ -1498,6 +1538,63 @@ def create_app(
         project_id: str, body: WorkspaceRegister
     ) -> dict[str, Any]:
         return service.register_workspace(project_id, **body.model_dump())
+
+    def _backup_settings_payload() -> dict[str, Any]:
+        return {
+            "auto_backup_enabled": _BACKUP_SETTINGS_OVERRIDE.get(
+                "auto_backup_enabled", resolved.auto_backup_enabled
+            ),
+            "auto_backup_interval_seconds": _BACKUP_SETTINGS_OVERRIDE.get(
+                "auto_backup_interval_seconds", resolved.auto_backup_interval_seconds
+            ),
+            "auto_backup_max_kept": _BACKUP_SETTINGS_OVERRIDE.get(
+                "auto_backup_max_kept", resolved.auto_backup_max_kept
+            ),
+            "config_path": str(
+                resolved.config_path
+                if resolved.config_path
+                else Path(resolved.data_dir) / "config.toml"
+            ),
+            "effective": "保存即写入配置文件 [backup]（与自动备份调度共用同一来源）；调度线程在服务重启后的下一个周期按新配置执行",
+        }
+
+    @app.get("/api/v1/admin/backup-settings")
+    def get_backup_settings(request: Request) -> dict[str, Any]:
+        _require_management(request)
+        return _backup_settings_payload()
+
+    @app.put("/api/v1/admin/backup-settings")
+    def put_backup_settings(request: Request, body: BackupSettingsUpdate) -> dict[str, Any]:
+        _require_management(request)
+        if body.auto_backup_interval_seconds is not None and body.auto_backup_interval_seconds < 60:
+            raise DomainError(
+                "invalid_backup_settings",
+                "auto_backup_interval_seconds must be at least 60",
+                status_code=422,
+            )
+        if body.auto_backup_max_kept is not None and body.auto_backup_max_kept < 1:
+            raise DomainError(
+                "invalid_backup_settings",
+                "auto_backup_max_kept must be at least 1",
+                status_code=422,
+            )
+        updates = {
+            "auto_backup_enabled": body.auto_backup_enabled,
+            "auto_backup_interval_seconds": body.auto_backup_interval_seconds,
+            "auto_backup_max_kept": body.auto_backup_max_kept,
+        }
+        target = (
+            Path(resolved.config_path)
+            if resolved.config_path
+            else Path(resolved.data_dir) / "config.toml"
+        )
+        existing_text = target.read_text(encoding="utf-8") if target.is_file() else ""
+        applied = {key: value for key, value in updates.items() if value is not None}
+        updated_text = upsert_toml_section(existing_text, "backup", applied)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(updated_text, encoding="utf-8")
+        _BACKUP_SETTINGS_OVERRIDE.update(applied)
+        return _backup_settings_payload()
 
     @app.get("/api/v1/projects/{project_id}/documents")
     def list_documents(project_id: str, include_archived: bool = False) -> dict[str, Any]:

@@ -923,7 +923,7 @@ def task_define_from_intake(
     acceptance_criteria: list[str] | None = None,
     description: str = "",
     depends_on: list[str] | None = None,
-    priority: int = 2,
+    priority: int | None = None,
     note: str = "",
     request_id: str = "",
 ) -> dict[str, Any]:
@@ -1085,7 +1085,7 @@ def task_create(
     acceptance_criteria: list[str] | None = None,
     description: str = "",
     depends_on: list[str] | None = None,
-    priority: int = 2,
+    priority: int | None = None,
     actor_session_id: str = "",
     token: str = "",
     request_id: str = "",

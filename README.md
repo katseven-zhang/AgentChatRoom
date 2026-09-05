@@ -437,6 +437,19 @@ Agent 自报的 `worktree` 不会被服务盲目信任。Work Report 采集 Git 
 - 读写权限：REST `GET /api/v1/projects/{id}/documents`（清单）与 `GET .../documents/{doc_key}`（含历史）为只读；创建新版本与归档（`POST .../documents`、`POST .../documents/{doc_key}/archive`）走管理认证，Agent 侧只读，修改规范请走任务流程提案。MCP 提供 `project_document_list` 与 `project_document_get`（按 kind/version 取全文）；CLI 提供 `doc-list` / `doc-get`。
 - 三者分工：仓库 `AGENTS.md` 定义协作流程，`README.md` 是产品公共契约，项目文档承载**本项目**的架构与工程规范，互不同步复制。
 
+### 项目设置：每个选项的语义与生效时机
+
+项目设置对话框（Web「项目设置」）与 REST `PATCH /api/v1/projects/{id}` 复用同一受验证的项目设置模型（`normalize_project_settings`，未知键拒绝）：
+
+| 选项 | 语义 | 什么时候会生效 | 对谁生效 |
+| --- | --- | --- | --- |
+| 项目名称 | Room 显示名 | 保存后立即 | Room 内所有页面与导出数据 |
+| 租约冲突策略 | 提示并记录（advisory）/ 提交前阻断（pre_commit_block） | 保存后立即 | 本项目的文件租约提交前检查（申请租约时的冲突始终拒绝，与本设置无关） |
+| 默认任务优先级 | 0–4；任务创建未显式指定优先级时采用（Web/MCP/CLI 一致） | 保存后立即 | 本项目后续新建任务 |
+| 团队约定 | 自由记录的协作约定清单（自动去重去空），**无控制作用** | 保存后立即对 Room 内所有成员可见 | 仅作可读记录；权限由成员权限与项目成员管理决定 |
+| 审计历史保留策略 | 永久保留（默认）/ 保留 30 天 / 保留 90 天 | 保存后立即清理一次；此后随审计读取每小时至多清理一次 | 本项目的审计历史；清理只按时间整条删除到期事件，绝不改写或重排保留事件，清理动作本身写审计（`audit.purged`）；删除不可恢复 |
+| 自动备份开关 / 备份保留份数 | 直接读写备份能力引入的 `[backup]` 配置（`GET/PUT /api/v1/admin/backup-settings`），无第二套配置 | 保存即写入配置文件 `[backup]`；自动备份调度在服务重启后的下一个周期按新配置执行 | 整个数据库的自动备份调度（全局，所有项目共用） |
+
 ## 知识资产（Knowledge Asset）
 
 Room 中的沉淀知识以版本化 Knowledge Asset 保存，默认类型包括决策、流程、坑点、验证方式、偏好和参考资料。知识资产与任务执行相互独立：Agent 先提交候选版本，再由不同 Agent Identity 独立审核，未通过审核的知识不会进入已批准状态。

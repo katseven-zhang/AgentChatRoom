@@ -656,7 +656,7 @@ def build_parser() -> argparse.ArgumentParser:
     task.add_argument("--description", default="")
     task.add_argument("--accept", action="append", default=[])
     task.add_argument("--depends-on", action="append", default=[])
-    task.add_argument("--priority", type=int, default=2)
+    task.add_argument("--priority", type=int, default=None)
 
     tasks = commands.add_parser("task-list", help="List tasks")
     tasks.add_argument("project_id")
