@@ -88,6 +88,40 @@ def test_service_create_backup_audits_and_prunes(service, project, tmp_path, mon
     assert len(second["pruned"]) == 1
     listed = service.list_backups()
     assert len(listed) <= 1
+    assert all(Path(item["file"]).name.startswith("backup-") for item in listed)
+
+
+def test_backup_retention_applies_immediately(service, project):
+    """Setting 保留份数 must prune existing backups right away, not wait for
+    the next backup (user feedback)."""
+    from pathlib import Path
+
+    created = [service.create_backup() for _ in range(4)]
+    assert len(service.list_backups()) == 4
+
+    pruned = service.enforce_backup_retention(2)
+    assert len(pruned) == 2
+    listed = service.list_backups()
+    assert len(listed) == 2
+    kept_names = {Path(item["file"]).name for item in listed}
+    assert Path(created[-1]["output"]).name in kept_names
+
+    # create_backup honours an explicit max_kept in the same way.
+    service.create_backup(max_kept=1)
+    assert len(service.list_backups()) == 1
+
+
+def test_list_backups_hides_legacy_nonmanaged_snapshots(service, project, tmp_path):
+    """迁移前 .db 旧快照不进管理列表（磁盘保留）。"""
+    from pathlib import Path
+
+    directory = service._backup_directory()
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / "pre-some-migration-20260830.db").write_bytes(b"x")
+    service.create_backup()
+    listed = service.list_backups()
+    assert [Path(item["file"]).suffix for item in listed] == [".sqlite"]
+    assert all("pre-some-migration" not in item["file"] for item in listed)
 
 
 def test_service_restore_rejects_unsafe_and_restores_with_confirmation(service, project):
@@ -156,7 +190,7 @@ def test_service_restore_reports_busy_database(service, project):
 def test_auto_backup_cycle_creates_backup_and_audits(service, project):
     from agentchatroom.api import run_auto_backup_cycle
 
-    result = run_auto_backup_cycle(service)
+    result = run_auto_backup_cycle(service, max_kept=5)
     assert result is not None
     from pathlib import Path
 
@@ -186,13 +220,19 @@ def test_auto_backup_cycle_swallows_and_logs_errors():
     assert any(record.getMessage() == "automatic backup failed" for record in records)
 
 
+class _WorkerSettings:
+    auto_backup_enabled = True
+    auto_backup_interval_seconds = 3600
+    auto_backup_max_kept = 10
+
+
 def test_auto_backup_loop_continues_after_failure():
     from agentchatroom.api import auto_backup_worker
 
     calls: list[str] = []
 
     class Stub:
-        def create_backup(self, *, source):
+        def create_backup(self, *, source, max_kept=None):
             calls.append(source)
             if len(calls) == 1:
                 raise RuntimeError("first cycle fails")
@@ -206,11 +246,38 @@ def test_auto_backup_loop_continues_after_failure():
             self.wait_calls += 1
             return self.wait_calls >= 3
 
-    auto_backup_worker(Stub(), 3600, FakeEvent())
+    auto_backup_worker(Stub(), _WorkerSettings(), FakeEvent())
     assert calls == ["auto", "auto"]
 
 
-def test_start_auto_backup_worker_respects_enabled_flag(service, monkeypatch):
+def test_auto_backup_loop_skips_cycles_when_disabled():
+    from agentchatroom.api import auto_backup_worker
+
+    calls: list[str] = []
+
+    class Stub:
+        def create_backup(self, *, source, max_kept=None):
+            calls.append(source)
+            return {"ok": True}
+
+    class DisabledSettings(_WorkerSettings):
+        auto_backup_enabled = False
+
+    class FakeEvent:
+        def __init__(self):
+            self.wait_calls = 0
+
+        def wait(self, timeout):
+            self.wait_calls += 1
+            return self.wait_calls >= 3
+
+    auto_backup_worker(Stub(), DisabledSettings(), FakeEvent())
+    assert calls == []
+
+
+def test_start_auto_backup_worker_always_starts_daemon_thread(service, monkeypatch):
+    """The worker thread starts unconditionally; per-cycle gating happens in
+    the loop so management toggles apply without a restart."""
     import threading
 
     from agentchatroom.api import start_auto_backup_worker
@@ -218,25 +285,7 @@ def test_start_auto_backup_worker_respects_enabled_flag(service, monkeypatch):
     class DisabledSettings:
         auto_backup_enabled = False
         auto_backup_interval_seconds = 3600
-
-    def forbidden_thread(*args, **kwargs):
-        raise AssertionError("worker thread must not start when disabled")
-
-    monkeypatch.setattr(threading, "Thread", forbidden_thread)
-    assert (
-        start_auto_backup_worker(service, DisabledSettings(), threading.Event())
-        is None
-    )
-
-
-def test_start_auto_backup_worker_starts_daemon_thread(service, monkeypatch):
-    import threading
-
-    from agentchatroom.api import start_auto_backup_worker
-
-    class EnabledSettings:
-        auto_backup_enabled = True
-        auto_backup_interval_seconds = 3600
+        auto_backup_max_kept = 10
 
     started: dict = {}
 
@@ -249,6 +298,6 @@ def test_start_auto_backup_worker_starts_daemon_thread(service, monkeypatch):
             started["started"] = True
 
     monkeypatch.setattr(threading, "Thread", FakeThread)
-    worker = start_auto_backup_worker(service, EnabledSettings(), threading.Event())
+    worker = start_auto_backup_worker(service, DisabledSettings(), threading.Event())
     assert started == {"name": "agentchatroom-auto-backup", "daemon": True, "started": True}
     assert worker is not None

@@ -214,7 +214,11 @@ def test_web_event_and_audit_panels_catch_up_to_latest_cursor():
     assert "connectEvents(eventPage.cursor)" in javascript
     assert "state.auditHasOlder" in javascript
     assert "state.auditHasNewer" in javascript
-    assert "mergeAuditEvents(state.auditEvents, audit.events)" in javascript
+    assert "const AUDIT_PAGE_SIZE = 10;" in javascript
+    assert "mergeAuditEvents" not in javascript
+    assert "resetAuditBuffer" not in javascript
+    assert 'data-audit-action="older"' in javascript
+    assert "上一页" in javascript and "下一页" in javascript
     assert "const EVENT_WINDOW_SIZE = 500;" in javascript
     assert "settings?.audit_window_size" in javascript
     assert "AUDIT_WINDOW_SIZE" not in javascript
@@ -992,6 +996,7 @@ def test_web_design_tokens_scale_and_readability_floor():
     declarations remain, and color hex literals live only inside the two
     theme blocks."""
     stylesheet = (WEB_DIR / "app.css").read_text(encoding="utf-8")
+    javascript = (WEB_DIR / "app.js").read_text(encoding="utf-8")
 
     # R1: 字号全部走刻度令牌。
     assert "--fs-xs: 13px;" in stylesheet
@@ -1036,3 +1041,9 @@ def test_web_design_tokens_scale_and_readability_floor():
     assert ".error-state" in stylesheet
     assert ".state-box" in stylesheet
     assert "button:disabled," in stylesheet
+
+    # 反馈修正：备份列表紧凑分页 + 对话框复选框样式修正。
+    assert "BACKUP_PAGE_SIZE" in javascript
+    assert 'data-backup-page="prev"' in javascript
+    assert ".backup-item {" in stylesheet
+    assert ".dialog-form label.check-control input[type=\"checkbox\"]" in stylesheet

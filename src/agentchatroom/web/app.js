@@ -37,6 +37,8 @@ const state = {
   auditHasOlder: false,
   auditHasNewer: false,
   auditFilter: "",
+  auditPage: 1,
+  backupPage: 1,
   runtime: null,
   expandedEvents: new Set(),
   collapsedGroups: new Set(),
@@ -796,9 +798,11 @@ function auditPageSize() {
   return Number.isFinite(configured) && configured > 0 ? configured : 100;
 }
 
-function auditQueryUrl(projectId, { after = 0, before = 0, eventType = "" } = {}) {
+const AUDIT_PAGE_SIZE = 10;
+
+function auditQueryUrl(projectId, { after = 0, before = 0, eventType = "", limit = AUDIT_PAGE_SIZE } = {}) {
   const filter = eventType ? `&event_type=${encodeURIComponent(eventType)}` : "";
-  return `/api/v1/projects/${projectId}/audit?after=${after}&before=${before}&limit=${auditPageSize()}${filter}`;
+  return `/api/v1/projects/${projectId}/audit?after=${after}&before=${before}&limit=${limit}${filter}`;
 }
 
 async function fetchAuditTail(projectId, eventType) {
@@ -807,18 +811,13 @@ async function fetchAuditTail(projectId, eventType) {
   return api(auditQueryUrl(projectId, { before: (probe.latest_cursor || 0) + 1, eventType }));
 }
 
-function mergeAuditEvents(existing, incoming) {
-  const seen = new Set(existing.map((event) => event.id));
-  return [...existing, ...incoming.filter((event) => !seen.has(event.id))]
-    .sort((a, b) => a.id - b.id);
-}
-
-async function resetAuditBuffer(projectId, eventType) {
+async function resetAuditPages(projectId, eventType) {
   const page = await fetchAuditTail(projectId, eventType);
   state.auditEvents = page.events;
   state.auditHasOlder = page.has_older;
   state.auditHasNewer = page.has_newer;
   state.auditFilter = eventType;
+  state.auditPage = 1;
 }
 
 async function loadOlderAuditEvents() {
@@ -828,20 +827,34 @@ async function loadOlderAuditEvents() {
     before: state.auditEvents[0].id,
     eventType,
   }));
-  state.auditEvents = mergeAuditEvents(state.auditEvents, page.events);
-  if (page.events.length) state.auditHasOlder = page.has_older;
+  if (!page.events.length) {
+    state.auditHasOlder = false;
+    renderAudit();
+    return;
+  }
+  state.auditEvents = page.events;
+  state.auditHasOlder = page.has_older;
+  state.auditHasNewer = true;
+  state.auditPage += 1;
   renderAudit();
 }
 
 async function loadNewerAuditEvents() {
-  if (!state.projectId) return;
+  if (!state.projectId || !state.auditHasNewer || !state.auditEvents.length) return;
   const eventType = elements["audit-event-filter"].value;
-  const newest = state.auditEvents[state.auditEvents.length - 1];
-  const page = newest
-    ? await api(auditQueryUrl(state.projectId, { after: newest.id, eventType }))
-    : await fetchAuditTail(state.projectId, eventType);
-  state.auditEvents = mergeAuditEvents(state.auditEvents, page.events);
-  if (page.events.length) state.auditHasNewer = page.has_newer;
+  const page = await api(auditQueryUrl(state.projectId, {
+    after: state.auditEvents[state.auditEvents.length - 1].id,
+    eventType,
+  }));
+  if (!page.events.length) {
+    state.auditHasNewer = false;
+    renderAudit();
+    return;
+  }
+  state.auditEvents = page.events;
+  state.auditHasNewer = page.has_newer;
+  state.auditHasOlder = true;
+  state.auditPage = Math.max(1, state.auditPage - 1);
   renderAudit();
 }
 
@@ -880,6 +893,7 @@ async function selectProject(projectId) {
     state.auditHasOlder = audit.has_older;
     state.auditHasNewer = audit.has_newer;
     state.auditFilter = "";
+    state.auditPage = 1;
     state.runtime = runtime;
     state.managedBackups = backups.backups || [];
     state.autoBackupInfo = backups.auto_backup || null;
@@ -1517,25 +1531,46 @@ function backupSizeLabel(size) {
   return `${kb.toFixed(kb >= 1024 ? 0 : 1)} KB`;
 }
 
+const BACKUP_PAGE_SIZE = 5;
+
 function renderBackups() {
   const autoBackup = state.autoBackupInfo;
   const autoSummary = autoBackup
-    ? `自动备份：${autoBackup.enabled ? `已开启 · 每 ${Math.round(autoBackup.interval_seconds / 60)} 分钟 · 保留 ${autoBackup.max_kept} 份` : "未开启（可用配置 [backup] 开启）"}`
+    ? `自动备份：${autoBackup.enabled ? `已开启 · 每 ${Math.round(autoBackup.interval_seconds / 60)} 分钟 · 保留 ${autoBackup.max_kept} 份` : "未开启（可在项目设置或配置 [backup] 开启）"}`
     : "";
-  elements["backup-list"].innerHTML = state.managedBackups.length
-    ? `${autoSummary ? `<p class="secondary-text" style="margin: 0 0 8px;">${escapeHtml(autoSummary)}</p>` : ""}${state.managedBackups.map((backup) => `
-      <article class="management-item">
+  const total = state.managedBackups.length;
+  const pages = Math.max(1, Math.ceil(total / BACKUP_PAGE_SIZE));
+  state.backupPage = Math.min(Math.max(1, state.backupPage || 1), pages);
+  const summary = autoSummary ? `<p class="secondary-text backup-summary">${escapeHtml(autoSummary)}</p>` : "";
+  if (!total) {
+    elements["backup-list"].innerHTML = `${summary}<div class="empty-state">还没有备份。点「立即备份」把当前协作数据库另存为快照。</div>`;
+    return;
+  }
+  const rows = state.managedBackups
+    .slice((state.backupPage - 1) * BACKUP_PAGE_SIZE, state.backupPage * BACKUP_PAGE_SIZE)
+    .map((backup) => {
+      const fileName = String(backup.file).split(/[\\/]/).pop();
+      return `
+      <article class="management-item backup-item">
         <time class="audit-time">${escapeHtml(formatTime(backup.created_at))}</time>
-        <div>
-          <h4>${escapeHtml(backup.file)}</h4>
-          <p>${escapeHtml(`${backup.backend || "-"} · schema v${backup.schema_version ?? "-"} · ${backupSizeLabel(backup.size)} · ${backup.source === "auto" ? "自动" : "手动"}`)}</p>
+        <div class="backup-meta">
+          <span class="backup-file" title="${escapeHtml(backup.file)}">${escapeHtml(fileName)}</span>
+          <span class="secondary-text">${escapeHtml(`${backup.backend || "-"} · schema v${backup.schema_version ?? "-"} · ${backupSizeLabel(backup.size)} · ${backup.source === "auto" ? "自动" : "手动"}`)}</span>
         </div>
         <div class="management-actions">
           <button type="button" class="secondary-button" data-backup-copy="${escapeHtml(backup.file)}">复制路径</button>
           <button type="button" class="danger-button" data-backup-restore="${escapeHtml(backup.file)}">回滚</button>
         </div>
-      </article>`).join("")}`
-    : `${autoSummary ? `<p class="secondary-text" style="margin: 0 0 8px;">${escapeHtml(autoSummary)}</p>` : ""}<div class="empty-state">还没有备份。点「立即备份」把当前协作数据库另存为快照。</div>`;
+      </article>`;
+    }).join("");
+  const pager = total > BACKUP_PAGE_SIZE
+    ? `<div class="audit-pager">
+        <button type="button" class="secondary-button" data-backup-page="prev" ${state.backupPage <= 1 ? "disabled" : ""}>← 上一页</button>
+        <span class="secondary-text">第 ${state.backupPage} / ${pages} 页 · 共 ${total} 份</span>
+        <button type="button" class="secondary-button" data-backup-page="next" ${state.backupPage >= pages ? "disabled" : ""}>下一页 →</button>
+      </div>`
+    : "";
+  elements["backup-list"].innerHTML = `${summary}${rows}${pager}`;
 }
 
 async function createManagedBackup() {
@@ -1822,31 +1857,37 @@ function wireDocumentList() {
   });
 }
 
-function auditPagerButton(action, label, visible) {  return visible
-    ? `<div class="audit-pager"><button type="button" class="secondary-button" data-audit-action="${action}">${label}</button></div>`
-    : "";
+function auditPager() {
+  return `<div class="audit-pager">
+    <button type="button" class="secondary-button" data-audit-action="older" ${state.auditHasOlder ? "" : "disabled"}>← 上一页</button>
+    <span class="secondary-text">第 ${state.auditPage || 1} 页 · 每页 ${AUDIT_PAGE_SIZE} 条</span>
+    <button type="button" class="secondary-button" data-audit-action="newer" ${state.auditHasNewer ? "" : "disabled"}>下一页 →</button>
+  </div>`;
 }
 
 function renderAudit() {
-  elements["audit-list"].innerHTML = state.auditEvents.length
-    ? `${auditPagerButton("older", "加载更早", state.auditHasOlder)}${state.auditEvents.slice().reverse().map((event) => `
+  const items = state.auditEvents.length
+    ? state.auditEvents.slice().reverse().map((event) => `
       <article class="management-item">
         <time class="audit-time">${escapeHtml(formatTime(event.created_at))}</time>
         <div>
           <h4>${escapeHtml(eventLabel(event.event_type))} ${eventIdBadge(event.id)}</h4>
           <p>${escapeHtml(event.task_id ? `任务 ${shortId(event.task_id)}` : event.actor_session_id ? `接入 ${shortId(event.actor_session_id)}` : "管理主体")}</p>
         </div>
-      </article>`).join("")}${auditPagerButton("newer", "加载更新", state.auditHasNewer)}`
-    : `${auditPagerButton("older", "加载更早", state.auditHasOlder)}<div class="empty-state">当前筛选下没有审计事件</div>${auditPagerButton("newer", "加载更新", state.auditHasNewer)}`;
+      </article>`).join("")
+    : '<div class="empty-state">当前筛选下没有审计事件</div>';
+  elements["audit-list"].innerHTML = `${auditPager()}${items}`;
 }
 
 async function refreshManagement() {
   if (!state.projectId) return;
   const eventType = elements["audit-event-filter"].value;
-  const auditRefresh = eventType === state.auditFilter
-    ? (state.auditEvents.length
-        ? api(auditQueryUrl(state.projectId, { after: state.auditEvents[state.auditEvents.length - 1].id, eventType }))
-        : fetchAuditTail(state.projectId, eventType))
+  const auditRefresh = eventType === state.auditFilter && state.auditEvents.length
+    ? api(auditQueryUrl(state.projectId, {
+        after: state.auditEvents[0].id - 1,
+        before: state.auditEvents[state.auditEvents.length - 1].id + 1,
+        eventType,
+      }))
     : fetchAuditTail(state.projectId, eventType);
   const [members, credentials, workspaces, audit, runtime, backups] = await Promise.all([
     api(`/api/v1/projects/${state.projectId}/members`),
@@ -1859,15 +1900,13 @@ async function refreshManagement() {
   state.members = members.members;
   state.credentials = credentials.credentials;
   state.workspaces = workspaces.workspaces;
-  if (eventType === state.auditFilter) {
-    state.auditEvents = mergeAuditEvents(state.auditEvents, audit.events);
-    if (audit.events.length) state.auditHasNewer = audit.has_newer;
-  } else {
-    state.auditEvents = audit.events;
-    state.auditHasOlder = audit.has_older;
-    state.auditHasNewer = audit.has_newer;
+  if (eventType !== state.auditFilter) {
     state.auditFilter = eventType;
+    state.auditPage = 1;
   }
+  state.auditEvents = audit.events;
+  state.auditHasOlder = audit.has_older;
+  state.auditHasNewer = audit.has_newer;
   state.runtime = runtime;
   state.managedBackups = backups.backups || [];
   state.autoBackupInfo = backups.auto_backup || null;
@@ -2051,6 +2090,12 @@ elements["refresh-runtime-button"].addEventListener("click", () => refreshManage
 wireDocumentList();
 elements["create-backup-button"].addEventListener("click", () => createManagedBackup().catch(handleError));
 elements["backup-list"].addEventListener("click", (event) => {
+  const pageButton = event.target.closest("[data-backup-page]");
+  if (pageButton) {
+    state.backupPage += pageButton.dataset.backupPage === "prev" ? -1 : 1;
+    renderBackups();
+    return;
+  }
   const copy = event.target.closest("[data-backup-copy]");
   if (copy) {
     copyText(copy.dataset.backupCopy).then(() => showToast("备份路径已复制")).catch(handleError);

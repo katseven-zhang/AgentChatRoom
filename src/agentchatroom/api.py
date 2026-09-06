@@ -768,32 +768,51 @@ def upsert_toml_section(text: str, section: str, values: dict[str, Any]) -> str:
     return "\n".join([*lines[: start + 1], *kept, *rendered, *lines[end :]]) + "\n"
 
 
-def run_auto_backup_cycle(service: Any) -> dict[str, Any] | None:
+def run_auto_backup_cycle(service: Any, max_kept: int | None = None) -> dict[str, Any] | None:
     """Run one automatic-backup cycle; failures are logged, never raised."""
     try:
-        return service.create_backup(source="auto")
+        return service.create_backup(source="auto", max_kept=max_kept)
     except Exception:
         logging.getLogger(__name__).exception("automatic backup failed")
         return None
 
 
+def effective_backup_settings(settings: Any) -> dict[str, Any]:
+    """Runtime backup settings: management overrides over loaded config."""
+    return {
+        "auto_backup_enabled": _BACKUP_SETTINGS_OVERRIDE.get(
+            "auto_backup_enabled", settings.auto_backup_enabled
+        ),
+        "auto_backup_interval_seconds": _BACKUP_SETTINGS_OVERRIDE.get(
+            "auto_backup_interval_seconds", settings.auto_backup_interval_seconds
+        ),
+        "auto_backup_max_kept": _BACKUP_SETTINGS_OVERRIDE.get(
+            "auto_backup_max_kept", settings.auto_backup_max_kept
+        ),
+    }
+
+
 def auto_backup_worker(
-    service: Any, interval_seconds: int, stop_event: "threading.Event"
+    service: Any, settings: Any, stop_event: "threading.Event"
 ) -> None:
-    interval = max(60, int(interval_seconds))
-    while not stop_event.wait(timeout=interval):
-        run_auto_backup_cycle(service)
+    """Backup loop: re-reads effective settings every cycle, so management
+    toggles (enable / interval / retention) apply without a restart."""
+    while not stop_event.wait(
+        timeout=max(60, int(effective_backup_settings(settings)["auto_backup_interval_seconds"]))
+    ):
+        state = effective_backup_settings(settings)
+        if not state["auto_backup_enabled"]:
+            continue
+        run_auto_backup_cycle(service, state["auto_backup_max_kept"])
 
 
 def start_auto_backup_worker(
     service: Any, settings: Any, stop_event: "threading.Event"
-) -> "threading.Thread | None":
-    """Start the daemon backup worker when enabled; None when disabled."""
-    if not settings.auto_backup_enabled:
-        return None
+) -> "threading.Thread":
+    """Start the daemon backup worker; per-cycle gating happens in the loop."""
     worker = threading.Thread(
         target=auto_backup_worker,
-        args=(service, settings.auto_backup_interval_seconds, stop_event),
+        args=(service, settings, stop_event),
         name="agentchatroom-auto-backup",
         daemon=True,
     )
@@ -1541,16 +1560,11 @@ def create_app(
         return service.register_workspace(project_id, **body.model_dump())
 
     def _backup_settings_payload() -> dict[str, Any]:
+        effective = effective_backup_settings(resolved)
         return {
-            "auto_backup_enabled": _BACKUP_SETTINGS_OVERRIDE.get(
-                "auto_backup_enabled", resolved.auto_backup_enabled
-            ),
-            "auto_backup_interval_seconds": _BACKUP_SETTINGS_OVERRIDE.get(
-                "auto_backup_interval_seconds", resolved.auto_backup_interval_seconds
-            ),
-            "auto_backup_max_kept": _BACKUP_SETTINGS_OVERRIDE.get(
-                "auto_backup_max_kept", resolved.auto_backup_max_kept
-            ),
+            "auto_backup_enabled": effective["auto_backup_enabled"],
+            "auto_backup_interval_seconds": effective["auto_backup_interval_seconds"],
+            "auto_backup_max_kept": effective["auto_backup_max_kept"],
             "config_path": str(
                 resolved.config_path
                 if resolved.config_path
@@ -1595,7 +1609,12 @@ def create_app(
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(updated_text, encoding="utf-8")
         _BACKUP_SETTINGS_OVERRIDE.update(applied)
-        return _backup_settings_payload()
+        payload = _backup_settings_payload()
+        # 保留份数立即生效：保存即按新上限清理现存备份，无需等下一次备份。
+        payload["pruned"] = service.enforce_backup_retention(
+            payload["auto_backup_max_kept"]
+        )
+        return payload
 
     @app.get("/api/v1/projects/{project_id}/documents")
     def list_documents(project_id: str, include_archived: bool = False) -> dict[str, Any]:

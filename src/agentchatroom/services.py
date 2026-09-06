@@ -7137,7 +7137,13 @@ class AgentChatRoomService:
                     payload=payload,
                 )
 
-    def create_backup(self, *, actor_session_id: str | None = None, source: str = "management") -> dict[str, Any]:
+    def create_backup(
+        self,
+        *,
+        actor_session_id: str | None = None,
+        source: str = "management",
+        max_kept: int | None = None,
+    ) -> dict[str, Any]:
         """Snapshot the live database into the managed backups directory."""
         directory = self._backup_directory()
         directory.mkdir(parents=True, exist_ok=True)
@@ -7183,7 +7189,7 @@ class AgentChatRoomService:
             json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
             encoding="utf-8",
         )
-        kept = self._prune_backups()
+        kept = self._prune_backups(max_kept)
         return {**result, "latest_event_id": latest_event_id, "pruned": kept}
 
     def list_backups(self) -> list[dict[str, Any]]:
@@ -7194,6 +7200,10 @@ class AgentChatRoomService:
         for manifest_path in sorted(directory.glob("*.manifest.json")):
             data = json_load(manifest_path.read_text(encoding="utf-8"), {})
             target = manifest_path.with_name(manifest_path.name[: -len(".manifest.json")])
+            if not target.name.startswith("backup-"):
+                # 历史遗留快照（如迁移前 .db 备份）不属于本功能管理列表，
+                # 保留在磁盘上但不进产品列表：它们多为旧 schema，已不可回滚。
+                continue
             backups.append(
                 {
                     "file": str(target),
@@ -7208,8 +7218,12 @@ class AgentChatRoomService:
         backups.sort(key=lambda item: str(item.get("created_at") or ""), reverse=True)
         return backups
 
-    def _prune_backups(self) -> list[str]:
-        kept_max = int(getattr(self.settings, "auto_backup_max_kept", 10))
+    def _prune_backups(self, kept_max: int | None = None) -> list[str]:
+        kept_max = (
+            int(kept_max)
+            if kept_max is not None
+            else int(getattr(self.settings, "auto_backup_max_kept", 10))
+        )
         if kept_max < 0:
             kept_max = 0
         backups = self.list_backups()
@@ -7220,6 +7234,10 @@ class AgentChatRoomService:
             target.with_name(target.name + ".manifest.json").unlink(missing_ok=True)
             removed.append(str(target))
         return removed
+
+    def enforce_backup_retention(self, max_kept: int) -> list[str]:
+        """Apply the retention policy immediately (settings save path)."""
+        return self._prune_backups(max_kept)
 
     def _latest_event_id(self) -> int:
         with self.database.connect() as connection:

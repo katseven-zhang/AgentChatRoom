@@ -1064,7 +1064,65 @@ body.is-resizing-panels {
 .audit-pager {
   display: flex;
   justify-content: center;
-  padding: 8px 0;
+  align-items: center;
+  gap: var(--sp-3);
+  padding: var(--sp-2) 0;
+}
+
+.audit-pager button[disabled] {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+/* #67 反馈修正：对话框内复选框不再被表单 label/输入框全局样式拉伸 */
+.dialog-form label.check-control {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  white-space: normal;
+  line-height: var(--lh-body);
+  color: var(--text);
+  font-size: var(--fs-xs);
+}
+
+.dialog-form label.check-control input[type="checkbox"] {
+  width: 15px;
+  height: 15px;
+  min-height: 0;
+  padding: 0;
+  flex: 0 0 auto;
+  margin: 0;
+  accent-color: var(--primary);
+}
+
+/* 备份列表：紧凑单行 + 文件名省略 + 翻页 */
+.backup-summary {
+  margin: 0 0 var(--sp-2);
+  font-size: var(--fs-xs);
+}
+
+.backup-item {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  gap: var(--sp-3);
+  align-items: center;
+  padding: var(--sp-2) var(--sp-3);
+}
+
+.backup-meta {
+  min-width: 0;
+  display: grid;
+  gap: 2px;
+}
+
+.backup-file {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: Consolas, "Cascadia Code", monospace;
+  font-size: var(--fs-xs);
+  font-weight: var(--weight-semibold);
 }
 
 .runtime-code,
