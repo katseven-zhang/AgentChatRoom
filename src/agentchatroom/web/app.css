@@ -199,6 +199,8 @@ select:focus-visible,
   height: 100vh;
   min-height: 100vh;
   overflow: hidden;
+  box-sizing: border-box;
+  border-right: 1px solid var(--border);
   display: grid;
   grid-template-columns:
     var(--left-panel-width)
@@ -734,7 +736,10 @@ body.is-resizing-panels {
   grid-area: work;
   min-width: 0;
   min-height: 0;
+  max-width: 100%;
   overflow-y: auto;
+  overflow-x: clip;
+  box-sizing: border-box;
   padding: 22px 24px 32px;
 }
 
@@ -2033,6 +2038,9 @@ button.event-id {
   display: grid;
   grid-template-rows: 72px minmax(0, 1fr) auto;
   background: var(--surface);
+  border-left: 1px solid var(--border);
+  border-right: 1px solid var(--border);
+  box-sizing: border-box;
 }
 
 .chat-header {
