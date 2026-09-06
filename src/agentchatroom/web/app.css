@@ -1095,10 +1095,16 @@ body.is-resizing-panels {
   accent-color: var(--primary);
 }
 
-/* 备份列表：紧凑单行 + 文件名省略 + 翻页 */
+/* 备份列表：紧凑单行 + 文件名省略 + 统一行高 + 翻页 */
 .backup-summary {
   margin: 0 0 var(--sp-2);
   font-size: var(--fs-xs);
+}
+
+#backup-list {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
 }
 
 .backup-item {
@@ -1106,13 +1112,33 @@ body.is-resizing-panels {
   grid-template-columns: auto minmax(0, 1fr) auto;
   gap: var(--sp-3);
   align-items: center;
-  padding: var(--sp-2) var(--sp-3);
+  min-height: 42px;
+  height: 42px;
+  padding: 0 var(--sp-3);
+  box-sizing: border-box;
+}
+
+.management-item.backup-item {
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  min-height: 42px;
+  height: 42px;
+  padding: 0 var(--sp-3);
+}
+
+.backup-item .audit-time {
+  flex-shrink: 0;
+  white-space: nowrap;
+  font-size: var(--fs-xs);
+  color: var(--text-muted);
 }
 
 .backup-meta {
   min-width: 0;
-  display: grid;
-  gap: 2px;
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  overflow: hidden;
+  white-space: nowrap;
 }
 
 .backup-file {
@@ -1123,6 +1149,31 @@ body.is-resizing-panels {
   font-family: Consolas, "Cascadia Code", monospace;
   font-size: var(--fs-xs);
   font-weight: var(--weight-semibold);
+  flex: 0 1 auto;
+}
+
+.backup-detail,
+.backup-meta .secondary-text {
+  flex-shrink: 0;
+  font-size: var(--fs-xs);
+  color: var(--text-muted);
+  white-space: nowrap;
+}
+
+.backup-item .management-actions {
+  flex-shrink: 0;
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  gap: var(--sp-1);
+  flex-wrap: nowrap;
+}
+
+.backup-item .management-actions button {
+  min-height: 28px;
+  padding: 2px 10px;
+  font-size: var(--fs-xs);
+  white-space: nowrap;
 }
 
 .runtime-code,
@@ -1367,7 +1418,53 @@ body.is-resizing-panels {
 .panel-toolbar {
   display: flex;
   justify-content: space-between;
+  align-items: center;
+  gap: var(--sp-2);
+  flex-wrap: wrap;
   margin-bottom: 12px;
+}
+
+.task-sort-controls {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  flex-wrap: wrap;
+  margin-left: auto;
+}
+
+.sort-caption {
+  font-size: var(--fs-xs);
+  color: var(--text-muted);
+}
+
+.sort-button {
+  background: var(--surface-muted);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  color: var(--text);
+  font-size: var(--fs-xs);
+  padding: 4px 10px;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: background 0.16s var(--ease), border-color 0.16s var(--ease);
+}
+
+.sort-button:hover {
+  background: var(--surface);
+  border-color: var(--border-strong);
+}
+
+.sort-button.is-active {
+  background: var(--primary-soft);
+  border-color: var(--primary);
+  color: var(--primary);
+  font-weight: var(--weight-semibold);
+}
+
+.sort-reset-button {
+  padding: 4px 8px;
+  font-size: var(--fs-xs);
+  min-height: auto;
 }
 
 .segmented-control {
@@ -2985,6 +3082,26 @@ dialog::backdrop {
     justify-content: flex-start;
   }
 
+  .management-item.backup-item {
+    grid-template-columns: auto minmax(0, 1fr) auto;
+    gap: var(--sp-2);
+    padding: 0 var(--sp-2);
+  }
+
+  .backup-item .management-actions {
+    justify-content: flex-end;
+  }
+
+  .backup-item .backup-meta .secondary-text,
+  .backup-item .backup-detail {
+    display: none;
+  }
+
+  .backup-item .management-actions button {
+    padding: 2px 6px;
+    font-size: var(--fs-xs);
+  }
+
   .audit-heading {
     align-items: flex-start;
     flex-direction: column;
@@ -3245,16 +3362,6 @@ dd {
   max-height: 320px;
   overflow: auto;
   white-space: pre-wrap;
-}
-
-.doc-edit-form {
-  margin-top: 10px;
-  display: grid;
-  gap: 8px;
-}
-
-.doc-edit-form[hidden] {
-  display: none;
 }
 
 .doc-history {

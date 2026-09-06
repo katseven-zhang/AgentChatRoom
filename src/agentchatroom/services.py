@@ -87,6 +87,7 @@ AGENT_PERMISSIONS = {
     "audit:read",
     "member:read",
     "member:write",
+    "document:write",
 }
 DEFAULT_AGENT_PERMISSIONS = AGENT_PERMISSIONS - {"audit:read"}
 PROJECT_SETTINGS_DEFAULTS: dict[str, Any] = {
@@ -7238,6 +7239,61 @@ class AgentChatRoomService:
     def enforce_backup_retention(self, max_kept: int) -> list[str]:
         """Apply the retention policy immediately (settings save path)."""
         return self._prune_backups(max_kept)
+
+    def delete_backup(
+        self,
+        filename: str,
+        *,
+        actor: str | None = None,
+        actor_session_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Delete a managed backup file and its manifest after strict path validation.
+
+        Deletes must be audited. Only managed backups matching the filename pattern
+        are allowed to be deleted to protect arbitrary filesystem locations and legacy snapshots.
+        """
+        if not filename or not re.match(r"^backup-[a-zA-Z0-9_T.-]+\.sqlite$", filename):
+            raise DomainError(
+                "invalid_backup_filename",
+                f"Invalid backup filename: {filename}",
+                status_code=400,
+            )
+        directory = self._backup_directory().resolve()
+        target = (directory / filename).resolve()
+        try:
+            target.relative_to(directory)
+        except ValueError:
+            raise DomainError(
+                "invalid_backup_filename",
+                "Backup path must be within the backup directory",
+                status_code=400,
+            )
+        if not target.is_file():
+            raise DomainError(
+                "backup_not_found",
+                f"Backup file not found: {filename}",
+                status_code=404,
+            )
+        size = target.stat().st_size
+        manifest_path = target.with_name(target.name + ".manifest.json")
+        target.unlink(missing_ok=True)
+        manifest_path.unlink(missing_ok=True)
+        self._emit_backup_event(
+            "backup.deleted",
+            payload={
+                "file": str(target),
+                "filename": target.name,
+                "size": size,
+                "actor": actor or "management",
+            },
+            actor_session_id=actor_session_id,
+        )
+        return {
+            "deleted": True,
+            "filename": target.name,
+            "file": str(target),
+            "size": size,
+        }
 
     def _latest_event_id(self) -> int:
         with self.database.connect() as connection:

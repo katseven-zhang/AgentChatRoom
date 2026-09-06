@@ -21,6 +21,7 @@ const state = {
   streamHadError: false,
   busyCount: 0,
   taskEntry: "",
+  taskSort: { key: "", direction: "asc" },
   taskExpert: { execution: "", verification: "", integration: "", priority: "", owner: "", number: "" },
   eventFilter: "all",
   hideSystemFeedEvents: true,
@@ -63,6 +64,7 @@ const elements = Object.fromEntries(
     "project-folder-picker-button",
     "task-dialog", "task-form", "task-raw-description-input", "task-target-agent-input",
     "task-target-agent-empty", "task-intake-submit", "task-intake-list", "task-table",
+    "task-sort-controls",
     "document-list",
     "task-edit-dialog", "task-detail-heading", "task-detail-contract", "task-timeline",
     "task-history-filter", "task-history-load-earlier", "task-history-load-later",
@@ -1284,6 +1286,27 @@ function sortForEntry(tasks, entry) {
   return sorted;
 }
 
+function applyTaskSort(tasks, sortConfig = state.taskSort) {
+  if (!sortConfig || !sortConfig.key) return tasks;
+  const copy = [...tasks];
+  const dir = sortConfig.direction === "desc" ? -1 : 1;
+  if (sortConfig.key === "priority") {
+    copy.sort((a, b) => {
+      const pa = Number(a.priority ?? 2);
+      const pb = Number(b.priority ?? 2);
+      if (pa !== pb) return (pa - pb) * dir;
+      return Number(b.task_number ?? 0) - Number(a.task_number ?? 0);
+    });
+  } else if (sortConfig.key === "number") {
+    copy.sort((a, b) => {
+      const na = Number(a.task_number ?? 0);
+      const nb = Number(b.task_number ?? 0);
+      return (na - nb) * dir;
+    });
+  }
+  return copy;
+}
+
 function matchesEntry(task, entry) {
   const view = taskView(task);
   if (entry.key === "") return true;
@@ -1348,8 +1371,24 @@ function renderTaskExpertFilters(tasks) {
     ${phases.length ? `<label>精确状态<select data-expert="phase"><option value="">全部</option>${phaseOptions(phases)}</select></label>` : ""}`;
 }
 
+function renderTaskSortControls() {
+  const container = elements["task-sort-controls"];
+  if (!container) return;
+  const sort = state.taskSort || { key: "", direction: "asc" };
+  const priActive = sort.key === "priority";
+  const numActive = sort.key === "number";
+  const priLabel = priActive ? (sort.direction === "asc" ? "优先级 P0→P4 ↑" : "优先级 P4→P0 ↓") : "优先级 P0-P4";
+  const numLabel = numActive ? (sort.direction === "desc" ? "任务号 #N 降序 ↓" : "任务号 #N 升序 ↑") : "任务号 #N";
+  container.innerHTML = `
+    <span class="sort-caption secondary-text">排序:</span>
+    <button type="button" class="sort-button ${priActive ? "is-active" : ""}" data-task-sort="priority" title="按优先级排序（点击切换升/降序）">${escapeHtml(priLabel)}</button>
+    <button type="button" class="sort-button ${numActive ? "is-active" : ""}" data-task-sort="number" title="按任务号排序（点击切换升/降序）">${escapeHtml(numLabel)}</button>
+    ${sort.key ? '<button type="button" class="secondary-button sort-reset-button" data-task-sort="reset" title="恢复默认排序">重置</button>' : ""}`;
+}
+
 function renderTasks(tasks) {
   renderTaskNavigation(tasks);
+  renderTaskSortControls();
   renderTaskExpertFilters(tasks);
   renderTaskTable(tasks);
 }
@@ -1367,7 +1406,11 @@ function renderTaskTable(tasks) {
       return true;
     });
   }
-  filtered = sortForEntry(filtered, entry);
+  if (state.taskSort && state.taskSort.key) {
+    filtered = applyTaskSort(filtered, state.taskSort);
+  } else {
+    filtered = sortForEntry(filtered, entry);
+  }
   const names = Object.fromEntries((state.snapshot?.agents || []).map((agent) => [agent.id, agent.name]));
   elements["task-table"].innerHTML = filtered.length
     ? filtered.map((task) => {
@@ -1489,6 +1532,7 @@ function permissionLabel(permission) {
     "integration:write": "提交集成",
     "audit:read": "读取审计",
     "member:read": "读取成员", "member:write": "管理成员",
+    "document:write": "管理项目文档",
   }[permission] || permission;
 }
 
@@ -1555,11 +1599,12 @@ function renderBackups() {
         <time class="audit-time">${escapeHtml(formatTime(backup.created_at))}</time>
         <div class="backup-meta">
           <span class="backup-file" title="${escapeHtml(backup.file)}">${escapeHtml(fileName)}</span>
-          <span class="secondary-text">${escapeHtml(`${backup.backend || "-"} · schema v${backup.schema_version ?? "-"} · ${backupSizeLabel(backup.size)} · ${backup.source === "auto" ? "自动" : "手动"}`)}</span>
+          <span class="secondary-text backup-detail">${escapeHtml(`${backup.backend || "-"} · schema v${backup.schema_version ?? "-"} · ${backupSizeLabel(backup.size)} · ${backup.source === "auto" ? "自动" : "手动"}`)}</span>
         </div>
         <div class="management-actions">
           <button type="button" class="secondary-button" data-backup-copy="${escapeHtml(backup.file)}">复制路径</button>
           <button type="button" class="danger-button" data-backup-restore="${escapeHtml(backup.file)}">回滚</button>
+          <button type="button" class="danger-button" data-backup-delete="${escapeHtml(fileName)}">删除</button>
         </div>
       </article>`;
     }).join("");
@@ -1605,6 +1650,23 @@ async function restoreManagedBackup(backupFile) {
   }
   showToast("数据库已回滚，页面将刷新");
   window.setTimeout(() => window.location.reload(), 1200);
+}
+
+async function deleteManagedBackup(fileName) {
+  const confirmed = window.confirm(
+    `确定要删除备份文件 ${fileName} 吗？\n\n删除后不可恢复，对应的元数据快照也会被移除。`
+  );
+  if (!confirmed) return;
+  await api(`/api/v1/admin/backups/${encodeURIComponent(fileName)}`, {
+    method: "DELETE",
+  });
+  showToast(`备份文件已删除：${fileName}`);
+  const remaining = (state.managedBackups || []).length - 1;
+  const maxPage = Math.max(1, Math.ceil(remaining / BACKUP_PAGE_SIZE));
+  if (state.backupPage > maxPage) {
+    state.backupPage = maxPage;
+  }
+  await refreshManagement();
 }
 
 function runtimeConfigCards(runtime) {
@@ -1745,20 +1807,6 @@ function renderDocuments() {
         </summary>
         <div class="project-doc-body">
           ${documentBodyHtml(doc)}
-          <div class="management-actions">
-            <button type="button" class="secondary-button" data-doc-edit="${escapeHtml(doc.doc_key)}">编辑为新版本</button>
-          </div>
-          <form class="doc-edit-form" data-doc-form="${escapeHtml(doc.doc_key)}" hidden>
-            <label>标题 <input name="title" required></label>
-            <label>类型
-              <select name="kind">
-                <option value="binding">规范（binding，必须遵循）</option>
-                <option value="reference">参考（reference）</option>
-              </select>
-            </label>
-            <textarea name="content" rows="10" required></textarea>
-            <button type="submit" class="primary-button">保存新版本（旧版本不可变）</button>
-          </form>
           <div class="doc-history secondary-text">${escapeHtml(documentHistoryText(documentCacheEntry(doc.doc_key, doc.version) || {}))}</div>
         </div>
       </details>`).join("")
@@ -1800,23 +1848,6 @@ function showDocumentError(docKey, error) {
   container.replaceWith(box);
 }
 
-async function saveProjectDocument(form, docKey) {
-  const data = new FormData(form);
-  await api(`/api/v1/projects/${state.projectId}/documents`, {
-    method: "POST",
-    body: JSON.stringify({
-      doc_key: docKey,
-      kind: data.get("kind"),
-      title: data.get("title"),
-      content: String(data.get("content") || ""),
-    }),
-  });
-  showToast(`文档 ${docKey} 已保存为新版本`);
-  delete state.documentContentCache[docKey];
-  await refreshSnapshot(state.projectId);
-  renderDocuments();
-}
-
 function wireDocumentList() {
   elements["document-list"].addEventListener("click", async (event) => {
     const retryButton = event.target.closest("[data-doc-retry]");
@@ -1831,29 +1862,6 @@ function wireDocumentList() {
       if (doc) refreshDocumentBody(doc).catch((error) => showDocumentError(docKey, error));
       return;
     }
-    const editButton = event.target.closest("[data-doc-edit]");
-    const details = event.target.closest(".project-doc");
-    if (!editButton || !details) return;
-    const docKey = details.dataset.docKey;
-    const form = details.querySelector(".doc-edit-form");
-    if (!form.hidden) {
-      form.hidden = true;
-      return;
-    }
-    const manifest = (state.snapshot?.documents || []).find((item) => item.doc_key === docKey);
-    let doc = manifest ? documentCacheEntry(docKey, manifest.version) : null;
-    if (!doc && manifest) doc = await refreshDocumentBody(manifest);
-    if (!doc) return;
-    form.elements["title"].value = doc.title;
-    form.elements["kind"].value = doc.kind;
-    form.elements["content"].value = doc.content;
-    form.hidden = false;
-  });
-  elements["document-list"].addEventListener("submit", async (event) => {
-    const form = event.target.closest(".doc-edit-form");
-    if (!form) return;
-    event.preventDefault();
-    await saveProjectDocument(form, form.dataset.docForm);
   });
 }
 
@@ -2103,6 +2111,8 @@ elements["backup-list"].addEventListener("click", (event) => {
   }
   const restore = event.target.closest("[data-backup-restore]");
   if (restore) restoreManagedBackup(restore.dataset.backupRestore).catch(handleError);
+  const del = event.target.closest("[data-backup-delete]");
+  if (del) deleteManagedBackup(del.dataset.backupDelete).catch(handleError);
 });
 elements["task-assign-button"].addEventListener("click", () => openTaskAssignmentDialog().catch(handleError));
 
@@ -2351,6 +2361,29 @@ document.getElementById("task-navigation").addEventListener("click", (event) => 
   document.querySelectorAll("#task-navigation [data-task-entry]").forEach((item) => {
     item.classList.toggle("is-active", item === button);
   });
+  if (state.snapshot) renderTaskTable(state.snapshot.tasks);
+});
+
+elements["task-sort-controls"]?.addEventListener("click", (event) => {
+  const button = event.target.closest("[data-task-sort]");
+  if (!button) return;
+  const sortKey = button.dataset.taskSort;
+  if (sortKey === "reset") {
+    state.taskSort = { key: "", direction: "asc" };
+  } else if (sortKey === "priority") {
+    if (state.taskSort.key === "priority") {
+      state.taskSort.direction = state.taskSort.direction === "asc" ? "desc" : "asc";
+    } else {
+      state.taskSort = { key: "priority", direction: "asc" };
+    }
+  } else if (sortKey === "number") {
+    if (state.taskSort.key === "number") {
+      state.taskSort.direction = state.taskSort.direction === "desc" ? "asc" : "desc";
+    } else {
+      state.taskSort = { key: "number", direction: "desc" };
+    }
+  }
+  renderTaskSortControls();
   if (state.snapshot) renderTaskTable(state.snapshot.tasks);
 });
 

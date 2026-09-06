@@ -301,3 +301,115 @@ def test_start_auto_backup_worker_always_starts_daemon_thread(service, monkeypat
     worker = start_auto_backup_worker(service, DisabledSettings(), threading.Event())
     assert started == {"name": "agentchatroom-auto-backup", "daemon": True, "started": True}
     assert worker is not None
+
+
+def test_service_delete_backup_success_and_audit(service, project):
+    from pathlib import Path
+
+    created = service.create_backup(source="management")
+    output_path = Path(created["output"])
+    manifest_path = Path(created["manifest"])
+    assert output_path.is_file()
+    assert manifest_path.is_file()
+
+    filename = output_path.name
+    result = service.delete_backup(filename, actor="admin_tester")
+    assert result["deleted"] is True
+    assert result["filename"] == filename
+    assert not output_path.exists()
+    assert not manifest_path.exists()
+
+    events = service.query_audit(project["id"], event_type="backup.deleted")["events"]
+    assert len(events) >= 1
+    last_event = events[-1]
+    assert last_event["payload"]["filename"] == filename
+    assert last_event["payload"]["actor"] == "admin_tester"
+
+
+def test_service_delete_backup_security_and_validation(service, project, tmp_path):
+    import pytest
+    from agentchatroom.errors import DomainError
+
+    # Invalid filename format (directory traversal, wrong extension, wrong prefix)
+    for bad in [
+        "../backup-foo.sqlite",
+        "backup-foo.db",
+        "not-a-backup.sqlite",
+        "backup-with/slash.sqlite",
+        "",
+        "backup-foo.sqlite.manifest.json",
+    ]:
+        with pytest.raises(DomainError) as exc:
+            service.delete_backup(bad)
+        assert exc.value.code == "invalid_backup_filename"
+
+    # Non-existent backup
+    with pytest.raises(DomainError) as exc:
+        service.delete_backup("backup-nonexistent2026.sqlite")
+    assert exc.value.code == "backup_not_found"
+
+    # Legacy snapshot in backup directory must not be deletable
+    directory = service._backup_directory()
+    directory.mkdir(parents=True, exist_ok=True)
+    legacy_file = directory / "pre-migration-old.db"
+    legacy_file.write_bytes(b"legacy")
+    with pytest.raises(DomainError) as exc:
+        service.delete_backup(legacy_file.name)
+    assert exc.value.code == "invalid_backup_filename"
+    assert legacy_file.is_file()
+
+
+def test_api_delete_managed_backup(service, project):
+    from pathlib import Path
+    from starlette.testclient import TestClient
+    from agentchatroom.api import create_app
+
+    settings = service.settings
+    created = service.create_backup()
+    filename = Path(created["output"]).name
+
+    app = create_app(settings)
+    with TestClient(app) as client:
+        # Success deletion
+        response = client.delete(f"/api/v1/admin/backups/{filename}")
+        assert response.status_code == 200
+        assert response.json()["deleted"] is True
+
+        # 404 when deleting already deleted backup
+        response = client.delete(f"/api/v1/admin/backups/{filename}")
+        assert response.status_code == 404
+        assert response.json()["error"]["code"] == "backup_not_found"
+
+        # 400 for invalid filename
+        response = client.delete("/api/v1/admin/backups/invalid-file.txt")
+        assert response.status_code == 400
+
+
+def test_api_delete_managed_backup_requires_auth(monkeypatch, tmp_path):
+    from starlette.testclient import TestClient
+    from agentchatroom.api import create_app
+    from agentchatroom.config import Settings
+    from agentchatroom.database import Database
+
+    token = "a" * 24
+    monkeypatch.setenv("AGENTCHATROOM_MANAGEMENT_TOKEN", token)
+    monkeypatch.setenv("AGENTCHATROOM_MANAGEMENT_AUTH_REQUIRED", "true")
+    data_dir = tmp_path / "runtime"
+    Database(data_dir / "agentchatroom.db").initialize()
+
+    settings = Settings(
+        data_dir=data_dir,
+        management_auth_required=True,
+        management_token_env="AGENTCHATROOM_MANAGEMENT_TOKEN",
+    )
+    app = create_app(settings)
+    with TestClient(app) as client:
+        resp = client.delete("/api/v1/admin/backups/backup-test.sqlite")
+        assert resp.status_code == 401
+        assert resp.json()["error"]["code"] == "management_auth_required"
+
+        resp = client.delete(
+            "/api/v1/admin/backups/backup-test.sqlite",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert resp.status_code == 404

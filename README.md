@@ -435,6 +435,7 @@ Agent 自报的 `worktree` 不会被服务盲目信任。Work Report 采集 Git 
 - **位置可见性**：运行状态字段卡展示数据库类型、SQLite 绝对路径（PostgreSQL 显示脱敏 DSN 指向）、数据目录与日志路径，值全部来自运行时配置。
 - **立即备份**：`POST /api/v1/admin/backups`（管理认证）把数据库快照写入 `<数据目录>/backups/`，返回备份文件绝对路径（界面可复制）；备份清单记录 schema 版本与事件游标，操作写入审计事件 `backup.created`。
 - **从备份回滚**：`POST /api/v1/admin/backups/restore` 要求键入确认 `confirm="REPLACE"`（界面为二次确认弹窗）；安全校验包括 schema 版本一致（`backup_schema_mismatch`）、备份是否落后于当前最新写入（`backup_stale`，必须显式 `allow_data_loss=true` 接受丢弃较新数据）、数据库是否可写（`database_busy`）。拒绝与完成均写审计事件。回滚会丢弃备份之后的数据，请先确认没有任何 Agent 正在写入。
+- **删除备份**：`DELETE /api/v1/admin/backups/{filename}`（管理认证）安全删除指定的数据库快照及其元数据清单（`.manifest.json`），Web 界面提供二次确认弹窗防误触。严格限制文件名必须符合 `backup-*.sqlite` 命名格式，禁止路径穿越或删除未受管快照，成功删除后写入审计事件 `backup.deleted`。
 - **自动备份**：受验证配置 `[backup]`：`auto_backup_enabled`（默认关闭）、`auto_backup_interval_seconds`（默认 3600，最小 60）、`auto_backup_max_kept`（默认 10，超出自动清理最旧备份），环境变量 `AGENTCHATROOM_AUTO_BACKUP_*` 可覆盖。项目设置对话框（项目设置重设计任务）接线同一配置，无第二套事实来源。
 
 ### 项目文档：规范注入与回执闭环
@@ -447,7 +448,7 @@ Agent 自报的 `worktree` 不会被服务盲目信任。Work Report 采集 Git 
 回执闭环：`work_report` 时服务端从认领事件自动读取该快照并写入 `work.reported` 事件的 `spec_receipt` 字段（不依赖 Agent 自觉填写）；任务详情与验收界面按该版本对照判定合规。后端只负责注入、留痕与展示，不做合规性自动判定——独立验收才是执法环节。
 
 - 存储：文档是 Room 数据（数据库表 `project_documents`，schema v19），每次编辑生成不可变新版本，当前版本为指针；历史版本可查、绝不改写或删除。文档增删改全部写审计事件（`document.created` / `document.updated` / `document.archived`），文档更新随 Room 事件流增量可见，不做全量内容推送。
-- 读写权限：REST `GET /api/v1/projects/{id}/documents`（清单）与 `GET .../documents/{doc_key}`（含历史）为只读；创建新版本与归档（`POST .../documents`、`POST .../documents/{doc_key}/archive`）走管理认证，Agent 侧只读，修改规范请走任务流程提案。MCP 提供 `project_document_list` 与 `project_document_get`（按 kind/version 取全文）；CLI 提供 `doc-list` / `doc-get`。
+- 读写权限：REST `GET /api/v1/projects/{id}/documents`（清单）与 `GET .../documents/{doc_key}`（含历史）为只读；创建新版本与归档（`POST .../documents`、`POST .../documents/{doc_key}/archive`）走管理认证，保留用于运维脚本场景。项目文档由 Agent 经 MCP 接口（`project_document_upsert`）进行不可变新版本维护，人工仅经 REST 脚本化操作，Web 管理端仅提供只读展示而不提供人工编辑界面。MCP 提供 `project_document_list`、`project_document_get`（按 kind/version 取全文）与 `project_document_upsert`；CLI 提供 `doc-list` / `doc-get`。规范注入与回执闭环保持不变。
 - 三者分工：仓库 `AGENTS.md` 定义协作流程，`README.md` 是产品公共契约，项目文档承载**本项目**的架构与工程规范，互不同步复制。
 
 ### 项目设置：每个选项的语义与生效时机

@@ -744,6 +744,30 @@ def project_document_get(
 
 
 @mcp.tool()
+def project_document_upsert(
+    project_id: str = "",
+    doc_key: str = "",
+    kind: str = "binding",
+    title: str = "",
+    content: str = "",
+) -> dict[str, Any]:
+    """Create a new immutable version of a project document (binding or reference)."""
+    try:
+        _authorize_remote(project_id, "document:write")
+    except DomainError as error:
+        return {"ok": False, **error.as_dict()}
+    return _tool_result(
+        get_service().upsert_project_document,
+        project_id,
+        doc_key=doc_key,
+        kind=kind,
+        title=title,
+        content=content,
+        actor="agent",
+    )
+
+
+@mcp.tool()
 def task_get(project_id: str = "", task_id: str = "") -> dict[str, Any]:
     """Return one complete task by ID without expanding the whole project board."""
     try:

@@ -989,6 +989,11 @@ def test_web_project_documents_live_in_the_management_tab():
     assert "function refreshDocumentBody(" in javascript
     assert "function patchDocumentBody(" in javascript
     assert "loadProjectDocument" not in javascript
+    assert "doc-edit-form" not in javascript
+    assert "data-doc-edit" not in javascript
+    assert "saveProjectDocument" not in javascript
+    stylesheet = (WEB_DIR / "app.css").read_text(encoding="utf-8")
+    assert ".doc-edit-form" not in stylesheet
 
 
 def test_web_design_tokens_scale_and_readability_floor():
@@ -1047,3 +1052,113 @@ def test_web_design_tokens_scale_and_readability_floor():
     assert 'data-backup-page="prev"' in javascript
     assert ".backup-item {" in stylesheet
     assert ".dialog-form label.check-control input[type=\"checkbox\"]" in stylesheet
+
+
+def test_backup_list_compact_single_row_layout():
+    stylesheet = Path("src/agentchatroom/web/app.css").read_text(encoding="utf-8")
+    javascript = Path("src/agentchatroom/web/app.js").read_text(encoding="utf-8")
+
+    # JavaScript DOM 结构：日期 + 文件名 + 详情 + 按钮组
+    assert '<article class="management-item backup-item">' in javascript
+    assert '<time class="audit-time">' in javascript
+    assert 'class="backup-file"' in javascript
+    assert 'class="secondary-text backup-detail"' in javascript
+    assert 'class="management-actions"' in javascript
+    assert "data-backup-copy=" in javascript
+    assert "data-backup-restore=" in javascript
+
+    # CSS 单行网格与固定行高
+    assert "#backup-list {" in stylesheet
+    assert ".backup-item {" in stylesheet
+    assert ".management-item.backup-item {" in stylesheet
+    assert "height: 42px;" in stylesheet
+    assert "box-sizing: border-box;" in stylesheet
+
+    # CSS 省略截断与右对齐
+    assert ".backup-meta {" in stylesheet
+    assert "text-overflow: ellipsis;" in stylesheet
+    assert "white-space: nowrap;" in stylesheet
+    assert ".backup-item .management-actions {" in stylesheet
+    assert "margin-left: auto;" in stylesheet
+
+    # 移动端适配：保持单行与右对齐按钮，隐藏次要文字避免溢出
+    assert ".backup-item .backup-detail" in stylesheet
+
+
+def test_task_list_sorting_controls_and_behavior():
+    markup = (WEB_DIR / "index.html").read_text(encoding="utf-8")
+    stylesheet = (WEB_DIR / "app.css").read_text(encoding="utf-8")
+    javascript = (WEB_DIR / "app.js").read_text(encoding="utf-8")
+
+    # Markup: toolbar includes task-sort-controls
+    assert 'id="task-sort-controls"' in markup
+    assert 'class="task-sort-controls"' in markup
+
+    # CSS: sort controls and active state
+    assert ".task-sort-controls {" in stylesheet
+    assert ".sort-button {" in stylesheet
+    assert ".sort-button.is-active {" in stylesheet
+    assert ".sort-reset-button {" in stylesheet
+
+    # JS: pure sorting function and state
+    assert "function applyTaskSort(" in javascript
+    assert "function renderTaskSortControls(" in javascript
+    assert 'data-task-sort="priority"' in javascript
+    assert 'data-task-sort="number"' in javascript
+    assert "state.taskSort" in javascript
+
+    # Test sorting pure function using node
+    import subprocess
+    node_test = """
+    const vm = require('vm');
+    const fs = require('fs');
+    const code = fs.readFileSync('src/agentchatroom/web/app.js', 'utf8');
+    const fnMatch = code.match(/function applyTaskSort[\\s\\S]*?\\n\\}/);
+    if (!fnMatch) throw new Error('applyTaskSort not found');
+    const sandbox = { state: { taskSort: { key: '', direction: 'asc' } } };
+    vm.createContext(sandbox);
+    vm.runInContext(fnMatch[0], sandbox);
+
+    const tasks = [
+      { id: '1', task_number: 10, priority: 3 },
+      { id: '2', task_number: 5, priority: 0 },
+      { id: '3', task_number: 20, priority: 1 },
+      { id: '4', task_number: 15, priority: 0 },
+    ];
+
+    const priAsc = sandbox.applyTaskSort(tasks, { key: 'priority', direction: 'asc' });
+    if (priAsc[0].priority !== 0 || priAsc[1].priority !== 0 || priAsc[2].priority !== 1 || priAsc[3].priority !== 3) {
+      throw new Error('priority asc failed');
+    }
+    if (priAsc[0].task_number !== 15 || priAsc[1].task_number !== 5) {
+      throw new Error('priority tie breaker failed');
+    }
+
+    const priDesc = sandbox.applyTaskSort(tasks, { key: 'priority', direction: 'desc' });
+    if (priDesc[0].priority !== 3 || priDesc[1].priority !== 1 || priDesc[2].priority !== 0) {
+      throw new Error('priority desc failed');
+    }
+
+    const numAsc = sandbox.applyTaskSort(tasks, { key: 'number', direction: 'asc' });
+    if (numAsc[0].task_number !== 5 || numAsc[3].task_number !== 20) {
+      throw new Error('number asc failed');
+    }
+
+    const numDesc = sandbox.applyTaskSort(tasks, { key: 'number', direction: 'desc' });
+    if (numDesc[0].task_number !== 20 || numDesc[3].task_number !== 5) {
+      throw new Error('number desc failed');
+    }
+
+    console.log('applyTaskSort node test passed');
+    """
+    res = subprocess.run(["node", "-e", node_test], check=True, capture_output=True, text=True)
+    assert "applyTaskSort node test passed" in res.stdout
+
+
+def test_backup_delete_button_and_handler_in_web_assets():
+    javascript = (WEB_DIR / "app.js").read_text(encoding="utf-8")
+    assert 'data-backup-delete="${escapeHtml(fileName)}"' in javascript
+    assert "async function deleteManagedBackup(" in javascript
+    assert "api(`/api/v1/admin/backups/${encodeURIComponent(fileName)}`" in javascript
+    assert 'const del = event.target.closest("[data-backup-delete]");' in javascript
+    assert "window.confirm(" in javascript

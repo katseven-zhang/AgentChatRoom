@@ -1313,6 +1313,11 @@ def create_app(
             allow_data_loss=body.allow_data_loss,
         )
 
+    @app.delete("/api/v1/admin/backups/{filename}")
+    def delete_managed_backup(request: Request, filename: str) -> dict[str, Any]:
+        _require_management(request)
+        return service.delete_backup(filename, actor="management")
+
     @app.get("/api/v1/projects")
     def list_projects() -> dict[str, Any]:
         return {"projects": service.list_projects()}

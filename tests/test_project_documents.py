@@ -124,3 +124,168 @@ def test_document_rest_surfaces(settings, project_dir):
         assert detail.json()["document"]["content"] == "内容"
         board = client.get(f"/api/v1/projects/{project['id']}/tasks")
         assert board.status_code == 200
+
+
+def test_mcp_project_document_upsert_success_and_history(service, project, joined_agents):
+    executor, _ = joined_agents
+    from agentchatroom.mcp_server import (
+        _bound_service_provider,
+        project_document_get,
+        project_document_list,
+        project_document_upsert,
+    )
+
+    token = _bound_service_provider.set(lambda: service)
+    try:
+        res1 = project_document_upsert(
+            project_id=project["id"],
+            doc_key="guidelines",
+            kind="binding",
+            title="开发规范",
+            content="首要规则：先写测试",
+        )
+        assert res1["ok"] is True
+        doc1 = res1["result"]["document"]
+        assert doc1["version"] == 1
+        assert doc1["doc_key"] == "guidelines"
+        assert doc1["created_by"] == "agent"
+
+        # Update to version 2
+        res2 = project_document_upsert(
+            project_id=project["id"],
+            doc_key="guidelines",
+            kind="binding",
+            title="开发规范",
+            content="首要规则：先写测试，再写实现",
+        )
+        assert res2["ok"] is True
+        doc2 = res2["result"]["document"]
+        assert doc2["version"] == 2
+        assert len(doc2["history"]) == 2
+
+        # Check project_document_get
+        get_latest = project_document_get(project_id=project["id"], doc_key="guidelines")
+        assert get_latest["ok"] is True
+        assert get_latest["result"]["document"]["content"] == "首要规则：先写测试，再写实现"
+
+        get_v1 = project_document_get(project_id=project["id"], doc_key="guidelines", version=1)
+        assert get_v1["ok"] is True
+        assert get_v1["result"]["document"]["content"] == "首要规则：先写测试"
+
+        # Check audit events
+        created_events = service.query_audit(project["id"], event_type="document.created")["events"]
+        updated_events = service.query_audit(project["id"], event_type="document.updated")["events"]
+        assert any(e["payload"]["doc_key"] == "guidelines" and e["payload"]["actor"] == "agent" for e in created_events)
+        assert any(e["payload"]["doc_key"] == "guidelines" and e["payload"]["actor"] == "agent" for e in updated_events)
+
+        # Check room_sync incremental visibility
+        sync_res = service.room_sync(
+            project["id"],
+            session_id=executor["agent"]["id"],
+            token=executor["token"],
+            after=0,
+        )
+        event_types = [e["event_type"] for e in sync_res["events"]]
+        assert "document.created" in event_types
+        assert "document.updated" in event_types
+    finally:
+        _bound_service_provider.reset(token)
+
+
+def test_mcp_project_document_upsert_validation_failures(service, project):
+    from agentchatroom.mcp_server import _bound_service_provider, project_document_upsert
+
+    token = _bound_service_provider.set(lambda: service)
+    try:
+        # Invalid kind
+        res_kind = project_document_upsert(
+            project_id=project["id"], doc_key="test-doc", kind="bad_kind", title="T", content="C"
+        )
+        assert res_kind["ok"] is False
+        assert res_kind["error"]["code"] == "invalid_project_document_kind"
+
+        # Invalid doc_key (path traversal)
+        res_key1 = project_document_upsert(
+            project_id=project["id"], doc_key="../evil", kind="binding", title="T", content="C"
+        )
+        assert res_key1["ok"] is False
+        assert res_key1["error"]["code"] == "invalid_project_document_key"
+
+        # Invalid doc_key (uppercase / invalid characters)
+        res_key2 = project_document_upsert(
+            project_id=project["id"], doc_key="Bad_Doc!", kind="binding", title="T", content="C"
+        )
+        assert res_key2["ok"] is False
+        assert res_key2["error"]["code"] == "invalid_project_document_key"
+
+        # Empty title
+        res_title = project_document_upsert(
+            project_id=project["id"], doc_key="test-doc", kind="binding", title="   ", content="C"
+        )
+        assert res_title["ok"] is False
+        assert res_title["error"]["code"] == "invalid_project_document"
+
+        # Empty content
+        res_content = project_document_upsert(
+            project_id=project["id"], doc_key="test-doc", kind="binding", title="T", content="   "
+        )
+        assert res_content["ok"] is False
+        assert res_content["error"]["code"] == "invalid_project_document"
+    finally:
+        _bound_service_provider.reset(token)
+
+
+def test_mcp_project_document_upsert_remote_token_authorization(service, project, monkeypatch):
+    from mcp.server.auth.provider import AccessToken
+    from agentchatroom.mcp_server import _bound_service_provider, project_document_upsert
+
+    token = _bound_service_provider.set(lambda: service)
+    try:
+        # 1. Token without document:write permission
+        fake_token_no_write = AccessToken(
+            token="tok1",
+            client_id="client1",
+            scopes=["room:read", "message:write"],
+            expires_at=9999999999,
+            subject="agent1",
+            claims={"project_id": project["id"]},
+        )
+        monkeypatch.setattr("agentchatroom.mcp_server.get_access_token", lambda: fake_token_no_write)
+        res_forbidden = project_document_upsert(
+            project_id=project["id"], doc_key="valid-key", kind="binding", title="T", content="C"
+        )
+        assert res_forbidden["ok"] is False
+        assert res_forbidden["error"]["code"] == "agent_token_permission_forbidden"
+
+        # 2. Token for a different project
+        fake_token_wrong_project = AccessToken(
+            token="tok2",
+            client_id="client2",
+            scopes=["document:write"],
+            expires_at=9999999999,
+            subject="agent2",
+            claims={"project_id": "other_project_id"},
+        )
+        monkeypatch.setattr("agentchatroom.mcp_server.get_access_token", lambda: fake_token_wrong_project)
+        res_wrong_proj = project_document_upsert(
+            project_id=project["id"], doc_key="valid-key", kind="binding", title="T", content="C"
+        )
+        assert res_wrong_proj["ok"] is False
+        assert res_wrong_proj["error"]["code"] == "agent_token_project_forbidden"
+
+        # 3. Token with document:write permission for correct project
+        fake_token_ok = AccessToken(
+            token="tok3",
+            client_id="client3",
+            scopes=["document:write"],
+            expires_at=9999999999,
+            subject="agent3",
+            claims={"project_id": project["id"]},
+        )
+        monkeypatch.setattr("agentchatroom.mcp_server.get_access_token", lambda: fake_token_ok)
+        res_ok = project_document_upsert(
+            project_id=project["id"], doc_key="valid-key", kind="binding", title="T", content="C"
+        )
+        assert res_ok["ok"] is True
+    finally:
+        _bound_service_provider.reset(token)
