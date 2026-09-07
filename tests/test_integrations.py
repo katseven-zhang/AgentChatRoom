@@ -196,3 +196,53 @@ def test_frozen_build_uses_exe_mcp_dispatch_everywhere(tmp_path, monkeypatch):
         prompt = profile["onboarding_prompts"]["local"]
         assert " -m " not in prompt, profile_id
         assert '"mcp"' in prompt, profile_id
+
+
+def test_generated_mcp_configs_contain_no_terminal_launch_chain(tmp_path):
+    """#101: generated configs must never imply a cmd/terminal launch chain."""
+    forbidden = [
+        ".cmd",
+        ".bat",
+        "cmd /c",
+        "cmd.exe",
+        "powershell",
+        "pwsh",
+        "windows terminal",
+        "bash -c",
+        "start ",
+    ]
+    settings = Settings(data_dir=tmp_path / "data")
+    result = build_mcp_integration(
+        settings, python_executable=tmp_path / "runtime" / "python.exe"
+    )
+    payloads = [
+        json.dumps(result["generic_json"], ensure_ascii=False),
+        json.dumps(result["remote_bridge_json"], ensure_ascii=False),
+        json.dumps(result["streamable_http_json"], ensure_ascii=False),
+    ]
+    for profile in result["profiles"].values():
+        for key in ("config_text", "remote_bridge_config_text"):
+            value = profile.get(key)
+            if value:
+                payloads.append(value)
+    for payload in payloads:
+        lowered = payload.lower()
+        for marker in forbidden:
+            assert marker not in lowered, f"found {marker!r} in generated config"
+
+
+def test_onboarding_prompt_states_lifecycle_and_pin_semantics(tmp_path):
+    """#101/#97: the handoff prompt states no auto-start and the pin caveat."""
+    settings = Settings(data_dir=tmp_path / "data")
+    project = {
+        "id": "project_prompt",
+        "name": "AgentChatRoom",
+        "project_key": "sample-project",
+        "root_path": str(tmp_path),
+    }
+    result = build_mcp_integration(settings, project=project)
+    prompt = result["onboarding_prompt"]
+    assert "不会启动 AgentChatRoom 后台服务" in prompt
+    assert "失败也不会自动拉起" in prompt
+    assert "AGENTCHATROOM_PROJECT_PATH" in prompt
+    assert "兜底" in prompt

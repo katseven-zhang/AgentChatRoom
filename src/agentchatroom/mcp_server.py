@@ -1732,6 +1732,9 @@ def create_mcp(
     return server
 
 
+MCP_STARTUP_UNAVAILABLE_EXIT_CODE = 2
+
+
 def main(argv: list[str] | None = None) -> None:
     global presence_manager
     parser = argparse.ArgumentParser(
@@ -1745,16 +1748,38 @@ def main(argv: list[str] | None = None) -> None:
     )
     parser.parse_args(argv)
     global _loaded_identity
-    settings = load_settings()
-    room_service = get_service()
-    _loaded_identity = _configured_local_identity()
-    presence_manager = LocalPresenceManager(
-        room_service,
-        enabled=settings.presence_keepalive_enabled,
-        interval_seconds=settings.presence_keepalive_interval_seconds,
-    )
-    presence_manager.start()
-    _auto_join_local_checkout()
+    # Startup must fail bounded: when the local engine cannot start (unusable
+    # data directory, broken database, identity misconfiguration), print one
+    # diagnosable stderr line and exit without spawning any process, retrying,
+    # or leaking a traceback, tokens, or user paths beyond the failing input.
+    try:
+        settings = load_settings()
+        room_service = get_service()
+        _loaded_identity = _configured_local_identity()
+        presence_manager = LocalPresenceManager(
+            room_service,
+            enabled=settings.presence_keepalive_enabled,
+            interval_seconds=settings.presence_keepalive_interval_seconds,
+        )
+        presence_manager.start()
+    except Exception as error:  # noqa: BLE001 - bounded startup failure boundary
+        code = getattr(error, "code", type(error).__name__)
+        message = str(error).strip() or code
+        sys.stderr.write(
+            f"agentchatroom mcp unavailable ({code}): {message}\n"
+            f"recovery: fix the local engine inputs and restart the MCP "
+            f"connection; the MCP server never starts AgentChatRoom itself\n"
+        )
+        raise SystemExit(MCP_STARTUP_UNAVAILABLE_EXIT_CODE) from None
+    try:
+        # Presence is best-effort: an unexpected auto-join failure must not
+        # take the MCP server down or trigger client restart loops.
+        _auto_join_local_checkout()
+    except Exception as error:  # noqa: BLE001 - presence is best-effort
+        logger.warning(
+            "Local MCP auto-join failed: %s",
+            getattr(error, "code", type(error).__name__),
+        )
     try:
         mcp.run(transport="stdio")
     finally:

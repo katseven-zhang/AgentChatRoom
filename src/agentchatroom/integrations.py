@@ -169,6 +169,12 @@ def build_onboarding_prompt(
         "http": "直接 HTTP MCP",
         "remote": "远程 Bridge",
     }[transport]
+    lifecycle_note = (
+        "\n\n生命周期说明：MCP 连接本身不会启动 AgentChatRoom 后台服务、"
+        "GUI、托盘或任何终端窗口，失败也不会自动拉起任何进程；本机 stdio "
+        "模式为随连接内嵌的引擎，无需常驻服务；远程/Bridge 模式要求目标"
+        "服务已由用户显式启动，未运行时连接以明确错误结束。"
+    )
     pin_warning = ""
     if transport == "local" and PROJECT_PATH_ENV_VAR in config_text:
         pin_warning = (
@@ -184,7 +190,7 @@ def build_onboarding_prompt(
 连接方式：{transport_label}
 请根据当前客户端和运行环境自行完成接入。连接配置：
 
-{config_text.rstrip()}{pin_warning}"""
+{config_text.rstrip()}{lifecycle_note}{pin_warning}"""
 
 
 def _profile_identity_environment(

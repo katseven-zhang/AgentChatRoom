@@ -409,6 +409,16 @@ workspace roots / cwd 是可靠的当前工作区证据，永远优先于配置�
 
 Web「配置本机 Agent」把四件事实分开显示：软件配置、进程连接（MCP Presence）、Room Session、当前对话同步。浏览器无法观察某个模型对话是否已同步，因此不会把左侧「已连接」画成「当前对话已同步」。CLI `room-bootstrap` 复用同一领域服务，成功结果也不打印 Session Token。
 
+### MCP 生命周期与启动归属
+
+MCP 连接永远不启动 AgentChatRoom：本机 stdio 入口（打包 exe 的 `mcp` 子命令或 `python -m agentchatroom.mcp_server`）不生成任何子进程，不会拉起后台服务、GUI、托盘或 cmd/PowerShell/Terminal；生成给客户端的连接配置也不含任何批处理/终端启动链。三种模式的启动归属：
+
+1. **本机 stdio**：引擎随 MCP 连接内嵌在 MCP 进程内，读写本地数据库，无需任何常驻服务；连接存在即引擎存在，连接断开进程随之退出。这不属于"启动 Chatroom"，用户不启动任何服务也可以在各客户端使用 MCP。
+2. **本机 HTTP（Web/管理前端）**：仅由用户显式启动（`serve`、`serve --detach` 或 GUI 面板「启动服务」按钮）；MCP 不探测、不等待、更不会代为拉起。
+3. **远程 HTTP/Bridge**：Bridge 只连接用户配置的已运行目标；目标未运行或健康检查失败时按有界次数重试（默认 3 次、指数退避），耗尽后以原错误明确结束，不猜测地址、不代启动目标服务。
+
+失败封闭：本机 stdio 入口在引擎无法启动（如数据目录不可用、数据库损坏）时，输出一行 `agentchatroom mcp unavailable (<原因>): <说明>` 并以退出码 `2` 结束——无堆栈噪声、无重试循环、不泄露 Token；后续是否重连由客户端策略决定，AgentChatRoom 不做自动重试。GUI 的自动启动默认关闭（`client.toml [target] auto_start`，默认 false），只有用户显式点击「启动服务」才创建后台服务进程；「不使用 Chatroom」是正常状态——不启动任何 AgentChatRoom 进程不会影响其他客户端，配置、Presence、MCP 连接、Room Session 与对话同步仍然分层表达。
+
 ### MCP 消息注入限制与有效性过滤
 
 为避免新对话或增量同步时向 Agent 上下文灌入海量系统审计事件（如加入/离开 Room、Session 替换、任务分配/状态变更、文件租约冲突等），`room_bootstrap` 与 MCP `room_sync` 的消息投影仅注入最近有效的 Agent 消息：

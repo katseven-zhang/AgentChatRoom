@@ -775,6 +775,100 @@ def test_local_mcp_requires_a_fully_configured_software_identity(
     assert service.list_projects() == []
 
 
+def test_mcp_startup_path_never_spawns_subprocess(
+    monkeypatch, service, project_dir, tmp_path
+):
+    """MCP connection must never pull up AgentChatRoom or any helper process.
+
+    #101: the stdio entry point embeds the engine; startup (settings, service,
+    presence, auto-join) must complete without any subprocess creation so a
+    client connecting cannot start a backend, GUI, tray, or terminal chain.
+    """
+    _configure_local_software(monkeypatch, key="codex", name="Codex", client="codex")
+    project = service.create_project(root_path=str(project_dir))
+    register_checkout_project(project_dir, project)
+    monkeypatch.setattr(mcp_server, "service", service)
+    monkeypatch.chdir(project_dir)
+
+    import subprocess as subprocess_module
+    from pathlib import Path
+
+    def _make_guard(module, name, real):
+        def guard(*args, **kwargs):
+            command = args[0] if args else kwargs.get("args")
+            head = (
+                str(command[0])
+                if isinstance(command, (list, tuple)) and command
+                else ""
+            )
+            if module is subprocess_module and Path(head).stem.lower() == "git":
+                # Reading the checkout's git remote is the one legitimate
+                # subprocess use; anything else must fail the guard.
+                return real(*args, **kwargs)
+            raise AssertionError(
+                f"MCP startup must not spawn {head or name!r}"
+            )
+
+        return guard
+
+    for name in ("run", "Popen", "check_call", "check_output", "call"):
+        monkeypatch.setattr(
+            subprocess_module,
+            name,
+            _make_guard(subprocess_module, name, getattr(subprocess_module, name)),
+        )
+    for name in ("system", "popen", "spawnl", "spawnle", "spawnv", "spawnve"):
+        if hasattr(os, name):
+            monkeypatch.setattr(os, name, _make_guard(os, name, getattr(os, name)))
+    monkeypatch.setattr(
+        asyncio,
+        "create_subprocess_exec",
+        _make_guard(
+            asyncio, "create_subprocess_exec", asyncio.create_subprocess_exec
+        ),
+    )
+
+    settings = Settings(data_dir=tmp_path / "no-spawn-data")
+    engine = mcp_server.AgentChatRoomService(
+        Database(settings.database_path), settings
+    )
+    engine.initialize()
+    joined = mcp_server._auto_join_local_checkout()
+    assert joined is not None
+    assert joined["project"]["id"] == project["id"]
+
+
+def test_local_stdio_main_fails_bounded_without_usable_data_dir(tmp_path):
+    """An unusable engine input exits once with a diagnosable stderr line.
+
+    #101: no traceback noise, no retry loop, no window/process chain, and no
+    token material in the failure output.
+    """
+    marker = tmp_path / "not-a-directory"
+    marker.write_text("x", encoding="utf-8")
+    env = os.environ.copy()
+    env.update(
+        {
+            "AGENTCHATROOM_DATA_DIR": str(marker),
+            "AGENTCHATROOM_SOFTWARE_KEY": "bounded",
+            "AGENTCHATROOM_SOFTWARE_NAME": "Bounded",
+            "AGENTCHATROOM_SOFTWARE_CLIENT": "pytest",
+        }
+    )
+    proc = subprocess.run(
+        [sys.executable, "-m", "agentchatroom.mcp_server"],
+        input="",
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=30,
+    )
+    assert proc.returncode == mcp_server.MCP_STARTUP_UNAVAILABLE_EXIT_CODE
+    assert "agentchatroom mcp unavailable" in proc.stderr
+    assert "recovery" in proc.stderr
+    assert "Traceback" not in proc.stderr
+
+
 def test_local_mcp_startup_auto_joins_a_registered_checkout(
     monkeypatch, service, project_dir
 ):
