@@ -782,6 +782,7 @@ def test_local_mcp_startup_auto_joins_a_registered_checkout(
     project = service.create_project(root_path=str(project_dir))
     register_checkout_project(project_dir, project)
     monkeypatch.setenv(mcp_server.PROJECT_PATH_ENV, str(project_dir))
+    monkeypatch.chdir(project_dir)
     _configure_local_software(
         monkeypatch, key="codex", name="Codex", client="codex"
     )
@@ -1052,6 +1053,7 @@ async def test_local_mcp_stdio_startup_auto_joins_and_disconnects_on_exit(
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
         env=environment,
+        cwd=str(project_dir),
     )
     assert process.stdin is not None
 

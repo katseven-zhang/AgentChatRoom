@@ -358,7 +358,7 @@ def test_invalid_registration_and_ambiguous_workspaces(
     assert ambiguous.public["required_action"] == "open_one_workspace_folder"
     assert ambiguous.public["details"]["candidate_count"] == 2
 
-    overridden = bootstrap_local_room(
+    pinned_cannot_resolve_ambiguity = bootstrap_local_room(
         service,
         software_key="boot-agent",
         software_name="Boot Agent",
@@ -366,8 +366,11 @@ def test_invalid_registration_and_ambiguous_workspaces(
         workspace_roots=[project_dir, other],
         explicit_project_path=project_dir,
     )
-    assert overridden.public["status"] == "ready"
-    assert overridden.public["project"]["id"] == first["id"]
+    assert pinned_cannot_resolve_ambiguity.public["status"] == "ambiguous_workspace"
+    assert (
+        pinned_cannot_resolve_ambiguity.public["required_action"]
+        == "open_one_workspace_folder"
+    )
 
     broken = tmp_path / "broken-checkout"
     broken.mkdir()
@@ -466,6 +469,7 @@ def test_auto_join_establishes_presence_without_conversation_binding(
     _register_project(service, project_dir)
     monkeypatch.setattr(mcp_server, "service", service)
     monkeypatch.setenv(PROJECT_PATH_ENV, str(project_dir))
+    monkeypatch.chdir(project_dir)
     joined = mcp_server._auto_join_local_checkout()
     assert joined is not None
     assert joined["token"]
@@ -679,7 +683,7 @@ def test_mcp_workspace_roots_do_not_enter_the_wrong_room(
     assert selected["result"]["project"]["id"] != second["id"]
 
 
-def test_discover_workspace_candidates_prefer_explicit_override(tmp_path):
+def test_discover_workspace_candidates_uses_workspace_evidence_first(tmp_path):
     first = tmp_path / "one"
     second = tmp_path / "two"
     first.mkdir()
@@ -691,6 +695,108 @@ def test_discover_workspace_candidates_prefer_explicit_override(tmp_path):
     found = discover_workspace_candidates(
         workspace_roots=[first, second],
         cwd=second,
-        explicit_project_path=first,
     )
-    assert found == [first.resolve()]
+    assert found == [first.resolve(), second.resolve()]
+    assert discover_workspace_candidates(cwd=second) == [second.resolve()]
+    assert discover_workspace_candidates() == []
+
+
+def test_configured_project_path_is_fallback_not_override(
+    monkeypatch, service, project_dir, tmp_path
+):
+    _configure_software(monkeypatch)
+    pinned = _register_project(service, project_dir)
+    other_dir = tmp_path / "other-workspace"
+    other_dir.mkdir()
+    other = service.create_project(root_path=str(other_dir), name="Other")
+    register_checkout_project(other_dir, other)
+
+    pinned_session = bootstrap_local_room(
+        service,
+        software_key="boot-agent",
+        software_name="Boot Agent",
+        client="codex",
+        model="unknown",
+        cwd=project_dir,
+    )
+    assert pinned_session.binding is not None
+    pinned_session_id = pinned_session.binding.session_id
+
+    selected = bootstrap_local_room(
+        service,
+        software_key="boot-agent",
+        software_name="Boot Agent",
+        client="codex",
+        model="unknown",
+        workspace_roots=[other_dir],
+        cwd=other_dir,
+        explicit_project_path=project_dir,
+    )
+    assert selected.binding is not None
+    assert selected.binding.project_id == other["id"]
+    assert selected.binding.project_id != pinned["id"]
+    notices = selected.public.get("notices") or []
+    assert any(
+        notice.get("code") == "configured_project_path_ignored" for notice in notices
+    )
+
+    snapshot = service.snapshot(pinned["id"])
+    online = [agent for agent in snapshot["agents"] if agent["status"] == "online"]
+    assert [agent["id"] for agent in online] == [pinned_session_id]
+
+
+def test_configured_project_path_fallback_without_workspace_evidence(
+    monkeypatch, service, project_dir, tmp_path
+):
+    _configure_software(monkeypatch)
+    project = _register_project(service, project_dir)
+    unregistered = tmp_path / "plain"
+    unregistered.mkdir()
+    selected = bootstrap_local_room(
+        service,
+        software_key="boot-agent",
+        software_name="Boot Agent",
+        client="codex",
+        model="unknown",
+        cwd=unregistered,
+        explicit_project_path=project_dir,
+    )
+    assert selected.binding is not None
+    assert selected.binding.project_id == project["id"]
+    assert selected.public.get("notices") in (None, [])
+
+
+def test_workspace_evidence_wins_over_unresolvable_pin(
+    monkeypatch, service, project_dir, tmp_path
+):
+    _configure_software(monkeypatch)
+    project = _register_project(service, project_dir)
+    selected = bootstrap_local_room(
+        service,
+        software_key="boot-agent",
+        software_name="Boot Agent",
+        client="codex",
+        model="unknown",
+        cwd=project_dir,
+        explicit_project_path=tmp_path / "not-a-checkout",
+    )
+    assert selected.binding is not None
+    assert selected.binding.project_id == project["id"]
+
+
+def test_auto_join_prefers_cwd_checkout_over_pinned_path(
+    monkeypatch, service, project_dir, tmp_path
+):
+    _configure_software(monkeypatch)
+    pinned = _register_project(service, project_dir)
+    other_dir = tmp_path / "cwd-workspace"
+    other_dir.mkdir()
+    other = service.create_project(root_path=str(other_dir), name="Cwd")
+    register_checkout_project(other_dir, other)
+    monkeypatch.setattr(mcp_server, "service", service)
+    monkeypatch.setenv(PROJECT_PATH_ENV, str(project_dir))
+    monkeypatch.chdir(other_dir)
+    joined = mcp_server._auto_join_local_checkout()
+    assert joined is not None
+    assert joined["project"]["id"] == other["id"]
+    assert joined["project"]["id"] != pinned["id"]

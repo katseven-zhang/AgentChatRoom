@@ -169,13 +169,22 @@ def build_onboarding_prompt(
         "http": "直接 HTTP MCP",
         "remote": "远程 Bridge",
     }[transport]
+    pin_warning = ""
+    if transport == "local" and PROJECT_PATH_ENV_VAR in config_text:
+        pin_warning = (
+            f"\n\n注意：`{PROJECT_PATH_ENV_VAR}` 是单个 checkout 的兜底路径，"
+            "工作区 roots/cwd 的登记解析始终优先。若把本配置粘贴到"
+            "用户级/全局客户端配置（多个工作区共用），请删除该行，"
+            "让每个工作区按自身 checkout 登记解析 Room；"
+            "否则未登记的工作区会被兜底进错误项目。"
+        )
 
     return f"""请为 {client_label} 接入名为 `{MCP_SERVER_NAME}` 的 MCP Server。
 
 连接方式：{transport_label}
 请根据当前客户端和运行环境自行完成接入。连接配置：
 
-{config_text.rstrip()}"""
+{config_text.rstrip()}{pin_warning}"""
 
 
 def _profile_identity_environment(

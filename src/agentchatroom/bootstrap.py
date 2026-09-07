@@ -148,12 +148,7 @@ def discover_workspace_candidates(
     *,
     workspace_roots: Iterable[str | Path] | None = None,
     cwd: str | Path | None = None,
-    explicit_project_path: str | Path | None = None,
 ) -> list[Path]:
-    if explicit_project_path and str(explicit_project_path).strip():
-        found = find_registered_checkout(explicit_project_path)
-        return [found] if found is not None else []
-
     ordered: list[Path] = []
     seen: set[str] = set()
 
@@ -171,6 +166,15 @@ def discover_workspace_candidates(
     if cwd is not None and str(cwd).strip():
         add(find_registered_checkout(cwd))
     return ordered
+
+
+def resolve_configured_checkout(
+    explicit_project_path: str | Path | None,
+) -> Path | None:
+    """Resolve the configured project path as a registered checkout fallback."""
+    if explicit_project_path and str(explicit_project_path).strip():
+        return find_registered_checkout(explicit_project_path)
+    return None
 
 
 def redact_runtime_value(value: Any, *, key: str = "") -> Any:
@@ -245,6 +249,43 @@ def compact_room_snapshot(snapshot: Mapping[str, Any], *, cursor: int) -> dict[s
     )
 
 
+def _configured_path_ignored_notice(
+    workspace_candidates: list[Path],
+    configured_checkout: Path | None,
+    selected_checkout: Path,
+    project: Mapping[str, Any],
+) -> dict[str, Any] | None:
+    """Notice when the configured path points to a different registered Project.
+
+    Workspace roots/cwd always win; the configured path is only a fallback. A
+    conflicting pin must never be followed silently, so the ready payload
+    reports the ignored pin with a single recovery action.
+    """
+    if not workspace_candidates or configured_checkout is None:
+        return None
+    if os.path.normcase(str(configured_checkout)) == os.path.normcase(
+        str(selected_checkout)
+    ):
+        return None
+    try:
+        configured_key, present = resolve_checkout_project_key(configured_checkout)
+    except DomainError:
+        return None
+    if not present or not configured_key:
+        return None
+    if configured_key == str(project.get("project_key", "")):
+        return None
+    return {
+        "code": "configured_project_path_ignored",
+        "message": (
+            "AGENTCHATROOM_PROJECT_PATH registers a different Project; "
+            "workspace roots/cwd took precedence"
+        ),
+        "configured_project_key": configured_key,
+        "required_action": "align_or_remove_agentchatroom_project_path_env",
+    }
+
+
 def bootstrap_local_room(
     service: AgentChatRoomService,
     *,
@@ -262,12 +303,16 @@ def bootstrap_local_room(
     if loaded_identity is not None and loaded_identity != current_identity:
         return BootstrapOutcome(bootstrap_status_payload("mcp_restart_required"))
 
-    candidates = discover_workspace_candidates(
+    workspace_candidates = discover_workspace_candidates(
         workspace_roots=workspace_roots,
         cwd=cwd,
-        explicit_project_path=explicit_project_path,
     )
-    if not candidates:
+    configured_checkout = resolve_configured_checkout(explicit_project_path)
+    if workspace_candidates:
+        candidates: list[Path] = workspace_candidates
+    elif configured_checkout is not None:
+        candidates = [configured_checkout]
+    else:
         return BootstrapOutcome(bootstrap_status_payload("project_not_registered"))
     unique_keys: dict[str, Path] = {}
     invalid: Path | None = None
@@ -364,6 +409,11 @@ def bootstrap_local_room(
     token = str(joined["token"])
     cursor = int(synced.get("cursor") or joined.get("cursor") or 0)
     public = bootstrap_status_payload("ready")
+    ignored_notice = _configured_path_ignored_notice(
+        workspace_candidates, configured_checkout, checkout, project
+    )
+    if ignored_notice is not None:
+        public["notices"] = [ignored_notice]
     public["conversation_synced"] = True
     public["connection"] = {
         "software_configured": True,

@@ -31,6 +31,7 @@ from .bootstrap import (
     bootstrap_local_room,
     bootstrap_status_payload,
     configured_software_identity,
+    find_registered_checkout,
     workspace_path_from_file_uri,
     PROJECT_PATH_ENV,
     SOFTWARE_CLIENT_ENV,
@@ -241,18 +242,29 @@ async def collect_mcp_workspace_roots(context: Any) -> list[Path]:
 
 
 def _auto_join_local_checkout() -> dict[str, Any] | None:
-    """Create startup Presence only for a fully configured registered checkout."""
-    project_path = os.getenv(PROJECT_PATH_ENV, "").strip()
-    if not project_path or _configured_local_identity() is None:
+    """Create startup Presence only for a fully configured registered checkout.
+
+    Startup Presence follows the same workspace precedence as room_bootstrap:
+    the current working directory's checkout wins; the configured project path
+    is only a fallback, so a stale pin cannot pull presence into another Room.
+    """
+    if _configured_local_identity() is None:
+        return None
+    target = find_registered_checkout(Path.cwd())
+    if target is None:
+        pinned_path = os.getenv(PROJECT_PATH_ENV, "").strip()
+        if pinned_path:
+            target = find_registered_checkout(pinned_path)
+    if target is None:
         return None
     try:
-        registered_project_key, _ = resolve_checkout_project_key(project_path)
+        registered_project_key, _ = resolve_checkout_project_key(target)
     except DomainError as error:
         logger.warning("Local MCP auto-join skipped: %s", error.code)
         return None
     if not registered_project_key:
         return None
-    response = room_join(project_path=project_path, model="unknown")
+    response = room_join(project_path=str(target), model="unknown")
     if not response.get("ok"):
         error = response.get("error") or {}
         logger.warning(
