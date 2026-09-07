@@ -415,7 +415,7 @@ MCP 连接永远不启动 AgentChatRoom：本机 stdio 入口（打包 exe 的 `
 
 1. **本机 stdio**：引擎随 MCP 连接内嵌在 MCP 进程内，读写本地数据库，无需任何常驻服务；连接存在即引擎存在，连接断开进程随之退出。这不属于"启动 Chatroom"，用户不启动任何服务也可以在各客户端使用 MCP。
 2. **本机 HTTP（Web/管理前端）**：仅由用户显式启动（`serve`、`serve --detach` 或 GUI 面板「启动服务」按钮）；MCP 不探测、不等待、更不会代为拉起。
-3. **远程 HTTP/Bridge**：Bridge 只连接用户配置的已运行目标；目标未运行或健康检查失败时按有界次数重试（默认 3 次、指数退避），耗尽后以原错误明确结束，不猜测地址、不代启动目标服务。
+3. **远程 HTTP/Bridge**：Bridge 只连接用户配置的已运行目标；目标未运行或健康检查失败时按有界次数重试（默认 3 次、指数退避），耗尽后请求得到有界答复——`tools/list` 返回空工具列表，工具调用返回 `bridge_upstream_unavailable` 错误载荷（含恢复动作），请求不会悬挂，也不猜测地址、不代启动目标服务。
 
 失败封闭：本机 stdio 入口在引擎无法启动（如数据目录不可用、数据库损坏）时，输出一行 `agentchatroom mcp unavailable (<原因>): <说明>` 并以退出码 `2` 结束——无堆栈噪声、无重试循环、不泄露 Token；后续是否重连由客户端策略决定，AgentChatRoom 不做自动重试。GUI 的自动启动默认关闭（`client.toml [target] auto_start`，默认 false），只有用户显式点击「启动服务」才创建后台服务进程；「不使用 Chatroom」是正常状态——不启动任何 AgentChatRoom 进程不会影响其他客户端，配置、Presence、MCP 连接、Room Session 与对话同步仍然分层表达。
 

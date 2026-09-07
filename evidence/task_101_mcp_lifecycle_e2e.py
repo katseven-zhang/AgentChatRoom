@@ -154,6 +154,20 @@ class StdioClient:
                 self.proc.kill()
 
 
+def _issue_real_agent_token() -> str:
+    """Issue a real agent token from the running backend's own database."""
+    real_settings = Settings(
+        data_dir=REPO / ".agentchatroom" / "runtime"
+    )
+    real_service = AgentChatRoomService(
+        Database(real_settings.database_path), real_settings
+    )
+    real_service.initialize()
+    return real_service.issue_agent_token(
+        "project_0cea8e90a369a4e96523", name="task-101-bridge-evidence"
+    )["token"]
+
+
 DATA_DIR = Path(tempfile.mkdtemp(prefix="acr101-data-"))
 WORK = Path(tempfile.mkdtemp(prefix="acr101-ws-"))
 
@@ -245,6 +259,191 @@ async def main() -> int:
         "bounded failures leave no terminal/helper processes behind",
         not after_failures,
         f"new_watched={after_failures[:3]}",
+    )
+
+    # Remote/HTTP entry, success path: the bridge connects to the running
+    # backend explicitly started by the user (127.0.0.1:8765) and serves
+    # tools/list over stdio. Read-only: no Room join, no writes. The agent
+    # token is issued by the real backend for this verification.
+    token = _issue_real_agent_token()
+    bridge_env = os.environ.copy()
+    bridge_env.update(
+        {
+            "AGENTCHATROOM_SERVER_URL": "http://127.0.0.1:8765/mcp",
+            "AGENTCHATROOM_AGENT_TOKEN": token,
+            "AGENTCHATROOM_SOFTWARE_KEY": "lifecycle-bridge",
+            "AGENTCHATROOM_SOFTWARE_NAME": "Lifecycle Bridge",
+            "AGENTCHATROOM_SOFTWARE_CLIENT": "pytest-stdio",
+            "PYTHONIOENCODING": "utf-8",
+        }
+    )
+    bridge = await asyncio.create_subprocess_exec(
+        PYTHON,
+        "-m",
+        "agentchatroom.mcp_bridge",
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        env=bridge_env,
+        cwd=str(WORK),
+    )
+
+    async def bridge_exchange(payload: dict) -> dict | None:
+        assert bridge.stdin is not None and bridge.stdout is not None
+        bridge.stdin.write((json.dumps(payload) + "\n").encode())
+        await bridge.stdin.drain()
+        while True:
+            line = await asyncio.wait_for(bridge.stdout.readline(), timeout=30)
+            message = json.loads(line)
+            if "method" in message and "id" in message:
+                bridge.stdin.write(
+                    (json.dumps({"jsonrpc": "2.0", "id": message["id"], "result": {}}) + "\n").encode()
+                )
+                await bridge.stdin.drain()
+                continue
+            return message if message.get("id") is not None else None
+
+    try:
+        init = await bridge_exchange(
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": "2025-06-18",
+                    "capabilities": {},
+                    "clientInfo": {"name": "lifecycle", "version": "1"},
+                },
+            }
+        )
+        assert bridge.stdin is not None
+        bridge.stdin.write(
+            (json.dumps({"jsonrpc": "2.0", "method": "notifications/initialized"}) + "\n").encode()
+        )
+        await bridge.stdin.drain()
+        listed = await bridge_exchange(
+            {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}}
+        )
+        tool_names = [
+            tool.get("name")
+            for tool in (listed or {}).get("result", {}).get("tools", [])
+        ]
+        check(
+            "remote/HTTP entry: bridge reaches the running backend and lists tools",
+            bool(init and init.get("result", {}).get("serverInfo"))
+            and "room_bootstrap" in tool_names,
+            f"tools={len(tool_names or [])}",
+        )
+    finally:
+        bridge.terminate()
+        try:
+            await asyncio.wait_for(bridge.wait(), timeout=10)
+        except TimeoutError:
+            bridge.kill()
+
+    # Remote/HTTP entry, failure path: dead target -> bounded clear failure.
+    # Connection refused is non-retryable-exhaustion: three quick attempts,
+    # then the bridge reports a JSON-RPC error for tools/list (or exits).
+    dead_env = dict(bridge_env)
+    dead_env["AGENTCHATROOM_SERVER_URL"] = "http://127.0.0.1:59999/mcp"
+    dead_env["AGENTCHATROOM_AGENT_TOKEN"] = token
+    dead = await asyncio.create_subprocess_exec(
+        PYTHON,
+        "-m",
+        "agentchatroom.mcp_bridge",
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        env=dead_env,
+        cwd=str(WORK),
+    )
+    start = time.time()
+    outcome = "no-response"
+    unavailable_payload = None
+    try:
+        assert dead.stdin is not None and dead.stdout is not None
+        for payload in (
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": "2025-06-18",
+                    "capabilities": {},
+                    "clientInfo": {"name": "lifecycle", "version": "1"},
+                },
+            },
+            {"jsonrpc": "2.0", "method": "notifications/initialized"},
+            {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}},
+        ):
+            dead.stdin.write((json.dumps(payload) + "\n").encode())
+            await dead.stdin.drain()
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + 90
+        while loop.time() < deadline:
+            line = await asyncio.wait_for(dead.stdout.readline(), timeout=95)
+            if not line:
+                outcome = "process-exited"
+                break
+            message = json.loads(line)
+            if message.get("id") == 2 and ("error" in message or "result" in message):
+                outcome = "tools-list-answered"
+                break
+        else:
+            outcome = "unbounded"
+        if outcome == "tools-list-answered":
+            # The bounded answer must carry a diagnosable recovery payload.
+            dead.stdin.write(
+                (
+                    json.dumps(
+                        {
+                            "jsonrpc": "2.0",
+                            "id": 3,
+                            "method": "tools/call",
+                            "params": {
+                                "name": "room_bootstrap",
+                                "arguments": {},
+                            },
+                        }
+                    )
+                    + "\n"
+                ).encode()
+            )
+            await dead.stdin.drain()
+            while True:
+                line = await asyncio.wait_for(dead.stdout.readline(), timeout=95)
+                message = json.loads(line)
+                if message.get("id") != 3:
+                    continue
+                content = message.get("result", {}).get("content", [])
+                unavailable_payload = json.loads(content[0].get("text", "{}") if content else "{}")
+                break
+    except TimeoutError:
+        outcome = "unbounded"
+    finally:
+        dead.terminate()
+        try:
+            await asyncio.wait_for(dead.wait(), timeout=10)
+        except TimeoutError:
+            dead.kill()
+    elapsed = time.time() - start
+    stderr_tail = (await dead.stderr.read(8000)).decode(errors="replace")
+    bounded = (
+        outcome in {"tools-list-answered", "process-exited"}
+        and elapsed < 100
+        and "Traceback" not in stderr_tail
+    )
+    if unavailable_payload is not None:
+        bounded = bounded and (
+            unavailable_payload.get("ok") is False
+            and unavailable_payload.get("error", {}).get("code")
+            == "bridge_upstream_unavailable"
+        )
+    check(
+        "remote/HTTP entry: dead target answers bounded with recovery action",
+        bounded,
+        f"outcome={outcome} elapsed={elapsed:.1f}s "
+        f"payload_code={(unavailable_payload or {}).get('error', {}).get('code')}",
     )
 
     print()

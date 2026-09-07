@@ -409,7 +409,15 @@ async def run_bridge(settings: BridgeSettings) -> None:
 
     @bridge.list_tools()
     async def list_tools() -> types.ListToolsResult:
-        return await upstream.list_tools()
+        try:
+            return await upstream.list_tools()
+        except Exception as error:  # noqa: BLE001 - fail closed per request
+            logger.warning(
+                "Upstream list_tools failed: %s", type(error).__name__
+            )
+            # An unreachable center must answer with a bounded, diagnosable
+            # result instead of leaving the MCP request unanswered forever.
+            return types.ListToolsResult(tools=[])
 
     @bridge.call_tool(validate_input=False)
     async def call_tool(
@@ -417,7 +425,28 @@ async def run_bridge(settings: BridgeSettings) -> None:
         arguments: dict[str, object],
     ) -> types.CallToolResult:
         forwarded = prepare_tool_arguments(name, arguments)
-        result = await upstream.call_tool(name, forwarded)
+        try:
+            result = await upstream.call_tool(name, forwarded)
+        except Exception as error:  # noqa: BLE001 - fail closed per request
+            logger.warning(
+                "Upstream call_tool %s failed: %s", name, type(error).__name__
+            )
+            payload = {
+                "ok": False,
+                "error": {
+                    "code": "bridge_upstream_unavailable",
+                    "message": (
+                        "AgentChatRoom center is not reachable; start the "
+                        "service or fix AGENTCHATROOM_SERVER_URL, then retry"
+                    ),
+                    "detail": type(error).__name__,
+                },
+            }
+            return types.CallToolResult(
+                content=[
+                    types.TextContent(type="text", text=json.dumps(payload))
+                ]
+            )
         presence.observe(name, forwarded, result)
         return result
 
