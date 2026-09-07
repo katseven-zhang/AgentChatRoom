@@ -146,3 +146,5 @@ def test_windows_package_workflow_builds_and_uploads_single_exe() -> None:
     assert "types:" in workflow and "published" in workflow
     assert "softprops/action-gh-release@v2" in workflow
     assert "github.event.release.tag_name" in workflow
+    assert "release_tag:" in workflow
+    assert "inputs.release_tag" in workflow

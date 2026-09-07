@@ -140,6 +140,9 @@ GUI 初次打开时在主屏居中，默认尺寸为 1440×900；较小屏幕会
 同一个 workflow 还会自动构建并把压缩包挂到对应的 GitHub Release，免去手动上传。该发布包是 PyInstaller
 onedir 形态，目录内的 DLL 和运行库必须与 exe 一起保留。
 
+如果 Release 事件没有自动触发，可在 **Run workflow** 的 `release_tag` 输入框填入已有标签（例如 `v0.2.3`）；
+构建完成后，压缩包会由 GitHub runner 上传到该 Release。
+
 人工冒烟测试建议依次确认：双击能打开面板；点击「启动服务」后能进入管理端；修改端口后重启仍使用新配置；点击「停止服务」回到占位页；
 关闭面板时三种选择语义正确；再次打开不会产生第二个 GUI 实例。若要验证 Agent 接入，可运行
 `agentchatroom.exe mcp` 并发送一次 MCP `initialize` 请求。

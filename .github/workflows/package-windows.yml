@@ -16,6 +16,11 @@ on:
     types:
       - published
   workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Existing GitHub Release tag to attach the Windows ZIP to (optional)
+        required: false
+        type: string
 
 permissions:
   contents: write
@@ -79,9 +84,9 @@ jobs:
           retention-days: 14
 
       - name: Upload archive to published release
-        if: github.event_name == 'release'
+        if: github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.release_tag != '')
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ github.event.release.tag_name }}
+          tag_name: ${{ inputs.release_tag || github.event.release.tag_name }}
           files: dist/agentchatroom-windows-x64.zip
           fail_on_unmatched_files: true
