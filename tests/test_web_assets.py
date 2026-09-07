@@ -9,6 +9,64 @@ from pathlib import Path
 WEB_DIR = Path(__file__).parents[1] / "src" / "agentchatroom" / "web"
 
 
+def test_web_theme_text_contrast_is_readable():
+    """Check actual theme colors, including filled controls in dark mode."""
+    css = (WEB_DIR / "app.css").read_text(encoding="utf-8")
+
+    def luminance(color):
+        channels = [int(color[i:i + 2], 16) / 255 for i in (1, 3, 5)]
+        linear = [c / 12.92 if c <= 0.04045 else ((c + 0.055) / 1.055) ** 2.4 for c in channels]
+        return sum(c * weight for c, weight in zip(linear, (0.2126, 0.7152, 0.0722)))
+
+    themes = re.findall(r':root(?:\[data-theme="dark"\])?\s*\{([^}]+)\}', css)
+    assert len(themes) == 2
+    for theme in themes:
+        colors = dict(re.findall(r'(--[\w-]+):\s*(#[\da-fA-F]{6});', theme))
+        pairs = [(text, bg) for text in ("--text", "--text-muted")
+                 for bg in ("--bg", "--surface", "--surface-muted")]
+        pairs += [("--on-accent", "--accent-fill"), ("--on-accent", "--accent-fill-hover")]
+        pairs += [(text, bg) for text, bg in (("--primary", "--primary-soft"),
+                  ("--red", "--red-soft"), ("--amber", "--amber-soft"), ("--blue", "--blue-soft"))]
+        for foreground, background in pairs:
+            assert foreground in colors and background in colors
+            light, dark = sorted((luminance(colors[foreground]), luminance(colors[background])), reverse=True)
+            ratio = (light + 0.05) / (dark + 0.05)
+            assert ratio >= 4.5, (foreground, background, round(ratio, 2))
+
+
+def test_web_appearance_precedence_and_restricted_storage(tmp_path):
+    javascript = (WEB_DIR / "app.js").read_text(encoding="utf-8")
+    start = javascript.index("function resolveAppearanceTheme(")
+    end = javascript.index("function applyPublicConfig()", start)
+    harness = tmp_path / "appearance.js"
+    harness.write_text("""
+const assert = require('node:assert/strict');
+const state = {config: {default_theme: 'system'}};
+let change, systemChange;
+const control = {value: 'default', addEventListener: (_, fn) => {change = fn;}};
+const document = {getElementById: () => control, documentElement: {dataset: {}}};
+const window = {matchMedia: () => ({matches: true, addEventListener: (_, fn) => {systemChange = fn;}})};
+let localStorage = {getItem: () => 'invalid', setItem: () => {throw Error('storage denied');}};
+""" + javascript[start:end] + """
+for (const [local, config, osDark, expected] of [
+  ['default', 'system', true, 'dark'], ['default', 'system', false, 'light'],
+  ['light', 'dark', true, 'light'], ['dark', 'light', false, 'dark'],
+  ['invalid', 'invalid', true, 'light']
+]) assert.equal(resolveAppearanceTheme(local, config, osDark), expected);
+initializeAppearance();
+assert.equal(control.value, 'default');
+assert.equal(document.documentElement.dataset.theme, 'dark');
+control.value = 'light'; change(); systemChange();
+assert.equal(document.documentElement.dataset.theme, 'light');
+localStorage = {getItem: () => 'dark'};
+initializeAppearance();
+assert.equal(control.value, 'dark');
+assert.equal(document.documentElement.dataset.theme, 'dark');
+""", encoding="utf-8")
+    run = subprocess.run(["node", str(harness)], capture_output=True, text=True)
+    assert run.returncode == 0, run.stderr
+
+
 def test_registered_web_elements_exist_in_markup():
     javascript = (WEB_DIR / "app.js").read_text(encoding="utf-8")
     markup = (WEB_DIR / "index.html").read_text(encoding="utf-8")
@@ -164,8 +222,9 @@ def test_web_supports_human_reading_and_guided_interactions():
     assert "snapshot.agent_identities" in javascript
     assert "当前连接" in javascript
     assert "累计" in javascript and "次接入" in javascript
-    assert 'app.css?v=1.0.0-central36' in markup
-    assert 'app.js?v=1.0.0-central36' in markup
+    assert 'app.css?v=1.0.0-central40' in markup
+    assert 'app.js?v=1.0.0-central40' in markup
+    assert len(re.findall(r'<script\b[^>]*src="/assets/app\.js', markup)) == 1
     assert 'id="task-history-filter"' in markup
     assert "function loadTaskHistory(" in javascript
     assert "function renderHistoryEvidence(" in javascript
@@ -187,23 +246,13 @@ def test_web_supports_human_reading_and_guided_interactions():
     assert "function eventIdBadge(eventId)" in javascript
     assert "eventIdBadge(event.id)" in javascript
     assert javascript.count("eventIdBadge(event.id)") >= 4
-    # Task #90: the leases/reviews tabs are closed-loop verified — their
-    # badges became neutral remarks; only management keeps the legacy badge.
-    # Task #95: all three tabs are now closed-loop — management keeps an
-    # "已闭环" badge, files/reviews stay "只读视图", none say 未闭环.
-    assert markup.count('class="tab-status">未闭环</span>') == 0
-    assert markup.count('class="tab-status">已闭环</span>') == 1
-    assert markup.count('class="tab-status">只读视图</span>') == 2
+    # Navigation labels describe user destinations, not internal release status.
+    assert 'class="tab-status"' not in markup
     assert 'aria-label="文件占用，只读视图"' in markup
     assert 'aria-label="验证，只读视图"' in markup
-    assert 'aria-label="管理，已闭环"' in markup
-    assert 'class="tab-status">协作视图</span>' in markup
-    assert markup.count('class="scope-status"><span>未闭环</span>') == 0
-    # 附属说明 span 一律用中性描述词（备注）；状态结论只出现在 tab 徽标上。
-    assert markup.count('class="scope-status"><span>备注</span>') == 3
-    assert markup.count('class="scope-status"><span>已闭环</span>') == 0
-    assert "管理能力已闭环" in markup
-    assert "成员与 Token 管理（签发/吊销）" in markup
+    assert 'aria-label="管理"' in markup
+    assert "服务端版本化投影" not in markup
+    assert "查看服务状态，管理备份、项目文档和访问权限" in markup
     assert "租约由 Agent 通过 MCP 申请与释放（会话关闭后自动失效）" in markup
     assert ".event-id" in stylesheet
     assert ".scope-status" in stylesheet
@@ -865,7 +914,7 @@ const outcomes = {};
 outcomes.rendersAllThree = (html.match(/agent-item/g) || []).length === 3;
 outcomes.modelShown = html.includes('模型 GPT-5');
 outcomes.unknownFallbacks = (html.match(/模型 unknown/g) || []).length === 2;
-outcomes.unifiedClientRoleLine = (html.match(/· 模型 /g) || []).length === 3;
+outcomes.detailsPreserved = html.includes("软件: codex") && html.includes("本次角色: executor") && html.includes("最后心跳:");
 outcomes.disconnectedBadge = html.includes('已接入 · 未连接');
 outcomes.offlineSortedLast = html.indexOf('agent-item') < html.indexOf('is-disconnected');
 // 模型缺失必须显式 unknown；渲染层绝不硬编码厂商名或猜测模型。
@@ -880,7 +929,7 @@ console.log(JSON.stringify(outcomes));
         "rendersAllThree": True,
         "modelShown": True,
         "unknownFallbacks": True,
-        "unifiedClientRoleLine": True,
+        "detailsPreserved": True,
         "disconnectedBadge": True,
         "offlineSortedLast": True,
     }
@@ -906,7 +955,7 @@ def test_web_typography_baseline_wraps_long_content_and_narrow_selects():
     assert baseline.count("overflow-wrap: anywhere;") == 1
     assert baseline.count(",") >= 7
     # #67 令牌化：基线块行高统一走 --lh-body 刻度令牌。
-    assert "line-height: var(--lh-body);" in baseline
+    assert "line-height: var(--lh-reading);" in baseline
     # 窄屏下 composer 下拉收缩，不再撑出横向滚动。
     assert ".composer-options select {" in stylesheet
     assert "flex: 1 1 auto;" in stylesheet

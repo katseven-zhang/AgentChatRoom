@@ -128,3 +128,18 @@ def test_ci_uses_node_24_action_runtimes() -> None:
 
     assert "actions/checkout@v7" in workflow
     assert "actions/setup-python@v7" in workflow
+
+
+def test_windows_package_workflow_builds_and_uploads_single_exe() -> None:
+    workflow = (ROOT / ".github" / "workflows" / "package-windows.yml").read_text(
+        encoding="utf-8"
+    )
+
+    assert "name: Package Windows EXE" in workflow
+    assert "runs-on: windows-latest" in workflow
+    assert 'python -m pip install -e ".[dev,gui]"' in workflow
+    assert 'python -m pip install "pyinstaller==6.22.2"' in workflow
+    assert "python -m PyInstaller --clean --noconfirm agentchatroom.spec" in workflow
+    assert "dist\\agentchatroom\\agentchatroom.exe" in workflow
+    assert "agentchatroom-windows-x64.zip" in workflow
+    assert "actions/upload-artifact@v4" in workflow

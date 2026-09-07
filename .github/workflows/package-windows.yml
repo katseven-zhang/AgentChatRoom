@@ -1,0 +1,73 @@
+name: Package Windows EXE
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/package-windows.yml"
+      - "agentchatroom.spec"
+      - "packaging/**"
+      - "pyproject.toml"
+      - "src/**"
+      - "tests/test_shell.py"
+      - "tests/test_web_assets.py"
+  workflow_dispatch:
+
+jobs:
+  package-windows:
+    runs-on: windows-latest
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install application and build dependencies
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev,gui]"
+          python -m pip install "pyinstaller==6.22.2"
+
+      - name: Validate source before packaging
+        shell: pwsh
+        run: |
+          python -m pytest tests/test_shell.py tests/test_web_assets.py -p no:cacheprovider --basetemp="$env:RUNNER_TEMP\acr-source-tests"
+          node --check src/agentchatroom/web/app.js
+
+      - name: Build onedir GUI package
+        shell: pwsh
+        run: |
+          $env:PYINSTALLER_CONFIG_DIR = Join-Path $env:RUNNER_TEMP "pyinstaller-cache"
+          python -m PyInstaller --clean --noconfirm agentchatroom.spec
+
+      - name: Smoke test packaged executable
+        shell: pwsh
+        run: |
+          if (!(Test-Path "dist\agentchatroom\agentchatroom.exe")) {
+            throw "PyInstaller did not produce dist\agentchatroom\agentchatroom.exe"
+          }
+          python -m pytest tests/test_shell.py -p no:cacheprovider --basetemp="$env:RUNNER_TEMP\acr-package-tests"
+
+      - name: Create downloadable archive
+        shell: pwsh
+        run: Compress-Archive -Path "dist\agentchatroom" -DestinationPath "dist\agentchatroom-windows-x64.zip" -Force
+
+      - name: Upload Windows artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: agentchatroom-windows-x64
+          path: dist/agentchatroom-windows-x64.zip
+          if-no-files-found: error
+          retention-days: 14

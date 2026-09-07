@@ -6,8 +6,8 @@
     <meta name="color-scheme" content="light">
     <title>AgentChatRoom</title>
     <link rel="icon" href="/assets/favicon.svg?v=1.0.0-central1" type="image/svg+xml">
-    <link rel="stylesheet" href="/assets/app.css?v=1.0.0-central36">
-    <script src="/assets/app.js?v=1.0.0-central36" defer></script>
+    <link rel="stylesheet" href="/assets/app.css?v=1.0.0-central40">
+    <script src="/assets/app.js?v=1.0.0-central40" defer></script>
   </head>
   <body>
     <div class="app-shell" id="app-shell">
@@ -20,6 +20,11 @@
           </div>
         </div>
         <div class="topbar-actions">
+          <select id="appearance-theme" class="theme-select" aria-label="界面主题" title="只影响当前浏览器或面板的显示">
+            <option value="default">默认主题</option>
+            <option value="light">浅色</option>
+            <option value="dark">深色</option>
+          </select>
           <div class="connection" id="connection-state" data-state="connecting">
             <span class="connection-dot"></span>
             <span id="connection-label">正在连接</span>
@@ -65,7 +70,7 @@
       <main class="workspace">
         <section class="workspace-header">
           <div>
-            <p class="context-label">当前 Room</p>
+            <p class="context-label">当前项目</p>
             <h2 id="room-name">尚未添加项目</h2>
             <p class="room-path" id="room-path">添加本地项目后即可开始协作</p>
           </div>
@@ -80,10 +85,10 @@
 
         <nav class="tabs" role="tablist" aria-label="项目视图">
           <button type="button" class="tab is-active" role="tab" id="tab-overview" data-tab="overview" aria-selected="true" aria-controls="panel-overview"><span class="tab-label">总览</span></button>
-          <button type="button" class="tab" role="tab" id="tab-tasks" data-tab="tasks" title="查看任务合同与协作过程" aria-label="任务" aria-selected="false" aria-controls="panel-tasks"><span class="tab-label">任务</span><span class="tab-status">协作视图</span></button>
-          <button type="button" class="tab" role="tab" id="tab-leases" data-tab="leases" title="租约由 Agent 通过 MCP 申请与释放，本页只读展示" aria-label="文件占用，只读视图" aria-selected="false" aria-controls="panel-leases"><span class="tab-label">文件占用</span><span class="tab-status">只读视图</span></button>
-          <button type="button" class="tab" role="tab" id="tab-reviews" data-tab="reviews" title="工作报告与验证结果由 Agent 通过 MCP 提交，本页只读展示" aria-label="验证，只读视图" aria-selected="false" aria-controls="panel-reviews"><span class="tab-label">验证</span><span class="tab-status">只读视图</span></button>
-          <button type="button" class="tab" role="tab" id="tab-management" data-tab="management" title="运行状态、备份与回滚、项目文档、成员、Token 与审计管理" aria-label="管理，已闭环" aria-selected="false" aria-controls="panel-management"><span class="tab-label">管理</span><span class="tab-status">已闭环</span></button>
+          <button type="button" class="tab" role="tab" id="tab-tasks" data-tab="tasks" title="查看任务合同与协作过程" aria-label="任务" aria-selected="false" aria-controls="panel-tasks"><span class="tab-label">任务</span></button>
+          <button type="button" class="tab" role="tab" id="tab-leases" data-tab="leases" title="租约由 Agent 通过 MCP 申请与释放，本页只读展示" aria-label="文件占用，只读视图" aria-selected="false" aria-controls="panel-leases"><span class="tab-label">文件占用</span></button>
+          <button type="button" class="tab" role="tab" id="tab-reviews" data-tab="reviews" title="工作报告与验证结果由 Agent 通过 MCP 提交，本页只读展示" aria-label="验证，只读视图" aria-selected="false" aria-controls="panel-reviews"><span class="tab-label">验证</span></button>
+          <button type="button" class="tab" role="tab" id="tab-management" data-tab="management" title="运行状态、备份与回滚、项目文档、成员、Token 与审计管理" aria-label="管理" aria-selected="false" aria-controls="panel-management"><span class="tab-label">管理</span></button>
         </nav>
 
         <section class="tab-panel is-active" id="panel-overview" role="tabpanel" aria-labelledby="tab-overview">
@@ -91,20 +96,20 @@
             <h3>三步开始多 Agent 协作</h3>
             <ol class="onboarding-steps">
               <li><strong>1. 添加项目</strong><span>把本地工作目录注册为协作 Room（右上角「+ 添加项目」）</span></li>
-              <li><strong>2. 配置本机 Agent</strong><span>按通用 MCP 配置完成本机接入，重载后等待它连接当前 Room</span></li>
+              <li><strong>2. 配置本机 Agent</strong><span>按通用 MCP 配置完成本机接入，重载后等待它连接当前项目</span></li>
               <li><strong>3. 提交第一件工作</strong><span>「新建任务」只需写清原始意图并选择受理 Agent，正式合同由 Agent 补全</span></li>
             </ol>
           </section>
           <div class="metric-strip">
             <div class="metric"><span>已接入 Agent</span><strong id="metric-agents">0</strong></div>
-            <div class="metric"><span>进行中</span><strong id="metric-active">0</strong></div>
+            <div class="metric"><span>未完成任务</span><strong id="metric-active">0</strong></div>
             <div class="metric"><span>文件占用</span><strong id="metric-leases">0</strong></div>
-            <div class="metric warning"><span>待验证</span><strong id="metric-reviews">0</strong></div>
+            <div class="metric warning"><span>需要处理</span><strong id="metric-reviews">0</strong></div>
           </div>
           <div class="overview-grid">
             <section class="data-section">
               <div class="section-heading">
-                <h3>正在进行</h3>
+                <h3>待办与进展</h3>
                 <span class="secondary-text">按优先级排列</span>
               </div>
               <div id="active-task-list" class="compact-list"></div>
@@ -120,13 +125,13 @@
         </section>
 
         <section class="tab-panel" id="panel-tasks" role="tabpanel" aria-labelledby="tab-tasks">
-          <div class="scope-status"><span>协作视图</span><p>提交原始任务说明后，由目标 Agent 受理并补全正式任务合同；执行、验证和集成过程在详情中只读呈现。导航入口与状态标签由服务端版本化投影统一提供，「需要处理」收件箱汇总退回、阻塞与集成失败三类异常。</p></div>
+          <div class="scope-status"><span>协作视图</span><p>描述你想完成的工作，交给 Agent 处理。在这里跟进进度、查看结果。在「需要处理」中查看被退回、受阻或集成失败的任务。</p></div>
           <div class="panel-toolbar">
             <nav class="task-navigation" id="task-navigation" aria-label="任务阶段入口"></nav>
             <div class="task-sort-controls" id="task-sort-controls" role="group" aria-label="任务排序"></div>
           </div>
           <details class="task-expert" id="task-expert">
-            <summary>精确筛选（执行 / 验收 / 集成 / 优先级 / 负责人 / 任务号 / 精确状态）</summary>
+            <summary>更多筛选</summary>
             <div class="task-expert-filters" id="task-expert-filters"></div>
           </details>
           <div id="task-table" class="task-table"></div>
@@ -160,7 +165,7 @@
         </section>
 
         <section class="tab-panel" id="panel-management" role="tabpanel" aria-labelledby="tab-management">
-          <div class="scope-status"><span>备注</span><p>管理能力已闭环：运行状态监控、数据库备份与回滚、项目文档、成员与 Token 管理（签发/吊销）、审计追溯均已可用；Workspace 由 Agent 接入自动登记。</p></div>
+          <div class="scope-status"><span>备注</span><p>查看服务状态，管理备份、项目文档和访问权限。操作记录可在下方审计中查询。</p></div>
           <div class="management-stack">
             <section class="data-section unframed management-section">
               <div class="section-heading">
@@ -200,7 +205,7 @@
               <div class="section-heading">
                 <div>
                   <h3>项目文档</h3>
-                  <p class="secondary-text">规范（binding）在 Agent 认领任务时自动注入并盖版本回执；编辑保存为不可变新版本</p>
+                  <p class="secondary-text">Agent 领取任务时会自动读取项目规范。每次编辑都会保存一个新版本，可查看历史内容。</p>
                 </div>
               </div>
               <div id="document-list" class="management-list"></div>
@@ -309,7 +314,7 @@
         </div>
         <form class="composer" id="message-form">
           <label class="sr-only" for="message-input">发送 Room 消息</label>
-          <textarea id="message-input" rows="3" maxlength="20000" placeholder="向当前 Room 发送消息（Ctrl+Enter 发送）" disabled></textarea>
+          <textarea id="message-input" rows="3" maxlength="20000" placeholder="向当前项目发送消息（Ctrl+Enter 发送）" disabled></textarea>
           <div class="composer-actions">
             <details class="composer-advanced" id="composer-advanced">
               <summary>高级选项</summary>
@@ -370,13 +375,13 @@
       <form method="dialog" class="dialog-form" id="task-form">
         <div class="dialog-header">
           <div>
-            <p class="context-label">用户提交</p>
-            <h2>提交新任务意图</h2>
+            <p class="context-label">交给 Agent 处理</p>
+            <h2>新建任务</h2>
           </div>
           <button type="button" class="icon-button dialog-close" title="关闭" aria-label="关闭">×</button>
         </div>
-        <p class="form-hint task-intake-hint">只需描述想完成的事情并选择一名已接入且未吊销的受理 Agent，当前未连接也可以先提交。标题、验收条件、优先级和依赖由 Agent 受理后补全。</p>
-        <label>原始任务说明 <textarea id="task-raw-description-input" name="raw_description" rows="6" maxlength="20000" required placeholder="例如：检查登录流程的异常处理，并补充必要的自动化测试"></textarea></label>
+        <p class="form-hint task-intake-hint">写下你想完成的事情，再选择一名 Agent。它会在受理后整理任务细节；当前未连接的 Agent 也可以接收任务。</p>
+        <label>任务说明 <textarea id="task-raw-description-input" name="raw_description" rows="6" maxlength="20000" required placeholder="例如：检查登录流程的异常处理，并补充必要的自动化测试"></textarea></label>
         <label>受理 Agent
           <select id="task-target-agent-input" name="target_member_id" required>
             <option value="">正在加载可受理 Agent…</option>
@@ -574,7 +579,7 @@
       <div class="dialog-form">
         <div class="dialog-header">
           <div>
-            <p class="context-label">当前 Room</p>
+            <p class="context-label">当前项目</p>
             <h2>配置本机 Agent</h2>
           </div>
           <button type="button" class="icon-button dialog-close" title="关闭" aria-label="关闭">×</button>
@@ -733,6 +738,5 @@
     </dialog>
 
     <div class="toast-region" id="toast-region" aria-live="polite"></div>
-    <script src="/assets/app.js?v=1.0.0-central36" defer></script>
   </body>
 </html>

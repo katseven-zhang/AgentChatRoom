@@ -983,7 +983,8 @@ async function refreshPresence() {
     renderAgents(agentIdentities);
     renderMetrics(agentIdentities, snapshot.tasks, snapshot.leases);
     renderLeases(snapshot.leases, snapshot.agents);
-    elements["chat-subtitle"].textContent = `${connectedAgentCount(agentIdentities)} 当前连接 / ${agentIdentities.length} 个 Agent / 累计 ${snapshot.agents.length} 次接入 · 游标 ${snapshot.cursor}`;
+    elements["chat-subtitle"].textContent = `${connectedAgentCount(agentIdentities)} 当前连接 / ${agentIdentities.length} 个 Agent`;
+    elements["chat-subtitle"].title = `${connectedAgentCount(agentIdentities)} 当前连接 / ${agentIdentities.length} 个 Agent / 累计 ${snapshot.agents.length} 次接入 · 游标 ${snapshot.cursor}`;
     if (JSON.stringify(snapshot.tasks || []) !== previousTasksJson) {
       renderTasks(snapshot.tasks);
       renderTaskIntakes();
@@ -1038,7 +1039,8 @@ function renderForEvent(event) {
     renderMetrics(agentIdentities, tasks, leases);
     renderEvents(agents, tasks);
     renderMessageTaskOptions(tasks);
-    elements["chat-subtitle"].textContent = `${connectedAgentCount(agentIdentities)} 当前连接 / ${agentIdentities.length} 个 Agent / 累计 ${state.snapshot.agents.length} 次接入 · 游标 ${state.snapshot.cursor}`;
+    elements["chat-subtitle"].textContent = `${connectedAgentCount(agentIdentities)} 当前连接 / ${agentIdentities.length} 个 Agent`;
+    elements["chat-subtitle"].title = `${connectedAgentCount(agentIdentities)} 当前连接 / ${agentIdentities.length} 个 Agent / 累计 ${state.snapshot.agents.length} 次接入 · 游标 ${state.snapshot.cursor}`;
     return;
   }
   if (type.startsWith("lease.")) {
@@ -1052,7 +1054,8 @@ function renderForEvent(event) {
     renderMetrics(agentIdentities, tasks, leases);
     renderEvents(agents, tasks);
     renderManagement();
-    elements["chat-subtitle"].textContent = `${connectedAgentCount(agentIdentities)} 当前连接 / ${agentIdentities.length} 个 Agent / 累计 ${state.snapshot.agents.length} 次接入 · 游标 ${state.snapshot.cursor}`;
+    elements["chat-subtitle"].textContent = `${connectedAgentCount(agentIdentities)} 当前连接 / ${agentIdentities.length} 个 Agent`;
+    elements["chat-subtitle"].title = `${connectedAgentCount(agentIdentities)} 当前连接 / ${agentIdentities.length} 个 Agent / 累计 ${state.snapshot.agents.length} 次接入 · 游标 ${state.snapshot.cursor}`;
     return;
   }
   renderAll();
@@ -1179,7 +1182,8 @@ function renderAll() {
   renderProjects();
   elements["room-name"].textContent = project.name;
   elements["room-path"].textContent = project.root_path;
-  elements["chat-subtitle"].textContent = `${connectedAgentCount(agentIdentities)} 当前连接 / ${agentIdentities.length} 个 Agent / 累计 ${agents.length} 次接入 · 游标 ${state.snapshot.cursor}`;
+  elements["chat-subtitle"].textContent = `${connectedAgentCount(agentIdentities)} 当前连接 / ${agentIdentities.length} 个 Agent`;
+  elements["chat-subtitle"].title = `${connectedAgentCount(agentIdentities)} 当前连接 / ${agentIdentities.length} 个 Agent / 累计 ${agents.length} 次接入 · 游标 ${state.snapshot.cursor}`;
   elements["onboarding"].classList.add("is-hidden");
   ["create-task-button", "archive-project-button", "project-settings-button", "export-project-button", "connect-agent-button",
     "create-token-button", "refresh-audit-button", "audit-event-filter", "create-backup-button",
@@ -1236,9 +1240,8 @@ function renderAgents(agents) {
         <span class="agent-avatar ${avatarColorClass(agent.id)}">${escapeHtml(initials(agent.name))}</span>
         <span class="agent-copy">
           <strong>${escapeHtml(agent.name)}</strong>
-          <small>${escapeHtml(agent.client)} · ${escapeHtml(agent.role)} · 模型 ${escapeHtml(modelLabel)}</small>
-          <small>${escapeHtml(taskSummary)}</small>
-          <small>心跳 ${escapeHtml(heartbeat)} · 活动 ${escapeHtml(activity)}</small>
+          <small>模型 ${escapeHtml(modelLabel)}</small>
+          <small class="agent-task-summary">${escapeHtml(taskSummary)}</small>
         </span>
         <span class="agent-presence ${escapeHtml(presenceStatus)}"><span class="status-dot ${escapeHtml(presenceStatus)}"></span>${escapeHtml(presenceLabel)}</span>
       </div>`;
@@ -2998,14 +3001,14 @@ function renderTaskContract(task) {
   elements["task-detail-heading"].textContent = `任务 #${task.task_number} · ${task.title}`;
   elements["task-detail-contract"].innerHTML = `
     <div class="task-contract-header">
-      <div><span class="task-number">任务 #${task.task_number}</span><span class="secondary-text">内部 ID：${escapeHtml(task.id)}</span></div>
+      <div><span class="task-number" title="内部 ID：${escapeHtml(task.id)}">任务 #${task.task_number}</span></div>
       <div class="task-meta"><span class="priority p${task.priority}">P${task.priority}</span>${taskViewBadgeHtml(view)}</div>
     </div>
     <dl class="task-contract-grid">
       <div><dt>当前阶段</dt><dd>${escapeHtml(phaseSummary)}</dd></div>
-      <div><dt>执行状态</dt><dd>${escapeHtml(`${view.execution_status} · ${executionFaceLabel(view.execution_status)}`)}</dd></div>
-      <div><dt>验收状态</dt><dd>${escapeHtml(`${view.verification_status} · ${verificationFaceLabel(view.verification_status)}`)}</dd></div>
-      <div><dt>集成状态</dt><dd>${escapeHtml(`${view.integration_status} · ${integrationFaceLabel(view.integration_status)}`)}</dd></div>
+      <div><dt>执行状态</dt><dd title="${escapeHtml(view.execution_status)}">${escapeHtml(executionFaceLabel(view.execution_status))}</dd></div>
+      <div><dt>验收状态</dt><dd title="${escapeHtml(view.verification_status)}">${escapeHtml(verificationFaceLabel(view.verification_status))}</dd></div>
+      <div><dt>集成状态</dt><dd title="${escapeHtml(view.integration_status)}">${escapeHtml(integrationFaceLabel(view.integration_status))}</dd></div>
       <div><dt>完成度</dt><dd>${escapeHtml(`${task.progress_percent}%`)}</dd></div>
       <div><dt>当前步骤</dt><dd>${escapeHtml(task.current_step || "暂无")}</dd></div>
       <div><dt>下一步</dt><dd>${escapeHtml(task.next_step || "暂无")}</dd></div>
@@ -3433,12 +3436,36 @@ function populateDomainOptions() {
   if (channels.includes("public")) elements["message-channel"].value = "public";
 }
 
+function resolveAppearanceTheme(preference, configuredTheme, systemDark) {
+  const selected = ["light", "dark"].includes(preference) ? preference : configuredTheme;
+  return selected === "system" ? (systemDark ? "dark" : "light")
+    : selected === "dark" ? "dark" : "light";
+}
+
+function applyAppearanceTheme() {
+  document.documentElement.dataset.theme = resolveAppearanceTheme(
+    document.getElementById("appearance-theme").value, state.config?.default_theme,
+    window.matchMedia("(prefers-color-scheme: dark)").matches,
+  );
+}
+
+function initializeAppearance() {
+  const control = document.getElementById("appearance-theme");
+  try {
+    const saved = localStorage.getItem("agentchatroom.appearance.theme");
+    control.value = ["light", "dark"].includes(saved) ? saved : "default";
+  } catch (_error) { /* Restricted WebViews can still change the current window. */ }
+  control.addEventListener("change", () => {
+    try { localStorage.setItem("agentchatroom.appearance.theme", control.value); }
+    catch (_error) { /* The visible preference works without persistent storage. */ }
+    applyAppearanceTheme();
+  });
+  window.matchMedia("(prefers-color-scheme: dark)").addEventListener("change", applyAppearanceTheme);
+  applyAppearanceTheme();
+}
+
 function applyPublicConfig() {
-  const configuredTheme = state.config.default_theme;
-  const resolvedTheme = configuredTheme === "system"
-    ? (window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light")
-    : configuredTheme;
-  document.documentElement.dataset.theme = resolvedTheme;
+  applyAppearanceTheme();
   populateDomainOptions();
   elements["product-name"].textContent = state.config.product_name;
   document.title = state.config.product_name;
@@ -3481,6 +3508,7 @@ async function bootstrap() {
   }
 }
 
+initializeAppearance();
 initializePanelLayout();
 document.querySelectorAll(".tab").forEach((item) => {
   item.tabIndex = item.classList.contains("is-active") ? 0 : -1;
