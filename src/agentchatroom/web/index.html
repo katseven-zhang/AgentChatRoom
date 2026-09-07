@@ -6,8 +6,8 @@
     <meta name="color-scheme" content="light">
     <title>AgentChatRoom</title>
     <link rel="icon" href="/assets/favicon.svg?v=1.0.0-central1" type="image/svg+xml">
-    <link rel="stylesheet" href="/assets/app.css?v=1.0.0-central27">
-    <script src="/assets/app.js?v=1.0.0-central27" defer></script>
+    <link rel="stylesheet" href="/assets/app.css?v=1.0.0-central36">
+    <script src="/assets/app.js?v=1.0.0-central36" defer></script>
   </head>
   <body>
     <div class="app-shell" id="app-shell">
@@ -81,9 +81,9 @@
         <nav class="tabs" role="tablist" aria-label="项目视图">
           <button type="button" class="tab is-active" role="tab" id="tab-overview" data-tab="overview" aria-selected="true" aria-controls="panel-overview"><span class="tab-label">总览</span></button>
           <button type="button" class="tab" role="tab" id="tab-tasks" data-tab="tasks" title="查看任务合同与协作过程" aria-label="任务" aria-selected="false" aria-controls="panel-tasks"><span class="tab-label">任务</span><span class="tab-status">协作视图</span></button>
-          <button type="button" class="tab" role="tab" id="tab-leases" data-tab="leases" title="当前功能尚未形成完整闭环" aria-label="文件占用，未闭环" aria-selected="false" aria-controls="panel-leases"><span class="tab-label">文件占用</span><span class="tab-status">未闭环</span></button>
-          <button type="button" class="tab" role="tab" id="tab-reviews" data-tab="reviews" title="当前功能尚未形成完整闭环" aria-label="验证，未闭环" aria-selected="false" aria-controls="panel-reviews"><span class="tab-label">验证</span><span class="tab-status">未闭环</span></button>
-          <button type="button" class="tab" role="tab" id="tab-management" data-tab="management" title="当前功能尚未形成完整闭环" aria-label="管理，未闭环" aria-selected="false" aria-controls="panel-management"><span class="tab-label">管理</span><span class="tab-status">未闭环</span></button>
+          <button type="button" class="tab" role="tab" id="tab-leases" data-tab="leases" title="租约由 Agent 通过 MCP 申请与释放，本页只读展示" aria-label="文件占用，只读视图" aria-selected="false" aria-controls="panel-leases"><span class="tab-label">文件占用</span><span class="tab-status">只读视图</span></button>
+          <button type="button" class="tab" role="tab" id="tab-reviews" data-tab="reviews" title="工作报告与验证结果由 Agent 通过 MCP 提交，本页只读展示" aria-label="验证，只读视图" aria-selected="false" aria-controls="panel-reviews"><span class="tab-label">验证</span><span class="tab-status">只读视图</span></button>
+          <button type="button" class="tab" role="tab" id="tab-management" data-tab="management" title="运行状态、备份与回滚、项目文档、成员、Token 与审计管理" aria-label="管理，已闭环" aria-selected="false" aria-controls="panel-management"><span class="tab-label">管理</span><span class="tab-status">已闭环</span></button>
         </nav>
 
         <section class="tab-panel is-active" id="panel-overview" role="tabpanel" aria-labelledby="tab-overview">
@@ -91,7 +91,7 @@
             <h3>三步开始多 Agent 协作</h3>
             <ol class="onboarding-steps">
               <li><strong>1. 添加项目</strong><span>把本地工作目录注册为协作 Room（右上角「+ 添加项目」）</span></li>
-              <li><strong>2. 配置本机 Agent</strong><span>选择客户端并完成本机 MCP 配置，重载后等待它连接当前 Room</span></li>
+              <li><strong>2. 配置本机 Agent</strong><span>按通用 MCP 配置完成本机接入，重载后等待它连接当前 Room</span></li>
               <li><strong>3. 提交第一件工作</strong><span>「新建任务」只需写清原始意图并选择受理 Agent，正式合同由 Agent 补全</span></li>
             </ol>
           </section>
@@ -134,7 +134,7 @@
         </section>
 
         <section class="tab-panel" id="panel-leases" role="tabpanel" aria-labelledby="tab-leases">
-          <div class="scope-status"><span>未闭环</span><p>当前只展示 Agent 通过 MCP 申请的租约；网页端暂不提供申请与释放。</p></div>
+          <div class="scope-status"><span>备注</span><p>租约由 Agent 通过 MCP 申请与释放（会话关闭后自动失效），本页只读展示当前占用。</p></div>
           <div class="data-section unframed">
             <div class="section-heading">
               <div>
@@ -147,7 +147,7 @@
         </section>
 
         <section class="tab-panel" id="panel-reviews" role="tabpanel" aria-labelledby="tab-reviews">
-          <div class="scope-status"><span>未闭环</span><p>当前只展示工作报告和独立验证结果；网页端暂不提供评审提交。</p></div>
+          <div class="scope-status"><span>备注</span><p>工作报告与独立验证结果由 Agent 通过 MCP 提交，本页只读展示验证队列与结论。</p></div>
           <div class="data-section unframed">
             <div class="section-heading">
               <div>
@@ -160,7 +160,7 @@
         </section>
 
         <section class="tab-panel" id="panel-management" role="tabpanel" aria-labelledby="tab-management">
-          <div class="scope-status"><span>未闭环</span><p>当前管理能力处于试运行阶段；成员、Token、Workspace 与审计仍缺少完整使用闭环。</p></div>
+          <div class="scope-status"><span>备注</span><p>管理能力已闭环：运行状态监控、数据库备份与回滚、项目文档、成员与 Token 管理（签发/吊销）、审计追溯均已可用；Workspace 由 Agent 接入自动登记。</p></div>
           <div class="management-stack">
             <section class="data-section unframed management-section">
               <div class="section-heading">
@@ -733,6 +733,6 @@
     </dialog>
 
     <div class="toast-region" id="toast-region" aria-live="polite"></div>
-    <script src="/assets/app.js?v=1.0.0-central27" defer></script>
+    <script src="/assets/app.js?v=1.0.0-central36" defer></script>
   </body>
 </html>

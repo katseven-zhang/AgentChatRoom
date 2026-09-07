@@ -11,7 +11,7 @@ if TYPE_CHECKING:
     from .config import Settings
 
 
-SCHEMA_VERSION = 19
+SCHEMA_VERSION = 20
 
 
 class DatabaseBackend(Protocol):
@@ -299,6 +299,9 @@ CREATE TABLE IF NOT EXISTS events (
 
 CREATE INDEX IF NOT EXISTS idx_events_project_cursor
 ON events(project_id, id);
+
+CREATE INDEX IF NOT EXISTS idx_events_project_actor_time
+ON events(project_id, actor_session_id, created_at);
 
 CREATE TABLE IF NOT EXISTS idempotency_records (
     scope TEXT NOT NULL,
@@ -750,6 +753,10 @@ MIGRATIONS = {
             updated_at TEXT NOT NULL,
             PRIMARY KEY(project_id, doc_key)
         );
+    """,
+    20: """
+        CREATE INDEX IF NOT EXISTS idx_events_project_actor_time
+        ON events(project_id, actor_session_id, created_at);
     """,
 }
 

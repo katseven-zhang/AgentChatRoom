@@ -738,7 +738,7 @@ body.is-resizing-panels {
   min-height: 0;
   max-width: 100%;
   overflow-y: auto;
-  overflow-x: clip;
+  overflow-x: auto;
   box-sizing: border-box;
   padding: 22px 24px 32px;
 }
@@ -2889,26 +2889,17 @@ dialog::backdrop {
   border: 0;
 }
 
-@media (max-width: 1280px) {
+/* 窄桌面窗口保持三列并排：侧栏允许压缩到可读下限以下、按用户保存的
+   宽度为上限，工作区压缩后内容横向滚动查看，Room 动态（第三列）永远
+   固定在右侧，不再堆叠到下方。 */
+@media (max-width: 1264px) {
   .app-shell {
-    height: auto;
-    overflow: visible;
-    grid-template-columns: 260px minmax(0, 1fr);
-    grid-template-rows: 64px minmax(560px, auto) minmax(480px, auto);
-    grid-template-areas:
-      "top top"
-      "side work"
-      "side chat";
-  }
-
-  .panel-resizer {
-    display: none;
-  }
-
-  .chat-panel {
-    min-height: 480px;
-    border-left: 0;
-    border-top: 1px solid var(--border);
+    grid-template-columns:
+      minmax(180px, var(--left-panel-width))
+      var(--panel-resizer-width)
+      minmax(0, 1fr)
+      var(--panel-resizer-width)
+      minmax(260px, var(--right-panel-width));
   }
 }
 

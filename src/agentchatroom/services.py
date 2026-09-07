@@ -7034,10 +7034,30 @@ class AgentChatRoomService:
                 ).fetchall()
             ]
             cursor = self.latest_cursor(connection, project_id)
+            # 历史接入会话只保留前端渲染与名称查找所需的字段，完整记录
+            # 留在数据库；成员身份聚合（agent_identities）基于全量会话计算。
+            agents_payload = [
+                {
+                    "id": agent["id"],
+                    "name": agent["name"],
+                    "client": agent["client"],
+                    "model": agent["model"],
+                    "role": agent["role"],
+                    "status": agent["status"],
+                    "current_task_id": agent.get("current_task_id"),
+                    "current_task_title": agent.get("current_task_title"),
+                    "last_heartbeat": agent["last_heartbeat"],
+                    "last_activity_at": agent["last_activity_at"],
+                    "unread_count": agent["unread_count"],
+                    "left_at": agent["left_at"],
+                    "created_at": agent["created_at"],
+                }
+                for agent in agents
+            ]
             return {
                 "project": project,
                 "members": members,
-                "agents": agents,
+                "agents": agents_payload,
                 "agent_identities": self._agent_identities(agents, tasks, members),
                 "tasks": tasks,
                 "leases": leases,

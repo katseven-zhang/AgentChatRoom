@@ -182,7 +182,10 @@ class ServiceController:
 
     def start(self, port: int) -> dict[str, Any]:
         effective = replace(self.settings, port=port)
-        return start_detached_server(effective, self.settings.host, port)
+        config_path = (
+            str(self.settings.config_path) if self.settings.config_path else None
+        )
+        return start_detached_server(effective, self.settings.host, port, config_path)
 
     def stop(self) -> dict[str, Any]:
         return stop_detached_server(self.settings)

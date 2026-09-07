@@ -3309,3 +3309,39 @@ def test_query_audit_supports_backward_paging_with_filters(service, project):
     )
     assert typed["events"]
     assert all(event["event_type"] == "message.message" for event in typed["events"])
+
+
+def test_snapshot_agents_projection_is_slimmed_for_frontend(service, project, tmp_path):
+    """Task #94: historical sessions stay in the database, but the snapshot
+    only carries the fields the frontend renders (name lookups, presence,
+    leave semantics) — heavy operational fields stay out of the payload."""
+    joined = service.join_room(
+        project["id"],
+        name="Slim Agent",
+        client="slim",
+        model="m1",
+        role="executor",
+        branch="feature-x",
+        worktree=str(tmp_path),
+        capabilities={"mcp": True},
+        metadata={"team": "core"},
+    )
+    session_id = joined["agent"]["id"]
+    service.leave_session(project["id"], session_id, joined["token"])
+
+    agents = service.snapshot(project["id"])["agents"]
+    assert len(agents) == 1
+    agent = agents[0]
+    assert agent["id"] == session_id
+    assert agent["name"] == "Slim Agent"
+    assert agent["left_at"] is not None
+    for heavy_field in (
+        "token_expires_at",
+        "branch",
+        "worktree",
+        "capabilities",
+        "metadata",
+        "member_id",
+        "agent_key",
+    ):
+        assert heavy_field not in agent, heavy_field

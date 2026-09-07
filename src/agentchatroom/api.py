@@ -15,7 +15,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, Callable, Literal
 
-from fastapi import FastAPI, Query, Request
+from fastapi import FastAPI, Query, Request, Response
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field
@@ -1058,6 +1058,14 @@ def create_app(
             }
         )
 
+    @app.get("/api/v1/version")
+    def server_version() -> dict[str, Any]:
+        return {
+            "version": __version__,
+            "schema_version": DOMAIN_SCHEMA_VERSION,
+            "product_name": resolved.product_name,
+        }
+
     @app.get("/api/v1/auth/status")
     def management_auth_status(request: Request) -> JSONResponse:
         cookie = request.cookies.get(resolved.management_cookie_name, "")
@@ -1409,7 +1417,10 @@ def create_app(
         )
 
     @app.get("/api/v1/projects/{project_id}/snapshot")
-    def project_snapshot(project_id: str) -> dict[str, Any]:
+    def project_snapshot(project_id: str, response: Response) -> dict[str, Any]:
+        response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+        response.headers["Pragma"] = "no-cache"
+        response.headers["Expires"] = "0"
         return service.snapshot(project_id)
 
     @app.get("/api/v1/projects/{project_id}/members")
@@ -1734,9 +1745,13 @@ def create_app(
     @app.get("/api/v1/projects/{project_id}/tasks")
     def list_tasks(
         project_id: str,
+        response: Response,
         status: str | None = None,
         phase: str | None = None,
     ) -> dict[str, Any]:
+        response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+        response.headers["Pragma"] = "no-cache"
+        response.headers["Expires"] = "0"
         return {
             "tasks": service.list_tasks(project_id, status=status, phase=phase)
         }

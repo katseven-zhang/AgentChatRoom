@@ -17,6 +17,11 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+gui = [
+  "pywebview>=5.0",
+  "pystray>=0.19",
+  "pillow>=10.0",
+]
 postgresql = [
   "psycopg[binary,pool]>=3.2,<4",
 ]
@@ -28,6 +33,7 @@ dev = [
 
 [project.scripts]
 agentchatroom = "agentchatroom.cli:main"
+agentchatroom-gui = "agentchatroom.shell:main"
 agentchatroom-mcp = "agentchatroom.mcp_server:main"
 agentchatroom-mcp-bridge = "agentchatroom.mcp_bridge:main"
 

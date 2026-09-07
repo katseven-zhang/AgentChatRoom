@@ -201,7 +201,14 @@ def build_mcp_integration(
     project: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build standard MCP configuration and client-specific onboarding profiles."""
-    command = str(Path(python_executable or sys.executable).resolve())
+    if getattr(sys, "frozen", False):
+        # The packaged single exe dispatches the stdio MCP server through its
+        # `mcp` subcommand; there is no Python interpreter to invoke with -m.
+        command = str(Path(sys.executable).resolve())
+        server_args = ["mcp"]
+    else:
+        command = str(Path(python_executable or sys.executable).resolve())
+        server_args = ["-m", MCP_MODULE]
     environment = {
         "AGENTCHATROOM_DATA_DIR": str(settings.data_dir),
         "AGENTCHATROOM_PRESENCE_KEEPALIVE_ENABLED": str(
@@ -222,7 +229,7 @@ def build_mcp_integration(
 
     server = {
         "command": command,
-        "args": ["-m", MCP_MODULE],
+        "args": server_args,
         "env": environment,
     }
     generic_json = {"mcpServers": {MCP_SERVER_NAME: server}}
@@ -294,7 +301,7 @@ def build_mcp_integration(
         local_environment.update(_profile_identity_environment(profile_id, profile))
         local_server = {
             "command": command,
-            "args": ["-m", MCP_MODULE],
+            "args": server_args,
             "env": local_environment,
         }
         local_json = {"mcpServers": {MCP_SERVER_NAME: local_server}}

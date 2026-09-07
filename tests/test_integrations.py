@@ -167,3 +167,32 @@ def test_project_integration_builds_stable_workbuddy_memory_without_live_state(t
     assert "无法自动配置时" not in codex_prompts["local"]
     assert "[mcp_servers.agentchatroom]" in codex_prompts["local"]
     assert "bearer_token_env_var" in codex_prompts["http"]
+
+
+def test_frozen_build_uses_exe_mcp_dispatch_everywhere(tmp_path, monkeypatch):
+    """Task #85/#88 follow-up: in a packaged (frozen) run, every generated MCP
+    snippet — including per-profile onboarding prompts — must dispatch through
+    `agentchatroom.exe mcp`, never `python -m agentchatroom.mcp_server`."""
+    import sys
+
+    from agentchatroom.config import Settings
+    from agentchatroom.integrations import build_mcp_integration
+
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    integration = build_mcp_integration(
+        Settings(data_dir=tmp_path),
+        project={"root_path": str(tmp_path)},
+    )
+
+    top_args = integration["args"]
+    assert top_args == ["mcp"]
+
+    for profile_id, profile in integration["profiles"].items():
+        config_text = profile["local_config_text"]
+        # In this non-frozen test process sys.executable is pytest's python,
+        # so only the dispatch args are the frozen-regression surface here.
+        assert '"-m"' not in config_text, profile_id
+        assert '"mcp"' in config_text, profile_id
+        prompt = profile["onboarding_prompts"]["local"]
+        assert " -m " not in prompt, profile_id
+        assert '"mcp"' in prompt, profile_id

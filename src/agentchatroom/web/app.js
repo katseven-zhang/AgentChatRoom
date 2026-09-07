@@ -1,7 +1,7 @@
 const state = {
   config: null,
   integration: null,
-  integrationFormat: "workbuddy",
+  integrationFormat: "generic",
   integrationTransport: "local",
   integrationLocalPlan: null,
   integrationLocalApplyResult: null,
@@ -701,17 +701,40 @@ function clearDialogDrafts(dialog) {
   if (dialog.id === "task-edit-dialog") state.editingTaskId = null;
 }
 
-function refreshSnapshot(projectId) {
+function fetchSnapshotDirect(projectId) {
+  const minCursor = Number(arguments[1] || 0);
   if (!projectId) return Promise.resolve(null);
-  if (state.snapshotInFlight && state.snapshotInFlight.projectId === projectId) {
-    return state.snapshotInFlight.promise;
-  }
   const request = { projectId, promise: null };
-  request.promise = api(`/api/v1/projects/${projectId}/snapshot`).finally(() => {
+  const cacheBuster = `_=${Date.now()}`;
+  const query = minCursor ? `?min_cursor=${minCursor}&${cacheBuster}` : `?${cacheBuster}`;
+  request.promise = api(`/api/v1/projects/${projectId}/snapshot${query}`, {
+    cache: "no-store",
+    headers: { "Cache-Control": "no-cache, no-store" },
+  }).finally(() => {
     if (state.snapshotInFlight === request) state.snapshotInFlight = null;
   });
   state.snapshotInFlight = request;
   return request.promise;
+}
+
+function refreshSnapshot(projectId) {
+  const minCursor = Number(arguments[1] || 0);
+  if (!projectId) return Promise.resolve(null);
+  if (minCursor > 0 && state.snapshot && Number(state.snapshot.cursor || 0) >= minCursor) {
+    return Promise.resolve(state.snapshot);
+  }
+  if (state.snapshotInFlight && state.snapshotInFlight.projectId === projectId) {
+    if (!minCursor) {
+      return state.snapshotInFlight.promise;
+    }
+    return state.snapshotInFlight.promise.then((snapshot) => {
+      if (snapshot && Number(snapshot.cursor || 0) >= minCursor) {
+        return snapshot;
+      }
+      return refreshSnapshot(projectId, minCursor);
+    });
+  }
+  return fetchSnapshotDirect(projectId, minCursor);
 }
 
 async function api(path, options = {}) {
@@ -952,6 +975,8 @@ async function refreshPresence() {
   try {
     const snapshot = await refreshSnapshot(projectId);
     if (projectId !== state.projectId || snapshot?.project?.id !== state.projectId) return;
+    if (state.snapshot && Number(snapshot.cursor || 0) < Number(state.snapshot.cursor || 0)) return;
+    const previousTasksJson = JSON.stringify(state.snapshot?.tasks || []);
     state.snapshot = snapshot;
     state.members = snapshot.members || state.members;
     const agentIdentities = currentAgentRoster(snapshot.agent_identities);
@@ -959,7 +984,14 @@ async function refreshPresence() {
     renderMetrics(agentIdentities, snapshot.tasks, snapshot.leases);
     renderLeases(snapshot.leases, snapshot.agents);
     elements["chat-subtitle"].textContent = `${connectedAgentCount(agentIdentities)} 当前连接 / ${agentIdentities.length} 个 Agent / 累计 ${snapshot.agents.length} 次接入 · 游标 ${snapshot.cursor}`;
+    if (JSON.stringify(snapshot.tasks || []) !== previousTasksJson) {
+      renderTasks(snapshot.tasks);
+      renderTaskIntakes();
+      renderReviews(snapshot.tasks, snapshot.agents);
+      renderMessageTaskOptions(snapshot.tasks);
+    }
   } catch (error) {
+    console.warn("Presence refresh failed", error);
     setConnection("offline", "浏览器正在重连");
   } finally {
     state.presenceRefreshInFlight = false;
@@ -968,6 +1000,9 @@ async function refreshPresence() {
 
 function applySnapshotIfCurrent(projectId, snapshot) {
   if (!snapshot || projectId !== state.projectId || snapshot.project?.id !== state.projectId) {
+    return false;
+  }
+  if (state.snapshot && Number(snapshot.cursor || 0) < Number(state.snapshot.cursor || 0)) {
     return false;
   }
   state.snapshot = snapshot;
@@ -994,11 +1029,16 @@ function renderForEvent(event) {
     || type.startsWith("intake.")
   ) {
     renderTasks(tasks);
-    renderTaskIntakes();
+    if (type.startsWith("task.intake_") || type.startsWith("intake.")) {
+      refreshTaskIntakeData().catch(console.warn);
+    } else {
+      renderTaskIntakes();
+    }
     renderReviews(tasks, agents);
     renderMetrics(agentIdentities, tasks, leases);
     renderEvents(agents, tasks);
     renderMessageTaskOptions(tasks);
+    elements["chat-subtitle"].textContent = `${connectedAgentCount(agentIdentities)} 当前连接 / ${agentIdentities.length} 个 Agent / 累计 ${state.snapshot.agents.length} 次接入 · 游标 ${state.snapshot.cursor}`;
     return;
   }
   if (type.startsWith("lease.")) {
@@ -1012,6 +1052,7 @@ function renderForEvent(event) {
     renderMetrics(agentIdentities, tasks, leases);
     renderEvents(agents, tasks);
     renderManagement();
+    elements["chat-subtitle"].textContent = `${connectedAgentCount(agentIdentities)} 当前连接 / ${agentIdentities.length} 个 Agent / 累计 ${state.snapshot.agents.length} 次接入 · 游标 ${state.snapshot.cursor}`;
     return;
   }
   renderAll();
@@ -1049,7 +1090,8 @@ function connectEvents(after) {
     if (capturedProjectId !== state.projectId) return;
     mergeEvents([event]);
     try {
-      const snapshot = await refreshSnapshot(capturedProjectId);
+      const minCursor = Number(event?.id || 0);
+      const snapshot = await refreshSnapshot(capturedProjectId, minCursor);
       if (!applySnapshotIfCurrent(capturedProjectId, snapshot)) return;
       renderForEvent(event);
     } catch (error) {
@@ -1065,7 +1107,7 @@ function projectGroupKey(project) {
 function renderProjects() {
   elements["project-count"].textContent = state.projects.length;
   if (!state.projects.length) {
-    elements["project-list"].innerHTML = '<div class="empty-state">还没有项目</div>';
+    setInnerHtmlIfChanged(elements["project-list"], '<div class="empty-state">还没有项目</div>');
     return;
   }
   const groups = new Map();
@@ -1075,7 +1117,7 @@ function renderProjects() {
     groups.get(key).push(project);
   }
   const showHeaders = groups.size > 1 || [...groups.values()].some((projects) => projects.length > 1);
-  elements["project-list"].innerHTML = [...groups.entries()].map(([groupKey, projects]) => {
+  const projectListHtml = [...groups.entries()].map(([groupKey, projects]) => {
     const collapsed = showHeaders && state.collapsedGroups.has(groupKey);
     const items = collapsed ? "" : projects.map((project) => `
       <button class="project-item ${project.id === state.projectId ? "is-active" : ""}" data-project-id="${escapeHtml(project.id)}" type="button"
@@ -1096,6 +1138,7 @@ function renderProjects() {
       </button>` : "";
     return `<div class="project-group">${header}${items}</div>`;
   }).join("");
+  setInnerHtmlIfChanged(elements["project-list"], projectListHtml);
 }
 
 function renderEmptyRoom() {
@@ -1154,6 +1197,12 @@ function renderAll() {
   renderManagement();
 }
 
+// 原生 title 提示框在元素被替换的瞬间销毁；presence 轮询每 2 秒全量重建
+// 列表会让悬停提示不稳定。内容未变化时跳过 innerHTML 赋值，DOM 保持不动。
+function setInnerHtmlIfChanged(element, html) {
+  if (element.innerHTML !== html) element.innerHTML = html;
+}
+
 function renderAgents(agents) {
   const roster = currentAgentRoster(agents);
   elements["agent-count"].textContent = roster.length;
@@ -1162,7 +1211,7 @@ function renderAgents(agents) {
     const rightDisconnected = right.connection_status === "disconnected" ? 1 : 0;
     return leftDisconnected - rightDisconnected;
   });
-  elements["agent-list"].innerHTML = ordered.length
+  const agentListHtml = ordered.length
     ? ordered.map((agent) => {
       const connected = agent.connection_status === "connected";
       const heartbeat = formatRelativeTime(agent.last_heartbeat);
@@ -1186,7 +1235,7 @@ function renderAgents(agents) {
       <div class="agent-item ${connected ? "" : "is-disconnected"}" title="${escapeHtml(details)}">
         <span class="agent-avatar ${avatarColorClass(agent.id)}">${escapeHtml(initials(agent.name))}</span>
         <span class="agent-copy">
-          <strong>${escapeHtml(agent.name)}${agent.unread_count ? ` <span class="unread-count" title="未读事件数：该 Agent 最前沿 Session 的已读游标之后、尚未同步的 Room 事件数">${agent.unread_count}</span>` : ""}</strong>
+          <strong>${escapeHtml(agent.name)}</strong>
           <small>${escapeHtml(agent.client)} · ${escapeHtml(agent.role)} · 模型 ${escapeHtml(modelLabel)}</small>
           <small>${escapeHtml(taskSummary)}</small>
           <small>心跳 ${escapeHtml(heartbeat)} · 活动 ${escapeHtml(activity)}</small>
@@ -1195,6 +1244,7 @@ function renderAgents(agents) {
       </div>`;
     }).join("")
     : '<div class="empty-state">等待 Agent 通过 MCP 或 CLI 加入</div>';
+  setInnerHtmlIfChanged(elements["agent-list"], agentListHtml);
 }
 
 function taskNotFinished(task) {
@@ -1866,10 +1916,12 @@ function wireDocumentList() {
 }
 
 function auditPager() {
+  // 列表按新→旧展示：视觉向下翻页加载更旧事件并递增页码，
+  // 视觉向上翻页加载更新事件，与阅读顺序保持一致。
   return `<div class="audit-pager">
-    <button type="button" class="secondary-button" data-audit-action="older" ${state.auditHasOlder ? "" : "disabled"}>← 上一页</button>
+    <button type="button" class="secondary-button" data-audit-action="newer" ${state.auditHasNewer ? "" : "disabled"}>← 上一页</button>
     <span class="secondary-text">第 ${state.auditPage || 1} 页 · 每页 ${AUDIT_PAGE_SIZE} 条</span>
-    <button type="button" class="secondary-button" data-audit-action="newer" ${state.auditHasNewer ? "" : "disabled"}>下一页 →</button>
+    <button type="button" class="secondary-button" data-audit-action="older" ${state.auditHasOlder ? "" : "disabled"}>下一页 →</button>
   </div>`;
 }
 
@@ -2358,10 +2410,7 @@ document.getElementById("task-navigation").addEventListener("click", (event) => 
   const button = event.target.closest("[data-task-entry]");
   if (!button) return;
   state.taskEntry = button.dataset.taskEntry;
-  document.querySelectorAll("#task-navigation [data-task-entry]").forEach((item) => {
-    item.classList.toggle("is-active", item === button);
-  });
-  if (state.snapshot) renderTaskTable(state.snapshot.tasks);
+  if (state.snapshot) renderTasks(state.snapshot.tasks);
 });
 
 elements["task-sort-controls"]?.addEventListener("click", (event) => {
@@ -2746,21 +2795,27 @@ async function refreshTaskIntakeTargets() {
   return options.length > 0;
 }
 
+let taskIntakeRefreshSequence = 0;
 async function refreshTaskIntakeData() {
   if (!state.projectId) return;
-  const [targets, intakes, tasks] = await Promise.all([
-    api(`/api/v1/projects/${state.projectId}/task-intakes/targets`),
-    api(`/api/v1/projects/${state.projectId}/task-intakes`),
-    api(`/api/v1/projects/${state.projectId}/tasks`),
+  const requestId = ++taskIntakeRefreshSequence;
+  const projectId = state.projectId;
+  const [targets, intakes] = await Promise.all([
+    api(`/api/v1/projects/${projectId}/task-intakes/targets`),
+    api(`/api/v1/projects/${projectId}/task-intakes`),
   ]);
+  // 迟到的旧响应或切换项目后到达的数据一律丢弃；任务行只允许经过
+  // applySnapshotIfCurrent 的项目 + 游标单调保护提交，防止旧列表覆盖新快照。
+  if (requestId !== taskIntakeRefreshSequence || projectId !== state.projectId) return;
   state.taskIntakeTargets = targets.targets || [];
   state.taskIntakes = intakes.intakes || [];
-  if (state.snapshot) state.snapshot.tasks = tasks.tasks || [];
-  renderTaskIntakes();
-  if (state.snapshot) {
+  const snapshot = await refreshSnapshot(projectId).catch(() => null);
+  if (requestId !== taskIntakeRefreshSequence || projectId !== state.projectId) return;
+  if (snapshot && applySnapshotIfCurrent(projectId, snapshot)) {
     renderTasks(state.snapshot.tasks);
     renderMessageTaskOptions(state.snapshot.tasks);
   }
+  renderTaskIntakes();
 }
 
 function sessionName(sessionId) {
@@ -3076,7 +3131,8 @@ async function downloadProjectExport() {
 function renderIntegrationTabs() {
   const container = document.querySelector(".integration-tabs");
   if (!container || !state.integration?.profiles) return;
-  const profileIds = Object.keys(state.integration.profiles);
+  // 配置助手只保留通用标准 MCP 接入；具名客户端预设仅保留在后端 CLI 里。
+  const profileIds = Object.keys(state.integration.profiles).filter((id) => id === "generic");
   if (!profileIds.length) return;
   if (!profileIds.includes(state.integrationFormat)) {
     state.integrationFormat = profileIds[0];

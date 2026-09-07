@@ -323,16 +323,29 @@ def start_detached_server(
     log_path = settings.data_dir / "server.log"
     environment = os.environ.copy()
     environment["AGENTCHATROOM_DATA_DIR"] = str(settings.data_dir)
-    command = [
-        sys.executable,
-        "-m",
-        "agentchatroom",
-        "serve",
-        "--host",
-        host,
-        "--port",
-        str(port),
-    ]
+    if getattr(sys, "frozen", False):
+        exe_name = "agentchatroom.exe" if os.name == "nt" else "agentchatroom"
+        console_exe = Path(sys.executable).with_name(exe_name)
+        target_executable = str(console_exe) if console_exe.exists() else sys.executable
+        command = [
+            target_executable,
+            "serve",
+            "--host",
+            host,
+            "--port",
+            str(port),
+        ]
+    else:
+        command = [
+            sys.executable,
+            "-m",
+            "agentchatroom",
+            "serve",
+            "--host",
+            host,
+            "--port",
+            str(port),
+        ]
     if config_path:
         command.extend(["--config", config_path])
     creationflags = 0

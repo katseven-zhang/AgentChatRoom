@@ -164,8 +164,8 @@ def test_web_supports_human_reading_and_guided_interactions():
     assert "snapshot.agent_identities" in javascript
     assert "当前连接" in javascript
     assert "累计" in javascript and "次接入" in javascript
-    assert 'app.css?v=1.0.0-central27' in markup
-    assert 'app.js?v=1.0.0-central27' in markup
+    assert 'app.css?v=1.0.0-central36' in markup
+    assert 'app.js?v=1.0.0-central36' in markup
     assert 'id="task-history-filter"' in markup
     assert "function loadTaskHistory(" in javascript
     assert "function renderHistoryEvidence(" in javascript
@@ -187,9 +187,24 @@ def test_web_supports_human_reading_and_guided_interactions():
     assert "function eventIdBadge(eventId)" in javascript
     assert "eventIdBadge(event.id)" in javascript
     assert javascript.count("eventIdBadge(event.id)") >= 4
-    assert markup.count('class="tab-status">未闭环</span>') == 3
+    # Task #90: the leases/reviews tabs are closed-loop verified — their
+    # badges became neutral remarks; only management keeps the legacy badge.
+    # Task #95: all three tabs are now closed-loop — management keeps an
+    # "已闭环" badge, files/reviews stay "只读视图", none say 未闭环.
+    assert markup.count('class="tab-status">未闭环</span>') == 0
+    assert markup.count('class="tab-status">已闭环</span>') == 1
+    assert markup.count('class="tab-status">只读视图</span>') == 2
+    assert 'aria-label="文件占用，只读视图"' in markup
+    assert 'aria-label="验证，只读视图"' in markup
+    assert 'aria-label="管理，已闭环"' in markup
     assert 'class="tab-status">协作视图</span>' in markup
-    assert markup.count('class="scope-status"><span>未闭环</span>') == 3
+    assert markup.count('class="scope-status"><span>未闭环</span>') == 0
+    # 附属说明 span 一律用中性描述词（备注）；状态结论只出现在 tab 徽标上。
+    assert markup.count('class="scope-status"><span>备注</span>') == 3
+    assert markup.count('class="scope-status"><span>已闭环</span>') == 0
+    assert "管理能力已闭环" in markup
+    assert "成员与 Token 管理（签发/吊销）" in markup
+    assert "租约由 Agent 通过 MCP 申请与释放（会话关闭后自动失效）" in markup
     assert ".event-id" in stylesheet
     assert ".scope-status" in stylesheet
     assert ".integration-chooser {\n  display: grid;\n  grid-template-columns: 1fr;" in stylesheet
@@ -219,6 +234,19 @@ def test_web_event_and_audit_panels_catch_up_to_latest_cursor():
     assert "resetAuditBuffer" not in javascript
     assert 'data-audit-action="older"' in javascript
     assert "上一页" in javascript and "下一页" in javascript
+    # Task #94: the unread badge is gone from the agent card face; the
+    # hover tooltip keeps connection/task/heartbeat details.
+    assert 'class="unread-count"' not in javascript
+    assert "未读事件数" not in javascript
+    # Task #92: the list renders newest-first, so the visually-down "下一页 →"
+    # must load older events and the visually-up "← 上一页" must load newer.
+    pager = javascript[javascript.index("function auditPager("):javascript.index("function renderAudit(")]
+    assert 'data-audit-action="newer"' in pager and "← 上一页" in pager
+    assert pager.index('data-audit-action="newer"') < pager.index("← 上一页")
+    assert 'data-audit-action="older"' in pager and "下一页 →" in pager
+    assert pager.index('data-audit-action="older"') < pager.index("下一页 →")
+    assert "state.auditHasNewer ? \"\" : \"disabled\"" in pager
+    assert "state.auditHasOlder ? \"\" : \"disabled\"" in pager
     assert "const EVENT_WINDOW_SIZE = 500;" in javascript
     assert "settings?.audit_window_size" in javascript
     assert "AUDIT_WINDOW_SIZE" not in javascript
@@ -792,7 +820,7 @@ def test_web_agent_cards_use_unified_projection_with_model_fallback(tmp_path):
     the shared identity projection, with an explicit `unknown` model when
     the backend reports none — and never branches on vendor names."""
     javascript = (WEB_DIR / "app.js").read_text(encoding="utf-8")
-    start = javascript.index("function renderAgents(agents)")
+    start = javascript.index("function setInnerHtmlIfChanged(")
     end = javascript.index("function taskNotFinished(task)", start)
 
     assert "agent.current_model" in javascript
@@ -1162,3 +1190,700 @@ def test_backup_delete_button_and_handler_in_web_assets():
     assert "api(`/api/v1/admin/backups/${encodeURIComponent(fileName)}`" in javascript
     assert 'const del = event.target.closest("[data-backup-delete]");' in javascript
     assert "window.confirm(" in javascript
+
+
+def test_web_task_events_synchronize_navigation_and_table_counts(tmp_path):
+    """Regression for Task #74:
+
+    When task lifecycle events (task.created, task.claimed, task.released,
+    task.cancelled, task.intake_defined) arrive, stage navigation count badges
+    and the task table must update within the exact same render cycle.
+    In-flight stale snapshots must not mask new incoming events, and presence
+    refresh must also reconcile tasks when background state changes.
+    """
+    javascript = (WEB_DIR / "app.js").read_text(encoding="utf-8")
+    assert "fetchSnapshotDirect" in javascript
+    assert "minCursor" in javascript
+    assert "renderTasks(snapshot.tasks)" in javascript
+    assert "if (state.snapshot) renderTasks(state.snapshot.tasks);" in javascript
+
+    config = {
+        "domain": {
+            "task_view": {
+                "schema_version": 2,
+                "phases": [
+                    "todo", "claimed", "in_progress", "blocked", "awaiting_review",
+                    "changes_requested", "pending_integration", "integration_failed",
+                    "done", "cancelled", "unclassified",
+                ],
+                "phase_labels": {
+                    "todo": "待认领", "claimed": "已认领", "in_progress": "执行中", "blocked": "阻塞",
+                    "awaiting_review": "待验收", "changes_requested": "已退回", "pending_integration": "待集成",
+                    "integration_failed": "集成失败", "done": "已完成", "cancelled": "已取消", "unclassified": "未归类",
+                },
+                "group_labels": {
+                    "claimable": "待认领", "active": "进行中", "review": "待验收", "integration": "待集成",
+                    "done": "已完成", "cancelled": "已取消", "unclassified": "未归类",
+                },
+                "attention_phases": ["blocked", "changes_requested", "integration_failed"],
+                "attention_label": "需要处理",
+                "active_subgroup_order": ["changes_requested", "blocked", "in_progress", "claimed"],
+            }
+        }
+    }
+
+    start_cfg = javascript.index("function taskViewConfig()")
+    end_table = javascript.index("function intakeTargetName(intake)")
+    start_snap = javascript.index("function fetchSnapshotDirect(projectId)")
+    end_snap = javascript.index("async function api(path, options = {})")
+    start_pres = javascript.index("async function refreshPresence()")
+    end_apply = javascript.index("function connectEvents(after)")
+
+    harness_template = '''
+const state = {
+  config: __CONFIG__,
+  projectId: 'prj_test',
+  snapshot: { project: { id: 'prj_test' }, tasks: [], agents: [], leases: [] },
+  events: [],
+  taskEntry: '',
+  taskExpert: { execution: '', verification: '', integration: '', priority: '', owner: '', number: '', phase: '' },
+  taskSort: { key: '', direction: 'asc' },
+  snapshotInFlight: null,
+  presenceRefreshInFlight: false,
+};
+
+const elements = {
+  'task-table': { innerHTML: '' },
+  'task-sort-controls': { innerHTML: '' },
+  'task-expert-filters': { innerHTML: '' },
+  'task-intake-list': { innerHTML: '' },
+  'review-list': { innerHTML: '' },
+  'metric-agents': { textContent: '0' },
+  'metric-active': { textContent: '0' },
+  'metric-leases': { textContent: '0' },
+  'metric-reviews': { textContent: '0' },
+  'agent-count': { textContent: '0' },
+  'agent-list': { innerHTML: '' },
+  'lease-list': { innerHTML: '' },
+  'active-task-list': { innerHTML: '' },
+  'recent-event-list': { innerHTML: '' },
+  'message-task': { innerHTML: '' },
+  'chat-stream': { innerHTML: '' },
+  'chat-subtitle': { textContent: '' },
+  'connection-state': { dataset: { state: '' } },
+  'connection-label': { textContent: '' },
+};
+
+const dom = {
+  'task-navigation': { innerHTML: '' },
+  'task-expert-filters': { innerHTML: '' },
+};
+
+const document = {
+  getElementById: (id) => dom[id] || elements[id] || { innerHTML: '', addEventListener: () => {} },
+  querySelectorAll: (selector) => [],
+};
+
+function escapeHtml(val) { return String(val ?? ''); }
+function shortId(val) { return String(val ?? ''); }
+function formatTime(val) { return '12:00'; }
+function currentAgentRoster(agents) { return agents || []; }
+function setConnection(st, msg) {}
+function renderAgents() {}
+function renderLeases() {}
+function renderTaskIntakes() {}
+function renderReviews() {}
+function renderEvents() {}
+function renderMessageTaskOptions() {}
+function renderEmptyRoom() {}
+function renderManagement() {}
+function connectedAgentCount() { return 0; }
+function renderAll() { renderTasks(state.snapshot.tasks); }
+function showToast(msg, type) {}
+function refreshTaskIntakeData() { return Promise.resolve(); }
+
+let mockServerSnapshot = {
+  project: { id: 'prj_test' },
+  cursor: 0,
+  tasks: [],
+  agents: [],
+  leases: [],
+};
+
+let serverFetchCount = 0;
+
+__SNIPPETS__
+
+// Override api
+api = function(path) {
+  serverFetchCount++;
+  if (path.includes('/snapshot')) {
+    return Promise.resolve(JSON.parse(JSON.stringify(mockServerSnapshot)));
+  }
+  return Promise.resolve({});
+};
+
+function getNavCounts() {
+  const html = dom['task-navigation'].innerHTML;
+  const regex = /data-task-entry="([^"]*)".*?<span class="entry-count">(\\d+)<\\/span>/gs;
+  const counts = {};
+  let match;
+  while ((match = regex.exec(html)) !== null) {
+    counts[match[1]] = parseInt(match[2], 10);
+  }
+  return counts;
+}
+
+(async () => {
+  // 1. Initial render
+  renderTasks(state.snapshot.tasks);
+  let counts = getNavCounts();
+  if (counts[''] !== 0 || counts['claimable'] !== 0) {
+    throw new Error('Initial count must be 0, got ' + JSON.stringify(counts));
+  }
+
+  // 2. task.created event arrives (event_id = 10)
+  mockServerSnapshot.cursor = 10;
+  mockServerSnapshot.tasks.push({
+    id: 't_1',
+    task_number: 1,
+    title: 'First Task',
+    execution_status: 'todo',
+    verification_status: 'not_required',
+    integration_status: 'pending',
+    priority: 2,
+    acceptance_criteria: ['Criterion 1'],
+    state_view: { phase: 'todo', group: 'claimable', needs_attention: false },
+  });
+
+  const event1 = { id: 10, event_type: 'task.created', task_id: 't_1' };
+  let snap1 = await refreshSnapshot(state.projectId, event1.id);
+  applySnapshotIfCurrent(state.projectId, snap1);
+  renderForEvent(event1);
+
+  counts = getNavCounts();
+  if (counts[''] !== 1 || counts['claimable'] !== 1) {
+    throw new Error('After task.created, claimable count must be 1, got ' + JSON.stringify(counts));
+  }
+  if (!elements['task-table'].innerHTML.includes('First Task')) {
+    throw new Error('Task table must contain First Task in the same render cycle');
+  }
+
+  // 3. Stale in-flight race test:
+  let delayResolve;
+  const delayedPromise = new Promise((resolve) => { delayResolve = resolve; });
+  state.snapshotInFlight = {
+    projectId: state.projectId,
+    promise: delayedPromise,
+  };
+
+  mockServerSnapshot.cursor = 20;
+  mockServerSnapshot.tasks.push({
+    id: 't_2',
+    task_number: 2,
+    title: 'Second Task',
+    execution_status: 'todo',
+    verification_status: 'not_required',
+    integration_status: 'pending',
+    priority: 1,
+    acceptance_criteria: ['Criterion 2'],
+    state_view: { phase: 'todo', group: 'claimable', needs_attention: false },
+  });
+
+  const event2 = { id: 20, event_type: 'task.created', task_id: 't_2' };
+  const eventPromise = refreshSnapshot(state.projectId, event2.id);
+
+  // Resolve the in-flight snapshot with OLD data (cursor 10)
+  state.snapshotInFlight = null;
+  delayResolve({
+    project: { id: 'prj_test' },
+    cursor: 10,
+    tasks: [mockServerSnapshot.tasks[0]],
+  });
+
+  let snap2 = await eventPromise;
+  if (snap2.cursor !== 20) {
+    throw new Error('Event snapshot must have cursor 20, got ' + snap2.cursor);
+  }
+  applySnapshotIfCurrent(state.projectId, snap2);
+  renderForEvent(event2);
+
+  counts = getNavCounts();
+  if (counts[''] !== 2 || counts['claimable'] !== 2) {
+    throw new Error('After event 2, claimable count must be 2, got ' + JSON.stringify(counts));
+  }
+
+  // 4. task.claimed transition: Task 1 claimed (group: active)
+  mockServerSnapshot.cursor = 21;
+  mockServerSnapshot.tasks[0].execution_status = 'claimed';
+  mockServerSnapshot.tasks[0].state_view = { phase: 'claimed', group: 'active', needs_attention: false };
+  const eventClaim = { id: 21, event_type: 'task.claimed', task_id: 't_1' };
+  let snapClaim = await refreshSnapshot(state.projectId, eventClaim.id);
+  applySnapshotIfCurrent(state.projectId, snapClaim);
+  renderForEvent(eventClaim);
+
+  counts = getNavCounts();
+  if (counts['claimable'] !== 1 || counts['active'] !== 1) {
+    throw new Error('After claim, claimable=1, active=1 expected, got ' + JSON.stringify(counts));
+  }
+
+  // 5. task.released transition: Task 1 released back to todo
+  mockServerSnapshot.cursor = 22;
+  mockServerSnapshot.tasks[0].execution_status = 'todo';
+  mockServerSnapshot.tasks[0].state_view = { phase: 'todo', group: 'claimable', needs_attention: false };
+  const eventRelease = { id: 22, event_type: 'task.released', task_id: 't_1' };
+  let snapRelease = await refreshSnapshot(state.projectId, eventRelease.id);
+  applySnapshotIfCurrent(state.projectId, snapRelease);
+  renderForEvent(eventRelease);
+
+  counts = getNavCounts();
+  if (counts['claimable'] !== 2 || counts['active'] !== 0) {
+    throw new Error('After release, claimable=2, active=0 expected, got ' + JSON.stringify(counts));
+  }
+
+  // 6. task.cancelled transition: Task 2 cancelled
+  mockServerSnapshot.cursor = 23;
+  mockServerSnapshot.tasks[1].execution_status = 'cancelled';
+  mockServerSnapshot.tasks[1].state_view = { phase: 'cancelled', group: 'cancelled', needs_attention: false };
+  const eventCancel = { id: 23, event_type: 'task.cancelled', task_id: 't_2' };
+  let snapCancel = await refreshSnapshot(state.projectId, eventCancel.id);
+  applySnapshotIfCurrent(state.projectId, snapCancel);
+  renderForEvent(eventCancel);
+
+  counts = getNavCounts();
+  if (counts['claimable'] !== 1 || counts['cancelled'] !== 1) {
+    throw new Error('After cancel, claimable=1, cancelled=1 expected, got ' + JSON.stringify(counts));
+  }
+
+  // 7. Full lifecycle transitions on Task 1 covering all stage tags:
+  // 7a. Claim Task 1 again -> active: 1
+  mockServerSnapshot.cursor = 24;
+  mockServerSnapshot.tasks[0].execution_status = 'claimed';
+  mockServerSnapshot.tasks[0].state_view = { phase: 'claimed', group: 'active', needs_attention: false };
+  const eventClaim2 = { id: 24, event_type: 'task.claimed', task_id: 't_1' };
+  applySnapshotIfCurrent(state.projectId, await refreshSnapshot(state.projectId, eventClaim2.id));
+  renderForEvent(eventClaim2);
+  counts = getNavCounts();
+  if (counts['claimable'] !== 0 || counts['active'] !== 1) {
+    throw new Error('After claim2, claimable=0, active=1 expected, got ' + JSON.stringify(counts));
+  }
+
+  // 7b. Block Task 1 -> attention: 1
+  mockServerSnapshot.cursor = 25;
+  mockServerSnapshot.tasks[0].execution_status = 'blocked';
+  mockServerSnapshot.tasks[0].state_view = { phase: 'blocked', group: 'active', needs_attention: true };
+  const eventBlocked = { id: 25, event_type: 'task.blocked', task_id: 't_1' };
+  applySnapshotIfCurrent(state.projectId, await refreshSnapshot(state.projectId, eventBlocked.id));
+  renderForEvent(eventBlocked);
+  counts = getNavCounts();
+  if (counts['attention'] !== 1 || counts['active'] !== 1) {
+    throw new Error('After task.blocked, attention=1, active=1 expected, got ' + JSON.stringify(counts));
+  }
+
+  // 7c. Unblock Task 1 -> attention: 0
+  mockServerSnapshot.cursor = 26;
+  mockServerSnapshot.tasks[0].execution_status = 'in_progress';
+  mockServerSnapshot.tasks[0].state_view = { phase: 'in_progress', group: 'active', needs_attention: false };
+  const eventUnblocked = { id: 26, event_type: 'task.unblocked', task_id: 't_1' };
+  applySnapshotIfCurrent(state.projectId, await refreshSnapshot(state.projectId, eventUnblocked.id));
+  renderForEvent(eventUnblocked);
+  counts = getNavCounts();
+  if (counts['attention'] !== 0 || counts['active'] !== 1) {
+    throw new Error('After task.unblocked, attention=0, active=1 expected, got ' + JSON.stringify(counts));
+  }
+
+  // 7d. Report Task 1 -> review: 1, active: 0
+  mockServerSnapshot.cursor = 27;
+  mockServerSnapshot.tasks[0].execution_status = 'awaiting_review';
+  mockServerSnapshot.tasks[0].state_view = { phase: 'awaiting_review', group: 'review', needs_attention: false };
+  const eventReported = { id: 27, event_type: 'task.reported', task_id: 't_1' };
+  applySnapshotIfCurrent(state.projectId, await refreshSnapshot(state.projectId, eventReported.id));
+  renderForEvent(eventReported);
+  counts = getNavCounts();
+  if (counts['review'] !== 1 || counts['active'] !== 0) {
+    throw new Error('After task.reported, review=1, active=0 expected, got ' + JSON.stringify(counts));
+  }
+
+  // 7e. Review submitted (changes requested) -> attention: 1, active: 1, review: 0
+  mockServerSnapshot.cursor = 28;
+  mockServerSnapshot.tasks[0].execution_status = 'changes_requested';
+  mockServerSnapshot.tasks[0].state_view = { phase: 'changes_requested', group: 'active', needs_attention: true };
+  const eventChanges = { id: 28, event_type: 'task.review_submitted', task_id: 't_1' };
+  applySnapshotIfCurrent(state.projectId, await refreshSnapshot(state.projectId, eventChanges.id));
+  renderForEvent(eventChanges);
+  counts = getNavCounts();
+  if (counts['attention'] !== 1 || counts['review'] !== 0 || counts['active'] !== 1) {
+    throw new Error('After changes requested, attention=1, review=0, active=1 expected, got ' + JSON.stringify(counts));
+  }
+
+  // 7f. Report Task 1 again -> attention: 0, review: 1, active: 0
+  mockServerSnapshot.cursor = 29;
+  mockServerSnapshot.tasks[0].execution_status = 'awaiting_review';
+  mockServerSnapshot.tasks[0].state_view = { phase: 'awaiting_review', group: 'review', needs_attention: false };
+  const eventReported2 = { id: 29, event_type: 'task.reported', task_id: 't_1' };
+  applySnapshotIfCurrent(state.projectId, await refreshSnapshot(state.projectId, eventReported2.id));
+  renderForEvent(eventReported2);
+  counts = getNavCounts();
+  if (counts['attention'] !== 0 || counts['review'] !== 1 || counts['active'] !== 0) {
+    throw new Error('After re-report, attention=0, review=1, active=0 expected, got ' + JSON.stringify(counts));
+  }
+
+  // 7g. Review submitted (approved) -> review: 0, integration: 1
+  mockServerSnapshot.cursor = 30;
+  mockServerSnapshot.tasks[0].execution_status = 'pending_integration';
+  mockServerSnapshot.tasks[0].state_view = { phase: 'pending_integration', group: 'integration', needs_attention: false };
+  const eventApproved = { id: 30, event_type: 'task.review_submitted', task_id: 't_1' };
+  applySnapshotIfCurrent(state.projectId, await refreshSnapshot(state.projectId, eventApproved.id));
+  renderForEvent(eventApproved);
+  counts = getNavCounts();
+  if (counts['review'] !== 0 || counts['integration'] !== 1) {
+    throw new Error('After approved, review=0, integration=1 expected, got ' + JSON.stringify(counts));
+  }
+
+  // 7h. Integrate Task 1 -> integration: 0, done: 1
+  mockServerSnapshot.cursor = 31;
+  mockServerSnapshot.tasks[0].execution_status = 'done';
+  mockServerSnapshot.tasks[0].state_view = { phase: 'done', group: 'done', needs_attention: false };
+  const eventIntegrated = { id: 31, event_type: 'task.integrated', task_id: 't_1' };
+  applySnapshotIfCurrent(state.projectId, await refreshSnapshot(state.projectId, eventIntegrated.id));
+  renderForEvent(eventIntegrated);
+  counts = getNavCounts();
+  if (counts['integration'] !== 0 || counts['done'] !== 1) {
+    throw new Error('After integrated, integration=0, done=1 expected, got ' + JSON.stringify(counts));
+  }
+
+  // 8. task.intake_defined path: new task created from intake
+  mockServerSnapshot.cursor = 32;
+  mockServerSnapshot.tasks.push({
+    id: 't_3',
+    task_number: 3,
+    title: 'Intake Defined Task',
+    execution_status: 'todo',
+    verification_status: 'not_required',
+    integration_status: 'pending',
+    priority: 2,
+    acceptance_criteria: ['Criterion 3'],
+    state_view: { phase: 'todo', group: 'claimable', needs_attention: false },
+  });
+  const eventIntake = { id: 32, event_type: 'task.intake_defined', task_id: 't_3' };
+  let snapIntake = await refreshSnapshot(state.projectId, eventIntake.id);
+  applySnapshotIfCurrent(state.projectId, snapIntake);
+  renderForEvent(eventIntake);
+
+  counts = getNavCounts();
+  if (counts['claimable'] !== 1) {
+    throw new Error('After intake_defined, claimable=1 expected, got ' + JSON.stringify(counts));
+  }
+
+  // 9. refreshPresence background reconciliation test:
+  mockServerSnapshot.cursor = 33;
+  mockServerSnapshot.tasks.push({
+    id: 't_4',
+    task_number: 4,
+    title: 'Background Task',
+    execution_status: 'todo',
+    verification_status: 'not_required',
+    integration_status: 'pending',
+    priority: 3,
+    acceptance_criteria: ['Criterion 4'],
+    state_view: { phase: 'todo', group: 'claimable', needs_attention: false },
+  });
+  await refreshPresence();
+  counts = getNavCounts();
+  if (counts['claimable'] !== 2 || counts['done'] !== 1 || counts['cancelled'] !== 1 || counts[''] !== 4) {
+    throw new Error('After refreshPresence reconciliation, claimable=2, done=1, cancelled=1, total=4 expected, got ' + JSON.stringify(counts));
+  }
+
+  console.log(JSON.stringify({ success: true, finalCounts: counts }));
+})();
+'''
+    snippets = (
+        javascript[start_cfg:end_table]
+        + "\n"
+        + javascript[start_snap:end_snap]
+        + "\n"
+        + javascript[start_pres:end_apply]
+    )
+    harness_code = harness_template.replace("__CONFIG__", json.dumps(config)).replace("__SNIPPETS__", snippets)
+    harness_file = tmp_path / "task_sync_harness.js"
+    harness_file.write_text(harness_code, encoding="utf-8")
+    output = subprocess.check_output(["node", str(harness_file)], text=True)
+    result = json.loads(output)
+    assert result["success"] is True
+    assert result["finalCounts"]["claimable"] == 2
+    assert result["finalCounts"]["done"] == 1
+    assert result["finalCounts"]["cancelled"] == 1
+    assert result["finalCounts"][""] == 4
+
+
+def test_web_assets_contain_no_hardcoded_host_or_port_literals():
+    """Anti-regression test for Task #73: assert that web frontend assets
+    contain zero hardcoded localhost, 127.0.0.1, 8765, or absolute URLs,
+    guaranteeing that the SPA can run transparently across any host/port,
+    pywebview shell, or remote server target without frontend modification.
+    """
+    web_files = list(WEB_DIR.glob("**/*"))
+    assert len(web_files) > 0, "Web directory must contain static assets"
+
+    forbidden_host_patterns = [
+        "127.0.0.1",
+        "localhost",
+        ":8765",
+    ]
+
+    for file_path in web_files:
+        if not file_path.is_file():
+            continue
+        content = file_path.read_text(encoding="utf-8", errors="replace")
+        for pattern in forbidden_host_patterns:
+            assert pattern not in content, (
+                f"Web asset {file_path.name} contains forbidden literal '{pattern}'. "
+                "Web frontend must use relative paths only to preserve adapter decoupling."
+            )
+        # JavaScript logic must not use any absolute HTTP(S) URLs
+        if file_path.suffix == ".js":
+            assert "http://" not in content and "https://" not in content, (
+                f"Script {file_path.name} contains absolute HTTP/HTTPS URL. "
+                "All frontend API and event requests must use relative paths."
+            )
+
+
+def test_web_intake_refresh_never_overwrites_snapshot_state(tmp_path):
+    """Task #74 review fix: the intake refresh path must never commit task
+    rows directly into the snapshot. Stale or cross-project intake responses
+    are dropped, and task reconciliation flows only through the
+    cursor-protected applySnapshotIfCurrent commit."""
+    import json
+    import subprocess
+
+    javascript = (WEB_DIR / "app.js").read_text(encoding="utf-8")
+    assert "state.snapshot.tasks =" not in javascript
+
+    start_intake = javascript.index("let taskIntakeRefreshSequence = 0;")
+    end_intake = javascript.index("function sessionName(sessionId)")
+    start_snap = javascript.index("function fetchSnapshotDirect(projectId)")
+    end_snap = javascript.index("async function api(path, options = {})")
+    start_apply = javascript.index("function applySnapshotIfCurrent(projectId, snapshot)")
+    end_apply = javascript.index("function renderForEvent(event)")
+
+    harness_template = '''
+const state = {
+  projectId: 'prj-B',
+  snapshot: { project: { id: 'prj-B' }, cursor: 20, tasks: [
+    { id: 't1', title: 'one', state_view: { phase: 'todo', group: 'claimable' } },
+    { id: 't2', title: 'two', state_view: { phase: 'done', group: 'done' } },
+  ] },
+  taskIntakes: [{ raw_description: 'existing' }],
+  taskIntakeTargets: [],
+  snapshotInFlight: null,
+  __renderedTasks: null,
+  __renderedIntakes: false,
+};
+
+let pendingApi = [];
+async function api(path, options = {}) {
+  return new Promise((resolve) => { pendingApi.push({ path, resolve }); });
+}
+function matchesSuffix(entry, pathSuffix) {
+  return entry.path.split('?')[0].endsWith(pathSuffix);
+}
+function resolveApi(pathSuffix, payload) {
+  const queue = pendingApi;
+  pendingApi = [];
+  let matched = null;
+  for (const entry of queue) {
+    if (!matched && matchesSuffix(entry, pathSuffix)) { matched = entry; continue; }
+    pendingApi.push(entry);
+  }
+  if (!matched) throw new Error('no pending api call ending with ' + pathSuffix);
+  matched.resolve(payload);
+}
+async function waitForApi(pathSuffix) {
+  for (let i = 0; i < 200; i += 1) {
+    const hit = pendingApi.find((entry) => matchesSuffix(entry, pathSuffix));
+    if (hit) return;
+    await Promise.resolve();
+  }
+  throw new Error('api call never appeared: ' + pathSuffix);
+}
+function renderTasks(tasks) { state.__renderedTasks = tasks; }
+function renderMessageTaskOptions(tasks) { state.__renderedOptionsTasks = tasks; }
+function renderTaskIntakes() { state.__renderedIntakes = true; }
+
+__SNIPPETS__
+
+(async () => {
+  const out = {};
+
+  // 1) Cross-project staleness: prj-A responses arrive after the switch to
+  // prj-B; the guarded intake refresh must drop them entirely.
+  state.projectId = 'prj-A';
+  const stale = refreshTaskIntakeData();
+  state.projectId = 'prj-B';
+  resolveApi('/targets', { targets: [{ id: 'm1' }] });
+  resolveApi('/task-intakes', { intakes: [{ raw_description: 'A-project' }] });
+  await stale;
+  out.staleDropped =
+    state.taskIntakes.length === 1
+    && state.taskIntakes[0].raw_description === 'existing'
+    && state.snapshot.cursor === 20
+    && state.snapshot.tasks.length === 2;
+
+  // 2) Out-of-order snapshot: the snapshot fetched during intake refresh is
+  // older than the current one; applySnapshotIfCurrent must reject it.
+  const fresh = refreshTaskIntakeData();
+  resolveApi('/targets', { targets: [] });
+  resolveApi('/task-intakes', { intakes: [{ raw_description: 'B-intake' }] });
+  await waitForApi('/snapshot');
+  resolveApi('/snapshot', { project: { id: 'prj-B' }, cursor: 10, tasks: [{ id: 't0' }] });
+  await fresh;
+  out.monotonicHeld =
+    state.snapshot.cursor === 20 && state.snapshot.tasks.length === 2;
+
+  // 3) A newer snapshot commits through the protected path and re-renders.
+  const newer = refreshTaskIntakeData();
+  resolveApi('/targets', { targets: [] });
+  resolveApi('/task-intakes', { intakes: [{ raw_description: 'B-intake-2' }] });
+  await waitForApi('/snapshot');
+  resolveApi('/snapshot', {
+    project: { id: 'prj-B' },
+    cursor: 25,
+    tasks: [1, 2, 3].map((i) => ({ id: 't' + i, state_view: { phase: 'todo', group: 'claimable' } })),
+  });
+  await newer;
+  out.newerApplied = state.snapshot.cursor === 25 && state.snapshot.tasks.length === 3;
+  out.renderedNewTasks = Boolean(state.__renderedTasks) && state.__renderedTasks.length === 3;
+  out.intakeListRendered = state.__renderedIntakes;
+
+  if (!out.staleDropped || !out.monotonicHeld || !out.newerApplied || !out.renderedNewTasks || !out.intakeListRendered) {
+    throw new Error('intake refresh regression: ' + JSON.stringify(out));
+  }
+  console.log(JSON.stringify({ success: true, out }));
+})();
+'''
+    snippets = (
+        javascript[start_snap:end_snap]
+        + "\n"
+        + javascript[start_apply:end_apply]
+        + "\n"
+        + javascript[start_intake:end_intake]
+    )
+    harness_code = harness_template.replace("__SNIPPETS__", snippets)
+    harness_file = tmp_path / "intake_refresh_harness.js"
+    harness_file.write_text(harness_code, encoding="utf-8")
+    output = subprocess.check_output(["node", str(harness_file)], text=True)
+    result = json.loads(output)
+    assert result["success"] is True
+    assert result["out"] == {
+        "staleDropped": True,
+        "monotonicHeld": True,
+        "newerApplied": True,
+        "renderedNewTasks": True,
+        "intakeListRendered": True,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Task #86: three-column layout holds at default window width.
+# Task #87: agent list rebuild skipped when unchanged (stable hover tooltip).
+# Task #88: local MCP assistant offers the generic profile only.
+# ---------------------------------------------------------------------------
+
+def test_web_css_keeps_desktop_three_columns_at_1280():
+    """Task #86: the exe default width (1280) must stay on the desktop
+    three-column grid; the stacking breakpoint moves below it."""
+    stylesheet = (WEB_DIR / "app.css").read_text(encoding="utf-8")
+    # Task #89: narrow desktop windows keep the three columns side by side —
+    # the third column (Room feed) never stacks below the workspace.
+    assert "@media (max-width: 1264px)" in stylesheet
+    assert "@media (max-width: 1280px)" not in stylesheet
+    assert "@media (max-width: 1120px)" not in stylesheet
+    assert '"side work"' not in stylesheet
+    assert "minmax(180px, var(--left-panel-width))" in stylesheet
+    assert "minmax(260px, var(--right-panel-width))" in stylesheet
+    # Task #89: compressed workspace content scrolls horizontally instead of
+    # being clipped away.
+    workspace_block = stylesheet[
+        stylesheet.index(".workspace {"):stylesheet.index(".workspace-header {")
+    ]
+    assert "overflow-x: auto" in workspace_block
+    assert "overflow-x: clip" not in workspace_block
+
+
+def test_web_agent_list_render_skips_rebuild_when_unchanged(tmp_path):
+    """Task #87: presence polling must not rebuild the agent list DOM when
+    nothing changed, so native hover tooltips stay stable."""
+    import json
+    import subprocess
+
+    javascript = (WEB_DIR / "app.js").read_text(encoding="utf-8")
+    assert "function setInnerHtmlIfChanged(" in javascript
+
+    start = javascript.index("function setInnerHtmlIfChanged(")
+    end = javascript.index("function taskNotFinished(")
+    snippets = javascript[start:end]
+
+    harness_template = '''
+let agentListHtml = "";
+const agentList = {
+  get innerHTML() { return agentListHtml; },
+  set innerHTML(value) { agentList.writes += 1; agentListHtml = value; },
+  writes: 0,
+};
+const elements = { "agent-list": agentList, "agent-count": {} };
+const state = { snapshot: { tasks: [] } };
+function currentAgentRoster(agents) { return agents; }
+function escapeHtml(value) { return String(value ?? ""); }
+function formatRelativeTime(value) { return String(value); }
+function initials(name) { return String(name).slice(0, 2); }
+function avatarColorClass() { return "c"; }
+function taskPhaseLabel(task) { return String(task.phase); }
+function legacyStatus(status) { return String(status); }
+
+__SNIPPETS__
+
+const agent = {
+  id: "a1", name: "Alpha", client: "demo", role: "executor",
+  connection_status: "connected", session_count: 1,
+  last_heartbeat: "hb-1", last_activity_at: "act-1",
+  current_model: "M", unread_count: 0,
+};
+
+renderAgents([agent]);
+renderAgents([agent]);
+const writesAfterSameData = agentList.writes;
+
+renderAgents([{ ...agent, last_heartbeat: "hb-2" }]);
+const writesAfterChangedData = agentList.writes;
+
+if (writesAfterSameData !== 1 || writesAfterChangedData !== 2) {
+  throw new Error("unexpected rebuild counts: " + writesAfterSameData + "/" + writesAfterChangedData);
+}
+console.log(JSON.stringify({ success: true, writesAfterSameData, writesAfterChangedData }));
+'''
+    harness_file = tmp_path / "agent_render_harness.js"
+    harness_file = tmp_path / "agent_render_harness.js"
+    harness_code = harness_template.replace("__SNIPPETS__", snippets)
+    harness_file.write_text(harness_code, encoding="utf-8")
+    output = subprocess.check_output(["node", str(harness_file)], text=True)
+    result = json.loads(output)
+    assert result["success"] is True
+    assert result["writesAfterSameData"] == 1
+    assert result["writesAfterChangedData"] == 2
+
+
+def test_web_local_mcp_assistant_offers_generic_only():
+    """Task #88: the onboarding assistant exposes the generic standard-MCP
+    profile only; named-client presets stay backend/CLI-only."""
+    javascript = (WEB_DIR / "app.js").read_text(encoding="utf-8")
+    markup = (WEB_DIR / "index.html").read_text(encoding="utf-8")
+
+    assert 'integrationFormat: "generic"' in javascript
+    assert 'filter((id) => id === "generic")' in javascript
+    # named-client defaults are gone from the UI layer
+    assert 'integrationFormat: "workbuddy"' not in javascript
+    assert "选择客户端并完成本机 MCP 配置" not in markup
+    assert "按通用 MCP 配置完成本机接入" in markup
+    # generic profile keeps the full onboarding flow wired
+    assert "renderIntegrationTabs()" in javascript
+    assert "integration-onboarding-prompt" in markup

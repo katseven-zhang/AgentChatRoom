@@ -1605,3 +1605,36 @@ def test_lease_acquire_conflict_and_advisory_check_over_rest(settings, project_d
         assert body["policy"] == "advisory"
         assert body["blocked"] is False
         assert len(body["conflicts"]) == 1
+
+
+def test_server_version_endpoint(settings):
+    """Verify /api/v1/version returns version, schema_version, and product_name."""
+    with TestClient(create_app(settings)) as client:
+        response = client.get("/api/v1/version")
+        assert response.status_code == 200
+        payload = response.json()
+        assert "version" in payload
+        assert "schema_version" in payload
+        assert payload["schema_version"] >= 7
+        assert payload["product_name"] == settings.product_name
+
+
+def test_snapshot_and_tasks_cache_control_headers(settings, project_dir):
+    """Verify snapshot and tasks endpoints return explicit no-cache headers to prevent browser caching."""
+    with TestClient(create_app(settings)) as client:
+        created = client.post(
+            "/api/v1/projects",
+            json={"root_path": str(project_dir), "name": "Cache Project"},
+        )
+        assert created.status_code == 201
+        project_id = created.json()["id"]
+
+        snap_res = client.get(f"/api/v1/projects/{project_id}/snapshot")
+        assert snap_res.status_code == 200
+        assert "no-cache" in snap_res.headers.get("Cache-Control", "")
+        assert "no-store" in snap_res.headers.get("Cache-Control", "")
+
+        tasks_res = client.get(f"/api/v1/projects/{project_id}/tasks")
+        assert tasks_res.status_code == 200
+        assert "no-cache" in tasks_res.headers.get("Cache-Control", "")
+        assert "no-store" in tasks_res.headers.get("Cache-Control", "")
