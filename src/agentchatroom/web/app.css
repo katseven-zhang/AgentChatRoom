@@ -1463,6 +1463,10 @@ body.is-resizing-panels {
   border-left: 3px solid var(--amber);
 }
 
+.compact-item.merged-activity {
+  border-left: 3px solid var(--border-strong, rgba(125, 140, 150, 0.55));
+}
+
 .compact-item.kind-blocker {
   border-left: 3px solid var(--red);
 }
