@@ -6,7 +6,7 @@ This module acts as an independent adapter layer:
 3. Edge WebView2 with fallback to system browser if unavailable.
 4. Window URL strictly resolved from ServerTarget abstraction (no hardcoded host/port).
 5. Single-instance enforcement (focuses existing window on duplicate launch).
-6. Closing semantics with three choices: stop & close, keep running & close, cancel.
+6. Closing semantics: stop & close, keep running in tray, cancel.
 7. Native folder dialog bridge using pywebview.create_file_dialog.
 8. Manual service control: a shell-owned top bar (status / port / start / stop)
    plus a local placeholder page so the user never sees 404 or connection
@@ -20,6 +20,7 @@ import ctypes
 import logging
 import os
 import sys
+import threading
 import webbrowser
 from dataclasses import replace
 from pathlib import Path
@@ -188,7 +189,10 @@ TOPBAR_JS = r"""
     startBtn.textContent = '启动服务';
     const stopBtn = css(document.createElement('button'), buttonCss('#b3556b'));
     stopBtn.textContent = '停止服务';
-    bar.append(dot, label, spacer, port, startBtn, stopBtn);
+    const trayBtn = css(document.createElement('button'), buttonCss('#526479'));
+    trayBtn.textContent = '收起到托盘';
+    trayBtn.title = '保留服务运行，点击右下角托盘图标可恢复面板';
+    bar.append(dot, label, spacer, port, startBtn, stopBtn, trayBtn);
     document.body.prepend(bar);
 
     // The SPA is a fixed 100vh app shell with internal scrolling; shrink it
@@ -238,6 +242,19 @@ TOPBAR_JS = r"""
         label.textContent = '正在停止服务…';
         try { await window.pywebview.api.stop_service(); } catch (error) { /* reported below */ }
         poll();
+    });
+    trayBtn.addEventListener('click', async () => {
+        trayBtn.disabled = true;
+        try {
+            const result = await window.pywebview.api.minimize_to_tray();
+            if (!(result && result.ok)) {
+                window.alert((result && result.error) || '暂时无法收起到托盘');
+            }
+        } catch (error) {
+            window.alert('收起到托盘失败，请稍后重试');
+        } finally {
+            trayBtn.disabled = false;
+        }
     });
     poll();
     setInterval(poll, 2000);
@@ -342,6 +359,12 @@ class ShellJsApi:
             "note": note,
         }
 
+    def minimize_to_tray(self) -> dict[str, Any]:
+        try:
+            return self._require_shell().hide_to_tray()
+        except RuntimeError as error:
+            return {"ok": False, "error": str(error)}
+
     def stop_service(self) -> dict[str, Any]:
         """Stop the detached local service and return to the placeholder page."""
         try:
@@ -427,16 +450,22 @@ FOLDER_PICKER_INTERCEPT_JS = r"""
 """
 
 
-def prompt_close_action_win32(service_running: bool, window_title: str = WINDOW_TITLE) -> str:
+def prompt_close_action_win32(
+    service_running: bool, window_title: str = WINDOW_TITLE, *, exit_panel: bool = False
+) -> str:
     """Prompt user for closing action using native message box."""
     if not service_running:
         return CLOSE
     if os.name == "nt":
         # MB_YESNOCANCEL = 0x00000003 | MB_ICONQUESTION = 0x00000020
+        keep_description = (
+            "保留后台服务运行，退出面板与托盘"
+            if exit_panel else "保留后台服务运行，收起到右下角托盘"
+        )
         msg = (
             "AgentChatRoom 服务仍在后台运行。\n\n"
             "【是】：结束后台服务并退出\n"
-            "【否】：保留后台服务运行，仅关闭面板\n"
+            f"【否】：{keep_description}\n"
             "【取消】：不关闭窗口"
         )
         # IDYES = 6, IDNO = 7, IDCANCEL = 2
@@ -522,16 +551,8 @@ class PanelTray:
             logger.warning("Tray restore failed: %s", redact_line(str(error)))
 
     def quit_from_tray(self, icon: Any = None, item: Any = None) -> None:
-        """Exit via the same three-choice closing semantics as the close button."""
-        window = self.shell.window
-        if not self.shell.on_window_closing():
-            return
-        self.stop()
-        if window is not None:
-            try:
-                window.destroy()
-            except Exception as error:
-                logger.warning("Tray quit failed: %s", redact_line(str(error)))
+        """Request a real exit without blocking the tray's message loop."""
+        threading.Thread(target=self.shell.request_tray_exit, daemon=True).start()
 
     def stop(self) -> None:
         if self.icon is not None:
@@ -541,6 +562,21 @@ class PanelTray:
                 pass
             self.icon = None
         self.started = False
+
+
+def initial_window_geometry(screens: list[Any]) -> dict[str, Any]:
+    """Center on the primary screen using WebView's logical screen units."""
+    width, height = 1440, 900
+    geometry: dict[str, Any] = {}
+    if screens:
+        screen = next((s for s in screens if s.x == 0 and s.y == 0), screens[0])
+        # Leave room for the taskbar and window decorations, including on
+        # smaller screens and displays with Windows scaling enabled.
+        width = min(width, max(1, int(screen.width * 0.9)))
+        height = min(height, max(1, int(screen.height * 0.9)))
+        geometry["screen"] = screen
+    geometry.update(width=width, height=height, min_size=(min(900, width), min(600, height)))
+    return geometry
 
 
 class GuiShell:
@@ -560,6 +596,7 @@ class GuiShell:
         self.js_api.bind_shell(self)
         self.tray = PanelTray(self)
         self.window: Any = None
+        self._tray_exit_requested = False
 
     def config_file_path(self) -> Path:
         if self.settings.config_path:
@@ -617,14 +654,32 @@ class GuiShell:
                 "Failed to inject shell bridges: %s", redact_line(str(error))
             )
 
-    def on_window_minimized(self) -> None:
-        """Minimize to tray when available so the panel is never lost."""
+    def hide_to_tray(self) -> dict[str, Any]:
+        """Preserve the service and hide only when a tray entry is available."""
         if not self.tray.started or not self.window:
-            return
+            return {"ok": False, "error": "托盘暂不可用，面板已保留，请稍后重试。"}
         try:
             self.window.hide()
+            return {"ok": True}
         except Exception as error:
             logger.warning("Minimize-to-tray failed: %s", redact_line(str(error)))
+            return {"ok": False, "error": "无法收起面板，请稍后重试。"}
+
+    def on_window_minimized(self) -> None:
+        self.hide_to_tray()
+
+    def request_tray_exit(self) -> None:
+        if self.window is None or self._tray_exit_requested:
+            return
+        self._tray_exit_requested = True
+        try:
+            # destroy() raises the closing event itself; prompting here as well
+            # would ask twice and could accidentally hide the panel on exit.
+            self.window.destroy()
+        except Exception as error:
+            logger.warning("Tray quit failed: %s", redact_line(str(error)))
+        finally:
+            self._tray_exit_requested = False
 
     def on_window_closing(self) -> bool:
         """Handle window close event with three choices.
@@ -635,7 +690,9 @@ class GuiShell:
             return True
 
         running = self.controller.is_running()
-        action = prompt_close_action_win32(running, WINDOW_TITLE)
+        action = prompt_close_action_win32(
+            running, WINDOW_TITLE, exit_panel=self._tray_exit_requested
+        )
         if action == STAY:
             return False
         if action == STOP_AND_CLOSE:
@@ -645,7 +702,12 @@ class GuiShell:
                 logger.error("Failed to stop local service: %s", redact_line(str(error)))
             return True
         if action == KEEP_RUNNING:
-            return True
+            if self._tray_exit_requested:
+                return True
+            self.hide_to_tray()
+            # Preserve the WebView event loop and its tray icon. If hiding is
+            # unavailable or fails, leave the window accessible instead.
+            return False
         return True
 
     def launch(self, debug: bool = False) -> int:
@@ -657,14 +719,18 @@ class GuiShell:
             webbrowser.open(self.target.base_url)
             return 0
 
+        try:
+            geometry = initial_window_geometry(webview.screens)
+        except Exception as error:
+            logger.warning("Screen detection failed: %s", redact_line(str(error)))
+            geometry = initial_window_geometry([])
+
         if self.controller.is_running():
             self.window = webview.create_window(
                 title=WINDOW_TITLE,
                 url=self.target.base_url,
                 js_api=self.js_api,
-                width=1440,
-                height=900,
-                min_size=(900, 600),
+                **geometry,
                 confirm_close=False,
             )
         else:
@@ -672,9 +738,7 @@ class GuiShell:
                 title=WINDOW_TITLE,
                 html=self.placeholder_html(),
                 js_api=self.js_api,
-                width=1440,
-                height=900,
-                min_size=(900, 600),
+                **geometry,
                 confirm_close=False,
             )
         self.js_api.set_window(self.window)

@@ -98,7 +98,7 @@ def test_server_target_probe_success_with_mock_version_endpoint():
         def do_GET(self):
             if self.path == "/api/v1/version":
                 payload = json.dumps({
-                    "version": "0.2.2",
+                    "version": "0.2.3",
                     "schema_version": 7,
                     "product_name": "AgentChatRoom",
                 }).encode("utf-8")
@@ -123,7 +123,7 @@ def test_server_target_probe_success_with_mock_version_endpoint():
         target = ServerTarget.local(f"http://127.0.0.1:{port}")
         probe = target.probe(timeout=2.0)
         assert probe.ok is True
-        assert probe.version == "0.2.2"
+        assert probe.version == "0.2.3"
         assert probe.schema_version == 7
         assert probe.product_name == "AgentChatRoom"
         assert probe.status_code == 200
@@ -859,47 +859,224 @@ def test_on_window_minimized_hides_only_when_tray_started():
     assert hidden == [True]
 
 
-def test_tray_quit_respects_closing_semantics():
+@pytest.mark.parametrize("action", [KEEP_RUNNING, STOP_AND_CLOSE, STAY])
+def test_tray_quit_prompts_once_and_can_really_exit(tmp_path, monkeypatch, action):
     from agentchatroom import shell as shell_module
 
-    shell = _build_manual_shell(Path("."))
-    tray = shell_module.PanelTray(shell)
-    tray.started = True
-
-    stopped = []
+    shell = _build_manual_shell(tmp_path)
+    shell.tray.started = True
+    prompts = []
     destroyed = []
 
-    class FakeIcon:
-        def stop(self):
-            stopped.append(True)
+    def prompt(running, title, *, exit_panel=False):
+        prompts.append((running, exit_panel))
+        return action
 
     class FakeWindow:
         def destroy(self):
-            destroyed.append(True)
+            if shell.on_window_closing():
+                destroyed.append(True)
 
-    tray.icon = FakeIcon()
     shell.window = FakeWindow()
-    monkeypatch_flags = {"allowed": True}
-    monkeypatch = monkeypatch_flags  # placeholder to keep flake calm
-
-    shell.on_window_closing = lambda: monkeypatch_flags["allowed"]
-    tray.quit_from_tray()
-    assert stopped == [True]
-    assert destroyed == [True]
-
-    stopped.clear()
-    destroyed.clear()
-    monkeypatch_flags["allowed"] = False
-    tray.started = True
-    tray.quit_from_tray()
-    assert stopped == []
-    assert destroyed == []
-    assert tray.started is True
+    monkeypatch.setattr(shell_module, "prompt_close_action_win32", prompt)
+    shell.request_tray_exit()
+    assert prompts == [(True, True)]
+    assert destroyed == ([] if action == STAY else [True])
+    assert shell.controller.stopped is (action == STOP_AND_CLOSE)
+    assert shell._tray_exit_requested is False
 
 
-def test_default_panel_window_is_1440x900():
+@pytest.mark.parametrize("tray_available", [True, False])
+def test_close_keep_running_preserves_panel_and_tray(tmp_path, monkeypatch, tray_available):
     from agentchatroom import shell as shell_module
 
-    source = Path(shell_module.__file__).read_text(encoding="utf-8")
-    assert "width=1440" in source
-    assert "height=900" in source
+    shell = _build_manual_shell(tmp_path)
+    shell.tray.started = tray_available
+    hidden = []
+
+    class FakeWindow:
+        def hide(self):
+            hidden.append(True)
+
+    shell.window = FakeWindow()
+    monkeypatch.setattr(shell_module, "prompt_close_action_win32", lambda *a, **k: KEEP_RUNNING)
+    assert shell.on_window_closing() is False
+    assert hidden == ([True] if tray_available else [])
+    assert shell.controller.is_running()
+    assert shell.tray.started is tray_available
+
+
+def test_close_keep_running_hide_failure_cancels_close(tmp_path, monkeypatch):
+    from agentchatroom import shell as shell_module
+
+    shell = _build_manual_shell(tmp_path)
+    shell.tray.started = True
+
+    class FakeWindow:
+        def hide(self):
+            raise RuntimeError("Cannot hide window")
+
+    shell.window = FakeWindow()
+    monkeypatch.setattr(shell_module, "prompt_close_action_win32", lambda *a, **k: KEEP_RUNNING)
+    assert shell.on_window_closing() is False
+    assert shell.controller.is_running()
+
+
+@pytest.mark.parametrize("running", [True, False])
+def test_tray_button_repeated_hide_restore_preserves_service(tmp_path, running):
+    shell = _build_manual_shell(tmp_path)
+    shell.controller.stopped = not running
+    shell.tray.started = True
+
+    class FakeWindow:
+        visible = True
+
+        def hide(self):
+            self.visible = False
+
+        def restore(self):
+            pass
+
+        def show(self):
+            self.visible = True
+
+    shell.window = FakeWindow()
+    for _ in range(100):
+        assert shell.js_api.minimize_to_tray() == {"ok": True}
+        assert not shell.window.visible
+        shell.tray.restore_panel()
+        assert shell.window.visible
+        assert shell.controller.is_running() is running
+    shell.tray.started = False
+    assert shell.js_api.minimize_to_tray()["ok"] is False
+    assert shell.window.visible
+
+
+def test_tray_button_reports_bridge_and_hide_failures(tmp_path):
+    assert ShellJsApi().minimize_to_tray()["ok"] is False
+    shell = _build_manual_shell(tmp_path)
+    shell.tray.started = True
+
+    class FakeWindow:
+        def hide(self):
+            raise RuntimeError("cannot hide")
+
+    shell.window = FakeWindow()
+    assert shell.js_api.minimize_to_tray()["ok"] is False
+    assert shell.controller.is_running()
+
+
+def test_topbar_tray_button_position_and_click_feedback():
+    import shutil
+    import subprocess
+    from agentchatroom.shell import TOPBAR_JS
+
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("Node.js unavailable")
+    harness = r'''
+const assert = require('node:assert/strict');
+const nodes = [];
+function element() {
+    return {style: {}, children: [], handlers: {},
+        append(...items) {this.children.push(...items)},
+        setAttribute() {}, addEventListener(name, fn) {this.handlers[name] = fn}};
+}
+global.document = {createElement() {const e = element(); nodes.push(e); return e},
+    body: {prepend() {}}, head: {appendChild() {}},
+    documentElement: {classList: {add() {}}}};
+let calls = 0, alerts = [], response = {ok: true};
+global.window = {alert(msg) {alerts.push(msg)}, pywebview: {api: {
+    async get_status() {return {running: true}},
+    async minimize_to_tray() {calls++; return response}
+}}};
+global.setInterval = () => {};
+'''
+    checks = r'''
+(async () => {
+    const bar = nodes.find(e => e.id === 'agentchatroom-shell-topbar');
+    const stop = bar.children.findIndex(e => e.textContent === '停止服务');
+    const button = bar.children[stop + 1];
+    assert.equal(button.textContent, '收起到托盘');
+    await button.handlers.click();
+    assert.equal(calls, 1);
+    assert.equal(button.disabled, false);
+    assert.deepEqual(alerts, []);
+    response = {ok: false, error: 'Tray unavailable'};
+    await button.handlers.click();
+    assert.deepEqual(alerts, ['Tray unavailable']);
+    assert.equal(button.disabled, false);
+})().catch(error => {console.error(error); process.exitCode = 1});
+'''
+    result = subprocess.run([node], input=harness + TOPBAR_JS + checks,
+                            capture_output=True, text=True, encoding="utf-8", timeout=15)
+    assert result.returncode == 0, result.stderr
+
+
+def test_tray_hide_restore_and_menu_exit_lifecycle(tmp_path, monkeypatch):
+    from agentchatroom import shell as shell_module
+
+    shell = _build_manual_shell(tmp_path)
+    shell.tray.started = True
+    destroyed = threading.Event()
+    prompts = []
+
+    def prompt(running, title, *, exit_panel=False):
+        prompts.append(exit_panel)
+        return STOP_AND_CLOSE if exit_panel else KEEP_RUNNING
+
+    class FakeWindow:
+        visible = True
+
+        def hide(self):
+            self.visible = False
+
+        def restore(self):
+            pass
+
+        def show(self):
+            self.visible = True
+
+        def destroy(self):
+            if shell.on_window_closing():
+                destroyed.set()
+
+    shell.window = FakeWindow()
+    monkeypatch.setattr(shell_module, "prompt_close_action_win32", prompt)
+    assert shell.on_window_closing() is False
+    assert shell.window.visible is False
+    shell.tray.restore_panel()
+    assert shell.window.visible is True
+    assert shell.controller.is_running()
+    shell.tray.quit_from_tray()
+    assert destroyed.wait(timeout=2)
+    assert prompts == [False, True]
+    assert shell.controller.stopped
+
+
+@pytest.mark.parametrize("action", [STOP_AND_CLOSE, STAY, CLOSE])
+def test_titlebar_close_stop_cancel_and_stopped_service(tmp_path, monkeypatch, action):
+    from agentchatroom import shell as shell_module
+
+    shell = _build_manual_shell(tmp_path)
+    shell.controller.stopped = action == CLOSE
+    monkeypatch.setattr(shell_module, "prompt_close_action_win32", lambda *a, **k: action)
+    assert shell.on_window_closing() is (action != STAY)
+    assert shell.controller.stopped is (action != STAY)
+
+
+def test_initial_panel_selects_primary_screen_and_fits_small_displays():
+    from types import SimpleNamespace
+    from agentchatroom import shell as shell_module
+
+    secondary = SimpleNamespace(x=-1920, y=0, width=1920, height=1080)
+    primary = SimpleNamespace(x=0, y=0, width=1920, height=1080)
+    geometry = shell_module.initial_window_geometry([secondary, primary])
+    assert geometry == dict(screen=primary, width=1440, height=900, min_size=(900, 600))
+    small = SimpleNamespace(x=0, y=0, width=1280, height=720)
+    geometry = shell_module.initial_window_geometry([small])
+    assert geometry == dict(screen=small, width=1152, height=648, min_size=(900, 600))
+    tiny = SimpleNamespace(x=0, y=0, width=800, height=600)
+    geometry = shell_module.initial_window_geometry([tiny])
+    assert geometry["min_size"] == (720, 540)
+    assert shell_module.initial_window_geometry([]) == dict(width=1440, height=900, min_size=(900, 600))

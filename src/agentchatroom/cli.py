@@ -428,6 +428,7 @@ def _terminate_server_process(pid: int) -> None:
     result = subprocess.run(
         ["taskkill", "/PID", str(pid), "/T", "/F"],
         check=False,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )

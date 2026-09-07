@@ -116,11 +116,13 @@ def test_windows_server_stop_uses_taskkill_for_the_process_tree(monkeypatch):
 
     monkeypatch.setattr(cli, "_WINDOWS", True)
     monkeypatch.setattr(cli.subprocess, "run", fake_run)
+    monkeypatch.setattr(cli.subprocess, "CREATE_NO_WINDOW", 0x08000000, raising=False)
 
     cli._terminate_server_process(4321)
 
     assert captured["command"] == ["taskkill", "/PID", "4321", "/T", "/F"]
     assert captured["kwargs"]["check"] is False
+    assert captured["kwargs"]["creationflags"] == 0x08000000
 
 
 def test_windows_server_stop_falls_back_when_taskkill_is_rejected(monkeypatch):
