@@ -56,7 +56,7 @@ const elements = Object.fromEntries(
     "create-task-button", "archive-project-button", "project-settings-button", "export-project-button",
     "connect-agent-button", "logout-button",
     "metric-agents", "metric-active", "metric-leases",
-    "metric-reviews", "active-task-list", "recent-event-list",
+    "metric-reviews", "active-task-list", "recent-event-list", "recent-activity-project",
     "lease-list", "review-list", "chat-subtitle", "chat-stream", "event-filter", "event-hide-system",
     "message-form", "message-input", "message-kind", "message-channel", "message-task", "message-priority",
     "message-requires-ack", "send-message-button", "onboarding", "new-message-notice",
@@ -1255,6 +1255,49 @@ function taskNotFinished(task) {
   return !["done", "cancelled"].includes(group);
 }
 
+const LIFECYCLE_ACTIVITY_TYPES = new Set([
+  "agent.joined", "agent.left", "agent.session_replaced", "workspace.updated",
+]);
+
+// Aggregate high-frequency session lifecycle events per (type, actor) for the
+// overview card only; the append-only event history and the Room feed stay
+// complete. Entries keep the position of their latest event.
+function mergeLifecycleActivity(events) {
+  const entries = [];
+  const byKey = new Map();
+  for (const event of events) {
+    if (!LIFECYCLE_ACTIVITY_TYPES.has(event.event_type)) {
+      entries.push({ event });
+      continue;
+    }
+    const actor = event.actor?.name || "";
+    const key = `${event.event_type}|${actor}`;
+    let entry = byKey.get(key);
+    if (!entry) {
+      entry = { merged: true, event_type: event.event_type, actor, count: 0, last: event };
+      byKey.set(key, entry);
+      entries.push(entry);
+    }
+    entry.count += 1;
+    entry.last = event;
+  }
+  const referenceId = (item) => (item.merged ? item.last.id : item.event.id);
+  entries.sort((a, b) => referenceId(a) - referenceId(b));
+  return entries;
+}
+
+function lifecycleActivitySummary(item) {
+  const times = item.count >= 3 ? ` ×${item.count}` : "";
+  const who = item.actor ? `${item.actor} ` : "";
+  const verbs = {
+    "agent.joined": "加入 Room",
+    "agent.left": "离开 Room",
+    "agent.session_replaced": "替换会话",
+    "workspace.updated": "更新工作区登记",
+  };
+  return `${who}${verbs[item.event_type] || eventLabel(item.event_type)}${times}`;
+}
+
 function renderMetrics(agents, tasks, leases) {
   const roster = currentAgentRoster(agents);
   elements["metric-agents"].textContent = roster.length;
@@ -1271,9 +1314,23 @@ function renderMetrics(agents, tasks, leases) {
       </div>`).join("")
     : '<div class="empty-state">当前没有进行中的工作。点「+ 新建任务」把第一件事交给受理 Agent。</div>';
 
-  const recent = state.events.slice(-6).reverse();
+  const projectName = state.snapshot?.project?.name || "";
+  if (elements["recent-activity-project"]) {
+    elements["recent-activity-project"].textContent = projectName
+      ? `当前项目：${projectName} · 实时更新`
+      : "实时更新";
+  }
+  const recent = mergeLifecycleActivity(state.events).slice(-6).reverse();
   elements["recent-event-list"].innerHTML = recent.length
-    ? recent.map((event) => {
+    ? recent.map((item) => {
+      if (item.merged && item.count >= 3) {
+        return `
+      <div class="compact-item merged-activity">
+        <div class="compact-heading"><span><strong>${escapeHtml(lifecycleActivitySummary(item))}</strong></span>${eventIdBadge(item.last.id)}</div>
+        <div class="compact-body"><div class="msg-line">${escapeHtml(formatTime(item.last.created_at))}</div></div>
+      </div>`;
+      }
+      const event = item.event;
       const isMessage = event.event_type.startsWith("message.") && event.payload?.body !== undefined;
       const modelBadge = isMessage ? messageModelBadge(event) : "";
       const preview = isMessage
