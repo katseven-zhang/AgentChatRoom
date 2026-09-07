@@ -1113,3 +1113,67 @@ def test_both_create_window_calls_enable_text_select():
             index += 1
         call_body = source[position : index + 1]
         assert "text_select=True" in call_body
+
+
+def test_tray_restore_retries_bounded_and_tracks_state(monkeypatch):
+    """#102: tray restore retries a bounded number of times and the shell
+    records visible/restore_failed states instead of failing silently."""
+    from agentchatroom import shell as shell_module
+
+    shell = _build_manual_shell(Path("."))
+    attempts = []
+
+    class FlakyWindow:
+        def restore(self):
+            attempts.append("restore")
+            if len(attempts) < 3:
+                raise RuntimeError("transient")
+
+        def show(self):
+            attempts.append("show")
+
+    shell.window = FlakyWindow()
+    monkeypatch.setattr(shell_module.time, "sleep", lambda seconds: None)
+    shell.tray.restore_panel()
+    assert attempts.count("restore") == 3  # bounded, stops as soon as one works
+    assert attempts[-1] == "show"
+    assert shell.window_state == "visible"
+
+
+def test_tray_restore_reports_failure_after_bounded_attempts(monkeypatch):
+    from agentchatroom import shell as shell_module
+
+    shell = _build_manual_shell(Path("."))
+
+    class BrokenWindow:
+        def restore(self):
+            raise RuntimeError("dead handle")
+
+        def show(self):
+            raise RuntimeError("dead handle")
+
+    shell.window = BrokenWindow()
+    sleeps = []
+    monkeypatch.setattr(shell_module.time, "sleep", lambda seconds: sleeps.append(seconds))
+    shell.tray.restore_panel()
+    assert shell.window_state == "restore_failed"
+    assert len(sleeps) == 3  # backoff between attempts, never unbounded
+
+
+def test_window_state_transitions_across_minimize_and_hide():
+    from agentchatroom import shell as shell_module
+
+    shell = _build_manual_shell(Path("."))
+    hidden = []
+
+    class FakeWindow:
+        def hide(self):
+            hidden.append(True)
+
+    shell.window = FakeWindow()
+    shell.tray.started = True
+    assert shell.window_state == "starting"
+    shell.on_window_minimized()
+    assert shell.window_state == "hidden"
+    shell._set_window_state("visible")
+    assert shell.window_state == "visible"

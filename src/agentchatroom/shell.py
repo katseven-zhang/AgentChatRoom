@@ -21,6 +21,7 @@ import logging
 import os
 import sys
 import threading
+import time
 import webbrowser
 from dataclasses import replace
 from pathlib import Path
@@ -573,18 +574,41 @@ class PanelTray:
             return False
 
     def restore_panel(self, icon: Any = None, item: Any = None) -> None:
-        """Bring the panel back to the foreground from tray/minimized state."""
+        """Bring the panel back to the foreground from tray/minimized state.
+
+        Runs on the tray's own thread; pywebview marshals each window call to
+        the UI thread. Restores with bounded retries so a transient failure
+        cannot wedge the tray: every attempt is logged, and the shell records
+        a diagnosable restore_failed state instead of failing silently.
+        """
         window = self.shell.window
         if window is None:
             return
-        try:
-            window.restore()
-        except Exception:
-            pass
-        try:
-            window.show()
-        except Exception as error:
-            logger.warning("Tray restore failed: %s", redact_line(str(error)))
+        attempts = 3
+        last_error: str | None = None
+        for attempt in range(1, attempts + 1):
+            try:
+                window.restore()
+                window.show()
+                self.shell._set_window_state("visible")
+                if attempt > 1:
+                    logger.info(
+                        "Tray restore succeeded on attempt %d", attempt
+                    )
+                return
+            except Exception as error:
+                last_error = redact_line(str(error))
+                logger.warning(
+                    "Tray restore attempt %d/%d failed: %s",
+                    attempt,
+                    attempts,
+                    type(error).__name__,
+                )
+            time.sleep(0.3 * attempt)
+        self.shell._set_window_state("restore_failed")
+        logger.error(
+            "Tray restore exhausted %d attempts: %s", attempts, last_error
+        )
 
     def quit_from_tray(self, icon: Any = None, item: Any = None) -> None:
         """Request a real exit without blocking the tray's message loop."""
@@ -634,6 +658,19 @@ class GuiShell:
         self.window: Any = None
         self._tray_exit_requested = False
         self._context_menu_enabled = False
+        self._window_state = "starting"
+        self._state_lock = threading.Lock()
+
+    def _set_window_state(self, state: str) -> None:
+        """Track the visible window lifecycle for audit and tray decisions."""
+        with self._state_lock:
+            self._window_state = state
+        logger.info("Shell window state: %s", state)
+
+    @property
+    def window_state(self) -> str:
+        with self._state_lock:
+            return self._window_state
 
     def config_file_path(self) -> Path:
         if self.settings.config_path:
@@ -736,12 +773,14 @@ class GuiShell:
             return {"ok": False, "error": "托盘暂不可用，面板已保留，请稍后重试。"}
         try:
             self.window.hide()
+            self._set_window_state("hidden")
             return {"ok": True}
         except Exception as error:
             logger.warning("Minimize-to-tray failed: %s", redact_line(str(error)))
             return {"ok": False, "error": "无法收起面板，请稍后重试。"}
 
     def on_window_minimized(self) -> None:
+        self._set_window_state("minimized")
         self.hide_to_tray()
 
     def request_tray_exit(self) -> None:
@@ -825,11 +864,14 @@ class GuiShell:
         self.window.events.loaded += self.on_window_loaded
         self.window.events.closing += self.on_window_closing
         self.window.events.minimized += self.on_window_minimized
+        self.window.events.shown += lambda: self._set_window_state("visible")
 
         self.tray.start()
+        self._set_window_state("visible")
 
         try:
             webview.start(debug=debug)
+            self._set_window_state("exited")
             return 0
         except Exception as error:
             logger.error(
