@@ -12,7 +12,13 @@ on:
       - "src/**"
       - "tests/test_shell.py"
       - "tests/test_web_assets.py"
+  release:
+    types:
+      - published
   workflow_dispatch:
+
+permissions:
+  contents: write
 
 jobs:
   package-windows:
@@ -71,3 +77,11 @@ jobs:
           path: dist/agentchatroom-windows-x64.zip
           if-no-files-found: error
           retention-days: 14
+
+      - name: Upload archive to published release
+        if: github.event_name == 'release'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.release.tag_name }}
+          files: dist/agentchatroom-windows-x64.zip
+          fail_on_unmatched_files: true

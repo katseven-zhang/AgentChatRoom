@@ -136,7 +136,8 @@ GUI 初次打开时在主屏居中，默认尺寸为 1440×900；较小屏幕会
 
 `.github/workflows/package-windows.yml` 会在 `main` 分支的相关代码更新后自动运行，也可以在 GitHub Actions 中手工选择
 `Package Windows EXE` 并点击 **Run workflow**。构建完成后，在 workflow 的 Artifacts 中下载
-`agentchatroom-windows-x64.zip`；解压后直接运行目录内唯一的 `agentchatroom.exe`，无需安装 Python。该发布包是 PyInstaller
+`agentchatroom-windows-x64.zip`；解压后直接运行目录内唯一的 `agentchatroom.exe`，无需安装 Python。发布 Release 后，
+同一个 workflow 还会自动构建并把压缩包挂到对应的 GitHub Release，免去手动上传。该发布包是 PyInstaller
 onedir 形态，目录内的 DLL 和运行库必须与 exe 一起保留。
 
 人工冒烟测试建议依次确认：双击能打开面板；点击「启动服务」后能进入管理端；修改端口后重启仍使用新配置；点击「停止服务」回到占位页；

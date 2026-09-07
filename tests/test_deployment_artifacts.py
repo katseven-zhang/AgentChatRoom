@@ -143,3 +143,6 @@ def test_windows_package_workflow_builds_and_uploads_single_exe() -> None:
     assert "dist\\agentchatroom\\agentchatroom.exe" in workflow
     assert "agentchatroom-windows-x64.zip" in workflow
     assert "actions/upload-artifact@v4" in workflow
+    assert "types:" in workflow and "published" in workflow
+    assert "softprops/action-gh-release@v2" in workflow
+    assert "github.event.release.tag_name" in workflow
