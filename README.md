@@ -407,7 +407,7 @@ workspace roots / cwd 是可靠的当前工作区证据，永远优先于配置�
 
 配置助手只负责首次安装或明确缺失配置，不得声称已经连接或同步。`room_bootstrap` 不编辑第三方客户端配置文件，不认领任务，不改写历史事件。兼容期仍可显式传入 `project_id` / `session_id` / `token`，但必须与当前绑定一致；跨 Project 或旧 Session 会被拒绝。非目标：不要求所有 MCP 客户端都支持自动 Resource 注入，也不把完全零调用作为首版硬要求。
 
-Web「配置本机 Agent」把四件事实分开显示：软件配置、进程连接（MCP Presence）、Room Session、当前对话同步。浏览器无法观察某个模型对话是否已同步，因此不会把左侧「已连接」画成「当前对话已同步」。CLI `room-bootstrap` 复用同一领域服务，成功结果也不打印 Session Token。
+Web「配置本机 Agent」把五件事实分开显示：工作区绑定、软件配置、进程连接（MCP Presence）、Room Session、当前对话同步。浏览器无法观察某个模型对话是否已同步，因此不会把左侧「已连接」画成「当前对话已同步」。生成的 onboarding prompt 内置「工作区与 Room 绑定边界」：本配置只针对当前显示的工作区/Project 生成（稳定软件身份可跨 Project 复用，工作区上下文不可静默复用；客户端不能提供可靠 workspace roots/cwd 时应使用独立 MCP 配置/进程并在重载后重新 bootstrap）；接入完成后第一步调用零参数 `room_bootstrap` 并核对返回的 Project 名称与 root_path；出现未登记、登记损坏、多 Project/配置冲突、项目不匹配或 Session 过期时立即停止消息、任务、文件占用等写操作，只按唯一 required_action 恢复；生效顺序为应用配置 → 重载客户端 MCP → 零参数 `room_bootstrap` 核对项目 → 之后才允许写操作。prompt 不要求或暴露任何项目/会话标识或凭据，也不指导手改 checkout 登记。CLI `room-bootstrap` 复用同一领域服务，成功结果也不打印 Session Token。
 
 ### MCP 生命周期与启动归属
 

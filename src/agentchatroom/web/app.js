@@ -3170,7 +3170,14 @@ function renderLocalMcpFacts() {
   const softwareConfigured = plan?.state === "current";
   const processConnected = identity?.connection_status === "connected";
   const roomSession = Number(identity?.active_session_count || 0) > 0;
+  const projectName = state.integration?.project?.name || "";
   const facts = [
+    {
+      label: "工作区绑定",
+      value: projectName ? `针对 ${projectName}` : "针对当前项目",
+      state: projectName ? "ready" : "pending",
+      note: "配置只针对当前工作区生成，不能跨工作区复用",
+    },
     {
       label: "软件配置",
       value: !plan ? "正在检测" : softwareConfigured ? "已配置" : "未就绪",

@@ -161,6 +161,7 @@ def build_onboarding_prompt(
     profile: Mapping[str, Any],
     transport: str,
     config_text: str,
+    project: Mapping[str, Any] | None = None,
 ) -> str:
     """Build a concise handoff containing only the generated MCP connection facts."""
     client_label = str(profile.get("label", profile_id)).strip() or profile_id
@@ -184,13 +185,25 @@ def build_onboarding_prompt(
             "让每个工作区按自身 checkout 登记解析 Room；"
             "否则未登记的工作区会被兜底进错误项目。"
         )
+    binding_section = ""
+    if project:
+        project_name = str(project.get("name", "")).strip()
+        workspace_label = f"「{project_name}」" if project_name else "当前项目"
+        binding_section = f"""
+
+工作区与 Room 绑定边界（必须遵守）：
+1. 本配置针对当前显示的工作区/Project{workspace_label}生成。稳定软件身份可跨 Project 复用；工作区路径与项目上下文不能被上一个项目静默带入另一个工作区。客户端若不能提供可靠的 workspace roots/cwd，请为本工作区使用独立的 MCP 配置/进程，并在重载后重新 bootstrap。
+2. 接入完成后第一步：调用零参数 `room_bootstrap`，核对返回的 Project 名称与 root_path 与当前工作区一致；status=ready 只表示绑定成功，conversation_synced 只表示当前模型对话已同步，两者是不同事实。
+3. 出现未登记、登记损坏、多 Project/配置冲突、Project 不匹配或 Session 过期时：立即停止消息、任务、文件占用等一切写操作，只按返回的 required_action 唯一恢复动作处理，不得改用其他项目继续写入。
+4. 不要填写、猜测或复制任何项目/会话标识或凭据；不要手改 checkout 登记文件；不要通过改软件身份绕过绑定。
+5. 生效顺序：应用配置 → 重载客户端 MCP → 零参数 `room_bootstrap` 核对项目 → 之后才允许消息、任务、文件占用等写操作。"""
 
     return f"""请为 {client_label} 接入名为 `{MCP_SERVER_NAME}` 的 MCP Server。
 
 连接方式：{transport_label}
 请根据当前客户端和运行环境自行完成接入。连接配置：
 
-{config_text.rstrip()}{lifecycle_note}{pin_warning}"""
+{config_text.rstrip()}{lifecycle_note}{pin_warning}{binding_section}"""
 
 
 def _profile_identity_environment(
@@ -379,18 +392,21 @@ def build_mcp_integration(
                     profile=profile,
                     transport="local",
                     config_text=config_text,
+                    project=project,
                 ),
                 "http": build_onboarding_prompt(
                     profile_id=profile_id,
                     profile=profile,
                     transport="http",
                     config_text=http_config_text,
+                    project=project,
                 ),
                 "remote": build_onboarding_prompt(
                     profile_id=profile_id,
                     profile=profile,
                     transport="remote",
                     config_text=remote_config_text,
+                    project=project,
                 ),
             }
         if profile_id == "workbuddy":

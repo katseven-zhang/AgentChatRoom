@@ -125,7 +125,15 @@ def test_project_integration_builds_stable_workbuddy_memory_without_live_state(t
     assert "请根据当前客户端和运行环境自行完成接入" in prompt
     assert "project_key：sample-project" not in prompt
     assert "room_join" not in prompt
-    assert "room_bootstrap" not in prompt
+    # #98: the prompt must now REQUIRE a first zero-arg room_bootstrap and a
+    # project check instead of staying silent about the binding step.
+    assert "工作区与 Room 绑定边界" in prompt
+    assert "调用零参数 `room_bootstrap`" in prompt
+    assert "root_path" in prompt
+    assert "不能被上一个项目静默带入另一个工作区" in prompt
+    assert "针对当前显示的工作区/Project「AgentChatRoom」" in prompt
+    assert "立即停止消息、任务、文件占用等一切写操作" in prompt
+    assert "不要填写、猜测或复制任何项目/会话标识或凭据" in prompt
     assert "model_display_name" not in prompt
     assert "协作规则" not in prompt
     assert ".agentchatroom/project.json" not in prompt
@@ -246,3 +254,11 @@ def test_onboarding_prompt_states_lifecycle_and_pin_semantics(tmp_path):
     assert "失败也不会自动拉起" in prompt
     assert "AGENTCHATROOM_PROJECT_PATH" in prompt
     assert "兜底" in prompt
+    # #98: every transport's prompt carries the same binding boundary.
+    for transport, text in result["profiles"]["generic"]["onboarding_prompts"].items():
+        assert "工作区与 Room 绑定边界" in text, transport
+        assert "调用零参数 `room_bootstrap`" in text, transport
+        assert "root_path" in text, transport
+        assert "立即停止消息、任务、文件占用等一切写操作" in text, transport
+        assert "「AgentChatRoom」" in text, transport
+        assert "生效顺序" in text, transport

@@ -235,7 +235,7 @@ def test_web_supports_human_reading_and_guided_interactions():
     assert "state.integration.profiles" in javascript
     assert 'id="integration-onboarding-prompt"' in markup
     assert "让 Agent 配置 MCP" in markup
-    assert "复制当前环境的 MCP 连接参数，由 Agent 自行完成接入" in markup
+    assert "复制当前环境的 MCP 连接参数与绑定边界，Agent 接入后先零参数 room_bootstrap 核对当前项目" in markup
     assert "受权限限制时返回可直接粘贴的配置文本" not in markup
     assert "复制配置指令" in markup
     assert "这段提示词包含当前项目" not in markup
