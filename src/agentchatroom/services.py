@@ -4101,6 +4101,91 @@ class AgentChatRoomService:
                 "cursor": event_id,
             }
 
+    def _cancel_task_resources_locked(
+        self,
+        connection: Any,
+        project_id: str,
+        task_id: str,
+        actor_session_id: str | None,
+    ) -> dict[str, Any]:
+        """Release active leases and cancel pending assignments/handoffs when
+        a task is cancelled. Runs inside an open write transaction so the
+        terminal state never leaves orphan resources behind."""
+        now = iso_now()
+        active_leases = connection.execute(
+            """
+            SELECT id FROM file_leases
+            WHERE project_id = ? AND task_id = ? AND released_at IS NULL
+            """,
+            (project_id, task_id),
+        ).fetchall()
+        released_lease_ids = [row["id"] for row in active_leases]
+        if released_lease_ids:
+            connection.execute(
+                """
+                UPDATE file_leases SET released_at = ?
+                WHERE project_id = ? AND task_id = ? AND released_at IS NULL
+                """,
+                (now, project_id, task_id),
+            )
+        pending_assignments = connection.execute(
+            """
+            SELECT id FROM task_assignments
+            WHERE project_id = ? AND task_id = ? AND status = 'pending'
+            """,
+            (project_id, task_id),
+        ).fetchall()
+        cancelled_assignment_ids = [row["id"] for row in pending_assignments]
+        if cancelled_assignment_ids:
+            placeholders = _sql_placeholders(len(cancelled_assignment_ids))
+            connection.execute(
+                f"""
+                UPDATE task_assignments
+                SET status = 'cancelled', responded_by_session_id = ?,
+                    response_note = 'cancelled by task cancellation', responded_at = ?
+                WHERE project_id = ? AND task_id = ?
+                  AND status = 'pending' AND id IN ({placeholders})
+                """,
+                (
+                    actor_session_id,
+                    now,
+                    project_id,
+                    task_id,
+                    *cancelled_assignment_ids,
+                ),
+            )
+        pending_handoffs = connection.execute(
+            """
+            SELECT id FROM task_handoffs
+            WHERE project_id = ? AND task_id = ? AND status = 'pending'
+            """,
+            (project_id, task_id),
+        ).fetchall()
+        cancelled_handoff_ids = [row["id"] for row in pending_handoffs]
+        if cancelled_handoff_ids:
+            placeholders = _sql_placeholders(len(cancelled_handoff_ids))
+            connection.execute(
+                f"""
+                UPDATE task_handoffs
+                SET status = 'cancelled', responded_by_session_id = ?,
+                    response_note = 'cancelled by task cancellation', responded_at = ?
+                WHERE project_id = ? AND task_id = ?
+                  AND status = 'pending' AND id IN ({placeholders})
+                """,
+                (
+                    actor_session_id,
+                    now,
+                    project_id,
+                    task_id,
+                    *cancelled_handoff_ids,
+                ),
+            )
+        return {
+            "released_lease_ids": released_lease_ids,
+            "cancelled_assignment_ids": cancelled_assignment_ids,
+            "cancelled_handoff_ids": cancelled_handoff_ids,
+        }
+
     def _release_task_locked(
         self,
         connection: Any,
@@ -5349,6 +5434,11 @@ class AgentChatRoomService:
                 event_type = "task.cancelled"
             else:
                 event_type = "task.updated"
+            cancellation_cleanup: dict[str, Any] | None = None
+            if event_type == "task.cancelled":
+                cancellation_cleanup = self._cancel_task_resources_locked(
+                    connection, project_id, task_id, session_id
+                )
             event_id = self._emit(
                 connection,
                 project_id,
@@ -5366,6 +5456,11 @@ class AgentChatRoomService:
                     "integration_status": next_integration_status,
                     "changed_fields": changed_fields,
                     "blocker_reason": next_blocker_reason,
+                    **(
+                        {"cancellation": cancellation_cleanup}
+                        if cancellation_cleanup is not None
+                        else {}
+                    ),
                 },
             )
             row = connection.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()

@@ -70,7 +70,7 @@ const elements = Object.fromEntries(
     "task-history-filter", "task-history-load-earlier", "task-history-load-later",
     "task-assign-button", "task-assignment-list", "task-assign-dialog", "task-assign-form",
     "task-release-button", "task-release-dialog", "task-release-form", "task-release-title",
-    "task-release-reason", "task-release-reason-text", "task-release-submit",
+    "task-release-reason", "task-release-reason-text", "task-release-submit", "task-cancel-button",
     "task-assign-title", "task-assign-agent", "task-assign-agent-empty", "task-assign-note", "task-assign-submit",
     "settings-dialog", "settings-form", "settings-project-name", "settings-lease-policy", "settings-roles",
     "settings-default-priority", "settings-mcp-message-limit", "settings-audit-retention", "settings-auto-backup", "settings-backup-max-kept", "settings-backup-hint",
@@ -693,6 +693,39 @@ function resetProjectFilters() {
 function taskReleaseVisible(task) {
   // 释放按钮只在可释放的执行阶段显示；终态与待验收阶段不换执行者。
   return ["claimed", "in_progress", "blocked"].includes(task.execution_status);
+}
+
+function taskCancelVisible(task) {
+  // 取消入口与服务端状态转换表一致：done 是终态不可取消，已取消无需重复取消。
+  const phase = taskView(task).phase;
+  return phase !== "done" && phase !== "cancelled";
+}
+
+async function cancelTask(task) {
+  elements["task-cancel-button"].disabled = true;
+  try {
+    await api(`/api/v1/projects/${state.projectId}/tasks/${task.id}`, {
+      method: "PATCH",
+      body: JSON.stringify({ status: "cancelled" }),
+    });
+    await refreshTaskIntakeData();
+    const updatedTask = state.snapshot?.tasks.find((item) => item.id === task.id) || task;
+    renderTaskContract(updatedTask);
+    renderTaskAssignments(updatedTask);
+    renderTaskTimeline(updatedTask);
+    renderTasks(state.snapshot?.tasks || []);
+    showToast(`任务 #${task.task_number} 已取消，历史与审计保留`);
+  } catch (error) {
+    handleError(error);
+    showToast(
+      error.code === "invalid_transition"
+        ? "任务当前状态不允许取消，请刷新后重试"
+        : `取消失败：${error.message}`,
+      "error",
+    );
+  } finally {
+    elements["task-cancel-button"].disabled = false;
+  }
 }
 
 function clearDialogDrafts(dialog) {
@@ -2228,6 +2261,23 @@ elements["backup-list"].addEventListener("click", (event) => {
 });
 elements["task-assign-button"].addEventListener("click", () => openTaskAssignmentDialog().catch(handleError));
 
+elements["task-cancel-button"].addEventListener("click", () => {
+  const task = state.snapshot?.tasks.find((item) => item.id === state.editingTaskId);
+  if (!task || !state.projectId) return;
+  const view = taskView(task);
+  const occupied = ["claimed", "in_progress", "blocked"].includes(task.execution_status);
+  const cancelNote =
+    "取消任务 #" + task.task_number + "「" + task.title + "」？\n\n" +
+    "当前状态：" + view.phase + "\n" +
+    (occupied
+      ? "该任务有执行中的 Agent：取消会立即释放其文件占用并撤销待确认指派。\n"
+      : "") +
+    "取消后将保留全部历史与审计记录，停止后续执行。确定要取消吗？";
+  const confirmed = window.confirm(cancelNote);
+  if (!confirmed) return;
+  cancelTask(task);
+});
+
 elements["task-release-button"].addEventListener("click", () => {
   const task = state.snapshot?.tasks.find((item) => item.id === state.editingTaskId);
   if (!task || !state.projectId) return;
@@ -3097,6 +3147,7 @@ async function openTaskDetails(taskId, options = {}) {
   renderTaskTimeline(task);
   elements["task-assign-button"].disabled = ["done", "cancelled"].includes(taskView(task).phase);
   elements["task-release-button"].classList.toggle("is-hidden", !taskReleaseVisible(task));
+  elements["task-cancel-button"].classList.toggle("is-hidden", !taskCancelVisible(task));
   elements["task-edit-dialog"].showModal();
   try {
     await loadTaskHistory(taskId);
