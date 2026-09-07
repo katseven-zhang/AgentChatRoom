@@ -150,8 +150,44 @@ async function startService() {
   }
 }
 </script>
+<script>
+__SHELL_COPY_JS__
+</script>
 </body>
 </html>
+"""
+
+# Right-click copy support for the desktop shell: pywebview 6.x only enables
+# the WebView2 default context menu in debug mode, so a right-click on a
+# selection copies immediately and confirms with a toast; pages without a
+# selection keep native behavior.
+SHELL_COPY_JS = r"""
+(function() {
+    if (window.__agentchatroom_shell_copy) return;
+    window.__agentchatroom_shell_copy = true;
+    document.addEventListener('contextmenu', function (event) {
+        var selection = '';
+        if (window.getSelection) selection = String(window.getSelection());
+        if (!selection) return;
+        event.preventDefault();
+        var copied = false;
+        try { copied = document.execCommand('copy'); } catch (error) { copied = false; }
+        if (!copied && navigator.clipboard) {
+            navigator.clipboard.writeText(selection).catch(function () {});
+        }
+        var toast = document.createElement('div');
+        toast.textContent = '已复制选中文本';
+        toast.style.cssText = [
+            'position:fixed', 'z-index:2147483000', 'left:50%', 'top:24px',
+            'transform:translateX(-50%)', 'padding:8px 16px', 'border-radius:8px',
+            'background:rgba(20,20,20,.85)', 'color:#fff',
+            'font:13px/1.6 "Segoe UI", system-ui, sans-serif',
+            'box-shadow:0 4px 16px rgba(0,0,0,.25)'
+        ].join(';');
+        document.body.appendChild(toast);
+        setTimeout(function () { toast.remove(); }, 1600);
+    }, true);
+})();
 """
 
 TOPBAR_JS = r"""
@@ -597,6 +633,7 @@ class GuiShell:
         self.tray = PanelTray(self)
         self.window: Any = None
         self._tray_exit_requested = False
+        self._context_menu_enabled = False
 
     def config_file_path(self) -> Path:
         if self.settings.config_path:
@@ -604,7 +641,10 @@ class GuiShell:
         return self.settings.data_dir / "config.toml"
 
     def placeholder_html(self) -> str:
-        return PLACEHOLDER_HTML.replace("%PORT%", str(self.settings.port))
+        return (
+            PLACEHOLDER_HTML.replace("%PORT%", str(self.settings.port))
+            .replace("__SHELL_COPY_JS__", SHELL_COPY_JS)
+        )
 
     def ensure_server_running(self) -> None:
         """In local mode, ensure detached server is running and healthy."""
@@ -644,14 +684,50 @@ class GuiShell:
         """Inject shell bridges into backend pages (never into the placeholder)."""
         if not self.window:
             return
+        self._enable_native_context_menu_once()
         try:
             current_url = self.window.get_current_url() or ""
             if current_url.startswith(self.target.base_url):
                 self.window.evaluate_js(FOLDER_PICKER_INTERCEPT_JS)
+                self.window.evaluate_js(SHELL_COPY_JS)
                 self.window.evaluate_js(TOPBAR_JS)
         except Exception as error:
             logger.warning(
                 "Failed to inject shell bridges: %s", redact_line(str(error))
+            )
+
+    def _enable_native_context_menu_once(self) -> None:
+        """Enable the WebView2 default context menu (right-click 复制).
+
+        pywebview 6.x only enables default context menus in debug mode; the
+        shell needs them for right-click copy in normal usage. Best effort:
+        if the native handle is unavailable the shell still offers selection
+        and Ctrl+C copy.
+        """
+        if self._context_menu_enabled:
+            return
+        browser = getattr(self.window, "native", None)
+        control = getattr(browser, "webview", None)
+        if control is None:
+            return
+
+        def _enable():
+            control.CoreWebView2.Settings.AreDefaultContextMenusEnabled = True
+
+        try:
+            if getattr(browser, "InvokeRequired", False):
+                from System import Action
+
+                browser.Invoke(Action(_enable))
+            else:
+                _enable()
+            self._context_menu_enabled = True
+            logger.info("WebView2 default context menu enabled")
+        except Exception as error:
+            logger.warning(
+                "Context menu enabling deferred: %s %s",
+                type(error).__name__,
+                redact_line(str(error)),
             )
 
     def hide_to_tray(self) -> dict[str, Any]:
@@ -732,6 +808,7 @@ class GuiShell:
                 js_api=self.js_api,
                 **geometry,
                 confirm_close=False,
+                text_select=True,
             )
         else:
             self.window = webview.create_window(
@@ -740,6 +817,7 @@ class GuiShell:
                 js_api=self.js_api,
                 **geometry,
                 confirm_close=False,
+                text_select=True,
             )
         self.js_api.set_window(self.window)
 

@@ -692,6 +692,8 @@ def test_shell_js_api_get_status_reports_running(tmp_path):
 def test_placeholder_and_topbar_carry_manual_controls_without_literals():
     from agentchatroom import shell as shell_module
 
+    from agentchatroom import shell as shell_module
+
     source = Path(shell_module.__file__).read_text(encoding="utf-8")
     assert "服务未启动" in shell_module.PLACEHOLDER_HTML
     assert "启动服务" in shell_module.PLACEHOLDER_HTML
@@ -1080,3 +1082,34 @@ def test_initial_panel_selects_primary_screen_and_fits_small_displays():
     geometry = shell_module.initial_window_geometry([tiny])
     assert geometry["min_size"] == (720, 540)
     assert shell_module.initial_window_geometry([]) == dict(width=1440, height=900, min_size=(900, 600))
+
+
+def test_both_create_window_calls_enable_text_select():
+    """#99: the desktop shell must allow text selection and copy everywhere.
+
+    pywebview defaults text_select to False; both create_window branches
+    (running-service navigation and the placeholder page) must opt in.
+    """
+    from agentchatroom import shell as shell_module
+
+    source = Path(shell_module.__file__).read_text(encoding="utf-8")
+    positions = [
+        index
+        for index in range(len(source))
+        if source.startswith("webview.create_window(", index)
+    ]
+    assert len(positions) == 2, "expected exactly two create_window calls"
+    for position in positions:
+        depth = 0
+        index = position + len("webview.create_window(")
+        start = index
+        while index < len(source):
+            if source[index] == "(":
+                depth += 1
+            elif source[index] == ")":
+                if depth == 0:
+                    break
+                depth -= 1
+            index += 1
+        call_body = source[position : index + 1]
+        assert "text_select=True" in call_body
