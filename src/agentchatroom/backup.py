@@ -140,6 +140,7 @@ def _run_database_tool(command: list[str], *, action: str) -> None:
         completed = subprocess.run(
             command,
             check=False,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
             capture_output=True,
             text=True,
             stdin=subprocess.DEVNULL,

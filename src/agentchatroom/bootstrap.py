@@ -4,7 +4,7 @@ import json
 import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable, Mapping
+from typing import Any, Callable, Iterable, Mapping
 from urllib.parse import unquote, urlparse
 
 from .errors import DomainError
@@ -161,9 +161,10 @@ def discover_workspace_candidates(
         seen.add(key)
         ordered.append(path.resolve())
 
-    for root in workspace_roots or ():
+    roots = list(workspace_roots or ())
+    for root in roots:
         add(find_registered_checkout(root))
-    if cwd is not None and str(cwd).strip():
+    if not roots and cwd is not None and str(cwd).strip():
         add(find_registered_checkout(cwd))
     return ordered
 
@@ -298,19 +299,21 @@ def bootstrap_local_room(
     cwd: str | Path | None = None,
     explicit_project_path: str | Path | None = None,
     loaded_identity: tuple[str, str, str] | None = None,
+    authorize_project: Callable[[str], Any] | None = None,
 ) -> BootstrapOutcome:
     current_identity = (software_key, software_name, client)
     if loaded_identity is not None and loaded_identity != current_identity:
         return BootstrapOutcome(bootstrap_status_payload("mcp_restart_required"))
 
+    roots = list(workspace_roots or ())
     workspace_candidates = discover_workspace_candidates(
-        workspace_roots=workspace_roots,
+        workspace_roots=roots,
         cwd=cwd,
     )
     configured_checkout = resolve_configured_checkout(explicit_project_path)
     if workspace_candidates:
         candidates: list[Path] = workspace_candidates
-    elif configured_checkout is not None:
+    elif configured_checkout is not None and not roots and not (cwd and str(cwd).strip()):
         candidates = [configured_checkout]
     else:
         return BootstrapOutcome(bootstrap_status_payload("project_not_registered"))
@@ -332,7 +335,7 @@ def bootstrap_local_room(
         if not present or not project_key:
             continue
         unique_keys.setdefault(project_key, candidate)
-    if invalid is not None and not unique_keys:
+    if invalid is not None:
         return BootstrapOutcome(bootstrap_status_payload("registration_invalid"))
     if len(unique_keys) > 1:
         return BootstrapOutcome(
@@ -369,6 +372,8 @@ def bootstrap_local_room(
 
     workspace_path = str(checkout)
     try:
+        if authorize_project is not None:
+            authorize_project(project["id"])
         registered = service.register_workspace(
             project["id"],
             host_key=f"host:{software_key}",

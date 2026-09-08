@@ -19,15 +19,18 @@ import sys
 def main() -> None:
     args = sys.argv[1:]
     command = args[0] if args else ""
+    if command == "mcp":
+        from agentchatroom.stdio_runtime import run_mcp_entry
+
+        run_mcp_entry(args[1:])
+        return
+    from agentchatroom.stdio_runtime import prepare_standard_streams
+
+    prepare_standard_streams()
     if command == "" or command == "gui" or command.startswith("-"):
         from agentchatroom.shell import main as shell_main
 
         shell_main(args[1:] if command == "gui" else args)
-        return
-    if command == "mcp":
-        from agentchatroom.mcp_server import main as mcp_main
-
-        mcp_main(args[1:])
         return
     from agentchatroom.cli import main as cli_main
 
@@ -35,4 +38,7 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+    from multiprocessing import freeze_support
+
+    freeze_support()
     main()

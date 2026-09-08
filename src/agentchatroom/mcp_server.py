@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
+import asyncio
 import inspect
 import logging
 import os
 import socket
 import sys
 import threading
+import weakref
 from collections.abc import Callable
 from contextvars import ContextVar
 from pathlib import Path
@@ -25,6 +26,7 @@ from .database import create_database
 from .errors import DomainError
 from .mcp_compat import CompatibleToolManager
 from .presence import LocalPresenceManager
+from .service_lifetime import require_running_service
 from .bootstrap import (
     RuntimeBinding,
     bind_runtime_arguments,
@@ -58,9 +60,13 @@ _runtime_binding: ContextVar[RuntimeBinding | None] = ContextVar(
     "agentchatroom_runtime_binding",
     default=None,
 )
-_session_bindings: dict[str, RuntimeBinding] = {}
+_session_bindings: dict[str, RuntimeBinding | None] = {}
 _session_bindings_lock = threading.RLock()
+_transport_keys: dict[int, tuple[weakref.ReferenceType, str]] = {}
+_active_binding_key: ContextVar[str | None] = ContextVar("mcp_binding_key", default=None)
 _loaded_identity: tuple[str, str, str] | None = None
+_stdio_settings = None
+_stdio_generation: str | None = None
 _bootstrap_workspace_roots: ContextVar[list[Path] | None] = ContextVar(
     "agentchatroom_bootstrap_workspace_roots",
     default=None,
@@ -81,18 +87,36 @@ class ServiceBoundToolManager(CompatibleToolManager):
     ) -> Any:
         provider_token = None
         roots_token = None
-        session_key = mcp_session_key(context)
+        try:
+            session_key = mcp_session_key(context)
+        except DomainError as error:
+            return {"ok": False, **error.as_dict()}
+        key_token = _active_binding_key.set(session_key)
         previous_binding = _runtime_binding.get()
         if self.service_provider is not None:
             provider_token = _bound_service_provider.set(self.service_provider)
         try:
+            if _stdio_settings is not None and self.service_provider is None:
+                try:
+                    _check_stdio_lifetime()
+                except DomainError:
+                    clear_runtime_binding()
+                    persist_runtime_binding(session_key, None)
+                    _runtime_binding.set(None)
+                    raise
             forwarded = dict(arguments or {})
             restored = get_runtime_binding(session_key)
-            if restored is not None:
-                _runtime_binding.set(restored)
+            _runtime_binding.set(restored)
+            with _session_bindings_lock:
+                invalidated = session_key in _session_bindings and restored is None
+            if invalidated and name != "room_bootstrap":
+                raise DomainError("session_expired", "Bootstrap must succeed before using this connection", status_code=401)
             if name == "room_bootstrap":
+                # Rebinding must fail closed, including identity and roots errors.
+                persist_runtime_binding(session_key, None)
+                _runtime_binding.set(None)
                 roots_token = _bootstrap_workspace_roots.set(
-                    await collect_mcp_workspace_roots(context)
+                    await collect_mcp_workspace_roots(context, timeout_seconds=get_service().settings.mcp_roots_timeout_seconds)
                 )
             elif name != "room_join":
                 tool = self.get_tool(name)
@@ -125,6 +149,7 @@ class ServiceBoundToolManager(CompatibleToolManager):
                 _runtime_binding.set(previous_binding)
             if provider_token is not None:
                 _bound_service_provider.reset(provider_token)
+            _active_binding_key.reset(key_token)
 
 
 MCP_INSTRUCTIONS = (
@@ -156,18 +181,38 @@ def mcp_session_key(context: Any = None) -> str:
     session = getattr(request_context, "session", None) if request_context is not None else None
     if session is None and context is not None:
         session = getattr(context, "session", None)
-    for attr in ("session_id", "_session_id", "id"):
-        value = getattr(session, attr, None) if session is not None else None
-        if value:
-            return f"mcp:{value}"
+    # The SDK ServerSession does not expose the HTTP transport's session ID.
+    # Bind to the actual connection object, never to its credentials: separate
+    # connections may legitimately share a software identity and access token.
+    if session is not None:
+        object_id = id(session)
+        with _session_bindings_lock:
+            existing = _transport_keys.get(object_id)
+            if existing is not None and existing[0]() is session:
+                return existing[1]
+            key = new_id("transport")
+            def released(reference):
+                with _session_bindings_lock:
+                    entry = _transport_keys.get(object_id)
+                    if entry is not None and entry[0] is reference:
+                        _transport_keys.pop(object_id, None)
+                        _session_bindings.pop(key, None)
+            try:
+                reference = weakref.ref(session, released)
+            except TypeError:
+                # Lightweight adapters must retain their own opaque key.
+                key = getattr(session, "_acr_binding_key", None) or key
+                setattr(session, "_acr_binding_key", key)
+            else:
+                _transport_keys[object_id] = (reference, key)
+            return key
     try:
         access = get_access_token()
     except LookupError:
         access = None
     token = getattr(access, "token", "") if access is not None else ""
-    if token:
-        digest = hashlib.sha256(str(token).encode("utf-8")).hexdigest()[:16]
-        return f"auth:{digest}"
+    if token or context is not None:
+        raise DomainError("runtime_context_missing", "A distinct MCP connection context is required", status_code=409)
     return "stdio:local"
 
 
@@ -191,7 +236,7 @@ def set_runtime_binding(
     session_key: str | None = None,
 ) -> None:
     _runtime_binding.set(binding)
-    persist_runtime_binding(session_key or "stdio:local", binding)
+    persist_runtime_binding(session_key or _active_binding_key.get() or "stdio:local", binding)
 
 
 def clear_runtime_binding(session_key: str | None = None) -> None:
@@ -215,7 +260,7 @@ def clear_bindings_for_agent_session(session_id: str) -> None:
         _runtime_binding.set(None)
 
 
-async def collect_mcp_workspace_roots(context: Any) -> list[Path]:
+async def collect_mcp_workspace_roots(context: Any, *, timeout_seconds: float = 5.0) -> list[Path]:
     if context is None:
         return []
     request_context = getattr(context, "request_context", None)
@@ -227,17 +272,25 @@ async def collect_mcp_workspace_roots(context: Any) -> list[Path]:
     list_roots = getattr(session, "list_roots", None) if session is not None else None
     if list_roots is None:
         return []
-    try:
-        result = await list_roots()
-    except Exception:
-        logger.debug("MCP client did not provide workspace roots")
+    client_params = getattr(session, "client_params", None)
+    if client_params is not None and getattr(client_params.capabilities, "roots", None) is None:
         return []
+    try:
+        result = await asyncio.wait_for(list_roots(), timeout=timeout_seconds)
+    except TimeoutError as error:
+        raise DomainError("workspace_roots_unavailable", "Workspace roots timed out; restore the client connection before bootstrap", status_code=409) from error
+    except Exception as error:
+        raise DomainError("workspace_roots_unavailable", "Workspace roots failed; restore the client connection before bootstrap", status_code=409) from error
     roots: list[Path] = []
     for root in getattr(result, "roots", None) or []:
         uri = str(getattr(root, "uri", "") or "")
         path = workspace_path_from_file_uri(uri)
         if path is not None:
             roots.append(path)
+        else:
+            raise DomainError("workspace_roots_unavailable", "Workspace root is not a valid file URI", status_code=409)
+    if not roots:
+        raise DomainError("workspace_roots_unavailable", "Client supplied an empty workspace", status_code=409)
     return roots
 
 
@@ -251,10 +304,6 @@ def _auto_join_local_checkout() -> dict[str, Any] | None:
     if _configured_local_identity() is None:
         return None
     target = find_registered_checkout(Path.cwd())
-    if target is None:
-        pinned_path = os.getenv(PROJECT_PATH_ENV, "").strip()
-        if pinned_path:
-            target = find_registered_checkout(pinned_path)
     if target is None:
         return None
     try:
@@ -303,11 +352,25 @@ def _new_mcp(
 mcp = _new_mcp()
 
 
+def _check_stdio_lifetime() -> None:
+    global _stdio_generation
+    generation = require_running_service(_stdio_settings)
+    if generation != _stdio_generation:
+        # A stop/start between calls must not preserve an old writable binding.
+        with _session_bindings_lock:
+            for key in _session_bindings:
+                _session_bindings[key] = None
+        _runtime_binding.set(None)
+        _stdio_generation = generation
+
+
 def get_service() -> AgentChatRoomService:
     global service
     provider = _bound_service_provider.get()
     if provider is not None:
         return provider()
+    if _stdio_settings is not None:
+        _check_stdio_lifetime()
     if service is None:
         settings = load_settings()
         service = AgentChatRoomService(create_database(settings), settings)
@@ -405,6 +468,7 @@ def room_bootstrap(model: str = "") -> dict[str, Any]:
     Zero-parameter on the normal path. The MCP process supplies software
     identity and checkout registration; the Session Token stays in process memory.
     """
+    set_runtime_binding(None)
     identity = _configured_local_identity()
     if identity is None:
         payload = bootstrap_status_payload("identity_not_configured")
@@ -425,9 +489,10 @@ def room_bootstrap(model: str = "") -> dict[str, Any]:
         client=client,
         model=model,
         workspace_roots=_bootstrap_workspace_roots.get(),
-        cwd=Path.cwd(),
-        explicit_project_path=os.getenv(PROJECT_PATH_ENV, "").strip() or None,
+        cwd=None if _bound_service_provider.get() is not None else Path.cwd(),
+        explicit_project_path=None if _bound_service_provider.get() is not None else os.getenv(PROJECT_PATH_ENV, "").strip() or None,
         loaded_identity=_loaded_identity,
+        authorize_project=lambda project_id: _authorize_remote(project_id, "room:join"),
     )
     if outcome.binding is None:
         payload = outcome.public
@@ -1736,7 +1801,7 @@ MCP_STARTUP_UNAVAILABLE_EXIT_CODE = 2
 
 
 def main(argv: list[str] | None = None) -> None:
-    global presence_manager
+    global presence_manager, _stdio_settings, _stdio_generation
     parser = argparse.ArgumentParser(
         prog="agentchatroom-mcp",
         description="Run the AgentChatRoom MCP server over stdio.",
@@ -1754,37 +1819,32 @@ def main(argv: list[str] | None = None) -> None:
     # or leaking a traceback, tokens, or user paths beyond the failing input.
     try:
         settings = load_settings()
+        _stdio_generation = require_running_service(settings)
+        _stdio_settings = settings
         room_service = get_service()
         _loaded_identity = _configured_local_identity()
         presence_manager = LocalPresenceManager(
             room_service,
             enabled=settings.presence_keepalive_enabled,
             interval_seconds=settings.presence_keepalive_interval_seconds,
+            availability_check=lambda: require_running_service(settings),
         )
         presence_manager.start()
     except Exception as error:  # noqa: BLE001 - bounded startup failure boundary
         code = getattr(error, "code", type(error).__name__)
-        message = str(error).strip() or code
         sys.stderr.write(
-            f"agentchatroom mcp unavailable ({code}): {message}\n"
-            f"recovery: fix the local engine inputs and restart the MCP "
-            f"connection; the MCP server never starts AgentChatRoom itself\n"
+            f"agentchatroom mcp unavailable ({code})\n"
+            "recovery: start the configured service explicitly; prefer HTTP MCP to avoid client-spawned processes\n"
         )
         raise SystemExit(MCP_STARTUP_UNAVAILABLE_EXIT_CODE) from None
-    try:
-        # Presence is best-effort: an unexpected auto-join failure must not
-        # take the MCP server down or trigger client restart loops.
-        _auto_join_local_checkout()
-    except Exception as error:  # noqa: BLE001 - presence is best-effort
-        logger.warning(
-            "Local MCP auto-join failed: %s",
-            getattr(error, "code", type(error).__name__),
-        )
+    # Wait for client roots: startup cwd/pins cannot safely establish presence.
     try:
         mcp.run(transport="stdio")
     finally:
         presence_manager.stop()
         presence_manager = None
+        _stdio_settings = None
+        _stdio_generation = None
 
 
 if __name__ == "__main__":

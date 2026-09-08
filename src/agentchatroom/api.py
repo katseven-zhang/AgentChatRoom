@@ -29,6 +29,7 @@ from .errors import DomainError
 from .integrations import build_mcp_integration
 from .local_mcp import LocalMcpConfigurator
 from .mcp_server import create_mcp
+from .service_lifetime import running_service
 from .project_registration import (
     register_checkout_project,
     remove_checkout_project_registration,
@@ -865,11 +866,12 @@ def create_app(
             service, resolved, auto_backup_stop
         )
         try:
-            if mcp_http_app is None:
-                yield
-            else:
-                async with mcp_server.session_manager.run():
+            with running_service(resolved):
+                if mcp_http_app is None:
                     yield
+                else:
+                    async with mcp_server.session_manager.run():
+                        yield
         finally:
             auto_backup_stop.set()
             if auto_backup_worker is not None:

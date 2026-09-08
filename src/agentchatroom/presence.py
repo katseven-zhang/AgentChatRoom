@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import threading
 from dataclasses import dataclass
+from typing import Callable
 
 from .errors import DomainError
 from .services import AgentChatRoomService
@@ -28,10 +29,12 @@ class LocalPresenceManager:
         *,
         enabled: bool,
         interval_seconds: float,
+        availability_check: Callable[[], None] | None = None,
     ) -> None:
         self.room_service = room_service
         self.enabled = enabled
         self.interval_seconds = interval_seconds
+        self.availability_check = availability_check
         self._sessions: dict[str, PresenceSession] = {}
         self._lock = threading.Lock()
         self._stop = threading.Event()
@@ -147,6 +150,13 @@ class LocalPresenceManager:
             self._sessions.pop(session_id, None)
 
     def heartbeat_once(self) -> None:
+        if self.availability_check is not None:
+            try:
+                self.availability_check()
+            except DomainError:
+                with self._lock:
+                    self._sessions.clear()
+                return
         with self._lock:
             sessions = list(self._sessions.values())
         for session in sessions:

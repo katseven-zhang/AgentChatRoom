@@ -234,10 +234,10 @@ def test_web_supports_human_reading_and_guided_interactions():
     assert 'class="segmented-control integration-tabs" id="integration-format-tabs"' in markup
     assert "state.integration.profiles" in javascript
     assert 'id="integration-onboarding-prompt"' in markup
-    assert "让 Agent 配置 MCP" in markup
+    assert "当前场景的接入指令" in markup
     assert "复制当前环境的 MCP 连接参数与绑定边界，Agent 接入后先零参数 room_bootstrap 核对当前项目" in markup
     assert "受权限限制时返回可直接粘贴的配置文本" not in markup
-    assert "复制配置指令" in markup
+    assert "复制接入指令" in markup
     assert "这段提示词包含当前项目" not in markup
     assert "function renderOnboardingPrompt()" in javascript
     assert "onboarding_prompts" in javascript
@@ -340,7 +340,7 @@ def test_web_local_mcp_assistant_separates_write_reload_and_presence_states():
 
     assert 'id="integration-local-assistant"' in markup
     assert '>配置本机 Agent</button>' in markup
-    assert '<h2>配置本机 Agent</h2>' in markup
+    assert '<h2>接入本机 Agent</h2>' in markup
     assert 'data-integration-transport=' not in markup
     assert '连接方式' not in markup
     assert 'id="integration-local-refresh"' in markup

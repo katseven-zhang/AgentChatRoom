@@ -138,6 +138,11 @@ class ClientConfig:
     mode: Literal["local", "remote"] = "local"
     remote_url: str = ""
     auto_start: bool = False
+    restore_timeout_seconds: float = 3.0
+
+    def __post_init__(self):
+        if not 0 < self.restore_timeout_seconds <= 60:
+            raise ValueError("restore_timeout_seconds must be between 0 and 60")
 
     def to_toml(self) -> str:
         lines = [
@@ -148,6 +153,7 @@ class ClientConfig:
             "[target]",
             f'mode = "{self.mode}"',
             f"auto_start = {str(self.auto_start).lower()}",
+            f"restore_timeout_seconds = {self.restore_timeout_seconds}",
         ]
         if self.remote_url:
             lines.append(f'remote_url = "{self.remote_url}"')
@@ -175,7 +181,8 @@ def load_client_config(config_path: Path | None = None) -> ClientConfig:
         if mode not in ("local", "remote"):
             mode = "local"
         auto_start = _parse_bool(target_section.get("auto_start", False))
-        return ClientConfig(mode=mode, remote_url=remote_url, auto_start=auto_start)
+        return ClientConfig(mode=mode, remote_url=remote_url, auto_start=auto_start,
+                            restore_timeout_seconds=float(target_section.get("restore_timeout_seconds", 3.0)))
     except Exception:
         return ClientConfig(mode="local")
 

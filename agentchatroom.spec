@@ -19,6 +19,7 @@ hidden_imports = [
     "agentchatroom.local_mcp",
     "agentchatroom.mcp_server",
     "agentchatroom.mcp_bridge",
+    "agentchatroom.stdio_runtime",
     "agentchatroom.models",
     "agentchatroom.project_registration",
     "agentchatroom.services",
@@ -86,8 +87,8 @@ exe_app = EXE(
     strip=False,
     upx=True,
     # Windowed: double-click opens the GUI panel without a console window.
-    # stdio callers (mcp subcommand, --help, serve log redirection) pass
-    # valid pipe/file handles, which the bootloader forwards unchanged.
+    # stdio_runtime explicitly restores inherited pipe/file handles; never
+    # assume that a windowed bootloader provides Python standard streams.
     console=False,
     disable_windowed_traceback=False,
     argv_emulation=False,

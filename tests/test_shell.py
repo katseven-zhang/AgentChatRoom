@@ -210,11 +210,12 @@ def test_shell_js_api_pick_directory_safe_without_window():
     assert api.pick_directory() is None
 
 
-def test_packaged_onedir_executables_smoke():
+def test_packaged_onedir_executables_smoke(tmp_path):
     import os
     import subprocess
-    dist_dir = Path(__file__).resolve().parent.parent / "dist" / "agentchatroom"
-    exe = dist_dir / ("agentchatroom.exe" if os.name == "nt" else "agentchatroom")
+    default_exe = Path(__file__).resolve().parent.parent / "dist" / "agentchatroom" / ("agentchatroom.exe" if os.name == "nt" else "agentchatroom")
+    exe = Path(os.environ.get("AGENTCHATROOM_TEST_EXE", str(default_exe)))
+    dist_dir = exe.parent
 
     if not exe.exists():
         pytest.skip("Packaged onedir bundle not built in this environment")
@@ -225,6 +226,7 @@ def test_packaged_onedir_executables_smoke():
     running = subprocess.run(
         ["tasklist", "/FI", "IMAGENAME eq agentchatroom.exe"],
         capture_output=True, text=True, encoding="gbk", errors="replace", check=False,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
     )
     if "agentchatroom.exe" in (running.stdout or ""):
         pytest.skip("An agentchatroom.exe instance is already running")
@@ -259,14 +261,25 @@ def test_packaged_onedir_executables_smoke():
     assert "usage: agentchatroom serve" in completed.stdout
 
     # MCP stdio dispatch smoke: `agentchatroom.exe mcp` answers initialize.
-    p = subprocess.Popen(
+    environment = os.environ.copy()
+    environment.pop("AGENTCHATROOM_CONFIG", None)
+    isolated_settings = Settings(data_dir=tmp_path / "packaged-data")
+    environment["AGENTCHATROOM_DATA_DIR"] = str(isolated_settings.data_dir)
+    p = None
+    from agentchatroom.service_lifetime import running_service
+    lifetime = running_service(isolated_settings)
+    lifetime.__enter__()
+    try:
+        p = subprocess.Popen(
         [str(exe), "mcp"],
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
-    )
-    init_msg = (
+        env=environment,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        init_msg = (
         json.dumps({
             "jsonrpc": "2.0",
             "id": 1,
@@ -279,8 +292,12 @@ def test_packaged_onedir_executables_smoke():
         })
         + "\n"
     )
-    stdout, _ = p.communicate(init_msg, timeout=30)
-    p.kill()
+        stdout, _ = p.communicate(init_msg, timeout=30)
+    finally:
+        if p is not None and p.poll() is None:
+            p.kill()
+            p.wait(timeout=5)
+        lifetime.__exit__(None, None, None)
     assert "jsonrpc" in stdout
     assert "protocolVersion" in stdout
 
@@ -303,7 +320,9 @@ def test_packaging_spec_single_executable_dispatch():
 
     # One entry dispatches every delivery mode from the single exe.
     assert "agentchatroom.shell" in entry_text
-    assert "agentchatroom.mcp_server" in entry_text
+    assert "agentchatroom.stdio_runtime" in entry_text
+    assert "run_mcp_entry(args[1:])" in entry_text
+    assert "freeze_support()" in entry_text
     assert "agentchatroom.cli" in entry_text
 
     suffix = ".exe" if os.name == "nt" else ""
@@ -1048,6 +1067,7 @@ def test_tray_hide_restore_and_menu_exit_lifecycle(tmp_path, monkeypatch):
     assert shell.on_window_closing() is False
     assert shell.window.visible is False
     shell.tray.restore_panel()
+    assert shell.tray._restore_done.wait(2)
     assert shell.window.visible is True
     assert shell.controller.is_running()
     shell.tray.quit_from_tray()
@@ -1115,7 +1135,7 @@ def test_both_create_window_calls_enable_text_select():
         assert "text_select=True" in call_body
 
 
-def test_tray_restore_retries_bounded_and_tracks_state(monkeypatch):
+def test_tray_restore_runs_off_callback_thread_and_tracks_state(monkeypatch):
     """#102: tray restore retries a bounded number of times and the shell
     records visible/restore_failed states instead of failing silently."""
     from agentchatroom import shell as shell_module
@@ -1126,8 +1146,6 @@ def test_tray_restore_retries_bounded_and_tracks_state(monkeypatch):
     class FlakyWindow:
         def restore(self):
             attempts.append("restore")
-            if len(attempts) < 3:
-                raise RuntimeError("transient")
 
         def show(self):
             attempts.append("show")
@@ -1135,7 +1153,8 @@ def test_tray_restore_retries_bounded_and_tracks_state(monkeypatch):
     shell.window = FlakyWindow()
     monkeypatch.setattr(shell_module.time, "sleep", lambda seconds: None)
     shell.tray.restore_panel()
-    assert attempts.count("restore") == 3  # bounded, stops as soon as one works
+    assert shell.tray._restore_done.wait(2)
+    assert attempts.count("restore") == 1
     assert attempts[-1] == "show"
     assert shell.window_state == "visible"
 
@@ -1156,8 +1175,9 @@ def test_tray_restore_reports_failure_after_bounded_attempts(monkeypatch):
     sleeps = []
     monkeypatch.setattr(shell_module.time, "sleep", lambda seconds: sleeps.append(seconds))
     shell.tray.restore_panel()
+    assert shell.tray._restore_done.wait(2)
     assert shell.window_state == "restore_failed"
-    assert len(sleeps) == 3  # backoff between attempts, never unbounded
+    assert not sleeps
 
 
 def test_window_state_transitions_across_minimize_and_hide():

@@ -32,6 +32,8 @@ jobs:
     steps:
       - name: Check out source
         uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.release_tag || github.ref }}
 
       - name: Set up Python
         uses: actions/setup-python@v7
@@ -54,7 +56,7 @@ jobs:
       - name: Validate source before packaging
         shell: pwsh
         run: |
-          python -m pytest tests/test_shell.py tests/test_web_assets.py -p no:cacheprovider --basetemp="$env:RUNNER_TEMP\acr-source-tests"
+          python -m pytest -p no:cacheprovider --basetemp="$env:RUNNER_TEMP\acr-source-tests"
           node --check src/agentchatroom/web/app.js
 
       - name: Build onedir GUI package
@@ -69,7 +71,8 @@ jobs:
           if (!(Test-Path "dist\agentchatroom\agentchatroom.exe")) {
             throw "PyInstaller did not produce dist\agentchatroom\agentchatroom.exe"
           }
-          python -m pytest tests/test_shell.py -p no:cacheprovider --basetemp="$env:RUNNER_TEMP\acr-package-tests"
+          $env:AGENTCHATROOM_TEST_EXE = (Resolve-Path "dist\agentchatroom\agentchatroom.exe").Path
+          python -m pytest tests/test_shell.py tests/test_stdio_runtime.py tests/test_mcp.py::test_local_mcp_stdio_waits_for_bootstrap_and_disconnects_on_exit tests/test_mcp.py::test_mcp_stdio_round_trip -p no:cacheprovider --basetemp="$env:RUNNER_TEMP\acr-package-tests"
 
       - name: Create downloadable archive
         shell: pwsh

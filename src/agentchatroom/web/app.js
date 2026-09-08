@@ -2,6 +2,7 @@ const state = {
   config: null,
   integration: null,
   integrationFormat: "generic",
+  integrationOnboardingMode: "first_setup",
   integrationTransport: "local",
   integrationLocalPlan: null,
   integrationLocalApplyResult: null,
@@ -1363,7 +1364,7 @@ function renderMetrics(agents, tasks, leases) {
         <div class="compact-body"><div class="msg-line">${escapeHtml(formatTime(item.last.created_at))}</div></div>
       </div>`;
       }
-      const event = item.event;
+      const event = item.merged ? item.last : item.event;
       const isMessage = event.event_type.startsWith("message.") && event.payload?.body !== undefined;
       const modelBadge = isMessage ? messageModelBadge(event) : "";
       const preview = isMessage
@@ -2327,6 +2328,15 @@ document.querySelectorAll(".dialog-close").forEach((button) => {
   button.addEventListener("click", () => button.closest("dialog").close());
 });
 
+document.getElementById("integration-onboarding-mode").addEventListener("change", (event) => {
+  state.integrationOnboardingMode = event.target.value;
+  state.integrationLocalRequest += 1;
+  state.integrationLocalPlan = null;
+  renderOnboardingPrompt();
+  renderLocalMcpPlan();
+  if (state.integrationOnboardingMode === "first_setup") void refreshLocalMcpPlan();
+});
+
 document.querySelector(".integration-tabs").addEventListener("click", (event) => {
   const button = event.target.closest("[data-integration-format]");
   if (!button) return;
@@ -3254,7 +3264,8 @@ function renderIntegrationTabs() {
 
 function localMcpAssistantSupported() {
   const profile = state.integration?.profiles?.[state.integrationFormat];
-  return state.integrationTransport === "local" && Boolean(profile?.local_config);
+  return state.integrationOnboardingMode === "first_setup"
+    && state.integrationTransport === "local" && Boolean(profile?.local_config);
 }
 
 function localMcpIdentity() {
@@ -3415,6 +3426,7 @@ async function refreshLocalMcpPlan(announce = false) {
 }
 
 async function applyLocalMcpPlan() {
+  if (!localMcpAssistantSupported()) return;
   const plan = state.integrationLocalPlan;
   if (!state.snapshot || !plan?.managed_apply_available) return;
   const confirmed = window.confirm(
@@ -3443,7 +3455,7 @@ async function applyLocalMcpPlan() {
     await refreshLocalMcpPlan();
   } finally {
     button.textContent = "应用配置";
-    button.disabled = !state.integrationLocalPlan?.managed_apply_available;
+    button.disabled = !localMcpAssistantSupported() || !state.integrationLocalPlan?.managed_apply_available;
   }
 }
 
@@ -3478,9 +3490,10 @@ async function openIntegrationDialog() {
 function renderOnboardingPrompt() {
   if (!state.integration) return;
   const profile = state.integration.profiles?.[state.integrationFormat];
-  elements["integration-onboarding-prompt"].textContent = profile?.onboarding_prompts?.local
-    || state.integration.onboarding_prompt
-    || "当前接入配置尚未生成。";
+  const mode = state.integrationOnboardingMode;
+  elements["integration-onboarding-prompt"].textContent = profile?.onboarding_modes?.[mode]?.local
+    || (mode === "first_setup" ? profile?.onboarding_prompts?.local || state.integration.onboarding_prompt : "")
+    || "当前场景的接入指令尚未生成，请更新服务后重新打开。不要套用首次配置指令。";
 }
 
 function renderIntegrationConfig() {

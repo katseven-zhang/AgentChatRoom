@@ -522,38 +522,42 @@ def test_concurrent_streamable_sessions_do_not_share_runtime_bindings(
                 )
             )
 
+    ctx_a = FakeContext([project_dir.resolve().as_uri()], "http-session-a")
+    ctx_b = FakeContext([other.resolve().as_uri()], "http-session-b")
     monkeypatch.chdir(project_dir)
     boot_a = _call_tool(
         "room_bootstrap",
         {},
-        context=FakeContext([project_dir.resolve().as_uri()], "http-session-a"),
+        context=ctx_a,
     )
     monkeypatch.chdir(other)
     boot_b = _call_tool(
         "room_bootstrap",
         {},
-        context=FakeContext([other.resolve().as_uri()], "http-session-b"),
+        context=ctx_b,
     )
     assert boot_a["ok"] is True
     assert boot_b["ok"] is True
     assert boot_a["result"]["project"]["id"] == first["id"]
     assert boot_b["result"]["project"]["id"] == second["id"]
-    assert mcp_server.get_runtime_binding("mcp:http-session-a").project_id == first["id"]
-    assert mcp_server.get_runtime_binding("mcp:http-session-b").project_id == second["id"]
+    key_a = mcp_server.mcp_session_key(ctx_a)
+    key_b = mcp_server.mcp_session_key(ctx_b)
+    assert mcp_server.get_runtime_binding(key_a).project_id == first["id"]
+    assert mcp_server.get_runtime_binding(key_b).project_id == second["id"]
     assert (
-        mcp_server.get_runtime_binding("mcp:http-session-a").token
-        != mcp_server.get_runtime_binding("mcp:http-session-b").token
+        mcp_server.get_runtime_binding(key_a).token
+        != mcp_server.get_runtime_binding(key_b).token
     )
 
     sync_a = _call_tool(
         "room_sync",
         {},
-        context=FakeContext([], "http-session-a"),
+        context=ctx_a,
     )
     sync_b = _call_tool(
         "room_sync",
         {},
-        context=FakeContext([], "http-session-b"),
+        context=ctx_b,
     )
     assert sync_a["ok"] is True
     assert sync_b["ok"] is True
@@ -562,7 +566,7 @@ def test_concurrent_streamable_sessions_do_not_share_runtime_bindings(
     mismatch = _call_tool(
         "room_sync",
         {"project_id": first["id"]},
-        context=FakeContext([], "http-session-b"),
+        context=ctx_b,
     )
     assert mismatch["ok"] is False
     assert mismatch["error"]["code"] == "runtime_context_mismatch"
@@ -745,7 +749,7 @@ def test_configured_project_path_is_fallback_not_override(
     assert [agent["id"] for agent in online] == [pinned_session_id]
 
 
-def test_configured_project_path_fallback_without_workspace_evidence(
+def test_unregistered_workspace_never_uses_stale_configured_path(
     monkeypatch, service, project_dir, tmp_path
 ):
     _configure_software(monkeypatch)
@@ -761,9 +765,8 @@ def test_configured_project_path_fallback_without_workspace_evidence(
         cwd=unregistered,
         explicit_project_path=project_dir,
     )
-    assert selected.binding is not None
-    assert selected.binding.project_id == project["id"]
-    assert selected.public.get("notices") in (None, [])
+    assert selected.binding is None
+    assert selected.public["status"] == "project_not_registered"
 
 
 def test_workspace_evidence_wins_over_unresolvable_pin(

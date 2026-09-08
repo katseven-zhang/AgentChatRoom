@@ -439,6 +439,7 @@ def _project_git_info(root: Path) -> tuple[str, Path]:
     try:
         remote = subprocess.run(
             ["git", "-C", str(root), "config", "--get", "remote.origin.url"],
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
             check=False,
             capture_output=True,
             text=True,
@@ -447,6 +448,7 @@ def _project_git_info(root: Path) -> tuple[str, Path]:
         ).stdout.strip()
         top = subprocess.run(
             ["git", "-C", str(root), "rev-parse", "--show-toplevel"],
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
             check=False,
             capture_output=True,
             text=True,
@@ -5504,6 +5506,8 @@ class AgentChatRoomService:
             self._authenticate(connection, project_id, session_id, token)
             if task_id:
                 task = self._require_task(connection, project_id, task_id)
+                if task["execution_status"] in {"cancelled", "completed"}:
+                    raise DomainError("task_not_leasable", "Terminal tasks cannot acquire file leases", status_code=409)
                 if task["owner_session_id"] not in {None, session_id}:
                     raise DomainError("not_task_owner", "Lease task belongs to another agent", status_code=403)
             active = connection.execute(
@@ -6981,6 +6985,7 @@ class AgentChatRoomService:
             try:
                 completed = subprocess.run(
                     ["git", "-C", str(worktree), *arguments],
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
                     check=False,
                     capture_output=True,
                     text=True,

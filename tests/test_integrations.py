@@ -1,9 +1,50 @@
 from __future__ import annotations
 
 import json
+import pytest
 
 from agentchatroom.config import Settings
 from agentchatroom.integrations import build_mcp_integration
+
+
+def test_onboarding_modes_separate_configuration_from_existing_connections(tmp_path):
+    project = {'name': 'Room B', 'root_path': str(tmp_path), 'id': 'do-not-copy', 'project_key': 'private-key'}
+    result = build_mcp_integration(Settings(data_dir=tmp_path / 'data'), project=project)
+    for profile in result['profiles'].values():
+        modes = profile['onboarding_modes']
+        assert set(modes) == {'first_setup', 'add_project', 'reconnect'}
+        assert modes['first_setup'] == profile['onboarding_prompts']
+        for mode in ('add_project', 'reconnect'):
+            assert set(modes[mode]) == {'local', 'http', 'remote'}
+            for prompt in modes[mode].values():
+                assert 'Room B' in prompt
+                assert json.dumps(str(tmp_path), ensure_ascii=False) in prompt
+                assert '调用零参数 `room_bootstrap`' in prompt
+                assert '不创建或修改软件身份' in prompt
+                assert '不新增同名连接器' in prompt
+                assert 'do-not-copy' not in prompt and 'private-key' not in prompt
+                assert 'mcpServers' not in prompt
+                assert 'AGENTCHATROOM_SOFTWARE_KEY' not in prompt
+                assert 'paste-issued-agent-token' not in prompt
+        assert '独立 MCP 连接上下文' in modes['add_project']['local']
+        assert '不重发结果未知的写操作' in modes['reconnect']['local']
+
+
+def test_invalid_onboarding_mode_is_rejected():
+    from agentchatroom.integrations import build_onboarding_prompt
+    with pytest.raises(ValueError, match='onboarding mode'):
+        build_onboarding_prompt(profile_id='generic', profile={}, transport='local', config_text='', mode='typo')
+
+
+def test_frontend_onboarding_mode_selection():
+    import subprocess
+    from pathlib import Path
+    result = subprocess.run(
+        ['node', str(Path(__file__).with_name('onboarding_modes.cjs'))],
+        capture_output=True, text=True, timeout=10,
+        creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0),
+    )
+    assert result.returncode == 0, result.stderr
 
 
 def test_mcp_integration_uses_explicit_runtime_configuration(tmp_path):
@@ -251,7 +292,9 @@ def test_onboarding_prompt_states_lifecycle_and_pin_semantics(tmp_path):
     result = build_mcp_integration(settings, project=project)
     prompt = result["onboarding_prompt"]
     assert "不会启动 AgentChatRoom 后台服务" in prompt
-    assert "失败也不会自动拉起" in prompt
+    assert "service_unavailable" in prompt
+    assert "用户已显式启动" in prompt
+    assert "直接 HTTP MCP" in prompt
     assert "AGENTCHATROOM_PROJECT_PATH" in prompt
     assert "兜底" in prompt
     # #98: every transport's prompt carries the same binding boundary.

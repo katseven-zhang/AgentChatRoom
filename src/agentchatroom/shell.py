@@ -527,6 +527,8 @@ class PanelTray:
         self.shell = shell
         self.icon: Any = None
         self.started = False
+        self._restore_lock = threading.Lock()
+        self._restore_done = threading.Event()
 
     def available(self) -> bool:
         if os.name != "nt":
@@ -574,41 +576,51 @@ class PanelTray:
             return False
 
     def restore_panel(self, icon: Any = None, item: Any = None) -> None:
-        """Bring the panel back to the foreground from tray/minimized state.
+        """Schedule restoration without blocking the tray's native message loop.
 
-        Runs on the tray's own thread; pywebview marshals each window call to
-        the UI thread. Restores with bounded retries so a transient failure
-        cannot wedge the tray: every attempt is logged, and the shell records
-        a diagnosable restore_failed state instead of failing silently.
+        A hung synchronous UI Invoke keeps a single worker occupied, never an
+        unbounded stream of retry threads. The deadline reports failure while
+        the tray remains available for exit and notifications.
         """
         window = self.shell.window
-        if window is None:
+        if window is None or not self._restore_lock.acquire(blocking=False):
             return
-        attempts = 3
-        last_error: str | None = None
-        for attempt in range(1, attempts + 1):
+        self._restore_done.clear()
+        self.shell._set_window_state("restoring")
+        expired = threading.Event()
+
+        def fail():
+            expired.set()
+            if self.shell.window_state == "restoring":
+                self.shell._set_window_state("restore_failed")
+                logger.error("Window restore failed or exceeded its deadline")
+                if self.icon is not None:
+                    try:
+                        self.icon.notify("面板暂时无法恢复；请通过托盘退出后重新打开。", WINDOW_TITLE)
+                    except Exception:
+                        logger.warning("Tray restore notification unavailable")
+
+        timer = threading.Timer(self.shell.client_config.restore_timeout_seconds, fail)
+        timer.daemon = True
+
+        def restore():
             try:
                 window.restore()
+                if expired.is_set() or self.shell.window is not window or self.shell.window_state != "restoring":
+                    return
                 window.show()
-                self.shell._set_window_state("visible")
-                if attempt > 1:
-                    logger.info(
-                        "Tray restore succeeded on attempt %d", attempt
-                    )
-                return
+                if not expired.is_set() and self.shell.window_state == "restoring":
+                    self.shell._set_window_state("visible")
             except Exception as error:
-                last_error = redact_line(str(error))
-                logger.warning(
-                    "Tray restore attempt %d/%d failed: %s",
-                    attempt,
-                    attempts,
-                    type(error).__name__,
-                )
-            time.sleep(0.3 * attempt)
-        self.shell._set_window_state("restore_failed")
-        logger.error(
-            "Tray restore exhausted %d attempts: %s", attempts, last_error
-        )
+                logger.warning("Tray restore failed: %s", type(error).__name__)
+                fail()
+            finally:
+                timer.cancel()
+                self._restore_lock.release()
+                self._restore_done.set()
+
+        timer.start()
+        threading.Thread(target=restore, name="agentchatroom-window-restore", daemon=True).start()
 
     def quit_from_tray(self, icon: Any = None, item: Any = None) -> None:
         """Request a real exit without blocking the tray's message loop."""

@@ -1,0 +1,37 @@
+const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const path = require('node:path');
+const vm = require('node:vm');
+const source = fs.readFileSync(path.join(__dirname, '../src/agentchatroom/web/app.js'), 'utf8');
+function extract(name) {
+  const start = source.indexOf(`function ${name}(`);
+  assert.ok(start >= 0);
+  const end = source.indexOf('\n}', start);
+  return source.slice(start, end + 2);
+}
+const profile = {
+  local_config: {}, onboarding_prompts: {local: 'legacy install'},
+  onboarding_modes: {
+    first_setup: {local: 'install'}, add_project: {local: 'join'}, reconnect: {local: 'recover'},
+  },
+};
+const context = {
+  state: {integration: {profiles: {generic: profile}}, integrationFormat: 'generic', integrationTransport: 'local'},
+  elements: {'integration-onboarding-prompt': {textContent: ''}},
+};
+vm.createContext(context);
+vm.runInContext(extract('renderOnboardingPrompt') + '\n' + extract('localMcpAssistantSupported'), context);
+for (const [mode, expected] of Object.entries({first_setup: 'install', add_project: 'join', reconnect: 'recover'})) {
+  context.state.integrationOnboardingMode = mode;
+  vm.runInContext('renderOnboardingPrompt()', context);
+  assert.equal(context.elements['integration-onboarding-prompt'].textContent, expected);
+  assert.equal(vm.runInContext('localMcpAssistantSupported()', context), mode === 'first_setup');
+}
+delete profile.onboarding_modes;
+context.state.integrationOnboardingMode = 'add_project';
+vm.runInContext('renderOnboardingPrompt()', context);
+assert.match(context.elements['integration-onboarding-prompt'].textContent, /不要套用首次配置指令/);
+context.state.integrationOnboardingMode = 'first_setup';
+vm.runInContext('renderOnboardingPrompt()', context);
+assert.equal(context.elements['integration-onboarding-prompt'].textContent, 'legacy install');
+console.log('onboarding mode selection and fail-closed fallback passed');

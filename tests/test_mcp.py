@@ -1115,9 +1115,20 @@ async def test_mcp_compatibility_is_schema_directed(monkeypatch, service, projec
         )
 
 
+@pytest.fixture(params=("source", "packaged"))
+def mcp_stdio_command(request):
+    if request.param == "source":
+        return [sys.executable, "-m", "agentchatroom.mcp_server"]
+    from pathlib import Path
+    executable = Path(os.environ.get("AGENTCHATROOM_TEST_EXE", str(Path(__file__).resolve().parents[1] / "dist" / "agentchatroom" / "agentchatroom.exe")))
+    if not executable.is_file():
+        pytest.skip("Packaged executable not available")
+    return [str(executable), "mcp"]
+
+
 @pytest.mark.asyncio
-async def test_local_mcp_stdio_startup_auto_joins_and_disconnects_on_exit(
-    tmp_path, project_dir
+async def test_local_mcp_stdio_waits_for_bootstrap_and_disconnects_on_exit(
+    tmp_path, project_dir, request, mcp_stdio_command
 ):
     environment = os.environ.copy()
     data_dir = tmp_path / "auto-join-data"
@@ -1139,47 +1150,45 @@ async def test_local_mcp_stdio_startup_auto_joins_and_disconnects_on_exit(
     bootstrap_service.initialize()
     project = bootstrap_service.create_project(root_path=str(project_dir))
     register_checkout_project(project_dir, project)
+    from agentchatroom.service_lifetime import running_service
+    lifetime = running_service(bootstrap_settings)
+    lifetime.__enter__()
+    request.addfinalizer(lambda: lifetime.__exit__(None, None, None))
     process = await asyncio.create_subprocess_exec(
-        sys.executable,
-        "-m",
-        "agentchatroom.mcp_server",
+        *mcp_stdio_command,
         stdin=asyncio.subprocess.PIPE,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
         env=environment,
         cwd=str(project_dir),
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
     )
     assert process.stdin is not None
 
-    try:
-        deadline = asyncio.get_running_loop().time() + 10
-        identity = None
-        while asyncio.get_running_loop().time() < deadline:
-            if process.returncode is not None:
-                stderr = await process.stderr.read()
-                pytest.fail(
-                    "MCP exited before startup Presence was established: "
-                    f"{stderr.decode(errors='replace')}"
-                )
-            identities = bootstrap_service.snapshot(project["id"])[
-                "agent_identities"
-            ]
-            identity = next(
-                (
-                    item
-                    for item in identities
-                    if item["software_key"] == "startup-test"
-                ),
-                None,
-            )
-            if identity and identity["connection_status"] == "connected":
-                break
-            await asyncio.sleep(0.05)
-        else:
-            pytest.fail("MCP startup did not establish Presence")
+    async def send(message):
+        process.stdin.write((json.dumps(message) + "\n").encode())
+        await process.stdin.drain()
 
-        assert identity is not None
-        assert identity["active_session_count"] == 1
+    async def receive(request_id):
+        while True:
+            line = await asyncio.wait_for(process.stdout.readline(), 10)
+            assert line
+            value = json.loads(line)
+            if value.get('method') == 'roots/list':
+                await send({'jsonrpc':'2.0', 'id':value['id'], 'result':{'roots':[{'uri':project_dir.as_uri()}]}})
+            elif value.get('id') == request_id:
+                return value
+
+    try:
+        await send({'jsonrpc':'2.0', 'id':1, 'method':'initialize', 'params':{
+            'protocolVersion':'2025-06-18', 'capabilities':{'roots':{}}, 'clientInfo':{'name':'lifecycle', 'version':'1'}}})
+        await receive(1)
+        assert not bootstrap_service.snapshot(project['id'])['agent_identities']
+        await send({'jsonrpc':'2.0', 'method':'notifications/initialized'})
+        await send({'jsonrpc':'2.0', 'id':2, 'method':'tools/call', 'params':{'name':'room_bootstrap','arguments':{}}})
+        reply = await receive(2)
+        assert json.loads(reply['result']['content'][0]['text'])['ok']
+        assert bootstrap_service.snapshot(project['id'])['agent_identities'][0]['active_session_count'] == 1
 
         process.stdin.close()
         await process.stdin.wait_closed()
@@ -1197,7 +1206,7 @@ async def test_local_mcp_stdio_startup_auto_joins_and_disconnects_on_exit(
 
 
 @pytest.mark.asyncio
-async def test_mcp_stdio_round_trip(tmp_path, project_dir):
+async def test_mcp_stdio_round_trip(tmp_path, project_dir, request, mcp_stdio_command):
     environment = os.environ.copy()
     data_dir = tmp_path / "mcp-data"
     environment["AGENTCHATROOM_DATA_DIR"] = str(data_dir)
@@ -1210,14 +1219,17 @@ async def test_mcp_stdio_round_trip(tmp_path, project_dir):
     )
     bootstrap_service.initialize()
     bootstrap_service.create_project(root_path=str(project_dir))
+    from agentchatroom.service_lifetime import running_service
+    lifetime = running_service(bootstrap_settings)
+    lifetime.__enter__()
+    request.addfinalizer(lambda: lifetime.__exit__(None, None, None))
     process = await asyncio.create_subprocess_exec(
-        sys.executable,
-        "-m",
-        "agentchatroom.mcp_server",
+        *mcp_stdio_command,
         stdin=asyncio.subprocess.PIPE,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
         env=environment,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
     )
     assert process.stdin is not None
     assert process.stdout is not None

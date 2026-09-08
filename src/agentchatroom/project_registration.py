@@ -91,6 +91,7 @@ def _git_info(root: Path) -> tuple[str, Path]:
             text=True,
             timeout=3,
             stdin=subprocess.DEVNULL,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         ).stdout.strip()
         top = subprocess.run(
             ["git", "-C", str(root), "rev-parse", "--show-toplevel"],
@@ -99,6 +100,7 @@ def _git_info(root: Path) -> tuple[str, Path]:
             text=True,
             timeout=3,
             stdin=subprocess.DEVNULL,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         ).stdout.strip()
         return remote, Path(top).resolve() if top else root
     except (OSError, subprocess.SubprocessError):

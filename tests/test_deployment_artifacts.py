@@ -63,7 +63,7 @@ def test_local_agent_runtime_state_is_ignored() -> None:
 def test_runtime_and_package_versions_match() -> None:
     metadata = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
 
-    assert metadata["project"]["version"] == __version__ == "0.2.3"
+    assert metadata["project"]["version"] == __version__ == "0.2.4"
 
 
 def test_readme_documents_cross_platform_support_boundary() -> None:
@@ -148,3 +148,6 @@ def test_windows_package_workflow_builds_and_uploads_single_exe() -> None:
     assert "github.event.release.tag_name" in workflow
     assert "release_tag:" in workflow
     assert "inputs.release_tag" in workflow
+    assert "AGENTCHATROOM_TEST_EXE" in workflow
+    assert "tests/test_stdio_runtime.py" in workflow
+    assert "test_local_mcp_stdio_waits_for_bootstrap_and_disconnects_on_exit" in workflow

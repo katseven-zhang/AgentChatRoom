@@ -581,12 +581,21 @@
         <div class="dialog-header">
           <div>
             <p class="context-label">当前项目</p>
-            <h2>配置本机 Agent</h2>
+            <h2>接入本机 Agent</h2>
           </div>
           <button type="button" class="icon-button dialog-close" title="关闭" aria-label="关闭">×</button>
         </div>
 
         <section class="integration-section integration-chooser">
+          <div>
+            <label for="integration-onboarding-mode">本次接入场景</label>
+            <select id="integration-onboarding-mode">
+              <option value="first_setup">首次配置软件</option>
+              <option value="add_project">已配置软件，加入本项目</option>
+              <option value="reconnect">恢复当前项目连接</option>
+            </select>
+            <p class="secondary-text">请按客户端实际配置选择；曾在房间出现不代表本机已配置。加入新项目和恢复连接不会应用配置。</p>
+          </div>
           <div>
             <p class="integration-choice-label">Agent 客户端</p>
             <div class="segmented-control integration-tabs" id="integration-format-tabs" aria-label="目标 Agent"></div>
@@ -616,10 +625,10 @@
         <section class="integration-section onboarding-section">
           <div class="integration-heading">
             <div>
-              <h3>让 Agent 配置 MCP</h3>
+              <h3>当前场景的接入指令</h3>
               <p class="secondary-text">复制当前环境的 MCP 连接参数与绑定边界，Agent 接入后先零参数 room_bootstrap 核对当前项目</p>
             </div>
-            <button class="primary-button copy-button" type="button" data-copy-target="integration-onboarding-prompt">复制配置指令</button>
+            <button class="primary-button copy-button" type="button" data-copy-target="integration-onboarding-prompt">复制接入指令</button>
           </div>
           <pre id="integration-onboarding-prompt" class="code-block onboarding-prompt"></pre>
         </section>

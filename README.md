@@ -4,6 +4,28 @@ AgentChatRoom 是一个面向异构 AI 编程 Agent 的项目级实时协作中�
 
 当前一期提供 Python 后端、浏览器管理端、REST、SSE、本机 MCP stdio、CLI 和 SQLite 本地档案。Streamable HTTP MCP、远程 stdio Bridge、PostgreSQL 和服务器部署适配器保留为后续阶段基础，不作为当前单机产品能力展示。
 
+## v0.2.4 修复说明
+
+- Windows 打包 MCP 初始化失败时不再弹异常对话框并挂住；修复继承标准流与后台子进程的控制台窗口处理。
+- 本机 MCP 必须使用用户显式启动的服务；未启动时失败退出，不自动拉起 GUI/服务。服务重启后旧绑定失效。
+- 多项目按实际 MCP 连接隔离；bootstrap 失败立即废弃旧绑定，工作区 roots 错误或超时不回退进入旧项目。
+- 托盘恢复窗口采用单个后台操作与可配置超时，防止重复点击堆积操作。
+- 接入指令区分首次配置、已配置软件加入新项目与恢复连接；取消任务不能重新获取文件租约，修复少量动态事件的聚合显示。
+
+升级时请替换完整 Windows ZIP 解压目录（包含 `_internal`），并检查各客户端 MCP 配置是否仍引用旧 EXE 路径。关闭旧 MCP 连接和服务后再替换；新进程才会加载修复。仅删除 EXE 会导致连接失败，不代表成功接入。每个并行项目需要独立连接上下文。
+
+## 接入场景选择
+
+Windows 单 EXE 的 `mcp` 入口与 GUI 错误呈现隔离：启动或运行失败仅向继承的 stderr 管道返回脱敏错误并退出，不弹 GUI 异常对话框。windowed 构建显式恢复继承的标准流，不创建控制台；缺少 MCP 输入/输出管道时失败退出。冻结程序在分发 GUI/CLI/MCP 前处理 multiprocessing 子进程入口。验证必须包含实际打包产物，不能仅以 Python 源码测试代替；测试环境可用 `AGENTCHATROOM_TEST_EXE` 指定本次覆盖构建的 EXE，握手/断连测试使用隔离目录，不访问正在使用的 Room 数据。
+
+Web「配置本机 Agent」入口内提供三种接入指令，由用户按客户端实际配置选择，不根据历史 Agent/在线记录推断本机配置：
+
+- **首次配置软件**：先核查已有连接器，确认没有时才配置一次。不得自行选择 EXE、启动服务或循环重试；已有连接器改走加入项目或恢复连接。
+- **已配置软件，加入本项目**：复用稳定软件身份和连接器配置，以独立工作区连接加入目标项目；不附安装配置片段，不改写全局路径，不重载其他项目的连接。客户端不能提供独立上下文时停止并说明限制。
+- **恢复当前项目连接**：确认用户已启动服务，只恢复当前项目；重新 bootstrap 并核对项目，不沿用旧凭据，不重发结果未知的写操作。
+
+加入与恢复场景不展示本机配置应用助手；高级手动配置仍可查看，但不是这两种场景的执行步骤。服务返回的 `profiles.*.onboarding_modes` 按 `first_setup`、`add_project`、`reconnect` 分组，组内保持 transport 键；原 `onboarding_prompts` 字段兼容保留为首次配置。缺少对应场景指令时前端明确提示更新服务，不回退安装指令。提示词是引导，不代替后端项目隔离、身份验证和失败封闭校验。
+
 ## 2026-09-03 新会话入口与任务筛选
 
 - 已配置且已登记的本机 Agent 新开对话时，调用一次零参数 `room_bootstrap` 即可解析当前 checkout、恢复或替换同一软件身份的 Session，并完成本次对话的首次同步。
@@ -121,7 +143,7 @@ AgentChatRoom 提供单 exe GUI 面板（基于 Edge WebView2 的 pywebview shel
 
 GUI 初次打开时在主屏居中，默认尺寸为 1440×900；较小屏幕会自动收缩到屏幕逻辑尺寸的 90% 以内。停止服务的 Windows 进程树清理以无窗口方式执行，不弹出额外的命令行窗口。
 
-运行页面顶部「停止服务」右侧提供「收起到托盘」按钮，点击后保留服务并隐藏面板，点击右下角托盘图标可恢复。托盘不可用或隐藏失败时显示提示并保留面板。面板窗口状态（启动中/可见/最小化/隐藏/恢复失败/退出）由壳层统一记录并可审计；托盘「打开面板」按有界重试（3 次递增退避）恢复、置前窗口，重试耗尽会记录 restore_failed 状态并给出可诊断日志，不会静默吞错或遗留假窗口。
+运行页面顶部「停止服务」右侧提供「收起到托盘」按钮，点击后保留服务并隐藏面板，点击右下角托盘图标可恢复。托盘「打开面板」将恢复操作放入单个后台线程，回调立即返回；超时进入 `restore_failed` 并尝试显示托盘通知。超时由 `client.toml [target] restore_timeout_seconds` 控制，默认 3 秒，范围大于 0 且不超过 60 秒。阻塞操作完成前重复点击不会产生新恢复线程，过期恢复不会继续主动显示窗口；托盘退出入口保持可调用。窗口状态区分启动中、恢复中、可见、最小化、隐藏、恢复失败与退出。
 
 - **单实例运行**：通过系统互斥锁保证单一 GUI 实例运行；二次双击会自动激活并聚焦到已打开的面板窗口。
 - **最小化进托盘**：面板最小化时隐藏到系统托盘继续运行（托盘图标常驻，左键单击恢复窗口，右键菜单提供「打开面板 / 退出」），不再出现最小化后找不到窗口的情况；托盘不可用的环境自动降级为任务栏最小化行为。
@@ -253,7 +275,7 @@ Linux 或 macOS：
 7. 在 Room 动态中查看消息、模型标签、任务进展、文件占用、验证结果和事件顺序。Room 动态默认勾选“只看消息动态”，仅展示普通消息、决策、阻塞三类消息事件；加入/离开 Room、连接状态、任务状态、租约等系统事件默认隐藏，取消勾选即可查看全部动态。该筛选只作用于面板展示（首次加载、实时追加、刷新和切换项目共用同一过滤），事件本身仍完整追加记录，任务详情时间线与审计查询不受影响。
 总览「最近活动」卡片按项目域呈现：标题旁标注当前项目（切换项目即随之更新），列表仅含当前所选项目的事件；同类高频会话生命周期事件（加入/离开 Room、替换会话、工作区登记更新）按事件与主体聚合计数展示（如「ZCode 加入 Room ×3」，3 条起合并），仅作用于该卡片的派生视图，Room 动态完整流与 append-only 事件历史仍逐条完整保留。发送框“高级选项”中的消息类型（普通/决策/阻塞）、频道（公共/评审/系统，关联任务时自动切换为任务频道）、关联任务、优先级与“需要确认”均有真实后端语义：类型决定动态与任务时间线徽章，频道与关联任务决定事件的归属和过滤，优先级产生醒目标签，需要确认会显示确认人数。
 
-一个本机 Agent 软件安装在一个 Project 中只对应一个持久软件身份。Codex、Trae、WorkBuddy、Grok Build 等客户端的本机 stdio MCP 配置通过 `AGENTCHATROOM_SOFTWARE_KEY`、`AGENTCHATROOM_SOFTWARE_NAME` 和 `AGENTCHATROOM_SOFTWARE_CLIENT` 注入身份，`AGENTCHATROOM_PROJECT_PATH` 仅作为当前 checkout 的兜底路径（用户级/多工作区共用配置中应删除该行，工作区 roots/cwd 的登记解析始终优先）。身份配置完整且 checkout 已登记时，MCP 进程启动即自动建立 Presence（cwd 已登记时优先加入 cwd 的 Room）；缺少配置时不会根据模型参数猜测身份，也不会自动创建 Room。自动 Presence 不能代替新对话的 `room_bootstrap`。模型不得按任务、角色、审核或运行检查临时改名。数据库 `agent_key`/`member_id` 由后端生成，不由 Agent 填写。每次连接仍保留新的 Session 审计记录，但同一软件在同一 Project 同时最多一个活动 Session。
+一个本机 Agent 软件安装在一个 Project 中只对应一个持久软件身份。本机 stdio MCP 配置通过 `AGENTCHATROOM_SOFTWARE_KEY`、`AGENTCHATROOM_SOFTWARE_NAME` 和 `AGENTCHATROOM_SOFTWARE_CLIENT` 注入身份。用户级/多工作区共用配置应移除 `AGENTCHATROOM_PROJECT_PATH`，每个连接使用客户端 roots 或自身 cwd；未登记工作区会失败。身份配置完整、服务已显式启动且 checkout 已登记后，客户端通过 `room_bootstrap` 建立 Presence；进程启动本身不会加入或替换会话。缺少配置时不会猜测身份或创建 Room。模型不得按任务、角色、审核或运行检查临时改名。数据库 `agent_key`/`member_id` 由后端生成；同一软件在同一 Project 最多一个活动 Session，不同 Project 可同时工作。
 
 Project 的创建、归档、永久删除和 Agent 接入使用不同语义：代码项目作用域还
 没有 Room 时，第一个 Agent 的 `room_join` 可以请求后端创建它，Web 管理端、REST 和
@@ -392,9 +414,13 @@ room_bootstrap
 
 1. MCP 客户端提供的 workspace roots；
 2. 当前工作目录向上查找 `.agentchatroom/project.json`；
-3. 前两者都没有命中任何已登记 checkout 时，才把已验证的 `AGENTCHATROOM_PROJECT_PATH` 作为兜底候选。
+3. 只有调用环境完全没有提供 roots 或 cwd 时，底层解析器才允许使用已验证的 `AGENTCHATROOM_PROJECT_PATH`。已提供但未登记的工作区必须失败，不能回退到旧项目。
 
-workspace roots / cwd 是可靠的当前工作区证据，永远优先于配置路径：当它们命中已登记 checkout 而配置路径指向另一个已登记 Project 时，进入工作区证据命中的 Room，并在成功结果的 `notices` 中返回 `configured_project_path_ignored`（含 `align_or_remove_agentchatroom_project_path_env` 恢复动作），不会静默跟随配置路径，也不会关闭另一 Project 的既有 Session。只有一个有效候选时自动进入；没有候选返回 `project_not_registered`，登记损坏返回 `registration_invalid`，workspace roots/cwd 命中多个不同 Project 时返回 `ambiguous_workspace`（配置路径不能消解歧义），禁止猜测或误入其他 Room。MCP 启动 Presence（自动加入）遵循同一优先级：仅当 cwd 没有已登记 checkout 时才使用配置路径兜底。
+客户端提供 roots 时只解析 roots，不再混入服务进程的 cwd；未提供 roots 才检查 cwd。若当前工作区与配置路径冲突，当前工作区优先，并返回 `configured_project_path_ignored` 提示。未登记返回 `project_not_registered`，任何候选登记损坏返回 `registration_invalid`，多个不同 Project 返回 `ambiguous_workspace`。进程启动阶段不自动加入 Room，须等待客户端完成 `room_bootstrap` 后才建立 Presence，防止启动 cwd 或旧配置替换别的项目会话。
+
+同一个软件身份可同时在不同 Project 工作。独立 stdio 进程各自持有绑定；共享服务中的绑定按实际 MCP 连接对象隔离，不能以 Token 或全局“当前项目”作为连接键。一个连接对应一个工作区，多项目并行须使用不同连接；单连接提交多个 Project roots 会明确拒绝。任何 bootstrap 失败都会废弃该连接的旧绑定，包含旧凭据的后续调用也须先重新 bootstrap；不会影响其他连接。
+
+客户端声明支持 roots 时，空列表、无效 URI、调用异常或超时都会拒绝绑定，不会回退到服务端 cwd。roots 超时由 `coordination.mcp_roots_timeout_seconds` 控制，默认 5 秒；环境变量 `AGENTCHATROOM_MCP_ROOTS_TIMEOUT_SECONDS` 优先于配置文件，取值大于 0 且不超过 60 秒。共享 HTTP 服务不能使用服务端 cwd 代替客户端工作区。服务每次显式启动都会更换生命周期代次，即使服务停止和重启发生在两次请求之间，旧本机绑定也必须重新 bootstrap。
 
 成功结果区分四件独立事实：软件已配置、MCP 进程已连接、Room Session 已恢复或替换、当前模型对话已同步。失败状态是有限集合，每种只有一个 `required_action`：
 
@@ -414,13 +440,13 @@ Web「配置本机 Agent」把五件事实分开显示：工作区绑定、软�
 
 ### MCP 生命周期与启动归属
 
-MCP 连接永远不启动 AgentChatRoom：本机 stdio 入口（打包 exe 的 `mcp` 子命令或 `python -m agentchatroom.mcp_server`）不生成任何子进程，不会拉起后台服务、GUI、托盘或 cmd/PowerShell/Terminal；生成给客户端的连接配置也不含任何批处理/终端启动链。三种模式的启动归属：
+MCP 不负责启动后台服务或 GUI。直接 HTTP MCP 不需要客户端创建本地进程；stdio 按协议由客户端创建适配器进程（打包 EXE 的 `mcp` 子命令或 Python 模块），它不代表 GUI。需要完全避免客户端反复创建本地进程时应使用 HTTP 配置，并移除旧 stdio 启动配置。三种模式的启动归属：
 
-1. **本机 stdio**：引擎随 MCP 连接内嵌在 MCP 进程内，读写本地数据库，无需任何常驻服务；连接存在即引擎存在，连接断开进程随之退出。这不属于"启动 Chatroom"，用户不启动任何服务也可以在各客户端使用 MCP。
+1. **本机 stdio**：必须先由用户通过 CMD、`serve` 或 GUI 显式启动同一数据目录的服务。服务生命周期持有 `service.lock` 的 OS 文件锁；适配器只检查，不创建锁或启动服务。未启动时在初始化数据库之前以 `service_unavailable` 失败；每次工具调用重新检查，服务停止后废弃绑定并拒绝写入。残留锁文件不代表服务运行。旧版本服务需要显式重启到新版本才能提供这一生命周期证明。
 2. **本机 HTTP（Web/管理前端）**：仅由用户显式启动（`serve`、`serve --detach` 或 GUI 面板「启动服务」按钮）；MCP 不探测、不等待、更不会代为拉起。
 3. **远程 HTTP/Bridge**：Bridge 只连接用户配置的已运行目标；目标未运行或健康检查失败时按有界次数重试（默认 3 次、指数退避），耗尽后请求得到有界答复——`tools/list` 返回空工具列表，工具调用返回 `bridge_upstream_unavailable` 错误载荷（含恢复动作），请求不会悬挂，也不猜测地址、不代启动目标服务。
 
-失败封闭：本机 stdio 入口在引擎无法启动（如数据目录不可用、数据库损坏）时，输出一行 `agentchatroom mcp unavailable (<原因>): <说明>` 并以退出码 `2` 结束——无堆栈噪声、无重试循环、不泄露 Token；后续是否重连由客户端策略决定，AgentChatRoom 不做自动重试。GUI 的自动启动默认关闭（`client.toml [target] auto_start`，默认 false），只有用户显式点击「启动服务」才创建后台服务进程；「不使用 Chatroom」是正常状态——不启动任何 AgentChatRoom 进程不会影响其他客户端，配置、Presence、MCP 连接、Room Session 与对话同步仍然分层表达。
+失败封闭：本机 stdio 入口在服务未运行、数据目录不可用或数据库损坏时输出脱敏错误码 `agentchatroom mcp unavailable (<原因>)` 与恢复动作，以退出码 `2` 结束，不输出原始异常或路径。后续是否重新创建适配器由客户端策略决定，AgentChatRoom 不做自动启动或进程重试；需要禁止客户端创建进程请禁用 stdio 并改用 HTTP。GUI 自动启动默认关闭（`client.toml [target] auto_start = false`）。Git 工作区校验使用无交互、无窗口且有超时的子进程，不启动 CMD/PowerShell。配置、连接、Presence、Room Session 与对话同步仍分别表达。
 
 ### MCP 消息注入限制与有效性过滤
 
