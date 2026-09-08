@@ -57,6 +57,7 @@ jobs:
         shell: pwsh
         run: |
           python -m pytest -p no:cacheprovider --basetemp="$env:RUNNER_TEMP\acr-source-tests"
+          if ($LASTEXITCODE -ne 0) { throw "Source regression tests failed" }
           node --check src/agentchatroom/web/app.js
 
       - name: Build onedir GUI package
