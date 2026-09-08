@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import socket
 import sys
 import threading
@@ -212,6 +213,33 @@ def test_port_is_free_reports_bound_port_as_taken() -> None:
         blocker.listen(1)
         assert port_is_free("127.0.0.1", port) is False
     assert port_is_free("127.0.0.1", port) is True
+
+
+def test_port_probe_rejects_live_reusable_listener() -> None:
+    with socket.socket() as listener:
+        listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(1)
+        assert port_is_free("127.0.0.1", listener.getsockname()[1]) is False
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX TCP TIME_WAIT restart semantics")
+def test_port_probe_allows_restart_after_server_active_close() -> None:
+    with socket.socket() as listener:
+        listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        listener.settimeout(2)
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(1)
+        address = listener.getsockname()
+        with socket.create_connection(address, timeout=2) as client:
+            peer, _ = listener.accept()
+            with peer:
+                peer.settimeout(2)
+                peer.shutdown(socket.SHUT_WR)
+                assert client.recv(1) == b""
+                client.shutdown(socket.SHUT_WR)
+                assert peer.recv(1) == b""
+    assert port_is_free(*address) is True
 
 
 def test_gui_service_controller_reuses_cli_lifecycle(settings) -> None:

@@ -62,7 +62,12 @@ def port_is_free(host: str, port: int) -> bool:
     family = socket.AF_INET6 if ":" in (host or "") else socket.AF_INET
     with socket.socket(family, socket.SOCK_STREAM) as probe:
         try:
+            # Match the POSIX server's restart behavior after TCP TIME_WAIT.
+            # Windows SO_REUSEADDR can share a live listener, so do not enable it there.
+            if os.name != "nt":
+                probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             probe.bind((host or "127.0.0.1", port))
+            probe.listen(1)
         except OSError:
             return False
     return True

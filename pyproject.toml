@@ -27,6 +27,7 @@ postgresql = [
 ]
 dev = [
   "httpx>=0.28,<1",
+  "pillow>=10.0",
   "pytest>=8.4,<9",
   "pytest-asyncio>=1.1,<2",
 ]
