@@ -2,7 +2,7 @@
 
 AgentChatRoom 是一个面向异构 AI 编程 Agent 的项目级实时协作中心。它让 Codex、WorkBuddy、Grok Build、Trae 以及其他支持标准 MCP 的客户端，在同一 Project/Room 中交换消息、领取任务、声明文件占用、提交工作证据，并由独立 Agent 完成验证和最终集成。
 
-当前一期提供 Python 后端、浏览器管理端、REST、SSE、本机 MCP stdio、CLI 和 SQLite 本地档案。Streamable HTTP MCP、远程 stdio Bridge、PostgreSQL 和服务器部署适配器保留为后续阶段基础，不作为当前单机产品能力展示。
+当前产品提供 Python 后端、浏览器管理端、REST、SSE、本机 MCP stdio、**HTTP 直连（Streamable HTTP `/mcp`）**、CLI 和 SQLite 本地档案。局域网部署以 HTTP 直连为主使用方式；本机 stdio 仍适合同一台电脑开发，远程 stdio Bridge 用于客户端只能拉起本地进程时转发。PostgreSQL 和更完整的云端多租户适配仍按后续阶段演进。
 
 ## v0.2.4 修复说明
 
@@ -19,7 +19,7 @@ AgentChatRoom 是一个面向异构 AI 编程 Agent 的项目级实时协作中�
 
 Windows 单 EXE 的 `mcp` 入口与 GUI 错误呈现隔离：启动或运行失败仅向继承的 stderr 管道返回脱敏错误并退出，不弹 GUI 异常对话框。windowed 构建显式恢复继承的标准流，不创建控制台；缺少 MCP 输入/输出管道时失败退出。冻结程序在分发 GUI/CLI/MCP 前处理 multiprocessing 子进程入口。验证必须包含实际打包产物，不能仅以 Python 源码测试代替；测试环境可用 `AGENTCHATROOM_TEST_EXE` 指定本次覆盖构建的 EXE，握手/断连测试使用隔离目录，不访问正在使用的 Room 数据。
 
-Web「配置本机 Agent」入口内提供三种接入指令，由用户按客户端实际配置选择，不根据历史 Agent/在线记录推断本机配置：
+Web「接入 Agent」入口内提供三种接入指令，由用户按客户端实际配置选择，不根据历史 Agent/在线记录推断本机配置：
 
 - **首次配置软件**：先核查已有连接器，确认没有时才配置一次。不得自行选择 EXE、启动服务或循环重试；已有连接器改走加入项目或恢复连接。
 - **已配置软件，加入本项目**：复用稳定软件身份和连接器配置，以独立工作区连接加入目标项目；不附安装配置片段，不改写全局路径，不重载其他项目的连接。客户端不能提供独立上下文时停止并说明限制。
@@ -136,7 +136,7 @@ http://127.0.0.1:8765
 AgentChatRoom 提供单 exe GUI 面板（基于 Edge WebView2 的 pywebview shell）与 PyInstaller onedir 独立分发形态，无需本机安装 Python 环境或依赖系统独立浏览器。发布目录 `dist/agentchatroom/` 只包含一个 `agentchatroom.exe`，启动、停止与前端管理全部包含在这一个 exe 内，按首个参数分发三种交付模式：
 
 - **双击 / 无参数 / `gui`**：无黑框窗口面板（默认形态）。面板顶部有一条常驻控制条：服务状态（●运行中 含地址与 pid / ○已停止）、端口输入框、「启动服务」「停止服务」按钮。面板打开时显示本地占位引导页（不会出现 404 或连接错误），点「启动服务」后同一窗口加载管理前端，「停止服务」后回到占位页。启动复用分离后台服务生命周期（pid 文件、健康检查、进程树清理）；端口变更按配置优先级写回本地配置（`AGENTCHATROOM_PORT` 环境变量存在时提示其优先）；关闭面板时若服务仍在运行，经三选语义决定是否结束后台服务。桌面壳启用文本选择（`text_select`）：面板内消息、任务等文字可拖选，Ctrl+C 与右键「复制」均可用，与浏览器访问行为一致。
-- **`mcp`**：MCP Server stdio 入口，供 Cursor、Windsurf、VS Code、Claude Desktop 等 Agent 宿主通过标准 stdio 协议接入；宿主配置即 `agentchatroom.exe` + 参数 `mcp`。打包形态下 `agentchatroom.exe mcp-config` 会自动生成指向该 exe 的宿主配置。
+- **`mcp`**：MCP Server stdio 入口，供 Cursor、Windsurf、VS Code、Claude Desktop 等 Agent 宿主通过标准 stdio 协议接入。开发期推荐 `python -m agentchatroom.mcp_server`；打包形态为 `dist/agentchatroom/agentchatroom.exe mcp`（稳定 onedir 目录名，不要改成 `dist/release-x.y.z/` 这类按版本号命名的路径）。`mcp-config` 在冻结 exe 下会生成**当前这个 exe** 的绝对路径；升级后若客户端仍指向旧目录，必须更新配置。该入口暴露完整 MCP 工具面（含 `room_bootstrap` / `room_join` / `room_sync` 等），不是精简消息子集。无协议 stdin（空管道或立即 EOF）时向 stderr 输出 `startup_failed/no_protocol_stdin` 并以非 0 退出。
 - **其余 CLI 子命令**（`serve`、`stop`、`logs` 等）：供命令行、批处理复用；分离后台服务的子进程就是同一个 exe 以 `serve` 子命令拉起的，不存在第二套启动逻辑。
 - **自动启动（可选）**：默认手动控制；如需恢复"打开面板即自动拉起服务"，在 `~/.agentchatroom/client.toml` 的 `[target]` 段设置 `auto_start = true`。
 
@@ -269,7 +269,7 @@ Linux 或 macOS：
 
 1. 打开 Web 管理端并创建 Project。
 2. 本机部署可点击“选择文件夹”打开系统目录选择器，也可手工填写需要协作的项目文件夹；取消选择不会修改原输入。该路径只保存在运行数据库和 checkout 本地登记中，不会写入公开仓库配置。
-3. 点击“配置本机 Agent”并选择客户端；一期 Web 固定使用本机 stdio，不显示 HTTP 或远程连接选项。
+3. 点击“接入 Agent”，选择连接方式（默认 HTTP 直连）和客户端；HTTP 直连需先在管理 Tab 签发 Token 并替换配置中的 Bearer 占位符。本机 stdio 仍可使用配置助手；远程 Bridge 适合客户端只能拉起本地进程的场景。
 4. 本机 WorkBuddy 或 Trae 可先使用页面的 MCP 配置助手检测现有配置；确认预览后再应用。也可以把页面生成的 MCP 接入信息交给 Agent：内容只包含目标客户端、连接方式和当前环境动态生成的 `agentchatroom` 配置，配置位置、写入方式和异常处理由 Agent 自行判断并向用户反馈。
 5. 按页面提示重启客户端、重新加载 MCP 或新开会话。配置文件已写入不等于已经连接，必须等左侧显示该软件在当前 Room“已连接”。左侧已连接只表示 MCP 进程 Presence，不等于当前模型对话已经同步。
 6. Agent 开始工作前调用一次 `room_bootstrap`。不要读取或修改 `mcp.json` / `config.toml`，也不要检查源码或数据库；只有该工具返回 `identity_not_configured` 时才使用本机 MCP 配置助手。
@@ -302,29 +302,85 @@ Room。`room_join` 会从忽略的 `.agentchatroom/project.json` 读取后端登
 加入该作用域唯一的活动 Room；如果登记仍指向已永久删除的 Project，只返回失效
 登记错误，不会用旧 key 复活。只有本地登记和数据库作用域都为空时才创建新 Room。
 
+## HTTP 直连为主使用模式
+
+局域网（阶段 B）和后续云端（阶段 C）以客户端 **url 模式直连中心 `/mcp`** 为主。本机 stdio（阶段 A）仍然支持，适合 Agent 与中心在同一台电脑、需要本机配置助手写入 `mcp.json` 的场景。
+
+### 端点、鉴权与 Token
+
+- 数据服务默认开启 Streamable HTTP MCP，路径为配置项 `mcp_http_path`（默认 `/mcp`），不是业务 REST 的 `/api/v1/*`。
+- 默认要求 `Authorization: Bearer <Agent Token>`。未带 Token 或 Token 无效时返回 **401**，并带 RFC 9728 受保护资源元数据。
+- Token 在 Web「管理」Tab 的 Agent 凭据中签发 / 轮换 / 回收。配置文本只含占位符 `<paste-issued-agent-token>`，不硬编码真实 Secret。不要把 Token 放进 URL、查询参数、日志或 Git。
+- 软件身份由生成的 HTTP 配置头注入（`X-AgentChatRoom-Software-Key/Name/Client`），或由已关联软件成员的 Token 提供。Agent 不得自行填写或发明 `agent_key`。
+
+### 客户端配置
+
+生成 HTTP 直连配置（推荐主路径）：
+
+```powershell
+.venv\Scripts\python.exe -m agentchatroom mcp-config --format generic-json --transport streamable-http
+.venv\Scripts\python.exe -m agentchatroom mcp-config --format workbuddy-json --transport streamable-http
+.venv\Scripts\python.exe -m agentchatroom mcp-config --format grok-toml --transport streamable-http
+.venv\Scripts\python.exe -m agentchatroom mcp-config --format codex-toml --transport streamable-http
+```
+
+通用 JSON 形状为 `mcpServers.agentchatroom.url` + `headers.Authorization`。把占位符替换为管理端签发的 Token 后，用真实 MCP 客户端以 url 模式调用零参数 `room_bootstrap`；`status=ready` 且返回的 Project 与当前工作区一致才允许写操作。
+
+Web「接入 Agent」向导把 **HTTP 直连**、本机 stdio、远程 Bridge 并列展示，默认选 HTTP 直连，并给出管理 Tab 签发 Token 的步骤。
+
+### 绑定语义与多项目边界
+
+一个 `/mcp` 端点服务 N 个 Project。每个 MCP 连接按客户端 `initialize` 提供的 **workspace roots** 绑定其中一个 Room；服务端绑定态**禁用**进程 cwd 和 `AGENTCHATROOM_PROJECT_PATH`，避免把服务进程的工作目录钉死成某一个项目。
+
+Roots 解析顺序：
+
+1. 先按数据库已注册项目匹配（`projects.root_path`、已登记 workspace `local_path`、以及路径在服务端存在时的 git remote + `logical_path` 作用域）。云端场景下客户端路径不必存在于服务端本地磁盘。
+2. 匹配不到再回退服务端文件系统探测 `.agentchatroom/project.json`（本机 stdio 仍可用）。
+3. 未登记 roots 返回 `project_not_registered`，并带 `required_action` 与 HTTP 模式正确动作（核对 roots / 在 Web 登记 / 换该项目的 Token，不要沿用项目 A 的条目去写项目 B）。
+
+Agent Token 也是项目作用域：roots 指向项目 B 但 Token 属于项目 A 时拒绝写入。多项目并行请使用不同 MCP 服务器条目（不同 roots + 对应项目的 Token），而不是指望一个连接在项目间切换。
+
+本机 stdio 单机路径保持 `workspace_roots > cwd > env`：roots/cwd 的登记解析始终优先，`AGENTCHATROOM_PROJECT_PATH` 只是兜底。
+
+### 三种连接方式与阶段对应
+
+| 方式 | 阶段 | 适用 |
+| --- | --- | --- |
+| HTTP 直连（`streamable-http`） | B 局域网，C 云端主路径 | 客户端支持 url + Bearer；不在 Agent 电脑上拉起中心进程 |
+| 本机 stdio（`local-stdio`） | A 单机 | Agent 与中心同一台电脑，可使用 Web 本机配置助手 |
+| 远程 Bridge（`remote-bridge`） | B/C 补充 | 客户端只能拉起本地进程，由 Bridge 转发到中心 `/mcp` |
+
+`/api/v1/*` 业务端点行为不变。stdio 与 Bridge 保持向后兼容。
+
 ## MCP 接入
 
 生成通用本机 stdio JSON：
 
 ```powershell
-.venv\Scripts\agentchatroom.exe mcp-config --format generic-json --transport local-stdio
+.venv\Scripts\python.exe -m agentchatroom mcp-config --format generic-json --transport local-stdio
 ```
 
 生成特定客户端格式：
 
 ```powershell
-.venv\Scripts\agentchatroom.exe mcp-config --format workbuddy-json --transport local-stdio
-.venv\Scripts\agentchatroom.exe mcp-config --format grok-toml --transport local-stdio
-.venv\Scripts\agentchatroom.exe mcp-config --format codex-toml --transport local-stdio
+.venv\Scripts\python.exe -m agentchatroom mcp-config --format workbuddy-json --transport local-stdio
+.venv\Scripts\python.exe -m agentchatroom mcp-config --format grok-toml --transport local-stdio
+.venv\Scripts\python.exe -m agentchatroom mcp-config --format codex-toml --transport local-stdio
 ```
 
-连接方式与一期范围：
+开发期 stdio 入口推荐：
+
+```powershell
+.venv\Scripts\python.exe -m agentchatroom.mcp_server
+```
+
+打包 EXE 使用稳定路径 `dist/agentchatroom/agentchatroom.exe mcp`。如果旧 `mcp.json` 仍指向已改名的 `dist\release-x.y.z\` 目录，升级后会静默找不到入口，需要改到上述稳定目录或重新运行 `mcp-config`。
+
+连接方式：
 
 - `local-stdio`：Agent 与中心在同一台电脑，共享同一个 `.agentchatroom/runtime`。
-- `streamable-http`：后续阶段客户端直接连接中心 `/mcp` 的基础适配，当前不在 Web 展示。
-- `remote-bridge`：后续阶段由本机 Bridge 转发到远程中心的基础适配，当前不在 Web 展示。
-
-一期 Web 只提供 `local-stdio` 配置流程。远程能力完成独立设计、代码同步边界和端到端验收前，不应通过隐藏入口或手工参数将其视为已支持产品能力。
+- `streamable-http`：客户端直接连接中心 `/mcp` 的主使用方式，Web 向导一等展示。
+- `remote-bridge`：由本机 Bridge 转发到远程中心，适合客户端只能拉起本地进程的场景。
 
 ### Agent 凭据传输约束
 
@@ -332,7 +388,7 @@ Agent Session Token 与 access token 只能放在 JSON 请求体、`Authorizatio
 
 ### 本机 MCP 配置助手
 
-`deployment_profile=local` 时，Web“配置本机 Agent”可为已验证的 JSON 客户端执行
+`deployment_profile=local` 时，Web“接入 Agent”在本机 stdio 方式下可为已验证的 JSON 客户端执行
 `检测 -> 预览 -> 用户确认 -> 备份 -> 原子写入 -> 再次校验`：
 
 - WorkBuddy 检测当前用户的 `~/.workbuddy/mcp.json`。
@@ -437,7 +493,7 @@ room_bootstrap
 
 配置助手只负责首次安装或明确缺失配置，不得声称已经连接或同步。`room_bootstrap` 不编辑第三方客户端配置文件，不认领任务，不改写历史事件。兼容期仍可显式传入 `project_id` / `session_id` / `token`，但必须与当前绑定一致；跨 Project 或旧 Session 会被拒绝。非目标：不要求所有 MCP 客户端都支持自动 Resource 注入，也不把完全零调用作为首版硬要求。
 
-Web「配置本机 Agent」把五件事实分开显示：工作区绑定、软件配置、进程连接（MCP Presence）、Room Session、当前对话同步。浏览器无法观察某个模型对话是否已同步，因此不会把左侧「已连接」画成「当前对话已同步」。生成的 onboarding prompt 内置「工作区与 Room 绑定边界」：本配置只针对当前显示的工作区/Project 生成（稳定软件身份可跨 Project 复用，工作区上下文不可静默复用；客户端不能提供可靠 workspace roots/cwd 时应使用独立 MCP 配置/进程并在重载后重新 bootstrap）；接入完成后第一步调用零参数 `room_bootstrap` 并核对返回的 Project 名称与 root_path；出现未登记、登记损坏、多 Project/配置冲突、项目不匹配或 Session 过期时立即停止消息、任务、文件占用等写操作，只按唯一 required_action 恢复；生效顺序为应用配置 → 重载客户端 MCP → 零参数 `room_bootstrap` 核对项目 → 之后才允许写操作。prompt 不要求或暴露任何项目/会话标识或凭据，也不指导手改 checkout 登记。CLI `room-bootstrap` 复用同一领域服务，成功结果也不打印 Session Token。
+Web「接入 Agent」把五件事实分开显示：工作区绑定、软件配置、进程连接（MCP Presence）、Room Session、当前对话同步。浏览器无法观察某个模型对话是否已同步，因此不会把左侧「已连接」画成「当前对话已同步」。生成的 onboarding prompt 内置「工作区与 Room 绑定边界」：本配置只针对当前显示的工作区/Project 生成（稳定软件身份可跨 Project 复用，工作区上下文不可静默复用；客户端不能提供可靠 workspace roots/cwd 时应使用独立 MCP 配置/进程并在重载后重新 bootstrap）；接入完成后第一步调用零参数 `room_bootstrap` 并核对返回的 Project 名称与 root_path；出现未登记、登记损坏、多 Project/配置冲突、项目不匹配或 Session 过期时立即停止消息、任务、文件占用等写操作，只按唯一 required_action 恢复；生效顺序为应用配置 → 重载客户端 MCP → 零参数 `room_bootstrap` 核对项目 → 之后才允许写操作。prompt 不要求或暴露任何项目/会话标识或凭据，也不指导手改 checkout 登记。CLI `room-bootstrap` 复用同一领域服务，成功结果也不打印 Session Token。
 
 ### MCP 生命周期与启动归属
 

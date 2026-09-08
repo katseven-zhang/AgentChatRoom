@@ -59,10 +59,76 @@ def prepare_standard_streams(*, require_protocol: bool = False) -> None:
         raise RuntimeError('mcp_stdio_unavailable')
 
 
+def _fail_no_protocol_stdin() -> None:
+    try:
+        if sys.stderr is not None:
+            sys.stderr.write(
+                'agentchatroom mcp unavailable (startup_failed/no_protocol_stdin)\n'
+            )
+            sys.stderr.flush()
+    except Exception:
+        pass
+    raise SystemExit(2) from None
+
+
+class _ProtocolStdin:
+    """Fail closed when the first MCP read is immediate EOF."""
+
+    _acr_protocol_guard = True
+
+    def __init__(self, inner):
+        object.__setattr__(self, '_inner', inner)
+        object.__setattr__(self, '_received', False)
+
+    def read(self, size=-1):
+        data = self._inner.read(size)
+        self._note(data)
+        return data
+
+    def readline(self, *args, **kwargs):
+        data = self._inner.readline(*args, **kwargs)
+        self._note(data)
+        return data
+
+    def readlines(self, hint=-1):
+        data = self._inner.readlines(hint)
+        self._note(b''.join(data) if data and isinstance(data[0], (bytes, bytearray)) else ''.join(data) if data else data)
+        return data
+
+    def _note(self, data) -> None:
+        if data:
+            object.__setattr__(self, '_received', True)
+        elif not self._received:
+            _fail_no_protocol_stdin()
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+    def __setattr__(self, name, value):
+        if name in {'_inner', '_received'}:
+            object.__setattr__(self, name, value)
+            return
+        setattr(self._inner, name, value)
+
+
+def install_protocol_stdin_guard() -> None:
+    current = getattr(sys, 'stdin', None)
+    if current is None:
+        _fail_no_protocol_stdin()
+    if getattr(current, '_acr_protocol_guard', False):
+        return
+    wrapper = _ProtocolStdin(current)
+    buffer = getattr(current, 'buffer', None)
+    if buffer is not None and not getattr(buffer, '_acr_protocol_guard', False):
+        object.__setattr__(wrapper, 'buffer', _ProtocolStdin(buffer))
+    sys.stdin = wrapper
+
+
 def run_mcp_entry(arguments: list[str]) -> None:
     """No GUI error dialog may escape from a headless MCP entry point."""
     try:
         prepare_standard_streams(require_protocol=True)
+        install_protocol_stdin_guard()
         from .mcp_server import main
         main(arguments)
     except SystemExit:

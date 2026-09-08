@@ -6,8 +6,8 @@
     <meta name="color-scheme" content="light">
     <title>AgentChatRoom</title>
     <link rel="icon" href="/assets/favicon.svg?v=1.0.0-central1" type="image/svg+xml">
-    <link rel="stylesheet" href="/assets/app.css?v=1.0.0-central40">
-    <script src="/assets/app.js?v=1.0.0-central40" defer></script>
+    <link rel="stylesheet" href="/assets/app.css?v=1.0.0-central41">
+    <script src="/assets/app.js?v=1.0.0-central41" defer></script>
   </head>
   <body>
     <div class="app-shell" id="app-shell">
@@ -75,7 +75,7 @@
             <p class="room-path" id="room-path">添加本地项目后即可开始协作</p>
           </div>
           <div class="workspace-actions">
-            <button class="secondary-button" id="connect-agent-button" type="button" disabled>配置本机 Agent</button>
+            <button class="secondary-button" id="connect-agent-button" type="button" disabled>接入 Agent</button>
             <button class="icon-button" id="project-settings-button" type="button" title="项目设置" aria-label="项目设置" disabled>⚙</button>
             <button class="secondary-button" id="export-project-button" type="button" disabled>导出</button>
             <button class="danger-button" id="archive-project-button" type="button" disabled>归档项目</button>
@@ -96,7 +96,7 @@
             <h3>三步开始多 Agent 协作</h3>
             <ol class="onboarding-steps">
               <li><strong>1. 添加项目</strong><span>把本地工作目录注册为协作 Room（右上角「+ 添加项目」）</span></li>
-              <li><strong>2. 配置本机 Agent</strong><span>按通用 MCP 配置完成本机接入，重载后等待它连接当前项目</span></li>
+              <li><strong>2. 接入 Agent</strong><span>优先用 HTTP 直连（url + Token）；本机 stdio 与远程 Bridge 仍可用</span></li>
               <li><strong>3. 提交第一件工作</strong><span>「新建任务」只需写清原始意图并选择受理 Agent，正式合同由 Agent 补全</span></li>
             </ol>
           </section>
@@ -581,7 +581,7 @@
         <div class="dialog-header">
           <div>
             <p class="context-label">当前项目</p>
-            <h2>接入本机 Agent</h2>
+            <h2>接入 Agent</h2>
           </div>
           <button type="button" class="icon-button dialog-close" title="关闭" aria-label="关闭">×</button>
         </div>
@@ -597,9 +597,35 @@
             <p class="secondary-text">请按客户端实际配置选择；曾在房间出现不代表本机已配置。加入新项目和恢复连接不会应用配置。</p>
           </div>
           <div>
+            <p class="integration-choice-label">连接方式</p>
+            <div class="segmented-control integration-transport-tabs" id="integration-transport-tabs" aria-label="连接方式">
+              <button type="button" class="is-active" data-integration-transport="http">HTTP 直连</button>
+              <button type="button" data-integration-transport="local">本机 stdio</button>
+              <button type="button" data-integration-transport="remote">远程 Bridge</button>
+            </div>
+            <p class="secondary-text">局域网与后续云端部署以 HTTP 直连为主；本机 stdio 适合同一台电脑开发，远程 Bridge 适合客户端只能拉起本地进程时转发。</p>
+          </div>
+          <div>
             <p class="integration-choice-label">Agent 客户端</p>
             <div class="segmented-control integration-tabs" id="integration-format-tabs" aria-label="目标 Agent"></div>
           </div>
+        </section>
+
+        <section id="integration-http-token-guide" class="integration-section http-token-guide">
+          <div class="integration-heading">
+            <div>
+              <h3>Token 发放</h3>
+              <p class="secondary-text">HTTP 直连使用管理端签发的 Agent Token。配置文本只含 Bearer 占位符，不会写入真实 Secret。</p>
+            </div>
+            <button type="button" class="secondary-button" id="integration-open-token-button">打开管理 Tab 签发</button>
+          </div>
+          <ol class="http-token-steps">
+            <li>打开「管理」Tab，在 Agent 凭据中点击「签发 Token」。</li>
+            <li>建议关联对应软件成员；复制一次性 Secret（关闭后不会再显示）。</li>
+            <li>把下方配置里的 <code>&lt;paste-issued-agent-token&gt;</code> 替换为该 Secret。</li>
+            <li>客户端以 url 模式连接 <code>/mcp</code>，调用零参数 <code>room_bootstrap</code> 核对项目。</li>
+            <li>回收或轮换 Token 仍在同一管理列表操作；不要把 Token 放进 URL、日志或仓库。</li>
+          </ol>
         </section>
 
         <section id="integration-local-assistant" class="integration-section local-mcp-assistant" hidden>

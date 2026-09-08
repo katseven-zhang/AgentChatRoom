@@ -76,6 +76,67 @@ def test_mcp_wrapper_preserves_expected_exit_code(monkeypatch):
     assert error.value.code == 2
 
 
+def test_empty_protocol_stdin_exits_nonzero(monkeypatch, capsys):
+    import io
+
+    monkeypatch.setattr(sys, 'stdin', io.StringIO(''))
+    stdio_runtime.install_protocol_stdin_guard()
+    with pytest.raises(SystemExit) as error:
+        sys.stdin.readline()
+    assert error.value.code == 2
+    captured = capsys.readouterr()
+    assert captured.out == ''
+    assert 'startup_failed/no_protocol_stdin' in captured.err
+
+
+def test_protocol_stdin_guard_allows_jsonrpc_payload(monkeypatch):
+    import io
+
+    monkeypatch.setattr(sys, 'stdin', io.StringIO('{"jsonrpc":"2.0","id":1}\n'))
+    stdio_runtime.install_protocol_stdin_guard()
+    line = sys.stdin.readline()
+    assert '"jsonrpc"' in line
+
+
+@pytest.mark.skipif(sys.platform != 'win32', reason='Packaged Windows EXE evidence')
+def test_packaged_mcp_empty_stdin_exits_nonzero():
+    from pathlib import Path
+    specified = os.environ.get('AGENTCHATROOM_TEST_EXE', '').strip()
+    if not specified:
+        pytest.skip('Set AGENTCHATROOM_TEST_EXE to a build that includes no_protocol_stdin')
+    executable = Path(specified)
+    if not executable.is_file():
+        pytest.skip('Packaged executable not available')
+    result = subprocess.run(
+        [str(executable), 'mcp'],
+        input='',
+        capture_output=True,
+        text=True,
+        timeout=20,
+        creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0),
+    )
+    assert result.returncode != 0
+    assert 'unavailable' in result.stderr
+    assert 'startup_failed' in result.stderr or 'service_unavailable' in result.stderr or 'no_protocol_stdin' in result.stderr
+
+
+def test_source_mcp_entry_empty_stdin_exits_nonzero(tmp_path):
+    env = os.environ.copy()
+    env['AGENTCHATROOM_DATA_DIR'] = str(tmp_path / 'runtime')
+    result = subprocess.run(
+        [sys.executable, '-m', 'agentchatroom.mcp_server'],
+        input='',
+        capture_output=True,
+        text=True,
+        timeout=20,
+        env=env,
+        cwd=str(tmp_path),
+    )
+    assert result.returncode != 0
+    assert 'unavailable' in result.stderr
+    assert result.stdout == ''
+
+
 def test_missing_pipe_does_not_allocate_console(monkeypatch):
     from types import SimpleNamespace
     fake_sys = SimpleNamespace(stdin=None, stdout=None, stderr=None)

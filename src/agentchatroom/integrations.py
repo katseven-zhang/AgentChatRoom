@@ -17,6 +17,9 @@ SOFTWARE_KEY_ENV_VAR = "AGENTCHATROOM_SOFTWARE_KEY"
 SOFTWARE_NAME_ENV_VAR = "AGENTCHATROOM_SOFTWARE_NAME"
 SOFTWARE_CLIENT_ENV_VAR = "AGENTCHATROOM_SOFTWARE_CLIENT"
 PROJECT_PATH_ENV_VAR = "AGENTCHATROOM_PROJECT_PATH"
+SOFTWARE_KEY_HEADER = "X-AgentChatRoom-Software-Key"
+SOFTWARE_NAME_HEADER = "X-AgentChatRoom-Software-Name"
+SOFTWARE_CLIENT_HEADER = "X-AgentChatRoom-Software-Client"
 
 # Client-specific details live at the integration boundary. The MCP server and
 # its domain model remain vendor-neutral; adding a client only adds a profile.
@@ -126,10 +129,25 @@ def _build_toml(server: dict[str, Any], environment: dict[str, str]) -> str:
     return "\n".join(lines) + "\n"
 
 
+def _streamable_http_identity_headers(identity_env: Mapping[str, str]) -> dict[str, str]:
+    return {
+        SOFTWARE_KEY_HEADER: str(
+            identity_env.get(SOFTWARE_KEY_ENV_VAR) or "<stable-software-key>"
+        ),
+        SOFTWARE_NAME_HEADER: str(
+            identity_env.get(SOFTWARE_NAME_ENV_VAR) or "<Software name>"
+        ),
+        SOFTWARE_CLIENT_HEADER: str(
+            identity_env.get(SOFTWARE_CLIENT_ENV_VAR) or "<software-client-code>"
+        ),
+    }
+
+
 def _build_streamable_http_toml(
     url: str,
     *,
     client: str,
+    identity_env: Mapping[str, str] | None = None,
 ) -> str:
     """Build a native HTTP MCP profile without embedding an Agent Token.
 
@@ -137,6 +155,7 @@ def _build_streamable_http_toml(
     bearer-token environment setting. Both are kept at this adapter boundary;
     the center and domain services remain unaware of client config syntax.
     """
+    identity_headers = _streamable_http_identity_headers(identity_env or {})
     lines = [
         f"[mcp_servers.{MCP_SERVER_NAME}]",
         "enabled = true",
@@ -144,12 +163,26 @@ def _build_streamable_http_toml(
     ]
     if client == "codex":
         lines.append(f"bearer_token_env_var = {json.dumps(AGENT_TOKEN_ENV_VAR)}")
+        lines.extend(
+            [
+                "",
+                f"[mcp_servers.{MCP_SERVER_NAME}.headers]",
+                *(
+                    f"{key} = {json.dumps(value)}"
+                    for key, value in identity_headers.items()
+                ),
+            ]
+        )
     else:
         lines.extend(
             [
                 "",
                 f"[mcp_servers.{MCP_SERVER_NAME}.headers]",
                 f'Authorization = "Bearer ${{{AGENT_TOKEN_ENV_VAR}}}"',
+                *(
+                    f"{key} = {json.dumps(value)}"
+                    for key, value in identity_headers.items()
+                ),
             ]
         )
     return "\n".join(lines) + "\n"
@@ -326,12 +359,16 @@ def build_mcp_integration(
         json.dumps(remote_bridge_json, ensure_ascii=False, indent=2) + "\n"
     )
     remote_bridge_toml = _build_toml(bridge_server, bridge_environment)
+    generic_identity = _profile_identity_environment(
+        "generic", MCP_CLIENT_PROFILES["generic"]
+    )
     streamable_http_json = {
         "mcpServers": {
             MCP_SERVER_NAME: {
                 "url": remote_url,
                 "headers": {
                     "Authorization": f"Bearer {AGENT_TOKEN_PLACEHOLDER}",
+                    **_streamable_http_identity_headers(generic_identity),
                 },
             }
         }
@@ -340,10 +377,18 @@ def build_mcp_integration(
         json.dumps(streamable_http_json, ensure_ascii=False, indent=2) + "\n"
     )
     grok_streamable_http_toml = _build_streamable_http_toml(
-        remote_url, client="grok_build"
+        remote_url,
+        client="grok_build",
+        identity_env=_profile_identity_environment(
+            "grok_build", MCP_CLIENT_PROFILES["grok_build"]
+        ),
     )
     codex_streamable_http_toml = _build_streamable_http_toml(
-        remote_url, client="codex"
+        remote_url,
+        client="codex",
+        identity_env=_profile_identity_environment(
+            "codex", MCP_CLIENT_PROFILES["codex"]
+        ),
     )
     project_instructions_text = (
         build_project_coordination_instructions(project) if project else ""
@@ -399,13 +444,30 @@ def build_mcp_integration(
             if profile["format"] == "json"
             else _build_toml(profile_bridge_server, profile_bridge_environment)
         )
-        if profile["format"] == "json":
-            http_config_text = streamable_http_json_text
-        elif profile_id == "codex":
-            http_config_text = codex_streamable_http_toml
-        else:
-            http_config_text = grok_streamable_http_toml
         identity_env = _profile_identity_environment(profile_id, profile)
+        if profile["format"] == "json":
+            profile_http_json = {
+                "mcpServers": {
+                    MCP_SERVER_NAME: {
+                        "url": remote_url,
+                        "headers": {
+                            "Authorization": f"Bearer {AGENT_TOKEN_PLACEHOLDER}",
+                            **_streamable_http_identity_headers(identity_env),
+                        },
+                    }
+                }
+            }
+            http_config_text = (
+                json.dumps(profile_http_json, ensure_ascii=False, indent=2) + "\n"
+            )
+        elif profile_id == "codex":
+            http_config_text = _build_streamable_http_toml(
+                remote_url, client="codex", identity_env=identity_env
+            )
+        else:
+            http_config_text = _build_streamable_http_toml(
+                remote_url, client="grok_build", identity_env=identity_env
+            )
         profiles[profile_id] = {
             **profile,
             "software_key": identity_env.get(SOFTWARE_KEY_ENV_VAR, ""),

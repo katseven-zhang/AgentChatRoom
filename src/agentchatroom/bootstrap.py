@@ -10,7 +10,9 @@ from urllib.parse import unquote, urlparse
 from .errors import DomainError
 from .project_registration import (
     PROJECT_REGISTRATION_RELATIVE_PATH,
+    checkout_scope,
     resolve_checkout_project_key,
+    stored_project_scope,
 )
 from .services import AgentChatRoomService
 
@@ -142,6 +144,78 @@ def find_registered_checkout(start: str | Path) -> Path | None:
         if (candidate / PROJECT_REGISTRATION_RELATIVE_PATH).is_file():
             return candidate
     return None
+
+
+def workspace_path_keys(value: str | Path) -> set[str]:
+    """Comparable keys for a workspace path that may not exist on this host."""
+    raw = str(value or "").strip()
+    if not raw:
+        return set()
+    keys = {
+        os.path.normcase(raw),
+        os.path.normcase(raw.replace("/", "\\")),
+        os.path.normcase(raw.replace("\\", "/")),
+    }
+    try:
+        keys.add(os.path.normcase(str(Path(raw).expanduser().resolve())))
+    except (OSError, RuntimeError, ValueError):
+        pass
+    return {key for key in keys if key}
+
+
+def match_registered_projects(
+    service: AgentChatRoomService,
+    roots: Iterable[str | Path],
+) -> list[tuple[dict[str, Any], Path]]:
+    """Match client workspace roots to projects already stored in the database.
+
+    Path existence on this host is not required. Matching order per root:
+    stored ``root_path``, registered workspace ``local_path``, then git
+    remote + logical_path scope when the path exists locally.
+    """
+    projects = service.list_projects()
+    if not projects:
+        return []
+    indexed: list[tuple[dict[str, Any], set[str]]] = []
+    for project in projects:
+        keys = workspace_path_keys(project.get("root_path", ""))
+        try:
+            for workspace in service.list_workspaces(str(project["id"])):
+                keys |= workspace_path_keys(workspace.get("local_path", ""))
+        except DomainError:
+            pass
+        indexed.append((project, keys))
+
+    matched: list[tuple[dict[str, Any], Path]] = []
+    seen_ids: set[str] = set()
+    for root in roots:
+        raw = str(root or "").strip()
+        if not raw:
+            continue
+        try:
+            client_path = Path(raw).expanduser().resolve()
+        except (OSError, RuntimeError, ValueError):
+            client_path = Path(raw)
+        client_keys = workspace_path_keys(raw) | workspace_path_keys(client_path)
+        found: dict[str, Any] | None = None
+        for project, keys in indexed:
+            if client_keys & keys:
+                found = project
+                break
+        if found is None:
+            try:
+                if client_path.exists():
+                    scope = checkout_scope(client_path)
+                    for project, _keys in indexed:
+                        if stored_project_scope(project) == scope:
+                            found = project
+                            break
+            except (DomainError, OSError):
+                found = None
+        if found is not None and str(found["id"]) not in seen_ids:
+            seen_ids.add(str(found["id"]))
+            matched.append((found, client_path))
+    return matched
 
 
 def discover_workspace_candidates(
@@ -306,69 +380,82 @@ def bootstrap_local_room(
         return BootstrapOutcome(bootstrap_status_payload("mcp_restart_required"))
 
     roots = list(workspace_roots or ())
-    workspace_candidates = discover_workspace_candidates(
-        workspace_roots=roots,
-        cwd=cwd,
-    )
-    configured_checkout = resolve_configured_checkout(explicit_project_path)
-    if workspace_candidates:
-        candidates: list[Path] = workspace_candidates
-    elif configured_checkout is not None and not roots and not (cwd and str(cwd).strip()):
-        candidates = [configured_checkout]
-    else:
-        return BootstrapOutcome(bootstrap_status_payload("project_not_registered"))
-    unique_keys: dict[str, Path] = {}
-    invalid: Path | None = None
-    for candidate in candidates:
-        try:
-            project_key, present = resolve_checkout_project_key(candidate)
-        except DomainError as error:
-            if error.code.startswith("project_registration"):
-                invalid = candidate
-                continue
-            return BootstrapOutcome(
-                bootstrap_status_payload(
-                    "registration_invalid",
-                    details={"code": error.code},
-                )
-            )
-        if not present or not project_key:
-            continue
-        unique_keys.setdefault(project_key, candidate)
-    if invalid is not None:
-        return BootstrapOutcome(bootstrap_status_payload("registration_invalid"))
-    if len(unique_keys) > 1:
+    db_matches = match_registered_projects(service, roots) if roots else []
+    if len(db_matches) > 1:
         return BootstrapOutcome(
             bootstrap_status_payload(
                 "ambiguous_workspace",
-                details={"candidate_count": len(unique_keys)},
+                details={"candidate_count": len(db_matches)},
             )
         )
-    if not unique_keys:
-        return BootstrapOutcome(bootstrap_status_payload("project_not_registered"))
-
-    project_key, checkout = next(iter(unique_keys.items()))
-    try:
-        project = service.resolve_project_for_join(
-            root_path=str(checkout),
-            registered_project_key=project_key,
+    configured_checkout = resolve_configured_checkout(explicit_project_path)
+    workspace_candidates: list[Path] = []
+    if db_matches:
+        project, checkout = db_matches[0]
+        workspace_candidates = [checkout]
+    else:
+        workspace_candidates = discover_workspace_candidates(
+            workspace_roots=roots,
+            cwd=cwd,
         )
-    except DomainError as error:
-        if error.code in {"project_archived", "project_not_found"}:
+        if workspace_candidates:
+            candidates: list[Path] = workspace_candidates
+        elif configured_checkout is not None and not roots and not (cwd and str(cwd).strip()):
+            candidates = [configured_checkout]
+        else:
+            return BootstrapOutcome(bootstrap_status_payload("project_not_registered"))
+        unique_keys: dict[str, Path] = {}
+        invalid: Path | None = None
+        for candidate in candidates:
+            try:
+                project_key, present = resolve_checkout_project_key(candidate)
+            except DomainError as error:
+                if error.code.startswith("project_registration"):
+                    invalid = candidate
+                    continue
+                return BootstrapOutcome(
+                    bootstrap_status_payload(
+                        "registration_invalid",
+                        details={"code": error.code},
+                    )
+                )
+            if not present or not project_key:
+                continue
+            unique_keys.setdefault(project_key, candidate)
+        if invalid is not None:
+            return BootstrapOutcome(bootstrap_status_payload("registration_invalid"))
+        if len(unique_keys) > 1:
+            return BootstrapOutcome(
+                bootstrap_status_payload(
+                    "ambiguous_workspace",
+                    details={"candidate_count": len(unique_keys)},
+                )
+            )
+        if not unique_keys:
+            return BootstrapOutcome(bootstrap_status_payload("project_not_registered"))
+
+        project_key, checkout = next(iter(unique_keys.items()))
+        try:
+            project = service.resolve_project_for_join(
+                root_path=str(checkout),
+                registered_project_key=project_key,
+            )
+        except DomainError as error:
+            if error.code in {"project_archived", "project_not_found"}:
+                return BootstrapOutcome(
+                    bootstrap_status_payload(
+                        "room_unavailable",
+                        details={"code": error.code},
+                    )
+                )
+            if error.code.startswith("project_registration"):
+                return BootstrapOutcome(bootstrap_status_payload("registration_invalid"))
             return BootstrapOutcome(
                 bootstrap_status_payload(
                     "room_unavailable",
                     details={"code": error.code},
                 )
             )
-        if error.code.startswith("project_registration"):
-            return BootstrapOutcome(bootstrap_status_payload("registration_invalid"))
-        return BootstrapOutcome(
-            bootstrap_status_payload(
-                "room_unavailable",
-                details={"code": error.code},
-            )
-        )
 
     workspace_path = str(checkout)
     try:

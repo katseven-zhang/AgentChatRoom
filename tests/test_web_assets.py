@@ -99,9 +99,13 @@ def test_web_bootstrap_and_phase_one_local_agent_hooks_are_complete():
     assert 'id="login-username"' not in markup
     assert 'autocomplete="current-password"' in markup
     assert "function renderIntegrationJoin()" in javascript
-    assert 'data-integration-transport=' not in markup
-    assert '"streamable_http_config_text"' not in javascript
-    assert '"remote_bridge_config_text"' not in javascript
+    assert 'data-integration-transport="http"' in markup
+    assert 'data-integration-transport="local"' in markup
+    assert 'data-integration-transport="remote"' in markup
+    assert "streamable_http_config_text" in javascript
+    assert "remote_bridge_config_text" in javascript
+    assert "paste-issued-agent-token" in markup
+    assert "打开管理 Tab 签发" in markup
     assert 'payload.host_key = "<stable-host-key>"' not in javascript
     assert 'payload.host_name = "<computer-name>"' not in javascript
     assert '"<path-to-project-on-this-computer>"' not in javascript
@@ -222,8 +226,8 @@ def test_web_supports_human_reading_and_guided_interactions():
     assert "snapshot.agent_identities" in javascript
     assert "当前连接" in javascript
     assert "累计" in javascript and "次接入" in javascript
-    assert 'app.css?v=1.0.0-central40' in markup
-    assert 'app.js?v=1.0.0-central40' in markup
+    assert 'app.css?v=1.0.0-central41' in markup
+    assert 'app.js?v=1.0.0-central41' in markup
     assert len(re.findall(r'<script\b[^>]*src="/assets/app\.js', markup)) == 1
     assert 'id="task-history-filter"' in markup
     assert "function loadTaskHistory(" in javascript
@@ -339,10 +343,12 @@ def test_web_local_mcp_assistant_separates_write_reload_and_presence_states():
     stylesheet = (WEB_DIR / "app.css").read_text(encoding="utf-8")
 
     assert 'id="integration-local-assistant"' in markup
-    assert '>配置本机 Agent</button>' in markup
-    assert '<h2>接入本机 Agent</h2>' in markup
-    assert 'data-integration-transport=' not in markup
-    assert '连接方式' not in markup
+    assert '>接入 Agent</button>' in markup
+    assert '<h2>接入 Agent</h2>' in markup
+    assert 'data-integration-transport="http"' in markup
+    assert '连接方式' in markup
+    assert 'id="integration-http-token-guide"' in markup
+    assert 'id="integration-open-token-button"' in markup
     assert 'id="integration-local-refresh"' in markup
     assert 'id="integration-local-apply"' in markup
     assert "function renderLocalMcpPlan()" in javascript
@@ -368,7 +374,9 @@ def test_web_local_mcp_assistant_separates_write_reload_and_presence_states():
     assert '.local-mcp-fact[data-state="ready"]' in stylesheet
     assert "grid-template-columns: repeat(2, minmax(0, 1fr));" in stylesheet
     assert ".integration-tabs button:last-child" in stylesheet
-    assert ".integration-transport-tabs" not in stylesheet
+    assert ".integration-transport-tabs" in stylesheet
+    assert ".http-token-guide" in stylesheet
+    assert ".http-token-steps" in stylesheet
 
 
 def test_web_desktop_panels_are_resizable_readable_and_persistent():
@@ -1932,7 +1940,7 @@ def test_web_local_mcp_assistant_offers_generic_only():
     # named-client defaults are gone from the UI layer
     assert 'integrationFormat: "workbuddy"' not in javascript
     assert "选择客户端并完成本机 MCP 配置" not in markup
-    assert "按通用 MCP 配置完成本机接入" in markup
+    assert "优先用 HTTP 直连（url + Token）" in markup
     # generic profile keeps the full onboarding flow wired
     assert "renderIntegrationTabs()" in javascript
     assert "integration-onboarding-prompt" in markup

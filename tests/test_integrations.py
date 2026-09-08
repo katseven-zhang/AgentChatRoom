@@ -115,9 +115,15 @@ def test_streamable_http_profiles_use_center_url_without_real_tokens(tmp_path):
         "https://room.example.test/mcp"
     )
     assert "<paste-issued-agent-token>" in result["streamable_http_json_text"]
+    assert "X-AgentChatRoom-Software-Key" in result["streamable_http_json_text"]
+    assert "acr." not in result["streamable_http_json_text"]
     assert "bearer_token_env_var" in result["codex_streamable_http_toml"]
     assert "AGENTCHATROOM_AGENT_TOKEN" in result["grok_streamable_http_toml"]
+    assert "X-AgentChatRoom-Software-Key" in result["grok_streamable_http_toml"]
     assert "<paste-issued-agent-token>" in result["profiles"]["workbuddy"][
+        "streamable_http_config_text"
+    ]
+    assert "X-AgentChatRoom-Software-Key" in result["profiles"]["workbuddy"][
         "streamable_http_config_text"
     ]
     assert "<paste-issued-agent-token>" not in result["grok_streamable_http_toml"]

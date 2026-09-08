@@ -2679,6 +2679,30 @@ dialog::backdrop {
   margin-top: 18px;
 }
 
+.integration-transport-tabs {
+  max-width: 100%;
+}
+
+.http-token-guide[hidden] {
+  display: none;
+}
+
+.http-token-steps {
+  margin: 8px 0 0;
+  padding-left: 1.25em;
+  color: var(--text);
+  font-size: var(--fs-sm);
+  line-height: 1.6;
+}
+
+.http-token-steps li + li {
+  margin-top: 6px;
+}
+
+.http-token-steps code {
+  font-size: var(--fs-xs);
+}
+
 .local-mcp-assistant {
   display: grid;
   gap: 8px;

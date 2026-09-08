@@ -10,9 +10,11 @@ function extract(name) {
   return source.slice(start, end + 2);
 }
 const profile = {
-  local_config: {}, onboarding_prompts: {local: 'legacy install'},
+  local_config: {}, onboarding_prompts: {local: 'legacy install', http: 'http install'},
   onboarding_modes: {
-    first_setup: {local: 'install'}, add_project: {local: 'join'}, reconnect: {local: 'recover'},
+    first_setup: {local: 'install', http: 'http-install'},
+    add_project: {local: 'join', http: 'http-join'},
+    reconnect: {local: 'recover', http: 'http-recover'},
   },
 };
 const context = {
@@ -20,7 +22,10 @@ const context = {
   elements: {'integration-onboarding-prompt': {textContent: ''}},
 };
 vm.createContext(context);
-vm.runInContext(extract('renderOnboardingPrompt') + '\n' + extract('localMcpAssistantSupported'), context);
+vm.runInContext(
+  extract('integrationTransportKey') + '\n' + extract('renderOnboardingPrompt') + '\n' + extract('localMcpAssistantSupported'),
+  context,
+);
 for (const [mode, expected] of Object.entries({first_setup: 'install', add_project: 'join', reconnect: 'recover'})) {
   context.state.integrationOnboardingMode = mode;
   vm.runInContext('renderOnboardingPrompt()', context);
@@ -34,4 +39,12 @@ assert.match(context.elements['integration-onboarding-prompt'].textContent, /不
 context.state.integrationOnboardingMode = 'first_setup';
 vm.runInContext('renderOnboardingPrompt()', context);
 assert.equal(context.elements['integration-onboarding-prompt'].textContent, 'legacy install');
+context.state.integrationTransport = 'http';
+profile.onboarding_modes = {
+  first_setup: {local: 'install', http: 'http-install'},
+  add_project: {local: 'join', http: 'http-join'},
+  reconnect: {local: 'recover', http: 'http-recover'},
+};
+vm.runInContext('renderOnboardingPrompt()', context);
+assert.equal(context.elements['integration-onboarding-prompt'].textContent, 'http-install');
 console.log('onboarding mode selection and fail-closed fallback passed');

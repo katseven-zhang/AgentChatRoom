@@ -3,7 +3,7 @@ const state = {
   integration: null,
   integrationFormat: "generic",
   integrationOnboardingMode: "first_setup",
-  integrationTransport: "local",
+  integrationTransport: "http",
   integrationLocalPlan: null,
   integrationLocalApplyResult: null,
   integrationLocalRequest: 0,
@@ -84,6 +84,7 @@ const elements = Object.fromEntries(
     "integration-local-path", "integration-local-message", "integration-local-changes",
     "integration-local-reload", "integration-local-facts", "integration-local-backup",
     "integration-local-refresh", "integration-local-apply",
+    "integration-transport-tabs", "integration-http-token-guide", "integration-open-token-button",
     "member-list", "refresh-audit-button", "audit-event-filter",
     "create-token-button", "token-list", "workspace-list", "audit-list",
     "create-backup-button", "backup-list",
@@ -1198,7 +1199,7 @@ function renderEmptyRoom() {
     "message-requires-ack", "send-message-button"]
     .forEach((id) => { elements[id].disabled = true; });
   elements["agent-count"].textContent = "0";
-  elements["agent-list"].innerHTML = '<div class="empty-state">Agent 完成「配置本机 Agent」并连接当前 Room 后，会显示在这里</div>';
+  elements["agent-list"].innerHTML = '<div class="empty-state">Agent 完成「接入 Agent」并连接当前 Room 后，会显示在这里</div>';
   elements["chat-stream"].innerHTML = '<div class="empty-state">Room 动态会实时显示在这里：Agent 加入、任务进展和消息按时间排列</div>';
   elements["task-table"].innerHTML = '<div class="empty-state">还没有正式任务。点右上角「+ 新建任务」提交原始任务意图，等待 Agent 受理和定义。</div>';
   elements["token-list"].innerHTML = '<div class="empty-state">选择项目后管理 Agent Token</div>';
@@ -2353,6 +2354,27 @@ document.querySelector(".integration-tabs").addEventListener("click", (event) =>
   void refreshLocalMcpPlan();
 });
 
+elements["integration-transport-tabs"].addEventListener("click", (event) => {
+  const button = event.target.closest("[data-integration-transport]");
+  if (!button) return;
+  state.integrationTransport = button.dataset.integrationTransport;
+  document.querySelectorAll("[data-integration-transport]").forEach((item) => {
+    item.classList.toggle("is-active", item === button);
+  });
+  renderIntegrationConfig();
+  renderOnboardingPrompt();
+  state.integrationLocalPlan = null;
+  state.integrationLocalApplyResult = null;
+  renderLocalMcpPlan();
+  if (state.integrationTransport === "local") void refreshLocalMcpPlan();
+});
+
+elements["integration-open-token-button"].addEventListener("click", () => {
+  elements["integration-dialog"].close();
+  activateTab(document.getElementById("tab-management"));
+  elements["create-token-button"].click();
+});
+
 elements["integration-local-refresh"].addEventListener("click", () => {
   void refreshLocalMcpPlan(true);
 });
@@ -3463,7 +3485,7 @@ async function openIntegrationDialog() {
   if (!state.snapshot) return;
   const project = state.snapshot.project;
   state.integration = await api(`/api/v1/projects/${project.id}/integrations/mcp`);
-  state.integrationTransport = "local";
+  state.integrationTransport = "http";
   elements["integration-data-dir"].textContent = state.integration.runtime.data_dir;
   elements["integration-log-path"].textContent = state.integration.runtime.log_path;
   elements["integration-cli-code"].textContent = [
@@ -3476,6 +3498,9 @@ async function openIntegrationDialog() {
     "--model", "MODEL_CODE_OR_UNKNOWN",
   ].join(" ");
   renderIntegrationTabs();
+  document.querySelectorAll("[data-integration-transport]").forEach((item) => {
+    item.classList.toggle("is-active", item.dataset.integrationTransport === state.integrationTransport);
+  });
   renderOnboardingPrompt();
   renderIntegrationConfig();
   renderIntegrationJoin();
@@ -3487,26 +3512,51 @@ async function openIntegrationDialog() {
   void refreshLocalMcpPlan();
 }
 
+function integrationTransportKey() {
+  if (state.integrationTransport === "http") return "http";
+  if (state.integrationTransport === "remote") return "remote";
+  return "local";
+}
+
+function integrationTransportLabel() {
+  if (state.integrationTransport === "http") return "HTTP 直连";
+  if (state.integrationTransport === "remote") return "远程 Bridge";
+  return "本机 stdio";
+}
+
 function renderOnboardingPrompt() {
   if (!state.integration) return;
   const profile = state.integration.profiles?.[state.integrationFormat];
   const mode = state.integrationOnboardingMode;
-  elements["integration-onboarding-prompt"].textContent = profile?.onboarding_modes?.[mode]?.local
-    || (mode === "first_setup" ? profile?.onboarding_prompts?.local || state.integration.onboarding_prompt : "")
+  const transport = integrationTransportKey();
+  elements["integration-onboarding-prompt"].textContent = profile?.onboarding_modes?.[mode]?.[transport]
+    || (mode === "first_setup" ? profile?.onboarding_prompts?.[transport] || (transport === "local" ? state.integration.onboarding_prompt : "") : "")
     || "当前场景的接入指令尚未生成，请更新服务后重新打开。不要套用首次配置指令。";
+}
+
+function renderHttpTokenGuide() {
+  const guide = elements["integration-http-token-guide"];
+  if (!guide) return;
+  guide.hidden = state.integrationTransport !== "http";
 }
 
 function renderIntegrationConfig() {
   if (!state.integration) return;
   const profile = state.integration.profiles?.[state.integrationFormat];
-  elements["integration-config-code"].textContent = profile?.local_config_text
-    || state.integration.generic_json_text;
+  const transport = integrationTransportKey();
+  const configText = transport === "http"
+    ? (profile?.streamable_http_config_text || state.integration.streamable_http_json_text)
+    : transport === "remote"
+      ? (profile?.remote_bridge_config_text || state.integration.remote_bridge_config_text)
+      : (profile?.local_config_text || state.integration.generic_json_text);
+  elements["integration-config-code"].textContent = configText || "";
   if (elements["integration-config-path"]) {
     const target = profile?.config_path_hint
       ? `建议配置文件：${profile.config_path_hint}`
       : "标准 MCP 配置片段";
-    elements["integration-config-path"].textContent = `${target} · 本机 stdio`;
+    elements["integration-config-path"].textContent = `${target} · ${integrationTransportLabel()}`;
   }
+  renderHttpTokenGuide();
 }
 
 function renderProjectInstructions() {

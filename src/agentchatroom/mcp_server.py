@@ -36,6 +36,7 @@ from .bootstrap import (
     find_registered_checkout,
     workspace_path_from_file_uri,
     PROJECT_PATH_ENV,
+    REQUIRED_ACTIONS,
     SOFTWARE_CLIENT_ENV,
     SOFTWARE_KEY_ENV,
     SOFTWARE_NAME_ENV,
@@ -71,6 +72,21 @@ _bootstrap_workspace_roots: ContextVar[list[Path] | None] = ContextVar(
     "agentchatroom_bootstrap_workspace_roots",
     default=None,
 )
+_bootstrap_http_identity: ContextVar[tuple[str, str, str] | None] = ContextVar(
+    "agentchatroom_bootstrap_http_identity",
+    default=None,
+)
+
+SOFTWARE_KEY_HEADER = "x-agentchatroom-software-key"
+SOFTWARE_NAME_HEADER = "x-agentchatroom-software-name"
+SOFTWARE_CLIENT_HEADER = "x-agentchatroom-software-client"
+HTTP_UNREGISTERED_ROOTS_ACTION = (
+    "Confirm the MCP client advertised workspace roots match a Project already "
+    "registered on this server (root_path, logical_path, or a previously "
+    "registered workspace path). If the workspace is new, create or open it in "
+    "the Web UI, then issue an Agent Token for that Project. Do not reuse a "
+    "token or server entry from another Project."
+)
 
 
 class ServiceBoundToolManager(CompatibleToolManager):
@@ -87,6 +103,7 @@ class ServiceBoundToolManager(CompatibleToolManager):
     ) -> Any:
         provider_token = None
         roots_token = None
+        http_identity_token = None
         try:
             session_key = mcp_session_key(context)
         except DomainError as error:
@@ -118,6 +135,10 @@ class ServiceBoundToolManager(CompatibleToolManager):
                 roots_token = _bootstrap_workspace_roots.set(
                     await collect_mcp_workspace_roots(context, timeout_seconds=get_service().settings.mcp_roots_timeout_seconds)
                 )
+                if self.service_provider is not None:
+                    http_identity_token = _bootstrap_http_identity.set(
+                        _software_identity_from_http(context)
+                    )
             elif name != "room_join":
                 tool = self.get_tool(name)
                 if tool is not None:
@@ -141,6 +162,8 @@ class ServiceBoundToolManager(CompatibleToolManager):
         except DomainError as error:
             return {"ok": False, **error.as_dict()}
         finally:
+            if http_identity_token is not None:
+                _bootstrap_http_identity.reset(http_identity_token)
             if roots_token is not None:
                 _bootstrap_workspace_roots.reset(roots_token)
             if name == "session_leave":
@@ -172,6 +195,90 @@ MCP_INSTRUCTIONS = (
 
 def _configured_local_identity() -> tuple[str, str, str] | None:
     return configured_software_identity()
+
+
+def _identity_tuple(*values: Any) -> tuple[str, str, str] | None:
+    parsed = tuple(str(value or "").strip() for value in values)
+    if len(parsed) != 3:
+        return None
+    if not all(parsed) or any(value.startswith("<") for value in parsed):
+        return None
+    return parsed[0], parsed[1], parsed[2]
+
+
+def _identity_from_member(
+    project_id: str,
+    member_id: str,
+    *,
+    room_service: AgentChatRoomService | None = None,
+) -> tuple[str, str, str] | None:
+    if not project_id or not member_id:
+        return None
+    try:
+        members = (room_service or get_service()).list_project_members(
+            project_id, include_revoked=False
+        )
+    except DomainError:
+        return None
+    member = next((item for item in members if str(item.get("id") or "") == member_id), None)
+    if member is None:
+        return None
+    metadata = member.get("metadata") or {}
+    return _identity_tuple(
+        metadata.get("software_key"),
+        member.get("name"),
+        metadata.get("client"),
+    )
+
+
+def _identity_from_credential(project_id: str, credential_id: str) -> tuple[str, str, str] | None:
+    if not project_id or not credential_id:
+        return None
+    try:
+        tokens = get_service().list_agent_tokens(project_id)
+    except DomainError:
+        return None
+    credential = next(
+        (item for item in tokens if str(item.get("id") or "") == credential_id),
+        None,
+    )
+    if credential is None:
+        return None
+    return _identity_from_member(project_id, str(credential.get("member_id") or ""))
+
+
+def _software_identity_from_http(context: Any) -> tuple[str, str, str] | None:
+    try:
+        access = get_access_token()
+    except LookupError:
+        access = None
+    if access is not None:
+        claims = access.claims or {}
+        from_claims = _identity_tuple(
+            claims.get("software_key"),
+            claims.get("software_name"),
+            claims.get("software_client"),
+        )
+        if from_claims is not None:
+            return from_claims
+        from_credential = _identity_from_credential(
+            str(claims.get("project_id") or ""),
+            str(claims.get("credential_id") or ""),
+        )
+        if from_credential is not None:
+            return from_credential
+    request_context = getattr(context, "request_context", None) if context is not None else None
+    if request_context is None and context is not None:
+        request_context = getattr(context, "_request_context", None)
+    request = getattr(request_context, "request", None) if request_context is not None else None
+    headers = getattr(request, "headers", None)
+    if headers is None:
+        return None
+    return _identity_tuple(
+        headers.get(SOFTWARE_KEY_HEADER),
+        headers.get(SOFTWARE_NAME_HEADER),
+        headers.get(SOFTWARE_CLIENT_HEADER),
+    )
 
 
 def mcp_session_key(context: Any = None) -> str:
@@ -260,8 +367,25 @@ def clear_bindings_for_agent_session(session_id: str) -> None:
         _runtime_binding.set(None)
 
 
+def _http_roots_required_error(message: str) -> DomainError:
+    return DomainError(
+        "workspace_roots_unavailable",
+        message,
+        status_code=409,
+        details={
+            "required_action": REQUIRED_ACTIONS["ambiguous_workspace"],
+            "http_correct_action": HTTP_UNREGISTERED_ROOTS_ACTION,
+        },
+    )
+
+
 async def collect_mcp_workspace_roots(context: Any, *, timeout_seconds: float = 5.0) -> list[Path]:
+    bound = _bound_service_provider.get() is not None
     if context is None:
+        if bound:
+            raise _http_roots_required_error(
+                "HTTP MCP requires the client to advertise workspace roots"
+            )
         return []
     request_context = getattr(context, "request_context", None)
     if request_context is None:
@@ -271,9 +395,17 @@ async def collect_mcp_workspace_roots(context: Any, *, timeout_seconds: float = 
         session = getattr(context, "session", None)
     list_roots = getattr(session, "list_roots", None) if session is not None else None
     if list_roots is None:
+        if bound:
+            raise _http_roots_required_error(
+                "HTTP MCP requires the client to advertise workspace roots"
+            )
         return []
     client_params = getattr(session, "client_params", None)
     if client_params is not None and getattr(client_params.capabilities, "roots", None) is None:
+        if bound:
+            raise _http_roots_required_error(
+                "HTTP MCP requires the client to advertise workspace roots"
+            )
         return []
     try:
         result = await asyncio.wait_for(list_roots(), timeout=timeout_seconds)
@@ -448,16 +580,26 @@ class AgentCredentialTokenVerifier:
             credential = self.room_service.authenticate_agent_token(token, touch=True)
         except DomainError:
             return None
+        claims: dict[str, Any] = {
+            "credential_id": credential["id"],
+            "project_id": credential["project_id"],
+        }
+        identity = _identity_from_member(
+            str(credential.get("project_id") or ""),
+            str(credential.get("member_id") or ""),
+            room_service=self.room_service,
+        )
+        if identity is not None:
+            claims["software_key"] = identity[0]
+            claims["software_name"] = identity[1]
+            claims["software_client"] = identity[2]
         return AccessToken(
             token=token,
             client_id=credential["id"],
             scopes=credential["permissions"],
             expires_at=int(parse_time(credential["expires_at"]).timestamp()),
             subject=credential["id"],
-            claims={
-                "credential_id": credential["id"],
-                "project_id": credential["project_id"],
-            },
+            claims=claims,
         )
 
 
@@ -469,16 +611,28 @@ def room_bootstrap(model: str = "") -> dict[str, Any]:
     identity and checkout registration; the Session Token stays in process memory.
     """
     set_runtime_binding(None)
-    identity = _configured_local_identity()
+    bound = _bound_service_provider.get() is not None
+    identity = _bootstrap_http_identity.get() if bound else _configured_local_identity()
     if identity is None:
         payload = bootstrap_status_payload("identity_not_configured")
+        details = {"required_action": payload["required_action"]}
+        if bound:
+            details["http_correct_action"] = (
+                "Issue an Agent Token linked to the software member, or add "
+                "X-AgentChatRoom-Software-Key/Name/Client headers from the "
+                "generated HTTP MCP config. Do not invent a software identity."
+            )
+            payload = dict(payload)
+            payload["details"] = {**(payload.get("details") or {}), **details}
         return {
             "ok": False,
             "result": payload,
             "error": {
                 "code": payload["status"],
-                "message": "Local MCP software identity is not configured",
-                "details": {"required_action": payload["required_action"]},
+                "message": "Local MCP software identity is not configured"
+                if not bound
+                else "HTTP MCP software identity is not configured",
+                "details": details,
             },
         }
     software_key, software_name, client = identity
@@ -489,22 +643,26 @@ def room_bootstrap(model: str = "") -> dict[str, Any]:
         client=client,
         model=model,
         workspace_roots=_bootstrap_workspace_roots.get(),
-        cwd=None if _bound_service_provider.get() is not None else Path.cwd(),
-        explicit_project_path=None if _bound_service_provider.get() is not None else os.getenv(PROJECT_PATH_ENV, "").strip() or None,
-        loaded_identity=_loaded_identity,
+        cwd=None if bound else Path.cwd(),
+        explicit_project_path=None if bound else os.getenv(PROJECT_PATH_ENV, "").strip() or None,
+        loaded_identity=None if bound else _loaded_identity,
         authorize_project=lambda project_id: _authorize_remote(project_id, "room:join"),
     )
     if outcome.binding is None:
-        payload = outcome.public
+        payload = dict(outcome.public)
+        details = {
+            "required_action": payload.get("required_action"),
+        }
+        if bound:
+            details["http_correct_action"] = HTTP_UNREGISTERED_ROOTS_ACTION
+            payload["details"] = {**(payload.get("details") or {}), **details}
         return {
             "ok": False,
             "result": payload,
             "error": {
                 "code": payload["status"],
                 "message": "Room bootstrap is not ready",
-                "details": {
-                    "required_action": payload.get("required_action"),
-                },
+                "details": details,
             },
         }
     set_runtime_binding(outcome.binding)
@@ -1839,6 +1997,9 @@ def main(argv: list[str] | None = None) -> None:
         raise SystemExit(MCP_STARTUP_UNAVAILABLE_EXIT_CODE) from None
     # Wait for client roots: startup cwd/pins cannot safely establish presence.
     try:
+        from .stdio_runtime import install_protocol_stdin_guard
+
+        install_protocol_stdin_guard()
         mcp.run(transport="stdio")
     finally:
         presence_manager.stop()
