@@ -836,6 +836,8 @@ def test_panel_tray_start_starts_detached_icon(monkeypatch):
     fake_module.Menu = FakeMenu
     fake_module.MenuItem = FakeMenuItem
     monkeypatch.setitem(sys.modules, "pystray", fake_module)
+    # This unit test exercises the Windows adapter, including on Linux CI.
+    monkeypatch.setattr(shell_module, "os", types.SimpleNamespace(name="nt"))
 
     assert tray.available() is True
     assert tray.start() is True
@@ -846,6 +848,18 @@ def test_panel_tray_start_starts_detached_icon(monkeypatch):
     # left-click default item restores the panel; a separate exit item exists
     assert any(entry[1] == "打开面板" and entry[2] for entry in items)
     assert any(entry[1] == "退出" and not entry[2] for entry in items)
+
+
+def test_panel_tray_is_unavailable_on_non_windows(monkeypatch):
+    import types
+
+    from agentchatroom import shell as shell_module
+
+    monkeypatch.setattr(shell_module, "os", types.SimpleNamespace(name="posix"))
+    tray = shell_module.PanelTray(_build_manual_shell(Path(".")))
+    assert tray.available() is False
+    assert tray.start() is False
+    assert tray.icon is None
 
 
 def test_panel_tray_start_falls_back_when_unavailable(monkeypatch):
