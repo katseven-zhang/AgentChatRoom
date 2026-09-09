@@ -3,7 +3,7 @@ from __future__ import annotations
 from agentchatroom.presence import LocalPresenceManager
 
 
-def test_new_same_identity_session_supersedes_process_owned_session(service, project):
+def test_same_identity_sessions_are_kept_alive_independently(service, project):
     first = service.join_room(
         project["id"],
         agent_key="trae-main",
@@ -34,15 +34,16 @@ def test_new_same_identity_session_supersedes_process_owned_session(service, pro
     )
 
     agents = {agent["id"]: agent for agent in service.snapshot(project["id"])["agents"]}
-    assert agents[first["agent"]["id"]]["status"] == "offline"
+    assert agents[first["agent"]["id"]]["status"] == "online"
     assert agents[second["agent"]["id"]]["status"] == "online"
 
     manager.stop()
     agents = {agent["id"]: agent for agent in service.snapshot(project["id"])["agents"]}
+    assert agents[first["agent"]["id"]]["status"] == "offline"
     assert agents[second["agent"]["id"]]["status"] == "offline"
 
 
-def test_recovered_session_restores_identity_before_new_join(service, project):
+def test_recovered_and_new_same_identity_sessions_remain_independent(service, project):
     first = service.join_room(
         project["id"],
         agent_key="codex-main",
@@ -70,9 +71,41 @@ def test_recovered_session_restores_identity_before_new_join(service, project):
     )
 
     agents = {agent["id"]: agent for agent in service.snapshot(project["id"])["agents"]}
-    assert agents[first["agent"]["id"]]["status"] == "offline"
+    assert agents[first["agent"]["id"]]["status"] == "online"
     assert agents[second["agent"]["id"]]["status"] == "online"
 
+    manager.stop()
+
+
+def test_transport_cleanup_closes_only_its_room_session(service, project):
+    first = service.join_room(
+        project["id"], name="Codex", client="codex", model="unknown"
+    )
+    second = service.join_room(
+        project["id"], name="Codex", client="codex", model="unknown"
+    )
+    live = {"transport-a", "transport-b"}
+    manager = LocalPresenceManager(
+        service,
+        enabled=True,
+        interval_seconds=60,
+        transport_check=lambda key: key in live,
+    )
+    manager.register(
+        project["id"], first["agent"]["id"], first["token"],
+        agent_key=first["agent"]["agent_key"], transport_key="transport-a",
+    )
+    manager.register(
+        project["id"], second["agent"]["id"], second["token"],
+        agent_key=second["agent"]["agent_key"], transport_key="transport-b",
+    )
+
+    live.remove("transport-a")
+    manager.heartbeat_once()
+    agents = {agent["id"]: agent for agent in service.snapshot(project["id"])["agents"]}
+
+    assert agents[first["agent"]["id"]]["status"] == "offline"
+    assert agents[second["agent"]["id"]]["status"] == "online"
     manager.stop()
 
 

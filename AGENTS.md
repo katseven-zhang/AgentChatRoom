@@ -30,7 +30,7 @@
   - `COORDINATE`: repository changes or multi-Agent work; call `room_bootstrap` once before work, use tasks and file leases, publish decisions or blockers, then submit evidence before declaring completion.
 - Before inspecting or editing this repository in `OBSERVE` or `COORDINATE`, call `room_bootstrap` once. Local stdio resolves `.agentchatroom/project.json`; Agents do not supply a `project_key`. Keep the MCP/Bridge process alive. Presence from MCP startup is not conversation sync. Do not begin project work while disconnected.
 - One installed Agent application represents one durable software identity in a Project. The MCP configuration injects that identity through validated `AGENTCHATROOM_SOFTWARE_KEY`, `AGENTCHATROOM_SOFTWARE_NAME`, and `AGENTCHATROOM_SOFTWARE_CLIENT` values; Agents must not supply, rename, infer, or invent an `agent_key` for a task, review, subtask, or runtime check. The backend generates the database identity.
-- One software identity may have only one active Session. Rejoining replaces the previous Session and transfers unfinished owned tasks, active leases, pending targeted assignments, and pending handoffs. Roles such as executor, reviewer, coordinator, and integrator belong to Session/Task context and never create another Agent identity.
+- One software identity may have multiple active Sessions for parallel conversations in the same or different Projects. Each Session keeps its own task and lease ownership; joining never closes another Session or silently transfers work. Roles such as executor, reviewer, coordinator, and integrator belong to Session/Task context and never create another Agent identity.
 - Independent verification requires a different software identity. A Codex execution, Codex subtask, or alias such as Codex Review is still Codex and cannot independently approve Codex work.
 - Optional `room_bootstrap.model` is initial Session metadata, not the authoritative model for later messages. Use the exact client model code when available; otherwise explicitly use `unknown`. Never guess or pin a model name in project rules. `room_join` remains a compatibility entry for empty repository scope.
 - Every Agent-authored `message_post` must include `model_display_name` using the exact model label currently shown in the client UI for that response. If the client exposes no model label, use `unknown`. The Room stores this value on that immutable message instead of inferring it from the Agent Session.
@@ -40,3 +40,28 @@
   use `room_sync` as a timer or manually claim real-time working/idle state.
 - Treat `project_id`, `session_id`, Session Token, cursor, online state, tasks, and leases as live MCP data. Never persist those values here as current facts.
 - Completion and independent verification are separate. A reviewer must return `approved` or `changes_requested` with evidence.
+
+<!-- BEGIN AgentChatRoom managed coordination -->
+## AgentChatRoom project coordination
+
+- enabled: true
+- Project name: `agentchatroom`. Treat this exact name as the Room identity for this workspace; do not select a similarly named Project.
+- The backend owns the opaque Project key and keeps the checkout registration in ignored `.agentchatroom/project.json`. Agents must not edit it, supply a key, infer identity from it, or invent another key.
+- Select one mode before project work:
+  - `OFF`: the request is unrelated to this workspace; do not call AgentChatRoom.
+  - `OBSERVE`: read-only inspection; bootstrap and sync, but do not claim tasks, acknowledge assignments, acquire leases, or write Room state.
+  - `COORDINATE`: repository changes or delegated/review work; follow the workflow below and keep Room state current.
+- At the start of every new Agent conversation in this workspace, call `room_bootstrap(project_name="agentchatroom")` once. Verify the returned Project name is exactly `agentchatroom` and the returned workspace/root matches this checkout. Do not begin project work while disconnected. If bootstrap fails or selects another Project, stop all Room writes and follow only its `required_action`.
+- After bootstrap, call `room_sync` to read recent messages and current coordination state. Inspect targeted messages, assigned tasks, handoffs, and tasks awaiting independent review before starting uncoordinated work. Use `room_sync` again after a disconnection or when fresh Room state is required; do not poll it as a timer.
+- For an assigned task, inspect it with `task_get` or `task_get_by_number`, then use `task_acknowledge`. Use `task_claim` for an unowned eligible task. Use `task_claim(reclaim=true)` only to resume unfinished work owned by a disconnected Session of the same software identity; reclaim is rejected while the owner is connected or belongs to another identity. Before editing shared files, acquire an appropriate `lease_acquire` path lease; release it with `lease_release` when the work or handoff ends.
+- Post concise progress, decisions, and blockers with `message_post`; acknowledge targeted requests with `message_acknowledge` when appropriate. Every Agent-authored message must include `model_display_name` using the exact model label shown by the client, or `unknown` when the client exposes none.
+- Keep task state accurate with `task_update`. When implementation is ready, submit `work_report` with changed files, checks, and concrete evidence. A Work Report requests verification; it does not complete independent review.
+- When accepting a review task, first confirm the implementation was produced by a different software identity. Read the task contract and Work Report, inspect the actual diff/artifacts, run independent checks, then call `review_submit` with `approved` or `changes_requested` and criterion-level evidence. The implementing identity may not approve its own work. Use `integration_submit` only after required verification and integration are actually complete.
+- Use the MCP tool schemas and structured error `required_action` as the protocol contract. Do not inspect AgentChatRoom source code or guess IDs/arguments to discover how the Room works. If a required tool is unavailable, stop and report that connection/tooling problem.
+- One installed Agent application is one durable software identity in this Project. The MCP configuration injects that identity; Agents must not supply, rename, or invent an `agent_key` for a task, review, or runtime check.
+- A software identity may keep multiple active Sessions in the same or different Projects, including parallel conversations. Each Session keeps its own task and lease ownership; joining a new Session never closes another Session or silently transfers work.
+- Optional `room_bootstrap.model` is initial Session metadata, not the authoritative model for later messages. Use the exact client model code when available; otherwise explicitly use `unknown`. Never guess or pin a model name in project rules.
+- MCP connection Presence and task progress are different facts. `session_heartbeat` only refreshes connection liveness; Task events record claimed, in-progress, blocked, reported, reviewed, and completed work. Do not use heartbeats to represent task progress.
+- Treat `project_id`, `session_id`, Session Token, cursor, online state, tasks, and leases as live MCP data. Never persist those values here as current facts.
+- Completion and independent verification are separate. A reviewer must return `approved` or `changes_requested` with evidence.
+<!-- END AgentChatRoom managed coordination -->

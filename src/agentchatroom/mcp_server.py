@@ -22,6 +22,11 @@ from mcp.server.auth.settings import AuthSettings
 from . import __version__
 from .config import load_settings
 from .contracts import ReviewCriterion, TestEvidence
+from .credential_bundle import (
+    CredentialBundleError,
+    decode_project_credential_bundle,
+    is_project_credential_bundle,
+)
 from .database import create_database
 from .errors import DomainError
 from .mcp_compat import CompatibleToolManager
@@ -57,6 +62,10 @@ _bound_service_provider: ContextVar[ServiceProvider | None] = ContextVar(
     "agentchatroom_mcp_service_provider",
     default=None,
 )
+_bound_presence_manager: ContextVar[LocalPresenceManager | None] = ContextVar(
+    "agentchatroom_mcp_presence_manager",
+    default=None,
+)
 _runtime_binding: ContextVar[RuntimeBinding | None] = ContextVar(
     "agentchatroom_runtime_binding",
     default=None,
@@ -90,9 +99,14 @@ HTTP_UNREGISTERED_ROOTS_ACTION = (
 
 
 class ServiceBoundToolManager(CompatibleToolManager):
-    def __init__(self, service_provider: ServiceProvider | None = None) -> None:
+    def __init__(
+        self,
+        service_provider: ServiceProvider | None = None,
+        presence: LocalPresenceManager | None = None,
+    ) -> None:
         super().__init__()
         self.service_provider = service_provider
+        self.presence = presence
 
     async def call_tool(
         self,
@@ -104,6 +118,7 @@ class ServiceBoundToolManager(CompatibleToolManager):
         provider_token = None
         roots_token = None
         http_identity_token = None
+        presence_token = None
         try:
             session_key = mcp_session_key(context)
         except DomainError as error:
@@ -112,6 +127,8 @@ class ServiceBoundToolManager(CompatibleToolManager):
         previous_binding = _runtime_binding.get()
         if self.service_provider is not None:
             provider_token = _bound_service_provider.set(self.service_provider)
+        if self.presence is not None:
+            presence_token = _bound_presence_manager.set(self.presence)
         try:
             if _stdio_settings is not None and self.service_provider is None:
                 try:
@@ -129,11 +146,32 @@ class ServiceBoundToolManager(CompatibleToolManager):
             if invalidated and name != "room_bootstrap":
                 raise DomainError("session_expired", "Bootstrap must succeed before using this connection", status_code=401)
             if name == "room_bootstrap":
+                access = get_access_token() if self.service_provider is not None else None
+                bundled_project_id = None
+                uses_bundle = bool(
+                    access is not None
+                    and (access.claims or {}).get("credential_bundle")
+                )
+                if uses_bundle:
+                    bundled_project_id = _bundle_project_for_name(
+                        access,
+                        str(forwarded.get("project_name") or ""),
+                    )
+                    if restored is not None and restored.project_id != bundled_project_id:
+                        raise DomainError(
+                            "project_session_rebind_forbidden",
+                            "This MCP Session is already bound to another Project; open a new client task Session",
+                            status_code=409,
+                        )
                 # Rebinding must fail closed, including identity and roots errors.
                 persist_runtime_binding(session_key, None)
                 _runtime_binding.set(None)
                 roots_token = _bootstrap_workspace_roots.set(
-                    await collect_mcp_workspace_roots(context, timeout_seconds=get_service().settings.mcp_roots_timeout_seconds)
+                    await collect_mcp_workspace_roots(
+                        context,
+                        timeout_seconds=get_service().settings.mcp_roots_timeout_seconds,
+                        required=not uses_bundle,
+                    )
                 )
                 if self.service_provider is not None:
                     http_identity_token = _bootstrap_http_identity.set(
@@ -172,6 +210,8 @@ class ServiceBoundToolManager(CompatibleToolManager):
                 _runtime_binding.set(previous_binding)
             if provider_token is not None:
                 _bound_service_provider.reset(provider_token)
+            if presence_token is not None:
+                _bound_presence_manager.reset(presence_token)
             _active_binding_key.reset(key_token)
 
 
@@ -182,7 +222,13 @@ MCP_INSTRUCTIONS = (
     "project_key, logical_path, agent_key, member_id, software name, or client "
     "type. Agents also do not supply logical_path. Local stdio resolves ignored "
     ".agentchatroom/project.json; the MCP process owns one configured software "
-    "identity and holds the Session Token in memory. Do not copy project_id, "
+    "identity and holds the Session Token in memory. HTTP multi-Project configs "
+    "supply only the non-secret project_name generated by onboarding; Project "
+    "tokens stay in MCP configuration. One MCP Session binds one Project and "
+    "cannot switch to another; parallel client tasks use parallel Sessions and "
+    "keep independent task ownership. A new Session never moves another "
+    "Session's work. Use task_claim(reclaim=true) only to explicitly resume an "
+    "unfinished task whose same-software owner is disconnected. Do not copy project_id, "
     "session_id, or token between tools. Presence from MCP startup is not "
     "conversation sync. If room_bootstrap returns identity_not_configured, use "
     "the local MCP configuration assistant; otherwise follow the single "
@@ -248,37 +294,49 @@ def _identity_from_credential(project_id: str, credential_id: str) -> tuple[str,
 
 
 def _software_identity_from_http(context: Any) -> tuple[str, str, str] | None:
+    credential_identity: tuple[str, str, str] | None = None
     try:
         access = get_access_token()
     except LookupError:
         access = None
     if access is not None:
         claims = access.claims or {}
-        from_claims = _identity_tuple(
+        credential_identity = _identity_tuple(
             claims.get("software_key"),
             claims.get("software_name"),
             claims.get("software_client"),
         )
-        if from_claims is not None:
-            return from_claims
-        from_credential = _identity_from_credential(
-            str(claims.get("project_id") or ""),
-            str(claims.get("credential_id") or ""),
-        )
-        if from_credential is not None:
-            return from_credential
+        if credential_identity is None:
+            credential_identity = _identity_from_credential(
+                str(claims.get("project_id") or ""),
+                str(claims.get("credential_id") or ""),
+            )
     request_context = getattr(context, "request_context", None) if context is not None else None
     if request_context is None and context is not None:
         request_context = getattr(context, "_request_context", None)
     request = getattr(request_context, "request", None) if request_context is not None else None
     headers = getattr(request, "headers", None)
     if headers is None:
-        return None
-    return _identity_tuple(
+        return credential_identity
+    header_identity = _identity_tuple(
         headers.get(SOFTWARE_KEY_HEADER),
         headers.get(SOFTWARE_NAME_HEADER),
         headers.get(SOFTWARE_CLIENT_HEADER),
     )
+    if (
+        credential_identity is not None
+        and header_identity is not None
+        and credential_identity != header_identity
+    ):
+        raise DomainError(
+            "software_identity_mismatch",
+            "HTTP software identity headers do not match the linked Agent Token identity",
+            status_code=403,
+            details={
+                "required_action": "restore_linked_software_identity_or_issue_unlinked_token",
+            },
+        )
+    return credential_identity or header_identity
 
 
 def mcp_session_key(context: Any = None) -> str:
@@ -321,6 +379,17 @@ def mcp_session_key(context: Any = None) -> str:
     if token or context is not None:
         raise DomainError("runtime_context_missing", "A distinct MCP connection context is required", status_code=409)
     return "stdio:local"
+
+
+def transport_binding_alive(session_key: str) -> bool:
+    """Return whether an MCP connection object still owns this binding key."""
+    if not session_key or session_key == "stdio:local":
+        return True
+    with _session_bindings_lock:
+        return any(
+            reference() is not None and key == session_key
+            for reference, key in _transport_keys.values()
+        )
 
 
 def get_runtime_binding(session_key: str | None = None) -> RuntimeBinding | None:
@@ -379,10 +448,15 @@ def _http_roots_required_error(message: str) -> DomainError:
     )
 
 
-async def collect_mcp_workspace_roots(context: Any, *, timeout_seconds: float = 5.0) -> list[Path]:
+async def collect_mcp_workspace_roots(
+    context: Any,
+    *,
+    timeout_seconds: float = 5.0,
+    required: bool = True,
+) -> list[Path]:
     bound = _bound_service_provider.get() is not None
     if context is None:
-        if bound:
+        if bound and required:
             raise _http_roots_required_error(
                 "HTTP MCP requires the client to advertise workspace roots"
             )
@@ -395,14 +469,14 @@ async def collect_mcp_workspace_roots(context: Any, *, timeout_seconds: float = 
         session = getattr(context, "session", None)
     list_roots = getattr(session, "list_roots", None) if session is not None else None
     if list_roots is None:
-        if bound:
+        if bound and required:
             raise _http_roots_required_error(
                 "HTTP MCP requires the client to advertise workspace roots"
             )
         return []
     client_params = getattr(session, "client_params", None)
     if client_params is not None and getattr(client_params.capabilities, "roots", None) is None:
-        if bound:
+        if bound and required:
             raise _http_roots_required_error(
                 "HTTP MCP requires the client to advertise workspace roots"
             )
@@ -459,6 +533,7 @@ def _auto_join_local_checkout() -> dict[str, Any] | None:
 def _new_mcp(
     service_provider: ServiceProvider | None = None,
     *,
+    presence: LocalPresenceManager | None = None,
     host: str = "127.0.0.1",
     port: int = 8000,
     streamable_http_path: str = "/mcp",
@@ -478,7 +553,7 @@ def _new_mcp(
         token_verifier=token_verifier,
         auth=auth,
     )
-    server._tool_manager = ServiceBoundToolManager(service_provider)
+    server._tool_manager = ServiceBoundToolManager(service_provider, presence)
     return server
 
 mcp = _new_mcp()
@@ -522,17 +597,19 @@ def _mcp_request_id(request_id: str) -> str:
 
 
 def _register_local_presence(payload: dict[str, Any]) -> None:
-    if presence_manager is None:
+    manager = _bound_presence_manager.get() or presence_manager
+    if manager is None:
         return
     project = payload.get("project") or {}
     agent = payload.get("agent") or {}
     token = str(payload.get("token", ""))
     if project.get("id") and agent.get("id") and token:
-        presence_manager.register(
+        manager.register(
             str(project["id"]),
             str(agent["id"]),
             token,
             agent_key=str(agent.get("agent_key") or agent["id"]),
+            transport_key=_active_binding_key.get() or "",
         )
 
 
@@ -545,23 +622,186 @@ def _ensure_local_presence(project_id: str, session_id: str, token: str) -> None
     tool call proves this process still owns the session, so use it to resume
     the background heartbeat keepalive automatically.
     """
-    if presence_manager is None:
+    manager = _bound_presence_manager.get() or presence_manager
+    if manager is None:
         return
-    presence_manager.ensure_registered(project_id, session_id, token)
+    manager.ensure_registered(
+        project_id,
+        session_id,
+        token,
+        transport_key=_active_binding_key.get() or "",
+    )
 
 
-def _authorize_remote(project_id: str, permission: str) -> AccessToken | None:
+def _project_access_claim(
+    access: AccessToken,
+    project_id: str,
+) -> dict[str, Any] | None:
+    claims = access.claims or {}
+    project_credentials = claims.get("project_credentials")
+    if not isinstance(project_credentials, dict):
+        return None
+    selected = project_credentials.get(project_id)
+    return selected if isinstance(selected, dict) else None
+
+
+def _bundle_project_for_name(access: AccessToken, project_name: str) -> str:
+    requested = project_name.strip()
+    claims = access.claims or {}
+    project_credentials = claims.get("project_credentials") or {}
+    unavailable = claims.get("unavailable_project_credentials") or {}
+    available_names = sorted(
+        str(item.get("name") or "")
+        for item in project_credentials.values()
+        if isinstance(item, dict) and str(item.get("name") or "").strip()
+    )
+    configured_names = sorted(
+        set(available_names)
+        | {
+            str(name)
+            for name in unavailable
+            if str(name).strip()
+        }
+    )
+    if not requested:
+        raise DomainError(
+            "project_credential_name_required",
+            "room_bootstrap requires the configured Project credential name",
+            status_code=409,
+            details={
+                "required_action": "call_room_bootstrap_with_project_name",
+                "available_project_names": available_names,
+                "configured_project_names": configured_names,
+            },
+        )
+    unavailable_item = unavailable.get(requested)
+    if isinstance(unavailable_item, dict):
+        reason = str(unavailable_item.get("reason") or "agent_token_invalid")
+        if reason == "agent_token_expired":
+            code = "project_credential_expired"
+            action = "renew_project_token"
+            message = "The selected Project Token has expired"
+        elif reason == "agent_token_revoked":
+            code = "project_credential_revoked"
+            action = "issue_new_project_token_and_update_bundle"
+            message = "The selected Project Token has been revoked"
+        else:
+            code = "project_credential_invalid"
+            action = "replace_project_token_in_bundle"
+            message = "The selected Project Token is invalid"
+        raise DomainError(
+            code,
+            message,
+            status_code=403,
+            details={
+                "project_name": requested,
+                "required_action": action,
+                "available_project_names": available_names,
+                "configured_project_names": configured_names,
+            },
+        )
+    matches = [
+        str(project_id)
+        for project_id, item in project_credentials.items()
+        if isinstance(item, dict) and str(item.get("name") or "").strip() == requested
+    ]
+    if len(matches) != 1:
+        raise DomainError(
+            "project_credential_name_mismatch",
+            "The configured Project credential name is missing or ambiguous",
+            status_code=403,
+            details={
+                "required_action": "call_room_bootstrap_with_project_name",
+                "available_project_names": available_names,
+                "configured_project_names": configured_names,
+            },
+        )
+    return matches[0]
+
+
+def _current_access_uses_bundle() -> bool:
+    access = get_access_token()
+    return bool(access is not None and (access.claims or {}).get("credential_bundle"))
+
+
+def _authorize_remote(
+    project_id: str,
+    permission: str,
+    *,
+    project_name: str = "",
+    require_project_name: bool = False,
+) -> AccessToken | None:
     access = get_access_token()
     if access is None:
         return None
     claims = access.claims or {}
-    if claims.get("project_id") != project_id:
+    bundled = bool(claims.get("credential_bundle"))
+    selected = _project_access_claim(access, project_id) if bundled else None
+    if bundled and selected is None:
+        raise DomainError(
+            "agent_token_project_forbidden",
+            "The MCP credential set has no valid token for this Project",
+            status_code=403,
+        )
+    if not bundled and claims.get("project_id") != project_id:
         raise DomainError(
             "agent_token_project_forbidden",
             "Agent token is not authorized for this Project",
             status_code=403,
         )
-    if permission not in access.scopes:
+    profile_name = str((selected or {}).get("name") or "").strip()
+    requested_name = project_name.strip()
+    if bundled and require_project_name and not requested_name:
+        raise DomainError(
+            "project_credential_name_required",
+            "room_bootstrap requires the configured Project credential name",
+            status_code=409,
+            details={"required_action": "call_room_bootstrap_with_project_name"},
+        )
+    if bundled and requested_name and requested_name != profile_name:
+        raise DomainError(
+            "project_credential_name_mismatch",
+            "The selected Project name does not match the token bound to this workspace",
+            status_code=403,
+        )
+    if bundled:
+        try:
+            credential = get_service().authenticate_agent_token(
+                str((selected or {}).get("token") or ""),
+                touch=True,
+            )
+        except DomainError as error:
+            if error.code == "agent_token_expired":
+                code = "project_credential_expired"
+                action = "renew_project_token"
+                message = "The selected Project Token has expired"
+            elif error.code == "agent_token_revoked":
+                code = "project_credential_revoked"
+                action = "issue_new_project_token_and_update_bundle"
+                message = "The selected Project Token has been revoked"
+            else:
+                code = "project_credential_invalid"
+                action = "replace_project_token_in_bundle"
+                message = "The selected Project Token is invalid"
+            raise DomainError(
+                code,
+                message,
+                status_code=403,
+                details={
+                    "project_name": profile_name,
+                    "required_action": action,
+                },
+            ) from error
+        if str(credential.get("project_id") or "") != project_id:
+            raise DomainError(
+                "agent_token_project_forbidden",
+                "The selected Project token does not belong to this Project",
+                status_code=403,
+            )
+        selected_permissions = set(credential.get("permissions") or [])
+    else:
+        selected_permissions = set(access.scopes)
+    if permission not in selected_permissions:
         raise DomainError(
             "agent_token_permission_forbidden",
             "Agent token lacks the required permission",
@@ -576,6 +816,74 @@ class AgentCredentialTokenVerifier:
         self.room_service = room_service
 
     async def verify_token(self, token: str) -> AccessToken | None:
+        if is_project_credential_bundle(token):
+            try:
+                entries = decode_project_credential_bundle(token)
+            except CredentialBundleError:
+                return None
+            project_credentials: dict[str, dict[str, Any]] = {}
+            unavailable_project_credentials: dict[str, dict[str, str]] = {}
+            identities: set[tuple[str, str, str]] = set()
+            scopes: set[str] = set()
+            latest_expiry = 0
+            for entry in entries:
+                try:
+                    credential = self.room_service.authenticate_agent_token(
+                        entry["token"], touch=False
+                    )
+                except DomainError as error:
+                    # Expired or revoked credentials disable only their Project;
+                    # other valid entries in the same client configuration remain usable.
+                    if error.code in {"agent_token_expired", "agent_token_revoked"}:
+                        unavailable_project_credentials[entry["name"]] = {
+                            "reason": error.code,
+                        }
+                    continue
+                project_id = str(credential["project_id"])
+                if project_id in project_credentials:
+                    return None
+                permissions = list(credential["permissions"])
+                project_credentials[project_id] = {
+                    "name": entry["name"],
+                    "token": entry["token"],
+                    "credential_id": credential["id"],
+                    "permissions": permissions,
+                }
+                scopes.update(permissions)
+                latest_expiry = max(
+                    latest_expiry,
+                    int(parse_time(credential["expires_at"]).timestamp()),
+                )
+                identity = _identity_from_member(
+                    project_id,
+                    str(credential.get("member_id") or ""),
+                    room_service=self.room_service,
+                )
+                if identity is not None:
+                    identities.add(identity)
+            if (
+                not project_credentials
+                and not unavailable_project_credentials
+            ) or len(identities) > 1:
+                return None
+            claims: dict[str, Any] = {
+                "credential_bundle": True,
+                "project_credentials": project_credentials,
+                "unavailable_project_credentials": unavailable_project_credentials,
+            }
+            if identities:
+                identity = next(iter(identities))
+                claims["software_key"] = identity[0]
+                claims["software_name"] = identity[1]
+                claims["software_client"] = identity[2]
+            return AccessToken(
+                token=token,
+                client_id="agentchatroom-project-credentials",
+                scopes=sorted(scopes),
+                expires_at=latest_expiry or None,
+                subject="agentchatroom-project-credentials",
+                claims=claims,
+            )
         try:
             credential = self.room_service.authenticate_agent_token(token, touch=True)
         except DomainError:
@@ -604,11 +912,11 @@ class AgentCredentialTokenVerifier:
 
 
 @mcp.tool()
-def room_bootstrap(model: str = "") -> dict[str, Any]:
+def room_bootstrap(model: str = "", project_name: str = "") -> dict[str, Any]:
     """Restore the current checkout Room for this conversation.
 
-    Zero-parameter on the normal path. The MCP process supplies software
-    identity and checkout registration; the Session Token stays in process memory.
+    Local stdio is zero-parameter. A multi-Project HTTP configuration supplies
+    only its non-secret Project credential name; all tokens stay in MCP config.
     """
     set_runtime_binding(None)
     bound = _bound_service_provider.get() is not None
@@ -636,6 +944,12 @@ def room_bootstrap(model: str = "") -> dict[str, Any]:
             },
         }
     software_key, software_name, client = identity
+    access = get_access_token() if bound else None
+    selected_project_id = (
+        _bundle_project_for_name(access, project_name)
+        if access is not None and (access.claims or {}).get("credential_bundle")
+        else None
+    )
     outcome = bootstrap_local_room(
         get_service(),
         software_key=software_key,
@@ -646,7 +960,14 @@ def room_bootstrap(model: str = "") -> dict[str, Any]:
         cwd=None if bound else Path.cwd(),
         explicit_project_path=None if bound else os.getenv(PROJECT_PATH_ENV, "").strip() or None,
         loaded_identity=None if bound else _loaded_identity,
-        authorize_project=lambda project_id: _authorize_remote(project_id, "room:join"),
+        authorize_project=lambda project_id: _authorize_remote(
+            project_id,
+            "room:join",
+            project_name=project_name,
+            require_project_name=bound and _current_access_uses_bundle(),
+        ),
+        database_first=bound,
+        selected_project_id=selected_project_id,
     )
     if outcome.binding is None:
         payload = dict(outcome.public)
@@ -702,6 +1023,13 @@ def room_join(
         if access is not None:
             claims = access.claims or {}
             project_id = str(claims.get("project_id", ""))
+            if claims.get("credential_bundle"):
+                raise DomainError(
+                    "room_join_not_supported_for_credential_bundle",
+                    "Multi-Project HTTP credentials must use room_bootstrap",
+                    status_code=409,
+                )
+            agent_token = access.token
             _authorize_remote(project_id, "room:join")
             if not host_key.strip() or not host_name.strip():
                 raise DomainError(
@@ -710,7 +1038,7 @@ def room_join(
                 )
             joined = room_service.join_remote_room(
                 project_id,
-                agent_token=access.token,
+                agent_token=agent_token,
                 host_key=host_key,
                 host_name=host_name,
                 workspace_path=worktree or project_path,
@@ -1375,9 +1703,10 @@ def task_claim(
     task_id: str = "",
     session_id: str = "",
     token: str = "",
+    reclaim: bool = False,
     request_id: str = "",
 ) -> dict[str, Any]:
-    """Atomically claim an available task for this agent session."""
+    """Claim an available task, or explicitly reclaim same-identity work after disconnect."""
     try:
         _authorize_remote(project_id, "task:write")
     except DomainError as error:
@@ -1388,6 +1717,7 @@ def task_claim(
         task_id,
         session_id,
         token,
+        reclaim=reclaim,
         request_id=_mcp_request_id(request_id),
     )
 
@@ -1912,6 +2242,7 @@ def knowledge_list(
 def create_mcp(
     room_service: AgentChatRoomService,
     *,
+    presence: LocalPresenceManager | None = None,
     host: str = "127.0.0.1",
     port: int = 8000,
     streamable_http_path: str = "/mcp",
@@ -1934,6 +2265,7 @@ def create_mcp(
     verifier = AgentCredentialTokenVerifier(room_service) if auth_required else None
     server = _new_mcp(
         lambda: room_service,
+        presence=presence,
         host=host,
         port=port,
         streamable_http_path=streamable_http_path,
@@ -1997,10 +2329,11 @@ def main(argv: list[str] | None = None) -> None:
         raise SystemExit(MCP_STARTUP_UNAVAILABLE_EXIT_CODE) from None
     # Wait for client roots: startup cwd/pins cannot safely establish presence.
     try:
-        from .stdio_runtime import install_protocol_stdin_guard
+        from .stdio_runtime import install_protocol_stdin_guard, verify_protocol_stdin
 
         install_protocol_stdin_guard()
         mcp.run(transport="stdio")
+        verify_protocol_stdin()
     finally:
         presence_manager.stop()
         presence_manager = None

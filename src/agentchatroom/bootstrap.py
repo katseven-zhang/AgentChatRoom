@@ -30,6 +30,7 @@ BOOTSTRAP_STATES = (
     "project_not_registered",
     "registration_invalid",
     "ambiguous_workspace",
+    "project_workspace_mismatch",
     "room_unavailable",
     "session_expired",
 )
@@ -40,6 +41,7 @@ REQUIRED_ACTIONS = {
     "project_not_registered": "create_or_open_project_in_web",
     "registration_invalid": "recreate_checkout_registration_via_web",
     "ambiguous_workspace": "open_one_workspace_folder",
+    "project_workspace_mismatch": "open_matching_workspace_or_select_matching_project",
     "room_unavailable": "restore_or_wait_for_room",
     "session_expired": "call_room_bootstrap",
 }
@@ -197,24 +199,25 @@ def match_registered_projects(
         except (OSError, RuntimeError, ValueError):
             client_path = Path(raw)
         client_keys = workspace_path_keys(raw) | workspace_path_keys(client_path)
-        found: dict[str, Any] | None = None
+        found: list[dict[str, Any]] = []
         for project, keys in indexed:
             if client_keys & keys:
-                found = project
-                break
-        if found is None:
+                found.append(project)
+        if not found:
             try:
                 if client_path.exists():
                     scope = checkout_scope(client_path)
                     for project, _keys in indexed:
                         if stored_project_scope(project) == scope:
-                            found = project
-                            break
+                            found.append(project)
             except (DomainError, OSError):
-                found = None
-        if found is not None and str(found["id"]) not in seen_ids:
-            seen_ids.add(str(found["id"]))
-            matched.append((found, client_path))
+                found = []
+        for project in found:
+            # Keep every matching project: the caller must reject ambiguity,
+            # rather than selecting by database iteration order.
+            if str(project["id"]) not in seen_ids:
+                seen_ids.add(str(project["id"]))
+                matched.append((project, client_path))
     return matched
 
 
@@ -374,13 +377,92 @@ def bootstrap_local_room(
     explicit_project_path: str | Path | None = None,
     loaded_identity: tuple[str, str, str] | None = None,
     authorize_project: Callable[[str], Any] | None = None,
+    database_first: bool = False,
+    selected_project_id: str | None = None,
 ) -> BootstrapOutcome:
     current_identity = (software_key, software_name, client)
     if loaded_identity is not None and loaded_identity != current_identity:
         return BootstrapOutcome(bootstrap_status_payload("mcp_restart_required"))
 
     roots = list(workspace_roots or ())
-    db_matches = match_registered_projects(service, roots) if roots else []
+    used_selected_project_root = False
+    if selected_project_id:
+        try:
+            project = service.get_project(selected_project_id)
+        except DomainError as error:
+            return BootstrapOutcome(
+                bootstrap_status_payload(
+                    "room_unavailable",
+                    details={"code": error.code},
+                )
+            )
+        workspace_candidates: list[Path] = []
+        db_matches = match_registered_projects(service, roots) if roots else []
+        if roots:
+            if len(roots) > 1 and any(
+                not match_registered_projects(service, [root]) for root in roots
+            ):
+                return BootstrapOutcome(
+                    bootstrap_status_payload("ambiguous_workspace")
+                )
+            if len(db_matches) != 1:
+                return BootstrapOutcome(
+                    bootstrap_status_payload(
+                        "project_workspace_mismatch",
+                        details={
+                            "selected_project": str(project.get("name") or ""),
+                            "matched_project_count": len(db_matches),
+                        },
+                    )
+                )
+            matched_project, checkout = db_matches[0]
+            if str(matched_project["id"]) != str(project["id"]):
+                return BootstrapOutcome(
+                    bootstrap_status_payload(
+                        "project_workspace_mismatch",
+                        details={
+                            "selected_project": str(project.get("name") or ""),
+                            "workspace_matches_selected_project": False,
+                        },
+                    )
+                )
+            workspace_candidates = [checkout]
+        else:
+            stored_root_value = str(project.get("root_path") or "").strip()
+            if not stored_root_value:
+                return BootstrapOutcome(
+                    bootstrap_status_payload(
+                        "project_workspace_mismatch",
+                        details={
+                            "selected_project": str(project.get("name") or ""),
+                            "server_project_root_available": False,
+                        },
+                    )
+                )
+            stored_root = Path(stored_root_value).expanduser()
+            try:
+                checkout = stored_root.resolve()
+            except OSError:
+                checkout = stored_root
+            if not checkout.is_dir():
+                return BootstrapOutcome(
+                    bootstrap_status_payload(
+                        "project_workspace_mismatch",
+                        details={
+                            "selected_project": str(project.get("name") or ""),
+                            "server_project_root_available": False,
+                        },
+                    )
+                )
+            workspace_candidates = [checkout]
+            used_selected_project_root = True
+    else:
+        db_matches = match_registered_projects(service, roots) if roots and database_first else []
+    if db_matches and len(roots) > 1:
+        # An unresolved root must not be silently discarded beside a known
+        # Project: it may represent a second checkout or a missing registration.
+        if any(not match_registered_projects(service, [root]) for root in roots):
+            return BootstrapOutcome(bootstrap_status_payload("ambiguous_workspace"))
     if len(db_matches) > 1:
         return BootstrapOutcome(
             bootstrap_status_payload(
@@ -389,8 +471,9 @@ def bootstrap_local_room(
             )
         )
     configured_checkout = resolve_configured_checkout(explicit_project_path)
-    workspace_candidates: list[Path] = []
-    if db_matches:
+    if selected_project_id:
+        pass
+    elif db_matches:
         project, checkout = db_matches[0]
         workspace_candidates = [checkout]
     else:
@@ -457,16 +540,20 @@ def bootstrap_local_room(
                 )
             )
 
-    workspace_path = str(checkout)
+    workspace_path = str(checkout) if checkout is not None else ""
     try:
         if authorize_project is not None:
             authorize_project(project["id"])
-        registered = service.register_workspace(
-            project["id"],
-            host_key=f"host:{software_key}",
-            host_name=software_name,
-            local_path=workspace_path,
-            worktree=workspace_path,
+        registered = (
+            service.register_workspace(
+                project["id"],
+                host_key=f"host:{software_key}",
+                host_name=software_name,
+                local_path=workspace_path,
+                worktree=workspace_path,
+            )
+            if workspace_path
+            else None
         )
         joined = service.join_room(
             project["id"],
@@ -477,8 +564,8 @@ def bootstrap_local_room(
             role=role,
             worktree=workspace_path,
             capabilities={"mcp": True},
-            host_id=registered["host"]["id"],
-            workspace_id=registered["workspace"]["id"],
+            host_id=registered["host"]["id"] if registered else None,
+            workspace_id=registered["workspace"]["id"] if registered else None,
         )
         synced = service.room_sync(
             project["id"],
@@ -501,16 +588,31 @@ def bootstrap_local_room(
     token = str(joined["token"])
     cursor = int(synced.get("cursor") or joined.get("cursor") or 0)
     public = bootstrap_status_payload("ready")
-    ignored_notice = _configured_path_ignored_notice(
-        workspace_candidates, configured_checkout, checkout, project
+    ignored_notice = (
+        _configured_path_ignored_notice(
+            workspace_candidates, configured_checkout, checkout, project
+        )
+        if checkout is not None
+        else None
     )
-    if ignored_notice is not None:
-        public["notices"] = [ignored_notice]
+    notices = [ignored_notice] if ignored_notice is not None else []
+    if used_selected_project_root:
+        notices.append(
+            {
+                "code": "server_project_root_registered",
+                "message": (
+                    "The client did not advertise workspace roots; the selected "
+                    "Project's existing server-local root was registered as this Session's Workspace"
+                ),
+            }
+        )
+    if notices:
+        public["notices"] = notices
     public["conversation_synced"] = True
     public["connection"] = {
         "software_configured": True,
         "process_connected": True,
-        "room_session": "replaced" if joined.get("replaced", {}).get("previous_session_ids") else "restored",
+        "room_session": "created",
         "conversation_synced": True,
     }
     public["project"] = compact_room_snapshot(synced.get("snapshot") or {}, cursor=cursor)["project"]

@@ -28,11 +28,15 @@ from .desktop import DirectoryPickerUnavailable, pick_directory
 from .errors import DomainError
 from .integrations import build_mcp_integration
 from .local_mcp import LocalMcpConfigurator
-from .mcp_server import create_mcp
+from .mcp_server import create_mcp, transport_binding_alive
+from .presence import LocalPresenceManager
 from .service_lifetime import running_service
 from .project_registration import (
     register_checkout_project,
+    remove_project_coordination_instructions,
     remove_checkout_project_registration,
+    validate_project_coordination_instructions,
+    write_project_coordination_instructions,
 )
 from .bootstrap import BOOTSTRAP_SCHEMA_VERSION, BOOTSTRAP_STATES, REQUIRED_ACTIONS
 from .task_history import TASK_HISTORY_SCHEMA_VERSION
@@ -72,6 +76,39 @@ from .services import (
     REQUEST_ID_PATTERN,
     new_id,
 )
+
+
+def _is_expected_windows_proactor_disconnect(
+    context: dict[str, Any], *, platform_name: str | None = None
+) -> bool:
+    """Identify the harmless Windows callback raised by an HTTP peer closing."""
+    if (platform_name or os.name) != "nt":
+        return False
+    error = context.get("exception")
+    if not isinstance(error, ConnectionResetError):
+        return False
+    if getattr(error, "winerror", None) != 10054:
+        return False
+    return "_ProactorBasePipeTransport._call_connection_lost" in repr(
+        context.get("handle")
+    )
+
+
+def _windows_http_exception_handler(
+    previous_handler: Callable[[asyncio.AbstractEventLoop, dict[str, Any]], None] | None,
+) -> Callable[[asyncio.AbstractEventLoop, dict[str, Any]], None]:
+    def handle_exception(
+        loop: asyncio.AbstractEventLoop, context: dict[str, Any]
+    ) -> None:
+        if _is_expected_windows_proactor_disconnect(context):
+            return
+        if previous_handler is not None:
+            previous_handler(loop, context)
+        else:
+            loop.default_exception_handler(context)
+
+    return handle_exception
+
 
 # ---------------------------------------------------------------------------
 # Server-side versioned presentation metadata for the task view projection
@@ -439,6 +476,14 @@ class AgentTokenRotate(StrictModel):
     expires_in_seconds: int | None = None
 
 
+class AgentTokenPermissionsUpdate(StrictModel):
+    permissions: list[str]
+
+
+class AgentTokenExtend(StrictModel):
+    extend_by_seconds: int
+
+
 class ProjectMemberCreate(StrictModel):
     member_key: str
     name: str
@@ -541,6 +586,7 @@ class TaskIntakeDefine(StrictModel):
 class TaskClaim(StrictModel):
     session_id: str
     token: str
+    reclaim: bool = False
 
 
 class TaskRelease(StrictModel):
@@ -843,8 +889,15 @@ def create_app(
     public_host = "127.0.0.1" if resolved.host in {"0.0.0.0", "::"} else resolved.host
     base_url = resolved.external_base_url or f"http://{public_host}:{resolved.port}"
     mcp_url = f"{base_url}{resolved.mcp_http_path}"
+    http_presence_manager = LocalPresenceManager(
+        service,
+        enabled=resolved.mcp_http_enabled and resolved.presence_keepalive_enabled,
+        interval_seconds=resolved.presence_keepalive_interval_seconds,
+        transport_check=transport_binding_alive,
+    )
     mcp_server = create_mcp(
         service,
+        presence=http_presence_manager,
         host=resolved.host,
         port=resolved.port,
         streamable_http_path=resolved.mcp_http_path,
@@ -862,21 +915,31 @@ def create_app(
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
+        event_loop = asyncio.get_running_loop()
+        previous_exception_handler = event_loop.get_exception_handler()
+        if os.name == "nt":
+            event_loop.set_exception_handler(
+                _windows_http_exception_handler(previous_exception_handler)
+            )
         auto_backup_worker = start_auto_backup_worker(
             service, resolved, auto_backup_stop
         )
         try:
             with running_service(resolved):
+                http_presence_manager.start()
                 if mcp_http_app is None:
                     yield
                 else:
                     async with mcp_server.session_manager.run():
                         yield
         finally:
+            http_presence_manager.stop()
             auto_backup_stop.set()
             if auto_backup_worker is not None:
                 auto_backup_worker.join(timeout=5)
             service.close()
+            if os.name == "nt":
+                event_loop.set_exception_handler(previous_exception_handler)
 
     app = FastAPI(
         title=resolved.product_name,
@@ -887,6 +950,7 @@ def create_app(
     app.state.settings = resolved
     app.state.service = service
     app.state.mcp_server = mcp_server
+    app.state.http_presence_manager = http_presence_manager
     app.state.directory_picker = resolved_directory_picker
     app.state.local_mcp_configurator = resolved_local_mcp_configurator
 
@@ -1361,6 +1425,7 @@ def create_app(
 
     @app.post("/api/v1/projects", status_code=201)
     def create_project(body: ProjectCreate) -> dict[str, Any]:
+        validate_project_coordination_instructions(body.root_path)
         values = body.model_dump()
         project = service.create_project(**values)
         register_checkout_project(body.root_path, project, replace_existing=True)
@@ -1384,7 +1449,9 @@ def create_app(
             }
             deleted = service.delete_project(project_id)
             removed = 0
-            cleanup_errors: list[dict[str, Any]] = []
+            instructions_removed = 0
+            registration_cleanup_errors: list[dict[str, Any]] = []
+            instruction_cleanup_errors: list[dict[str, Any]] = []
             for checkout_path in sorted(checkout_paths):
                 try:
                     removed += int(
@@ -1395,17 +1462,37 @@ def create_app(
                         )
                     )
                 except DomainError as error:
-                    cleanup_errors.append(error.as_dict()["error"])
+                    registration_cleanup_errors.append(error.as_dict()["error"])
+                try:
+                    instructions_removed += int(
+                        remove_project_coordination_instructions(checkout_path)
+                    )
+                except DomainError as error:
+                    instruction_cleanup_errors.append(error.as_dict()["error"])
             deleted["project_registration"] = {
                 "removed": removed,
-                "cleanup_errors": cleanup_errors,
+                "cleanup_errors": registration_cleanup_errors,
+            }
+            deleted["project_instructions"] = {
+                "removed": instructions_removed,
+                "cleanup_errors": instruction_cleanup_errors,
             }
             return deleted
         return service.archive_project(project_id)
 
     @app.patch("/api/v1/projects/{project_id}")
     def update_project(project_id: str, body: ProjectUpdate) -> dict[str, Any]:
-        return service.update_project(project_id, **body.model_dump())
+        if body.name is not None:
+            current = service.get_project(project_id)
+            validate_project_coordination_instructions(current["root_path"])
+        result = service.update_project(project_id, **body.model_dump())
+        if body.name is not None:
+            project = result["project"]
+            result["project_instructions"] = write_project_coordination_instructions(
+                project["root_path"],
+                project,
+            )
+        return result
 
     @app.get("/api/v1/projects/{project_id}/export")
     def export_project(project_id: str) -> JSONResponse:
@@ -1551,6 +1638,34 @@ def create_app(
         project_id: str, credential_id: str
     ) -> dict[str, Any]:
         return service.revoke_agent_token(project_id, credential_id)
+
+    @app.patch(
+        "/api/v1/projects/{project_id}/agent-tokens/{credential_id}/permissions"
+    )
+    def update_agent_token_permissions(
+        project_id: str,
+        credential_id: str,
+        body: AgentTokenPermissionsUpdate,
+    ) -> dict[str, Any]:
+        return service.update_agent_token_permissions(
+            project_id,
+            credential_id,
+            permissions=body.permissions,
+        )
+
+    @app.post(
+        "/api/v1/projects/{project_id}/agent-tokens/{credential_id}/extend"
+    )
+    def extend_agent_token(
+        project_id: str,
+        credential_id: str,
+        body: AgentTokenExtend,
+    ) -> dict[str, Any]:
+        return service.extend_agent_token(
+            project_id,
+            credential_id,
+            extend_by_seconds=body.extend_by_seconds,
+        )
 
     @app.post(
         "/api/v1/projects/{project_id}/agent-tokens/{credential_id}/rotate",
@@ -1741,6 +1856,7 @@ def create_app(
             event_id,
             body.session_id,
             body.token,
+            reclaim=body.reclaim,
             request_id=request.state.request_id,
         )
 

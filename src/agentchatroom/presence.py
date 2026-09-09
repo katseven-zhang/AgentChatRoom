@@ -18,6 +18,7 @@ class PresenceSession:
     session_id: str
     token: str
     agent_key: str
+    transport_key: str = ""
 
 
 class LocalPresenceManager:
@@ -30,11 +31,13 @@ class LocalPresenceManager:
         enabled: bool,
         interval_seconds: float,
         availability_check: Callable[[], None] | None = None,
+        transport_check: Callable[[str], bool] | None = None,
     ) -> None:
         self.room_service = room_service
         self.enabled = enabled
         self.interval_seconds = interval_seconds
         self.availability_check = availability_check
+        self.transport_check = transport_check
         self._sessions: dict[str, PresenceSession] = {}
         self._lock = threading.Lock()
         self._stop = threading.Event()
@@ -74,33 +77,18 @@ class LocalPresenceManager:
         token: str,
         *,
         agent_key: str,
+        transport_key: str = "",
     ) -> None:
         if not self.enabled:
             return
-        superseded: list[PresenceSession] = []
         with self._lock:
-            superseded = [
-                session
-                for session in self._sessions.values()
-                if session.project_id == project_id
-                and session.agent_key == agent_key
-                and session.session_id != session_id
-            ]
-            for session in superseded:
-                self._sessions.pop(session.session_id, None)
             self._sessions[session_id] = PresenceSession(
                 project_id=project_id,
                 session_id=session_id,
                 token=token,
                 agent_key=agent_key,
+                transport_key=transport_key,
             )
-        for session in superseded:
-            try:
-                self.room_service.leave_session(
-                    session.project_id, session.session_id, session.token
-                )
-            except DomainError:
-                pass
 
     def ensure_registered(
         self,
@@ -109,6 +97,7 @@ class LocalPresenceManager:
         token: str,
         *,
         agent_key: str = "",
+        transport_key: str = "",
     ) -> bool:
         """Register a live session for background heartbeat if missing.
 
@@ -142,6 +131,7 @@ class LocalPresenceManager:
                 session_id=session_id,
                 token=token,
                 agent_key=resolved_agent_key,
+                transport_key=transport_key,
             )
             return True
 
@@ -160,6 +150,21 @@ class LocalPresenceManager:
         with self._lock:
             sessions = list(self._sessions.values())
         for session in sessions:
+            if (
+                self.transport_check is not None
+                and session.transport_key
+                and not self.transport_check(session.transport_key)
+            ):
+                self.unregister(session.session_id)
+                try:
+                    self.room_service.leave_session(
+                        session.project_id,
+                        session.session_id,
+                        session.token,
+                    )
+                except DomainError:
+                    pass
+                continue
             try:
                 self.room_service.heartbeat(
                     session.project_id,

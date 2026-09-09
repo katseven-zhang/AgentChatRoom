@@ -4,6 +4,8 @@ const state = {
   integrationFormat: "generic",
   integrationOnboardingMode: "first_setup",
   integrationTransport: "http",
+  pendingHttpSetup: null,
+  issuedHttpSetup: null,
   integrationLocalPlan: null,
   integrationLocalApplyResult: null,
   integrationLocalRequest: 0,
@@ -29,6 +31,7 @@ const state = {
   taskIntakeTargets: [],
   taskIntakes: [],
   editingTaskId: null,
+  editingCredentialId: null,
   members: [],
   credentials: [],
   workspaces: [],
@@ -85,13 +88,24 @@ const elements = Object.fromEntries(
     "integration-local-reload", "integration-local-facts", "integration-local-backup",
     "integration-local-refresh", "integration-local-apply",
     "integration-transport-tabs", "integration-http-token-guide", "integration-open-token-button",
+    "integration-http-action-title", "integration-http-action-description", "integration-http-action-steps",
+    "integration-target-project",
     "member-list", "refresh-audit-button", "audit-event-filter",
-    "create-token-button", "token-list", "workspace-list", "audit-list",
+    "create-token-button", "token-list", "token-project-context", "workspace-list", "audit-list",
     "create-backup-button", "backup-list",
     "refresh-runtime-button", "runtime-status", "runtime-config", "runtime-config-raw", "runtime-log",
     "login-dialog", "login-form", "login-token", "login-error",
     "token-dialog", "token-form", "token-name", "token-member", "token-days", "token-permissions",
-    "token-secret-dialog", "token-secret-value", "token-secret-close",
+    "token-dialog-context", "token-dialog-title", "token-submit-button",
+    "token-existing-config-advanced", "token-existing-config-group", "token-project-credential-name", "token-existing-config",
+    "token-permissions-dialog", "token-permissions-form", "token-permissions-project",
+    "token-permissions-title", "token-permissions-edit", "token-permissions-submit",
+    "token-extend-dialog", "token-extend-form", "token-extend-project", "token-extend-title",
+    "token-extend-current", "token-extend-days", "token-extend-submit",
+    "token-secret-dialog", "token-secret-section", "token-secret-value", "token-secret-close", "token-secret-copy",
+    "token-secret-context", "token-secret-title",
+    "token-config-section", "token-config-value", "token-config-path", "token-config-projects", "token-config-format",
+    "token-config-heading", "token-config-copy", "token-config-hint",
   ].map((id) => [id, document.getElementById(id)])
 );
 
@@ -484,7 +498,8 @@ function eventLabel(type) {
     "message.acknowledged": "确认了消息",
     "message.message": "发布了消息", "message.decision": "发布了决策",
     "message.blocker": "发布了阻塞", "message.system": "发布了系统消息",
-    "credential.issued": "签发了 Agent Token", "credential.rotated": "轮换了 Agent Token",
+    "credential.issued": "签发了 Agent Token", "credential.rotated": "更换了 Agent Token",
+    "credential.permissions_updated": "修改了 Agent Token 权限", "credential.extended": "续期了 Agent Token",
     "credential.revoked": "吊销了 Agent Token", "workspace.registered": "登记了 Workspace",
     "workspace.updated": "更新了 Workspace",
     "member.created": "创建了项目成员", "member.updated": "更新了项目成员",
@@ -1203,6 +1218,7 @@ function renderEmptyRoom() {
   elements["chat-stream"].innerHTML = '<div class="empty-state">Room 动态会实时显示在这里：Agent 加入、任务进展和消息按时间排列</div>';
   elements["task-table"].innerHTML = '<div class="empty-state">还没有正式任务。点右上角「+ 新建任务」提交原始任务意图，等待 Agent 受理和定义。</div>';
   elements["token-list"].innerHTML = '<div class="empty-state">选择项目后管理 Agent Token</div>';
+  elements["token-project-context"].textContent = "当前 Project：未选择";
   elements["member-list"].innerHTML = '<div class="empty-state">选择项目后管理项目成员</div>';
   elements["workspace-list"].innerHTML = '<div class="empty-state">选择项目后查看 Workspace</div>';
   elements["audit-list"].innerHTML = '<div class="empty-state">选择项目后查看审计历史</div>';
@@ -1696,7 +1712,7 @@ function memberStatusClass(status) {
 function renderTokenMemberOptions(selected = "") {
   const activeMembers = state.members.filter((member) => member.status === "active");
   elements["token-member"].innerHTML = [
-    '<option value="">不关联成员</option>',
+    '<option value="">不关联；首次连接时自动创建成员</option>',
     ...activeMembers.map((member) => `<option value="${escapeHtml(member.id)}">${escapeHtml(member.name)} · ${escapeHtml(member.member_key)}</option>`),
   ].join("");
   if (activeMembers.some((member) => member.id === selected)) {
@@ -1892,19 +1908,26 @@ function renderMembers() {
 
 function renderCredentials() {
   const memberNames = Object.fromEntries(state.members.map((member) => [member.id, member.name]));
+  const projectName = state.snapshot?.project?.name || "未选择";
+  elements["token-project-context"].textContent = `当前 Project：${projectName}`;
   elements["token-list"].innerHTML = state.credentials.length
-    ? state.credentials.map((credential) => `
+    ? state.credentials.map((credential) => {
+      const manageable = !credential.revoked_at;
+      return `
       <article class="management-item">
         <div>
           <h4>${escapeHtml(credential.name)} <span class="status-badge ${credential.active ? "verified" : "cancelled"}">${credential.active ? "有效" : "已失效"}</span></h4>
-          <p>${credential.member_id ? `成员 ${escapeHtml(memberNames[credential.member_id] || shortId(credential.member_id))} · ` : ""}${escapeHtml(credential.permissions.map(permissionLabel).join(" · "))}</p>
+          <p><strong>所属 Project：${escapeHtml(projectName)}</strong></p>
+          ${credential.member_id ? `<p>成员 ${escapeHtml(memberNames[credential.member_id] || shortId(credential.member_id))}</p>` : ""}
           <p>到期 ${escapeHtml(formatTime(credential.expires_at))}${credential.last_used_at ? ` · 最近使用 ${escapeHtml(formatTime(credential.last_used_at))}` : " · 尚未使用"}</p>
         </div>
         <div class="management-actions">
-          ${credential.active ? `<button type="button" class="secondary-button" data-token-action="rotate" data-credential-id="${escapeHtml(credential.id)}">轮换</button>
+          ${manageable ? `<button type="button" class="secondary-button" data-token-action="permissions" data-credential-id="${escapeHtml(credential.id)}">修改权限</button>
+          <button type="button" class="secondary-button" data-token-action="extend" data-credential-id="${escapeHtml(credential.id)}">续期</button>
           <button type="button" class="danger-button" data-token-action="revoke" data-credential-id="${escapeHtml(credential.id)}">吊销</button>` : ""}
         </div>
-      </article>`).join("")
+      </article>`;
+    }).join("")
     : '<div class="empty-state">尚未签发 Agent Token</div>';
 }
 
@@ -2221,6 +2244,7 @@ elements["logout-button"].addEventListener("click", async () => {
   }
 });
 elements["create-token-button"].addEventListener("click", () => {
+  state.pendingHttpSetup = null;
   const permissions = state.config?.domain?.agent_permissions || [];
   const defaults = new Set(permissions.filter((permission) => permission !== "audit:read"));
   elements["token-permissions"].innerHTML = permissions.map((permission) => `
@@ -2229,6 +2253,12 @@ elements["create-token-button"].addEventListener("click", () => {
       <span>${escapeHtml(permissionLabel(permission))}</span>
     </label>`).join("");
   elements["token-form"].reset();
+  elements["token-existing-config-advanced"].hidden = true;
+  elements["token-project-credential-name"].value = "";
+  elements["token-existing-config"].value = "";
+  elements["token-dialog-context"].textContent = "Agent 凭据";
+  elements["token-dialog-title"].textContent = "签发 Token";
+  elements["token-submit-button"].textContent = "签发";
   renderTokenMemberOptions();
   elements["token-days"].value = "30";
   elements["token-dialog"].showModal();
@@ -2325,15 +2355,48 @@ elements["token-secret-close"].addEventListener("click", () => {
   elements["token-secret-dialog"].close();
 });
 
+elements["token-secret-dialog"].addEventListener("close", () => {
+  state.issuedHttpSetup = null;
+  elements["token-secret-section"].hidden = false;
+  elements["token-secret-copy"].hidden = false;
+  elements["token-secret-context"].textContent = "一次性 Secret";
+  elements["token-secret-title"].textContent = "保存 Agent Token";
+  elements["token-secret-value"].textContent = "";
+  elements["token-config-value"].textContent = "";
+  elements["token-config-path"].textContent = "";
+  elements["token-config-projects"].textContent = "";
+  elements["token-existing-config"].value = "";
+  elements["token-config-section"].hidden = true;
+});
+
+elements["token-dialog"].addEventListener("close", () => {
+  state.pendingHttpSetup = null;
+  elements["token-existing-config"].value = "";
+  elements["token-project-credential-name"].value = "";
+  elements["token-existing-config-advanced"].hidden = true;
+});
+
+elements["token-config-format"].addEventListener("change", () => {
+  renderIssuedHttpConfig();
+});
+
 document.querySelectorAll(".dialog-close").forEach((button) => {
   button.addEventListener("click", () => button.closest("dialog").close());
 });
 
 document.getElementById("integration-onboarding-mode").addEventListener("change", (event) => {
   state.integrationOnboardingMode = event.target.value;
+  if (state.integrationOnboardingMode === "migrate_http") {
+    state.integrationTransport = "http";
+    document.querySelectorAll("[data-integration-transport]").forEach((item) => {
+      item.classList.toggle("is-active", item.dataset.integrationTransport === "http");
+    });
+    renderIntegrationConfig();
+  }
   state.integrationLocalRequest += 1;
   state.integrationLocalPlan = null;
   renderOnboardingPrompt();
+  renderHttpTokenGuide();
   renderLocalMcpPlan();
   if (state.integrationOnboardingMode === "first_setup") void refreshLocalMcpPlan();
 });
@@ -2370,9 +2433,30 @@ elements["integration-transport-tabs"].addEventListener("click", (event) => {
 });
 
 elements["integration-open-token-button"].addEventListener("click", () => {
+  const profile = state.integration?.profiles?.[state.integrationFormat];
+  if (!profile) return;
+  const mode = state.integrationOnboardingMode;
+  const projectName = state.snapshot?.project?.name || "";
+  const setup = {projectId: state.projectId, projectName, profile: {...profile},
+    profiles: state.integration.profiles, format: state.integrationFormat, mode};
+  if (mode === "reconnect") {
+    elements["integration-dialog"].close();
+    showIssuedHttpResult(setup);
+    return;
+  }
   elements["integration-dialog"].close();
-  activateTab(document.getElementById("tab-management"));
   elements["create-token-button"].click();
+  state.pendingHttpSetup = setup;
+  const isAddProject = mode === "add_project";
+  elements["token-existing-config-advanced"].hidden = !isAddProject;
+  elements["token-project-credential-name"].value = projectName;
+  elements["token-name"].value = `${projectName} · ${profile.label || "Agent"} HTTP`;
+  elements["token-dialog-context"].textContent = isAddProject ? "加入当前 Project（增量）" : "首次接入";
+  elements["token-dialog-title"].textContent = isAddProject ? "签发本项目 Token 并生成增量提示词" : "签发首次 HTTP 凭据";
+  elements["token-submit-button"].textContent = isAddProject ? "签发并生成增量提示词" : "签发并生成接入提示词";
+  const member = state.members.find((item) => item.active !== false
+    && item.metadata?.software_key === profile.software_key);
+  if (member) elements["token-member"].value = member.id;
 });
 
 elements["integration-local-refresh"].addEventListener("click", () => {
@@ -2476,24 +2560,100 @@ elements["token-list"].addEventListener("click", async (event) => {
   const button = event.target.closest("[data-token-action]");
   if (!button || !state.projectId) return;
   const credentialId = button.dataset.credentialId;
+  const credential = state.credentials.find((item) => item.id === credentialId);
+  if (!credential) return;
   try {
-    if (button.dataset.tokenAction === "rotate") {
-      if (!window.confirm("轮换后旧 Token 会立即失效，确定继续吗？")) return;
-      const result = await api(`/api/v1/projects/${state.projectId}/agent-tokens/${credentialId}/rotate`, {
-        method: "POST",
-        body: JSON.stringify({ expires_in_seconds: 30 * 24 * 60 * 60 }),
-      });
-      showTokenSecret(result.token);
-      showToast("Token 已轮换");
-    } else if (button.dataset.tokenAction === "revoke") {
+    if (button.dataset.tokenAction === "permissions") {
+      state.editingCredentialId = credentialId;
+      const selected = new Set(credential.permissions || []);
+      const permissions = state.config?.domain?.agent_permissions || [];
+      elements["token-permissions-project"].textContent = `所属 Project：${state.snapshot?.project?.name || "未选择"}`;
+      elements["token-permissions-title"].textContent = `修改“${credential.name}”权限`;
+      elements["token-permissions-edit"].innerHTML = permissions.map((permission) => `
+        <label class="check-row">
+          <input type="checkbox" value="${escapeHtml(permission)}" ${selected.has(permission) ? "checked" : ""}>
+          <span>${escapeHtml(permissionLabel(permission))}</span>
+        </label>`).join("");
+      elements["token-permissions-dialog"].showModal();
+      return;
+    }
+    if (button.dataset.tokenAction === "extend") {
+      state.editingCredentialId = credentialId;
+      elements["token-extend-project"].textContent = `所属 Project：${state.snapshot?.project?.name || "未选择"}`;
+      elements["token-extend-title"].textContent = `续期“${credential.name}”`;
+      elements["token-extend-current"].textContent = `当前到期时间：${formatTime(credential.expires_at)}`;
+      elements["token-extend-days"].value = "30";
+      elements["token-extend-dialog"].showModal();
+      return;
+    }
+    if (button.dataset.tokenAction === "revoke") {
       if (!window.confirm("吊销后使用该 Token 的新连接会被拒绝，确定继续吗？")) return;
       await api(`/api/v1/projects/${state.projectId}/agent-tokens/${credentialId}`, { method: "DELETE" });
       showToast("Token 已吊销");
+      await refreshManagement();
     }
-    await refreshManagement();
   } catch (error) {
     handleError(error);
   }
+});
+
+elements["token-permissions-form"].addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const credentialId = state.editingCredentialId;
+  if (!credentialId || !state.projectId) return;
+  const permissions = Array.from(
+    elements["token-permissions-edit"].querySelectorAll('input[type="checkbox"]:checked')
+  ).map((input) => input.value);
+  if (!permissions.length) {
+    showToast("至少保留一项权限", "error");
+    return;
+  }
+  elements["token-permissions-submit"].disabled = true;
+  try {
+    await api(`/api/v1/projects/${state.projectId}/agent-tokens/${credentialId}/permissions`, {
+      method: "PATCH",
+      body: JSON.stringify({ permissions }),
+    });
+    elements["token-permissions-dialog"].close();
+    await refreshManagement();
+    showToast("Token 权限已更新，无需重新配置客户端");
+  } catch (error) {
+    handleError(error);
+  } finally {
+    elements["token-permissions-submit"].disabled = false;
+  }
+});
+
+elements["token-extend-form"].addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const credentialId = state.editingCredentialId;
+  if (!credentialId || !state.projectId) return;
+  const days = Number(elements["token-extend-days"].value);
+  if (!Number.isInteger(days) || days < 1 || days > 365) {
+    showToast("续期天数必须是 1 到 365 的整数", "error");
+    return;
+  }
+  elements["token-extend-submit"].disabled = true;
+  try {
+    await api(`/api/v1/projects/${state.projectId}/agent-tokens/${credentialId}/extend`, {
+      method: "POST",
+      body: JSON.stringify({ extend_by_seconds: days * 24 * 60 * 60 }),
+    });
+    elements["token-extend-dialog"].close();
+    await refreshManagement();
+    showToast(`Token 已续期 ${days} 天，Token 未更换`);
+  } catch (error) {
+    handleError(error);
+  } finally {
+    elements["token-extend-submit"].disabled = false;
+  }
+});
+
+elements["token-permissions-dialog"].addEventListener("close", () => {
+  state.editingCredentialId = null;
+});
+elements["token-extend-dialog"].addEventListener("close", () => {
+  state.editingCredentialId = null;
 });
 
 elements["member-list"].addEventListener("click", async (event) => {
@@ -2823,6 +2983,56 @@ elements["login-form"].addEventListener("submit", async (event) => {
 elements["token-form"].addEventListener("submit", async (event) => {
   event.preventDefault();
   if (!state.projectId) return;
+  const projectId = state.projectId;
+  const setup = state.pendingHttpSetup;
+  let existingProjectCredentials = [];
+  let projectCredentialName = "";
+  let manualImportText = "";
+  if (setup?.projectId === projectId) {
+    projectCredentialName = String(setup.projectName || "").trim();
+    // 正常主流程不粘贴任何配置；文本只出现在默认折叠的高级故障恢复区。
+    manualImportText = elements["token-existing-config"].value.trim();
+    if (manualImportText) {
+      try {
+        existingProjectCredentials = parseExistingProjectCredentials(manualImportText);
+      } catch (error) {
+        showToast(error.message || "已有 HTTP 配置无法解析", "error");
+        return;
+      }
+    }
+  }
+  const memberId = elements["token-member"].value;
+  const member = state.members.find((item) => item.id === memberId);
+  let softwareIdentity = null;
+  if (setup?.projectId === projectId) {
+    let selectedIdentity;
+    try {
+      selectedIdentity = softwareIdentityForMember(member);
+    } catch (error) {
+      showToast(error.message || "所选项目成员的软件身份不完整", "error");
+      return;
+    }
+    if (manualImportText) {
+      let existingIdentity;
+      try {
+        existingIdentity = parseExistingSoftwareIdentity(manualImportText);
+      } catch (error) {
+        showToast(error.message || "已有 HTTP 配置的软件身份无法解析", "error");
+        return;
+      }
+      if (!existingIdentity) {
+        showToast("已有配置缺少完整的软件身份字段，请粘贴完整 agentchatroom HTTP 配置", "error");
+        return;
+      }
+      if (selectedIdentity && !sameSoftwareIdentity(existingIdentity, selectedIdentity)) {
+        showToast("已有配置与所选项目成员不是同一个软件身份，不能合并", "error");
+        return;
+      }
+      softwareIdentity = existingIdentity;
+    } else {
+      softwareIdentity = selectedIdentity || createSoftwareIdentityForProfile(setup.profile);
+    }
+  }
   const permissions = [...elements["token-permissions"].querySelectorAll("input:checked")]
     .map((input) => input.value);
   if (!permissions.length) {
@@ -2830,17 +3040,31 @@ elements["token-form"].addEventListener("submit", async (event) => {
     return;
   }
   try {
-    const result = await api(`/api/v1/projects/${state.projectId}/agent-tokens`, {
+    const result = await api(`/api/v1/projects/${projectId}/agent-tokens`, {
       method: "POST",
       body: JSON.stringify({
         name: elements["token-name"].value.trim(),
-        member_id: elements["token-member"].value || null,
+        member_id: memberId || null,
         permissions,
         expires_in_seconds: Number(elements["token-days"].value) * 24 * 60 * 60,
       }),
     });
     elements["token-dialog"].close();
-    showTokenSecret(result.token);
+    state.pendingHttpSetup = null;
+    if (setup?.projectId === projectId) {
+      const newCredential = {name: projectCredentialName, token: result.token};
+      if (manualImportText || setup.mode !== "add_project") {
+        const projectCredentials = mergeProjectCredentials(existingProjectCredentials, newCredential);
+        showIssuedHttpResult({...setup, member, softwareIdentity, projectCredentials});
+      } else {
+        // 增量路径：后端只保存 Token 哈希，页面无法重建旧凭据；
+        // 合并旧配置的责任交给已配置的 Agent 在客户端本地完成。
+        showIssuedHttpResult({...setup, member, softwareIdentity,
+          projectCredentials: [newCredential], incremental: true});
+      }
+    } else {
+      showTokenSecret(result.token);
+    }
     await refreshManagement();
   } catch (error) {
     handleError(error);
@@ -2888,10 +3112,341 @@ elements["task-assign-form"].addEventListener("submit", async (event) => {
 
 
 function showTokenSecret(token) {
+  state.issuedHttpSetup = null;
+  elements["token-secret-context"].textContent = "一次性 Secret";
+  elements["token-secret-title"].textContent = "保存 Agent Token";
+  elements["token-secret-section"].hidden = false;
+  elements["token-secret-copy"].hidden = false;
+  elements["token-config-value"].textContent = "";
+  elements["token-config-section"].hidden = true;
   elements["token-secret-value"].textContent = token;
   if (!elements["token-secret-dialog"].open) {
     elements["token-secret-dialog"].showModal();
   }
+}
+
+function showIssuedHttpResult(setup) {
+  state.issuedHttpSetup = setup;
+  const reconnect = setup.mode === "reconnect";
+  elements["token-secret-context"].textContent = reconnect
+    ? "恢复当前 Project"
+    : setup.incremental ? "加入当前 Project（增量）" : "一次性 HTTP 接入内容";
+  elements["token-secret-title"].textContent = reconnect
+    ? "复制恢复连接提示词"
+    : setup.incremental ? "复制增量接入提示词" : "复制完整 HTTP 接入提示词";
+  elements["token-secret-section"].hidden = true;
+  elements["token-secret-copy"].hidden = true;
+  elements["token-secret-value"].textContent = "";
+  elements["token-config-format"].innerHTML = Object.entries(setup.profiles).map(([id, profile]) =>
+    `<option value="${escapeHtml(id)}">${escapeHtml(profile.label || id)}</option>`).join("");
+  elements["token-config-format"].value = setup.format;
+  elements["token-config-section"].hidden = false;
+  renderIssuedHttpConfig();
+  if (!elements["token-secret-dialog"].open) elements["token-secret-dialog"].showModal();
+}
+
+function renderIssuedHttpConfig() {
+  const setup = state.issuedHttpSetup;
+  const profile = setup?.profiles?.[elements["token-config-format"].value];
+  if (!profile) return;
+  if (setup.mode === "reconnect") {
+    elements["token-config-heading"].textContent = "恢复连接提示词";
+    elements["token-config-copy"].textContent = "复制恢复提示词";
+    elements["token-config-hint"].textContent = "本场景不签发新 Token，使用客户端已有的 agentchatroom HTTP 配置恢复连接。";
+    elements["token-config-value"].textContent = profile?.onboarding_modes?.reconnect?.http
+      || "恢复连接提示词尚未生成，请更新服务后重试。";
+    elements["token-config-path"].textContent = "无需修改或新增 MCP；把本提示词交给 Agent 执行连接核对";
+    elements["token-config-projects"].textContent = `目标 Project：${setup.projectName}`;
+    return;
+  }
+  if (setup.incremental) {
+    elements["token-config-heading"].textContent = "增量接入提示词（交给已配置的 Agent）";
+    elements["token-config-copy"].textContent = "复制增量提示词";
+    elements["token-config-hint"].textContent = "包含新 Project Token 明文，只整体复制给已配置过 agentchatroom 的那个 Agent；Agent 会在客户端本地保留旧配置并自行合并，不要发送到 Room、日志或仓库。";
+    elements["token-config-value"].textContent = incrementalHttpPrompt(profile, setup);
+    elements["token-config-path"].textContent = `${profile.config_path_hint || "客户端 MCP 配置"}；MCP Server 标准名称：agentchatroom（Agent 更新现有条目，不新增）`;
+    elements["token-config-projects"].textContent = `目标 Project：${setup.projectName}；客户端原有 Project 凭据由 Agent 在本地保留`;
+    return;
+  }
+  elements["token-config-heading"].textContent = "完整 HTTP 接入提示词";
+  elements["token-config-copy"].textContent = "复制完整提示词";
+  elements["token-config-hint"].textContent = "内容包含 Project 与 Token 的明文对应关系，只交给负责配置该客户端的 Agent；不要发送到 Room、日志或仓库。";
+  elements["token-config-value"].textContent = issuedHttpPrompt(profile, setup);
+  elements["token-config-path"].textContent = `${profile.config_path_hint || "客户端 MCP 配置"}；MCP Server 标准名称：agentchatroom`;
+  elements["token-config-projects"].textContent = `已包含 ${setup.projectCredentials.length} 个 Project：${setup.projectCredentials.map((item) => item.name).join("、")}`;
+}
+
+const PROJECT_CREDENTIAL_BUNDLE_PREFIX = "acrb.v1.";
+
+function encodeBase64UrlUtf8(value) {
+  const bytes = new TextEncoder().encode(value);
+  let binary = "";
+  for (const byte of bytes) binary += String.fromCharCode(byte);
+  return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
+}
+
+function decodeBase64UrlUtf8(value) {
+  const normalized = value.replace(/-/g, "+").replace(/_/g, "/");
+  const binary = atob(normalized + "=".repeat((4 - normalized.length % 4) % 4));
+  return new TextDecoder().decode(Uint8Array.from(binary, (character) => character.charCodeAt(0)));
+}
+
+function validateProjectCredentials(entries) {
+  if (!Array.isArray(entries) || !entries.length || entries.length > 32) {
+    throw new Error("项目凭据数量必须在 1 到 32 之间");
+  }
+  const names = new Set();
+  const tokens = new Set();
+  return entries.map((entry) => {
+    const name = String(entry?.name || "").trim();
+    const token = String(entry?.token || "").trim();
+    if (!name || name.length > 200 || !/^acr\.(?!bundle\.)[^\s]+$/.test(token)) {
+      throw new Error("项目名称或 Token 格式无效");
+    }
+    const folded = name.toLocaleLowerCase();
+    if (names.has(folded) || tokens.has(token)) throw new Error("项目凭据名称和 Token 必须唯一");
+    names.add(folded);
+    tokens.add(token);
+    return {name, token};
+  });
+}
+
+function encodeProjectCredentialBundle(entries) {
+  const projects = validateProjectCredentials(entries);
+  return `${PROJECT_CREDENTIAL_BUNDLE_PREFIX}${encodeBase64UrlUtf8(JSON.stringify({projects}))}`;
+}
+
+function decodeProjectCredentialBundle(bundle) {
+  const value = String(bundle || "").trim();
+  if (!value.startsWith(PROJECT_CREDENTIAL_BUNDLE_PREFIX) || value.length > 16384) {
+    throw new Error("多项目凭据包格式无效");
+  }
+  let parsed;
+  try {
+    parsed = JSON.parse(decodeBase64UrlUtf8(value.slice(PROJECT_CREDENTIAL_BUNDLE_PREFIX.length)));
+  } catch (_error) {
+    throw new Error("多项目凭据包无法解码");
+  }
+  if (!parsed || Object.keys(parsed).length !== 1 || !Array.isArray(parsed.projects)) {
+    throw new Error("多项目凭据包结构无效");
+  }
+  const projects = validateProjectCredentials(parsed.projects);
+  if (encodeProjectCredentialBundle(projects) !== value) throw new Error("多项目凭据包不是规范格式");
+  return projects;
+}
+
+function parseExistingProjectCredentials(input) {
+  const value = String(input || "").trim();
+  if (!value) return [];
+  const bundle = value.match(/acrb\.v1\.[A-Za-z0-9_-]+/)?.[0];
+  if (bundle) return decodeProjectCredentialBundle(bundle);
+  const entries = value.split(/\r?\n/).filter((line) => line.trim()).map((line) => {
+    const separator = line.indexOf("=");
+    if (separator < 1) throw new Error("请粘贴完整配置、凭据包，或使用“项目名称=Token”格式");
+    return {name: line.slice(0, separator), token: line.slice(separator + 1)};
+  });
+  return validateProjectCredentials(entries);
+}
+
+const SOFTWARE_IDENTITY_HEADER_NAMES = Object.freeze({
+  softwareKey: "X-AgentChatRoom-Software-Key",
+  softwareName: "X-AgentChatRoom-Software-Name",
+  softwareClient: "X-AgentChatRoom-Software-Client",
+});
+
+function normalizedSoftwareIdentity(identity) {
+  if (!identity) return null;
+  const normalized = Object.fromEntries(
+    Object.keys(SOFTWARE_IDENTITY_HEADER_NAMES).map((key) => [
+      key,
+      String(identity[key] || "").trim(),
+    ])
+  );
+  const present = Object.values(normalized).filter(Boolean).length;
+  if (!present) return null;
+  if (present !== 3) throw new Error("软件身份字段不完整，必须同时包含 Key、Name 和 Client");
+  return normalized;
+}
+
+function softwareIdentityForMember(member) {
+  return normalizedSoftwareIdentity({
+    softwareKey: member?.metadata?.software_key,
+    softwareName: member?.name,
+    softwareClient: member?.metadata?.client,
+  });
+}
+
+function concreteIdentityValue(value) {
+  const normalized = String(value || "").trim();
+  return normalized && !normalized.startsWith("<") ? normalized : "";
+}
+
+function createSoftwareIdentityForProfile(profile) {
+  const client = concreteIdentityValue(profile?.software_client) || "standard-mcp";
+  const name = concreteIdentityValue(profile?.software_name)
+    || concreteIdentityValue(profile?.label)
+    || "Standard MCP Agent";
+  const prefix = concreteIdentityValue(profile?.software_key) || client;
+  const suffix = globalThis.crypto?.randomUUID?.()
+    || `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
+  return normalizedSoftwareIdentity({
+    softwareKey: `${prefix}-${suffix}`,
+    softwareName: name,
+    softwareClient: client,
+  });
+}
+
+function parseExistingSoftwareIdentity(input) {
+  const value = String(input || "").trim();
+  if (!value) return null;
+  const found = {};
+  for (const [key, header] of Object.entries(SOFTWARE_IDENTITY_HEADER_NAMES)) {
+    const escaped = header.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const patterns = [
+      new RegExp(`"${escaped}"\\s*:\\s*"([^"]*)"`, "g"),
+      new RegExp(`(?:^|\\n)\\s*${escaped}\\s*=\\s*"([^"]*)"`, "g"),
+    ];
+    const values = new Set();
+    for (const pattern of patterns) {
+      for (const match of value.matchAll(pattern)) {
+        if (match[1].trim()) values.add(match[1].trim());
+      }
+    }
+    if (values.size > 1) throw new Error(`已有配置包含冲突的 ${header}`);
+    found[key] = values.size ? [...values][0] : "";
+  }
+  return normalizedSoftwareIdentity(found);
+}
+
+function sameSoftwareIdentity(left, right) {
+  return ["softwareKey", "softwareName", "softwareClient"].every(
+    (key) => left[key] === right[key]
+  );
+}
+
+function mergeProjectCredentials(existing, added) {
+  const incoming = {name: String(added.name || "").trim(), token: String(added.token || "").trim()};
+  const merged = existing.filter((item) => item.name.toLocaleLowerCase() !== incoming.name.toLocaleLowerCase());
+  merged.push(incoming);
+  return validateProjectCredentials(merged);
+}
+
+function issuedHttpPrompt(profile, setup) {
+  const projectCredentials = validateProjectCredentials(setup.projectCredentials);
+  const config = issuedHttpConfig(profile, projectCredentials, setup.softwareIdentity);
+  const mode = setup.mode === "add_project" ? "add_project" : "first_setup";
+  const bootstrapProjectName = String(setup.projectName || "").trim();
+  const modeLabel = mode === "add_project" ? "已配置软件，加入本项目" : "首次配置软件";
+  const mapping = projectCredentials.flatMap((item, index) => [
+    `project_name_${index + 1}=${JSON.stringify(item.name)}`,
+    `project_token_${index + 1}=${JSON.stringify(item.token)}`,
+  ]).join("\n");
+  const template = profile.streamable_http_config_text || "";
+  let instructions = profile?.onboarding_modes?.[mode]?.http
+    || profile?.onboarding_prompts?.http
+    || "按目标 Project 名称完成 room_bootstrap，并核对返回的 Project。";
+  if (template && instructions.includes(template)) {
+    instructions = instructions.replace(
+      template,
+      "（含真实凭据的完整 MCP 配置已在上方给出，请勿再使用占位配置。）",
+    );
+  }
+  return [
+    "请为当前客户端完成 AgentChatRoom HTTP MCP 接入。以下内容含真实测试凭据。",
+    `接入场景：${modeLabel}`,
+    `目标 Project：${bootstrapProjectName}`,
+    `本工作区固定 bootstrap 参数：project_name=${JSON.stringify(bootstrapProjectName)}`,
+    "MCP Server 标准名称：agentchatroom",
+    "",
+    "Project 与 Token 对应关系（配置时必须按名称保留，不得混用）：",
+    mapping,
+    "",
+    "可直接使用的 HTTP MCP 参考配置：",
+    config,
+    "",
+    "客户端配置格式如与参考格式不同，只转换语法；必须保留 URL、Authorization、软件身份字段和标准服务器名 agentchatroom。不要命名为 agentchatroom-stdio。",
+    "",
+    "完成配置后执行以下场景指令：",
+    instructions,
+    "",
+    "不要把上述 Token 发布到 Room、日志或仓库。",
+  ].join("\n");
+}
+
+function incrementalHttpPrompt(profile, setup) {
+  const credential = validateProjectCredentials(setup.projectCredentials)[0];
+  const projectName = String(setup.projectName || credential.name).trim();
+  const configHint = profile.config_path_hint || "客户端 MCP 配置文件";
+  const bootstrapCall = `room_bootstrap(project_name=${JSON.stringify(projectName)})`;
+  const linkedIdentity = setup.member
+    ? normalizedSoftwareIdentity(setup.softwareIdentity)
+    : null;
+  const identityInstruction = linkedIdentity
+    ? `本次 Token 已关联成员 ${JSON.stringify(setup.member.name)}，服务端会直接从已关联 Token 解析软件身份：X-AgentChatRoom-Software-Key=${JSON.stringify(linkedIdentity.softwareKey)}，X-AgentChatRoom-Software-Name=${JSON.stringify(linkedIdentity.softwareName)}，X-AgentChatRoom-Software-Client=${JSON.stringify(linkedIdentity.softwareClient)}。现有配置可以没有这三个 Header；若已经配置 Header，则三字段必须与上述身份完全一致，冲突时停止且不要覆盖。凭据包中的其他已关联 Token 也必须属于同一软件身份，否则服务端会拒绝整个连接。`
+    : "本次 Token 未关联成员。必须原样保留客户端现有的软件身份三字段；目标 Project 第一次成功连接时会按该身份自动登记成员。";
+  return [
+    "该客户端已经配置过 agentchatroom HTTP MCP。请把下面签发的新 Project 凭据增量合并进客户端现有配置；不要新建第二个 agentchatroom 连接器或同名变体，也不要重新执行首次安装。",
+    "",
+    "接入场景：已配置软件，加入本项目（增量合并）",
+    `目标 Project：${projectName}`,
+    `本工作区固定 bootstrap 参数：project_name=${JSON.stringify(projectName)}`,
+    "MCP Server 标准名称：agentchatroom（全局唯一，保持不变）",
+    "",
+    "本次签发的新凭据（只用于写入客户端本地 MCP 配置）：",
+    `project_name_1=${JSON.stringify(credential.name)}`,
+    `project_token_1=${JSON.stringify(credential.token)}`,
+    "",
+    identityInstruction,
+    "",
+    "操作步骤：",
+    `1. 先检查客户端本地是否已存在名为 agentchatroom 的 HTTP MCP 配置（配置位置参考：${configHint}）。找到后保留它的 url、Authorization 中的全部旧 Project 凭据，以及当前确实存在的软件身份三字段（X-AgentChatRoom-Software-Key / X-AgentChatRoom-Software-Name / X-AgentChatRoom-Software-Client）；缺少这些 Header 时不要据此判定失败，服务端可从已关联 Token 解析身份。只追加或替换本条目。`,
+    "2. Authorization 合并方法：现值为 `Bearer acrb.v1.<base64url>` 时，把 `acrb.v1.` 之后的 base64url 解码为 JSON {\"projects\":[{\"name\":...,\"token\":...}]}，按 Project 名称把 {\"name\":" + JSON.stringify(credential.name) + ",\"token\":" + JSON.stringify(credential.token) + "} 追加或替换进去，用相同编码重新打包为 `Bearer acrb.v1.<新值>` 写回。现值为单个 `Bearer acr.*` Token 时，先保持旧配置不变，用现有连接调用零参数 `room_bootstrap()` 读取并记录旧 Project 的精确名称；然后把旧名称与旧 Token、新名称与新 Token 一并打成上述 `acrb.v1` 凭据包。无法取得旧 Project 名称时停止，不得猜测。",
+    "3. 只写回同一个 agentchatroom 条目，不改动其他 Project 的凭据；保存后重载客户端 MCP，为本项目新建独立 MCP Session，调用 " + bootstrapCall + "，核对返回的 Project 名称与 root_path 与当前工作区一致后才允许写操作。",
+    "4. 无法读取或找不到现有 agentchatroom 配置时：停止合并，向用户报告失败原因和实际检查过的配置文件位置，请用户在 Web 签发弹窗底部展开「高级 · 故障恢复」手动粘贴完整 `acrb.v1` 配置；旧配置只有单个 `acr.*` Token 时，恢复区必须填写明确的 `旧Project名称=旧Token`，不能只粘贴无法识别项目名的单 Token。不要新建同名或变体 MCP，不要凭空重建配置，不要重试超过一次。",
+    "",
+    "不要把上述 Token 发布到 Room、日志或仓库；合并完成后不要在回复中复述 Token 内容。",
+  ].join("\n");
+}
+
+function issuedHttpConfig(profile, projectCredentials, softwareIdentity) {
+  let config = profile.streamable_http_config_text || "";
+  const bundle = encodeProjectCredentialBundle(projectCredentials);
+  const identity = normalizedSoftwareIdentity(softwareIdentity);
+  if (!identity) throw new Error("HTTP 接入配置缺少软件身份");
+  // Only the one-time result dialog receives this text. It is never stored in
+  // shared integration state, browser storage, Room messages, or logs.
+  if (profile.format === "json") {
+    const parsed = JSON.parse(config);
+    for (const server of Object.values(parsed.mcpServers || {})) {
+      server.headers.Authorization = `Bearer ${bundle}`;
+      server.headers["X-AgentChatRoom-Software-Key"] = identity.softwareKey;
+      server.headers["X-AgentChatRoom-Software-Name"] = identity.softwareName;
+      server.headers["X-AgentChatRoom-Software-Client"] = identity.softwareClient;
+    }
+    return JSON.stringify(parsed, null, 2);
+  }
+  const authorization = `Authorization = ${JSON.stringify(`Bearer ${bundle}`)}`;
+  const identityHeaders = {"X-AgentChatRoom-Software-Key": identity.softwareKey,
+    "X-AgentChatRoom-Software-Name": identity.softwareName, "X-AgentChatRoom-Software-Client": identity.softwareClient};
+  for (const [key, value] of Object.entries(identityHeaders)) {
+      const line = `${key} = ${JSON.stringify(value)}`;
+      const existing = new RegExp(`^${key} = .*$`, "m");
+      if (existing.test(config)) {
+        config = config.replace(existing, () => line);
+      } else {
+        config = config.replace(
+          /(\[mcp_servers\.[^\]\n]+\.(?:http_headers|headers)\])/,
+          `$1\n${line}`,
+        );
+      }
+  }
+  config = config.replace(/^bearer_token_env_var = .*\r?\n/gm, "");
+  if (/^Authorization = /m.test(config)) {
+    config = config.replace(/^Authorization = .*$/m, () => authorization);
+  } else {
+    config = config.replace(/(\[mcp_servers\.[^\]\n]+\.(?:http_headers|headers)\])/, `$1\n${authorization}`);
+  }
+  return config;
 }
 
 function handleError(error) {
@@ -3538,6 +4093,36 @@ function renderHttpTokenGuide() {
   const guide = elements["integration-http-token-guide"];
   if (!guide) return;
   guide.hidden = state.integrationTransport !== "http";
+  const mode = state.integrationOnboardingMode;
+  const projectName = state.snapshot?.project?.name || "当前 Project";
+  elements["integration-target-project"].textContent = projectName;
+  if (mode === "reconnect") {
+    elements["integration-http-action-title"].textContent = "生成恢复连接提示词";
+    elements["integration-http-action-description"].textContent = "不签发新 Token，不新增 MCP；生成一份让 Agent 使用现有 HTTP 配置恢复当前 Project 连接的提示词。";
+    elements["integration-open-token-button"].textContent = "生成恢复提示词";
+    elements["integration-http-action-steps"].innerHTML = `
+      <li>确认客户端已经保存名为 <code>agentchatroom</code> 的 HTTP MCP。</li>
+      <li>复制恢复提示词交给 Agent，要求它重载连接并调用指定 Project 的 <code>room_bootstrap</code>。</li>
+      <li>提示词会要求核对 Project 名称与路径；不重新签发或替换已有 Token。</li>`;
+    return;
+  }
+  const addProject = mode === "add_project";
+  elements["integration-http-action-title"].textContent = addProject
+    ? "签发本项目 Token 并生成增量提示词"
+    : "签发并生成首次接入提示词";
+  elements["integration-http-action-description"].textContent = addProject
+    ? "无需粘贴现有配置。签发当前 Project Token，生成一段交给已配置 Agent 的增量提示词：由 Agent 读取客户端本地现有配置，保留原有 Project 凭据，仅合并本项目。"
+    : "签发当前 Project 的 Token，生成一份包含可读 Project↔Token 映射、真实 MCP 配置和首次接入指令的完整提示词。";
+  elements["integration-open-token-button"].textContent = addProject
+    ? "签发并生成增量提示词"
+    : "签发并生成接入提示词";
+  elements["integration-http-action-steps"].innerHTML = addProject ? `
+      <li>只需确认客户端、Token 名称、有效期、可选成员与权限，不需要粘贴任何现有配置。</li>
+      <li>签发后生成一段增量提示词：Agent 自行检查客户端本地的 <code>agentchatroom</code> HTTP 配置，保留原有 URL、软件身份和旧 Project 凭据，仅合并新凭据并写回同一条目。</li>
+      <li>若 Agent 无法读取本地配置，改用签发弹窗底部「高级 · 故障恢复」手动粘贴合并。</li>` : `
+      <li>新数据库可保持“不关联”；首次连接成功时自动创建该软件成员。只有需要沿用已有身份时才关联旧成员。</li>
+      <li>签发结果只生成一个可复制区：Project↔Token 明文映射、含凭据包的 MCP 配置和首次接入指令都在其中。</li>
+      <li>把整段内容交给 Agent；Agent 按客户端格式写入名为 <code>agentchatroom</code> 的 MCP，并调用指定 Project 的 <code>room_bootstrap</code>。</li>`;
 }
 
 function renderIntegrationConfig() {

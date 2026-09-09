@@ -81,8 +81,9 @@ def test_empty_protocol_stdin_exits_nonzero(monkeypatch, capsys):
 
     monkeypatch.setattr(sys, 'stdin', io.StringIO(''))
     stdio_runtime.install_protocol_stdin_guard()
+    assert sys.stdin.readline() == ''
     with pytest.raises(SystemExit) as error:
-        sys.stdin.readline()
+        stdio_runtime.verify_protocol_stdin()
     assert error.value.code == 2
     captured = capsys.readouterr()
     assert captured.out == ''
@@ -134,6 +135,25 @@ def test_source_mcp_entry_empty_stdin_exits_nonzero(tmp_path):
     )
     assert result.returncode != 0
     assert 'unavailable' in result.stderr
+    assert result.stdout == ''
+
+
+def test_empty_stdin_with_running_service_reports_protocol_failure(tmp_path):
+    from agentchatroom.config import Settings
+    from agentchatroom.service_lifetime import running_service
+    settings = Settings(data_dir=tmp_path / 'running')
+    env = os.environ.copy()
+    env['AGENTCHATROOM_DATA_DIR'] = str(settings.data_dir)
+    with running_service(settings):
+        result = subprocess.run(
+            [sys.executable, '-m', 'agentchatroom.mcp_server'],
+            input='', capture_output=True, text=True, timeout=20,
+            env=env, cwd=str(tmp_path),
+            creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0),
+        )
+    assert result.returncode != 0
+    assert 'startup_failed/no_protocol_stdin' in result.stderr
+    assert 'Traceback' not in result.stderr
     assert result.stdout == ''
 
 

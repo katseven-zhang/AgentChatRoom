@@ -6,8 +6,8 @@
     <meta name="color-scheme" content="light">
     <title>AgentChatRoom</title>
     <link rel="icon" href="/assets/favicon.svg?v=1.0.0-central1" type="image/svg+xml">
-    <link rel="stylesheet" href="/assets/app.css?v=1.0.0-central41">
-    <script src="/assets/app.js?v=1.0.0-central41" defer></script>
+    <link rel="stylesheet" href="/assets/app.css?v=1.0.0-central51">
+    <script src="/assets/app.js?v=1.0.0-central51" defer></script>
   </head>
   <body>
     <div class="app-shell" id="app-shell">
@@ -96,7 +96,7 @@
             <h3>三步开始多 Agent 协作</h3>
             <ol class="onboarding-steps">
               <li><strong>1. 添加项目</strong><span>把本地工作目录注册为协作 Room（右上角「+ 添加项目」）</span></li>
-              <li><strong>2. 接入 Agent</strong><span>优先用 HTTP 直连（url + Token）；本机 stdio 与远程 Bridge 仍可用</span></li>
+              <li><strong>2. 接入 Agent</strong><span>使用 HTTP 直连（url + Project 凭据包），客户端只保留一个 agentchatroom MCP</span></li>
               <li><strong>3. 提交第一件工作</strong><span>「新建任务」只需写清原始意图并选择受理 Agent，正式合同由 Agent 补全</span></li>
             </ol>
           </section>
@@ -225,7 +225,8 @@
               <div class="section-heading">
                 <div>
                   <h3>Agent Token</h3>
-                  <p class="secondary-text">仅当 Agent 无法经自身软件身份接入（如远程部署、无本地 MCP）时才需要签发</p>
+                  <p class="secondary-text" id="token-project-context">当前 Project：未选择</p>
+                  <p class="secondary-text">签发、修改权限、续期与吊销都只作用于当前 Project；HTTP 接入时由完整提示词保存 Project↔Token 对应关系</p>
                 </div>
                 <button class="primary-button" id="create-token-button" type="button" disabled>签发 Token</button>
               </div>
@@ -252,7 +253,9 @@
                   <select id="audit-event-filter" aria-label="审计事件类型" disabled>
                     <option value="">全部事件</option>
                     <option value="credential.issued">Token 签发</option>
-                    <option value="credential.rotated">Token 轮换</option>
+                    <option value="credential.permissions_updated">Token 权限修改</option>
+                    <option value="credential.extended">Token 续期</option>
+                    <option value="credential.rotated">Token 更换（兼容历史）</option>
                     <option value="credential.revoked">Token 吊销</option>
                     <option value="member.created">成员创建</option>
                     <option value="member.updated">成员更新</option>
@@ -594,16 +597,14 @@
               <option value="add_project">已配置软件，加入本项目</option>
               <option value="reconnect">恢复当前项目连接</option>
             </select>
-            <p class="secondary-text">请按客户端实际配置选择；曾在房间出现不代表本机已配置。加入新项目和恢复连接不会应用配置。</p>
+            <p class="secondary-text">请按客户端实际配置选择；已有旧连接器时用生成的同名 HTTP 配置替换，不删除 Room 数据。</p>
           </div>
           <div>
             <p class="integration-choice-label">连接方式</p>
-            <div class="segmented-control integration-transport-tabs" id="integration-transport-tabs" aria-label="连接方式">
+            <div class="segmented-control integration-transport-tabs" id="integration-transport-tabs" aria-label="连接方式（仅 HTTP）">
               <button type="button" class="is-active" data-integration-transport="http">HTTP 直连</button>
-              <button type="button" data-integration-transport="local">本机 stdio</button>
-              <button type="button" data-integration-transport="remote">远程 Bridge</button>
             </div>
-            <p class="secondary-text">局域网与后续云端部署以 HTTP 直连为主；本机 stdio 适合同一台电脑开发，远程 Bridge 适合客户端只能拉起本地进程时转发。</p>
+            <p class="secondary-text">本机与远程客户端统一使用 HTTP 直连，共用服务并减少适配器进程。</p>
           </div>
           <div>
             <p class="integration-choice-label">Agent 客户端</p>
@@ -614,17 +615,16 @@
         <section id="integration-http-token-guide" class="integration-section http-token-guide">
           <div class="integration-heading">
             <div>
-              <h3>Token 发放</h3>
-              <p class="secondary-text">HTTP 直连使用管理端签发的 Agent Token。配置文本只含 Bearer 占位符，不会写入真实 Secret。</p>
+                <h3 id="integration-http-action-title">签发并生成首次接入提示词</h3>
+                <p id="integration-http-action-description" class="secondary-text">签发当前 Project 的 Token，生成一份包含目标 Project、真实 MCP 配置和首次接入指令的完整提示词。</p>
+                <p class="form-hint">目标 Project：<strong id="integration-target-project"></strong></p>
             </div>
-            <button type="button" class="secondary-button" id="integration-open-token-button">打开管理 Tab 签发</button>
+              <button type="button" class="secondary-button" id="integration-open-token-button">签发并生成接入提示词</button>
           </div>
-          <ol class="http-token-steps">
-            <li>打开「管理」Tab，在 Agent 凭据中点击「签发 Token」。</li>
-            <li>建议关联对应软件成员；复制一次性 Secret（关闭后不会再显示）。</li>
-            <li>把下方配置里的 <code>&lt;paste-issued-agent-token&gt;</code> 替换为该 Secret。</li>
-            <li>客户端以 url 模式连接 <code>/mcp</code>，调用零参数 <code>room_bootstrap</code> 核对项目。</li>
-            <li>回收或轮换 Token 仍在同一管理列表操作；不要把 Token 放进 URL、日志或仓库。</li>
+          <ol class="http-token-steps" id="integration-http-action-steps">
+              <li>核对软件成员、权限与有效期后签发。</li>
+              <li>签发结果只生成一个可复制区：Project 名称、含 Token 的完整 MCP 配置和对应接入指令都在其中。</li>
+              <li>把整段内容交给 Agent；Agent 写入客户端 MCP 设置并按其中的 Project 名称调用 <code>room_bootstrap</code>。</li>
           </ol>
         </section>
 
@@ -648,11 +648,11 @@
           </div>
         </section>
 
-        <section class="integration-section onboarding-section">
+        <section class="integration-section onboarding-section" hidden>
           <div class="integration-heading">
             <div>
               <h3>当前场景的接入指令</h3>
-              <p class="secondary-text">复制当前环境的 MCP 连接参数与绑定边界，Agent 接入后先零参数 room_bootstrap 核对当前项目</p>
+              <p class="secondary-text">复制当前环境的 HTTP MCP 连接参数与绑定边界，并使用页面给出的 Project 凭据名称完成 bootstrap。</p>
             </div>
             <button class="primary-button copy-button" type="button" data-copy-target="integration-onboarding-prompt">复制接入指令</button>
           </div>
@@ -733,25 +733,81 @@
       <form method="dialog" class="dialog-form" id="token-form">
         <div class="dialog-header">
           <div>
-            <p class="context-label">Agent 凭据</p>
-            <h2>签发 Token</h2>
+            <p class="context-label" id="token-dialog-context">Agent 凭据</p>
+            <h2 id="token-dialog-title">签发 Token</h2>
           </div>
           <button type="button" class="icon-button dialog-close" title="关闭" aria-label="关闭">×</button>
         </div>
         <label>名称 <input id="token-name" autocomplete="off" required></label>
-        <label>关联成员
+        <label>关联已有成员（可选）
           <select id="token-member">
-            <option value="">不关联成员</option>
+            <option value="">不关联；首次连接时自动创建成员</option>
           </select>
         </label>
+        <p class="form-hint">新项目无需预先创建成员。保持不关联时，Agent 首次成功连接会按生成配置中的软件身份自动登记；选择旧成员仅用于沿用已有身份。“已配置软件，加入本项目”建议保持不关联：Agent 合并时会保留客户端原身份，与所选成员不一致会被拒绝，选旧成员仅限确认身份相同时。</p>
         <label>有效天数 <input id="token-days" type="number" min="1" max="365" value="30" required></label>
+        <details id="token-existing-config-advanced" class="integration-fallback" hidden>
+          <summary>高级 · 故障恢复：手动粘贴已有配置合并（可选）</summary>
+          <section id="token-existing-config-group">
+            <label>本项目在 MCP 中的凭据名称（固定为 Project 名）
+              <input id="token-project-credential-name" autocomplete="off" readonly>
+            </label>
+            <label>已有的 agentchatroom HTTP 配置（可选，仅供故障恢复）
+              <textarea id="token-existing-config" rows="5" autocomplete="off" spellcheck="false"
+                placeholder="粘贴完整配置/acrb.v1 凭据包；旧单 Token 请按“旧Project名称=旧Token”填写"></textarea>
+            </label>
+            <p class="form-hint">正常流程无需粘贴任何内容：签发后生成的增量提示词会让已配置的 Agent 自行读取并合并客户端本地配置。这里仅用于 Agent 无法读取本地配置时的手动恢复；可粘贴完整配置、acrb.v1 凭据包，或逐行填写“Project名称=Token”。旧配置只有单个 acr.* Token 时必须先用旧连接确认其 Project 名称，不能只粘贴无法识别项目名的 Token。页面会生成一份保留原有 Project 的完整合并配置；留空不影响签发。</p>
+          </section>
+        </details>
         <fieldset class="dependency-fieldset">
           <legend>权限</legend>
           <div id="token-permissions" class="permission-grid"></div>
         </fieldset>
         <div class="dialog-actions">
           <button type="button" class="secondary-button dialog-close">取消</button>
-          <button type="submit" class="primary-button">签发</button>
+          <button type="submit" class="primary-button" id="token-submit-button">签发</button>
+        </div>
+      </form>
+    </dialog>
+
+    <dialog id="token-permissions-dialog">
+      <form method="dialog" class="dialog-form" id="token-permissions-form">
+        <div class="dialog-header">
+          <div>
+            <p class="context-label" id="token-permissions-project"></p>
+            <h2 id="token-permissions-title">修改 Token 权限</h2>
+          </div>
+          <button type="button" class="icon-button dialog-close" title="关闭" aria-label="关闭">×</button>
+        </div>
+        <p class="secondary-text">保存后立即影响该 Token 的后续请求；Token 本身不变，无需重新配置客户端。</p>
+        <fieldset class="dependency-fieldset">
+          <legend>权限</legend>
+          <div id="token-permissions-edit" class="permission-grid"></div>
+        </fieldset>
+        <div class="dialog-actions">
+          <button type="button" class="secondary-button dialog-close">取消</button>
+          <button type="submit" class="primary-button" id="token-permissions-submit">保存权限</button>
+        </div>
+      </form>
+    </dialog>
+
+    <dialog id="token-extend-dialog">
+      <form method="dialog" class="dialog-form" id="token-extend-form">
+        <div class="dialog-header">
+          <div>
+            <p class="context-label" id="token-extend-project"></p>
+            <h2 id="token-extend-title">Token 续期</h2>
+          </div>
+          <button type="button" class="icon-button dialog-close" title="关闭" aria-label="关闭">×</button>
+        </div>
+        <p id="token-extend-current" class="secondary-text"></p>
+        <label>增加有效期（天）
+          <input id="token-extend-days" type="number" min="1" max="365" value="30" required>
+        </label>
+        <p class="form-hint">从当前到期时间继续增加；已经过期则从现在重新起算。续期不更换 Token，无需重新接入 Agent。</p>
+        <div class="dialog-actions">
+          <button type="button" class="secondary-button dialog-close">取消</button>
+          <button type="submit" class="primary-button" id="token-extend-submit">确认续期</button>
         </div>
       </form>
     </dialog>
@@ -760,14 +816,25 @@
       <div class="dialog-form">
         <div class="dialog-header">
           <div>
-            <p class="context-label">一次性 Secret</p>
-            <h2>保存 Agent Token</h2>
+            <p class="context-label" id="token-secret-context">一次性 Secret</p>
+            <h2 id="token-secret-title">保存 Agent Token</h2>
           </div>
         </div>
-        <pre id="token-secret-value" class="code-block secret-block"></pre>
+          <section id="token-secret-section">
+          <pre id="token-secret-value" class="code-block secret-block"></pre>
+          </section>
+          <section id="token-config-section" hidden>
+             <h3 id="token-config-heading">完整 HTTP 接入提示词</h3>
+             <label>客户端配置格式 <select id="token-config-format"></select></label>
+             <p id="token-config-path" class="form-hint"></p>
+             <p id="token-config-projects" class="form-hint"></p>
+             <pre id="token-config-value" class="code-block secret-block"></pre>
+             <button class="secondary-button copy-button" type="button" data-copy-target="token-config-value" id="token-config-copy">复制完整提示词</button>
+             <p class="form-hint" id="token-config-hint">内容包含 Secret，只交给负责配置该客户端的 Agent；不要发到 Room、日志或仓库。</p>
+          </section>
         <p class="form-hint">关闭后不会再次显示。</p>
         <div class="dialog-actions">
-          <button class="secondary-button copy-button" type="button" data-copy-target="token-secret-value">复制</button>
+          <button class="secondary-button copy-button" type="button" data-copy-target="token-secret-value" id="token-secret-copy">复制</button>
           <button type="button" class="primary-button" id="token-secret-close">完成</button>
         </div>
       </div>

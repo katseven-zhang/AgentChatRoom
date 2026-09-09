@@ -90,6 +90,25 @@ class _ProtocolStdin:
         self._note(data)
         return data
 
+    def read1(self, size=-1):
+        # TextIOWrapper in the MCP SDK reads binary stdin through read1.
+        # Delegating it via __getattr__ bypassed the immediate-EOF guard.
+        read = getattr(self._inner, 'read1', self._inner.read)
+        data = read(size)
+        self._note(data)
+        return data
+
+    def readinto(self, buffer):
+        count = self._inner.readinto(buffer)
+        self._note(count)
+        return count
+
+    def readinto1(self, buffer):
+        read = getattr(self._inner, 'readinto1', self._inner.readinto)
+        count = read(buffer)
+        self._note(count)
+        return count
+
     def readlines(self, hint=-1):
         data = self._inner.readlines(hint)
         self._note(b''.join(data) if data and isinstance(data[0], (bytes, bytearray)) else ''.join(data) if data else data)
@@ -98,8 +117,6 @@ class _ProtocolStdin:
     def _note(self, data) -> None:
         if data:
             object.__setattr__(self, '_received', True)
-        elif not self._received:
-            _fail_no_protocol_stdin()
 
     def __getattr__(self, name):
         return getattr(self._inner, name)
@@ -122,6 +139,18 @@ def install_protocol_stdin_guard() -> None:
     if buffer is not None and not getattr(buffer, '_acr_protocol_guard', False):
         object.__setattr__(wrapper, 'buffer', _ProtocolStdin(buffer))
     sys.stdin = wrapper
+
+
+def verify_protocol_stdin() -> None:
+    """Report an empty completed transport from the main thread.
+
+    Raising SystemExit from the SDK's stdin worker produces an exception group
+    and runtime traceback. Let EOF close the transport normally, then fail here.
+    """
+    current = getattr(sys, 'stdin', None)
+    buffer = getattr(current, 'buffer', None)
+    if not (getattr(current, '_received', False) or getattr(buffer, '_received', False)):
+        _fail_no_protocol_stdin()
 
 
 def run_mcp_entry(arguments: list[str]) -> None:

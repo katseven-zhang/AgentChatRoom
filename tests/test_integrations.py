@@ -12,14 +12,19 @@ def test_onboarding_modes_separate_configuration_from_existing_connections(tmp_p
     result = build_mcp_integration(Settings(data_dir=tmp_path / 'data'), project=project)
     for profile in result['profiles'].values():
         modes = profile['onboarding_modes']
-        assert set(modes) == {'first_setup', 'add_project', 'reconnect'}
+        assert set(modes) == {'first_setup', 'add_project', 'reconnect', 'migrate_http'}
         assert modes['first_setup'] == profile['onboarding_prompts']
         for mode in ('add_project', 'reconnect'):
             assert set(modes[mode]) == {'local', 'http', 'remote'}
-            for prompt in modes[mode].values():
+            for transport, prompt in modes[mode].items():
                 assert 'Room B' in prompt
                 assert json.dumps(str(tmp_path), ensure_ascii=False) in prompt
-                assert '调用零参数 `room_bootstrap`' in prompt
+                if transport == 'http':
+                    assert 'room_bootstrap(project_name="Room B")' in prompt
+                    assert '本机 stdio' not in prompt
+                    assert '远程 Bridge' not in prompt
+                else:
+                    assert '`room_bootstrap`（零参数）' in prompt
                 assert '不创建或修改软件身份' in prompt
                 assert '不新增同名连接器' in prompt
                 assert 'do-not-copy' not in prompt and 'private-key' not in prompt
@@ -28,12 +33,37 @@ def test_onboarding_modes_separate_configuration_from_existing_connections(tmp_p
                 assert 'paste-issued-agent-token' not in prompt
         assert '独立 MCP 连接上下文' in modes['add_project']['local']
         assert '不重发结果未知的写操作' in modes['reconnect']['local']
+        migration = modes['migrate_http']['http']
+        assert '从本机 stdio 切换为直接 HTTP MCP' in migration
+        assert '只保留一个名称为 `agentchatroom` 的服务器' in migration
+        assert '`command`、`args`、`cwd`、`env`' in migration
+        assert '只删除客户端侧这个旧服务器条目' in migration
+        assert '可读 Project↔Token 映射' in migration
+        assert '一次性提示词' in migration
+        assert '无需删除 Project、成员、任务或历史' in migration
+        assert 'do-not-copy' not in migration and 'private-key' not in migration
 
 
 def test_invalid_onboarding_mode_is_rejected():
     from agentchatroom.integrations import build_onboarding_prompt
     with pytest.raises(ValueError, match='onboarding mode'):
         build_onboarding_prompt(profile_id='generic', profile={}, transport='local', config_text='', mode='typo')
+
+
+def test_add_project_http_prompt_drives_incremental_agent_side_merge(tmp_path):
+    """加入本项目的主流程零粘贴：签发后由已配置 Agent 在客户端本地增量合并。"""
+    project = {'name': 'Room B', 'root_path': str(tmp_path), 'id': 'p', 'project_key': 'k'}
+    result = build_mcp_integration(Settings(data_dir=tmp_path / 'data'), project=project)
+    prompt = result['profiles']['generic']['onboarding_modes']['add_project']['http']
+    assert '无需粘贴现有配置' in prompt
+    assert '增量提示词' in prompt
+    assert '保留原 url、软件身份三字段与全部旧 Project 凭据' in prompt
+    assert '写回同一个 agentchatroom 条目' in prompt
+    assert '高级 · 故障恢复' in prompt
+    assert '不新建第二个 agentchatroom 连接器' in prompt
+    assert '不把 Token 发送到 Room、日志或仓库' in prompt
+    # 旧的反向守卫保持：实际未配置连接器时不得自行转为安装流程。
+    assert '不要自行转为安装流程' in prompt
 
 
 def test_frontend_onboarding_mode_selection():
@@ -94,7 +124,7 @@ def test_mcp_integration_uses_explicit_runtime_configuration(tmp_path):
     assert remote["command"] == "python"
     assert remote["args"] == ["-m", "agentchatroom.mcp_bridge"]
     assert remote["env"]["AGENTCHATROOM_SERVER_URL"] == "http://127.0.0.1:8765/mcp"
-    assert remote["env"]["AGENTCHATROOM_AGENT_TOKEN"] == "<paste-issued-agent-token>"
+    assert remote["env"]["AGENTCHATROOM_AGENT_TOKEN"] == "<paste-issued-project-credential-bundle>"
     assert remote["env"]["AGENTCHATROOM_PRESENCE_KEEPALIVE_ENABLED"] == "true"
     assert remote["env"]["AGENTCHATROOM_PRESENCE_KEEPALIVE_INTERVAL_SECONDS"] == "15.0"
     assert result["transports"]["remote_stdio_bridge"]["owns_business_database"] is False
@@ -114,19 +144,23 @@ def test_streamable_http_profiles_use_center_url_without_real_tokens(tmp_path):
     assert result["streamable_http_json"]["mcpServers"]["agentchatroom"]["url"] == (
         "https://room.example.test/mcp"
     )
-    assert "<paste-issued-agent-token>" in result["streamable_http_json_text"]
+    assert "<paste-issued-project-credential-bundle>" in result["streamable_http_json_text"]
     assert "X-AgentChatRoom-Software-Key" in result["streamable_http_json_text"]
     assert "acr." not in result["streamable_http_json_text"]
     assert "bearer_token_env_var" in result["codex_streamable_http_toml"]
+    import tomllib
+    codex = tomllib.loads(result["codex_streamable_http_toml"])["mcp_servers"]["agentchatroom"]
+    assert "headers" not in codex
+    assert codex["http_headers"]["X-AgentChatRoom-Software-Key"] == "codex"
     assert "AGENTCHATROOM_AGENT_TOKEN" in result["grok_streamable_http_toml"]
     assert "X-AgentChatRoom-Software-Key" in result["grok_streamable_http_toml"]
-    assert "<paste-issued-agent-token>" in result["profiles"]["workbuddy"][
+    assert "<paste-issued-project-credential-bundle>" in result["profiles"]["workbuddy"][
         "streamable_http_config_text"
     ]
     assert "X-AgentChatRoom-Software-Key" in result["profiles"]["workbuddy"][
         "streamable_http_config_text"
     ]
-    assert "<paste-issued-agent-token>" not in result["grok_streamable_http_toml"]
+    assert "<paste-issued-project-credential-bundle>" not in result["grok_streamable_http_toml"]
 
 
 def test_remote_bridge_command_is_configurable(tmp_path):
@@ -155,7 +189,7 @@ def test_project_integration_builds_stable_workbuddy_memory_without_live_state(t
     result = build_mcp_integration(settings, project=project)
     memory = result["profiles"]["workbuddy"]["project_memory_text"]
 
-    assert result["schema_version"] == 4
+    assert result["schema_version"] == 5
     assert result["project"] == {"name": "AgentChatRoom"}
     assert "sample-project" not in memory
     assert "`OFF`" in memory and "`OBSERVE`" in memory and "`COORDINATE`" in memory
@@ -172,15 +206,14 @@ def test_project_integration_builds_stable_workbuddy_memory_without_live_state(t
     assert "请根据当前客户端和运行环境自行完成接入" in prompt
     assert "project_key：sample-project" not in prompt
     assert "room_join" not in prompt
-    # #98: the prompt must now REQUIRE a first zero-arg room_bootstrap and a
-    # project check instead of staying silent about the binding step.
+    # The local stdio prompt requires a first zero-argument bootstrap and check.
     assert "工作区与 Room 绑定边界" in prompt
-    assert "调用零参数 `room_bootstrap`" in prompt
+    assert "`room_bootstrap`（零参数）" in prompt
     assert "root_path" in prompt
-    assert "不能被上一个项目静默带入另一个工作区" in prompt
-    assert "针对当前显示的工作区/Project「AgentChatRoom」" in prompt
+    assert "首次 bootstrap 后固定绑定一个 Project" in prompt
+    assert "`agentchatroom` 是全局唯一连接器" in prompt
     assert "立即停止消息、任务、文件占用等一切写操作" in prompt
-    assert "不要填写、猜测或复制任何项目/会话标识或凭据" in prompt
+    assert "不要填写、猜测或复制项目 ID、会话标识或凭据" in prompt
     assert "model_display_name" not in prompt
     assert "协作规则" not in prompt
     assert ".agentchatroom/project.json" not in prompt
@@ -206,7 +239,7 @@ def test_project_integration_builds_stable_workbuddy_memory_without_live_state(t
     assert '"AGENTCHATROOM_SOFTWARE_KEY": "workbuddy"' in workbuddy_prompts["local"]
     assert '"mcpServers"' in workbuddy_prompts["local"]
     assert "直接 HTTP MCP" in workbuddy_prompts["http"]
-    assert "<paste-issued-agent-token>" in workbuddy_prompts["http"]
+    assert "<paste-issued-project-credential-bundle>" in workbuddy_prompts["http"]
     assert "远程 Bridge" in workbuddy_prompts["remote"]
     assert "agentchatroom.mcp_bridge" in workbuddy_prompts["remote"]
 
@@ -306,7 +339,10 @@ def test_onboarding_prompt_states_lifecycle_and_pin_semantics(tmp_path):
     # #98: every transport's prompt carries the same binding boundary.
     for transport, text in result["profiles"]["generic"]["onboarding_prompts"].items():
         assert "工作区与 Room 绑定边界" in text, transport
-        assert "调用零参数 `room_bootstrap`" in text, transport
+        if transport == "http":
+            assert 'room_bootstrap(project_name="AgentChatRoom")' in text
+        else:
+            assert "`room_bootstrap`（零参数）" in text
         assert "root_path" in text, transport
         assert "立即停止消息、任务、文件占用等一切写操作" in text, transport
         assert "「AgentChatRoom」" in text, transport

@@ -11,7 +11,7 @@ if TYPE_CHECKING:
     from .config import Settings
 
 
-SCHEMA_VERSION = 20
+SCHEMA_VERSION = 21
 
 
 class DatabaseBackend(Protocol):
@@ -192,6 +192,7 @@ CREATE TABLE IF NOT EXISTS task_assignments (
     task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
     assigned_by_session_id TEXT REFERENCES agent_sessions(id),
     assigned_to_session_id TEXT REFERENCES agent_sessions(id),
+    assigned_to_member_id TEXT REFERENCES project_members(id),
     responded_by_session_id TEXT REFERENCES agent_sessions(id),
     target_role TEXT NOT NULL DEFAULT '',
     required_capability TEXT NOT NULL DEFAULT '',
@@ -758,7 +759,38 @@ MIGRATIONS = {
         CREATE INDEX IF NOT EXISTS idx_events_project_actor_time
         ON events(project_id, actor_session_id, created_at);
     """,
+    21: """
+        CREATE INDEX IF NOT EXISTS idx_task_assignments_member
+        ON task_assignments(project_id, assigned_to_member_id, status, created_at);
+    """,
 }
+
+
+def ensure_task_assignment_member_column(
+    connection: Any, *, postgres: bool = False
+) -> None:
+    """Add the persistent member target before running the v21 index migration."""
+    if postgres:
+        row = connection.execute(
+            """
+            SELECT 1 FROM information_schema.columns
+            WHERE table_schema = current_schema()
+              AND table_name = 'task_assignments'
+              AND column_name = 'assigned_to_member_id'
+            """
+        ).fetchone()
+        exists = row is not None
+    else:
+        exists = any(
+            row["name"] == "assigned_to_member_id"
+            for row in connection.execute(
+                "PRAGMA table_info(task_assignments)"
+            ).fetchall()
+        )
+    if not exists:
+        connection.execute(
+            "ALTER TABLE task_assignments ADD COLUMN assigned_to_member_id TEXT REFERENCES project_members(id)"
+        )
 
 
 def ensure_project_member_columns(connection: Any, *, postgres: bool = False) -> None:
@@ -880,6 +912,7 @@ class Database:
             ensure_project_member_columns(connection)
             ensure_agent_identity_columns(connection)
             ensure_task_number_schema(connection)
+            ensure_task_assignment_member_column(connection)
             row = connection.execute("SELECT version FROM schema_meta LIMIT 1").fetchone()
             if row is None:
                 connection.execute(

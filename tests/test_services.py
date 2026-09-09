@@ -108,7 +108,7 @@ def test_session_leave_releases_leases_and_closes_token(
     assert failure.value.code == "session_closed"
 
 
-def test_software_identity_reconnect_replaces_the_previous_session(service, project):
+def test_software_identity_supports_parallel_sessions(service, project):
     first = service.join_room(
         project["id"],
         agent_key="codex-main",
@@ -133,23 +133,26 @@ def test_software_identity_reconnect_replaces_the_previous_session(service, proj
     assert identity["agent_key"] == second["agent"]["member_id"]
     assert first["agent"]["member_id"] == second["agent"]["member_id"]
     assert identity["session_count"] == 2
-    assert identity["active_session_count"] == 1
+    assert identity["active_session_count"] == 2
     assert identity["connection_status"] == "connected"
     assert identity["status"] == "online"
     assert identity["models"] == ["codex-ui-model", "unknown"]
     first_session = next(
         item for item in snapshot["agents"] if item["id"] == first["agent"]["id"]
     )
-    assert first_session["left_at"] is not None
+    assert first_session["left_at"] is None
 
     service.leave_session(
         project["id"], second["agent"]["id"], second["token"]
     )
+    still_connected = service.snapshot(project["id"])["agent_identities"][0]
+    assert still_connected["active_session_count"] == 1
+    assert still_connected["connection_status"] == "connected"
+
+    service.leave_session(project["id"], first["agent"]["id"], first["token"])
     disconnected = service.snapshot(project["id"])["agent_identities"][0]
     assert disconnected["active_session_count"] == 0
     assert disconnected["connection_status"] == "disconnected"
-    assert disconnected["activity_status"] is None
-    assert disconnected["status"] == "registered"
 
 
 def test_revoked_member_is_kept_in_history_but_removed_from_current_roster(
@@ -226,10 +229,10 @@ def test_agent_key_aliases_cannot_create_another_software_identity(service, proj
     assert len(identities) == 1
     assert first["agent"]["member_id"] == second["agent"]["member_id"]
     assert identities[0]["name"] == "Codex"
-    assert identities[0]["active_session_count"] == 1
+    assert identities[0]["active_session_count"] == 2
 
 
-def test_reconnect_transfers_owned_task_and_active_lease(service, project):
+def test_parallel_same_identity_session_does_not_transfer_task_or_lease(service, project):
     first = service.join_room(
         project["id"],
         agent_key="codex-main",
@@ -262,17 +265,24 @@ def test_reconnect_transfers_owned_task_and_active_lease(service, project):
         role="reviewer",
     )
 
-    assert second["replaced"]["previous_session_ids"] == [first["agent"]["id"]]
-    assert second["replaced"]["transferred_task_ids"] == [task["id"]]
-    assert second["replaced"]["transferred_lease_ids"] == [lease["id"]]
+    assert second["replaced"]["previous_session_ids"] == []
+    assert second["replaced"]["transferred_task_ids"] == []
+    assert second["replaced"]["transferred_lease_ids"] == []
     snapshot = service.snapshot(project["id"])
     stored_task = next(item for item in snapshot["tasks"] if item["id"] == task["id"])
     stored_lease = next(item for item in snapshot["leases"] if item["id"] == lease["id"])
-    assert stored_task["owner_session_id"] == second["agent"]["id"]
-    assert stored_lease["session_id"] == second["agent"]["id"]
+    assert stored_task["owner_session_id"] == first["agent"]["id"]
+    assert stored_lease["session_id"] == first["agent"]["id"]
+
+    with pytest.raises(DomainError) as connected:
+        service.claim_task(
+            project["id"], task["id"], second["agent"]["id"], second["token"],
+            reclaim=True,
+        )
+    assert connected.value.code == "task_owner_session_connected"
 
 
-def test_reconnect_recovers_unfinished_task_from_a_closed_identity_session(
+def test_explicit_reclaim_recovers_unfinished_task_from_closed_identity_session(
     service, project
 ):
     first = service.join_room(
@@ -309,7 +319,12 @@ def test_reconnect_recovers_unfinished_task_from_a_closed_identity_session(
     )
 
     assert second["replaced"]["previous_session_ids"] == []
-    assert second["replaced"]["transferred_task_ids"] == [task["id"]]
+    assert second["replaced"]["transferred_task_ids"] == []
+    reclaimed = service.claim_task(
+        project["id"], task["id"], second["agent"]["id"], second["token"],
+        reclaim=True,
+    )
+    assert reclaimed["event_id"] is not None
     stored_task = next(
         item for item in service.snapshot(project["id"])["tasks"] if item["id"] == task["id"]
     )
@@ -439,6 +454,43 @@ def test_agent_token_host_workspace_and_remote_session_flow(service, project):
     assert len(audit["events"]) == 1
     assert audit["events"][0]["payload"]["credential_id"] == credential["id"]
 
+    previous_expires_at = credential["expires_at"]
+    permissions_updated = service.update_agent_token_permissions(
+        project["id"], credential["id"], permissions=["room:join", "room:read"]
+    )
+    assert permissions_updated["credential"]["id"] == credential["id"]
+    assert permissions_updated["credential"]["permissions"] == [
+        "room:join",
+        "room:read",
+    ]
+    assert (
+        service.authenticate_agent_token(token, required_permission="room:read")["id"]
+        == credential["id"]
+    )
+    with pytest.raises(DomainError) as removed_permission:
+        service.authenticate_agent_token(token, required_permission="task:write")
+    assert removed_permission.value.code == "agent_token_permission_forbidden"
+
+    extended = service.extend_agent_token(
+        project["id"], credential["id"], extend_by_seconds=3600
+    )
+    assert extended["credential"]["id"] == credential["id"]
+    assert extended["token_changed"] is False
+    assert parse_time(extended["credential"]["expires_at"]) > parse_time(
+        previous_expires_at
+    )
+    assert service.authenticate_agent_token(token)["id"] == credential["id"]
+    assert len(
+        service.query_audit(
+            project["id"], event_type="credential.permissions_updated"
+        )["events"]
+    ) == 1
+    assert len(
+        service.query_audit(project["id"], event_type="credential.extended")[
+            "events"
+        ]
+    ) == 1
+
     rotated = service.rotate_agent_token(
         project["id"], credential["id"], expires_in_seconds=3600
     )
@@ -451,6 +503,11 @@ def test_agent_token_host_workspace_and_remote_session_flow(service, project):
 
     revoked = service.revoke_agent_token(project["id"], credential["id"])
     assert revoked["credential"]["active"] is False
+    with pytest.raises(DomainError) as revoked_extension:
+        service.extend_agent_token(
+            project["id"], credential["id"], extend_by_seconds=3600
+        )
+    assert revoked_extension.value.code == "agent_token_revoked"
     with pytest.raises(DomainError) as rejected:
         service.authenticate_agent_token(token)
     assert rejected.value.code == "agent_token_revoked"
@@ -868,8 +925,8 @@ def test_offline_member_assignment_targets_persistent_identity_and_survives_rejo
     assert assigned["task"]["owner_session_id"] is None
     assert assigned["task"]["execution_status"] == "todo"
 
-    # Rejoining the same identity replaces the session and retargets the
-    # pending assignment, so no other identity can acknowledge it.
+    # A later Session of the same persistent identity may acknowledge the
+    # member-targeted assignment without rewriting its original target Session.
     rejoined = service.join_room(
         project["id"],
         agent_key="reviewer-main",

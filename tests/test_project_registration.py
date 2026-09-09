@@ -9,14 +9,19 @@ import pytest
 from agentchatroom import mcp_server
 from agentchatroom.errors import DomainError
 from agentchatroom.project_registration import (
+    PROJECT_INSTRUCTIONS_BEGIN,
+    PROJECT_INSTRUCTIONS_END,
     checkout_scope,
     derive_logical_path,
     load_checkout_registration,
+    project_instructions_path,
     project_registration_path,
     register_checkout_project,
+    remove_project_coordination_instructions,
     remove_checkout_project_registration,
     resolve_checkout_project_key,
     validate_logical_path,
+    write_project_coordination_instructions,
 )
 
 
@@ -60,6 +65,99 @@ def test_checkout_registration_persists_backend_generated_project_key(
     assert project["id"] not in serialized
     assert "session" not in serialized.lower()
     assert "token" not in serialized.lower()
+
+
+def test_checkout_registration_creates_managed_project_agents_instructions(
+    service, project_dir
+):
+    project = service.create_project(
+        root_path=str(project_dir),
+        name="Project Alpha",
+    )
+
+    register_checkout_project(project_dir, project)
+
+    path = project_instructions_path(project_dir)
+    text = path.read_text(encoding="utf-8")
+    assert text.count(PROJECT_INSTRUCTIONS_BEGIN) == 1
+    assert text.count(PROJECT_INSTRUCTIONS_END) == 1
+    assert "Project name: `Project Alpha`" in text
+    assert 'room_bootstrap(project_name="Project Alpha")' in text
+    assert "room_sync" in text
+    assert "task_acknowledge" in text
+    assert "message_post" in text
+    assert "lease_acquire" in text
+    assert "work_report" in text
+    assert "review_submit" in text
+    assert "Do not inspect AgentChatRoom source" in text
+    assert project["id"] not in text
+    assert project["project_key"] not in text
+    assert "Bearer " not in text
+
+
+def test_managed_project_agents_instructions_preserve_user_rules_and_update_name(
+    service, project_dir
+):
+    path = project_instructions_path(project_dir)
+    path.write_text("# User rules\n\n- Keep this line.\n", encoding="utf-8")
+    project = service.create_project(root_path=str(project_dir), name="First Name")
+
+    first = write_project_coordination_instructions(project_dir, project)
+    second = write_project_coordination_instructions(project_dir, project)
+    renamed = {**project, "name": "Second Name"}
+    third = write_project_coordination_instructions(project_dir, renamed)
+
+    text = path.read_text(encoding="utf-8")
+    assert first["action"] == "appended"
+    assert second["action"] == "unchanged"
+    assert third["action"] == "updated"
+    assert text.startswith("# User rules\n\n- Keep this line.\n")
+    assert text.count(PROJECT_INSTRUCTIONS_BEGIN) == 1
+    assert "Second Name" in text
+    assert "First Name" not in text
+
+
+def test_managed_project_agents_instructions_reject_broken_markers(
+    service, project_dir
+):
+    path = project_instructions_path(project_dir)
+    path.write_text(f"# User rules\n{PROJECT_INSTRUCTIONS_BEGIN}\n", encoding="utf-8")
+    project = service.create_project(root_path=str(project_dir), name="Broken")
+
+    with pytest.raises(DomainError) as invalid:
+        write_project_coordination_instructions(project_dir, project)
+
+    assert invalid.value.code == "project_instructions_invalid"
+    assert path.read_text(encoding="utf-8").startswith("# User rules")
+
+
+def test_managed_project_agents_instructions_keep_exact_unusual_project_name(
+    service, project_dir
+):
+    name = f"Project  {PROJECT_INSTRUCTIONS_END}"
+    project = service.create_project(root_path=str(project_dir), name=name)
+
+    first = write_project_coordination_instructions(project_dir, project)
+    second = write_project_coordination_instructions(project_dir, project)
+
+    text = project_instructions_path(project_dir).read_text(encoding="utf-8")
+    assert first["project_name"] == name
+    assert second["action"] == "unchanged"
+    assert f"room_bootstrap(project_name={json.dumps(name)})" in text
+    assert text.count(f"\n{PROJECT_INSTRUCTIONS_END}\n") == 1
+
+
+def test_remove_managed_project_agents_instructions_preserves_user_rules(
+    service, project_dir
+):
+    path = project_instructions_path(project_dir)
+    path.write_text("# User rules\n\n- Keep this line.\n", encoding="utf-8")
+    project = service.create_project(root_path=str(project_dir), name="Temporary")
+    write_project_coordination_instructions(project_dir, project)
+
+    assert remove_project_coordination_instructions(project_dir) is True
+    assert path.read_text(encoding="utf-8") == "# User rules\n\n- Keep this line.\n"
+    assert remove_project_coordination_instructions(project_dir) is False
 
 
 def test_checkout_scope_is_detected_by_backend(tmp_path):

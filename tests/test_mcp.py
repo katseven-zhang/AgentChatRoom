@@ -934,7 +934,7 @@ def test_mcp_configured_software_identity_ignores_task_aliases(
     assert second["agent"]["client"] == "codex"
     identities = service.snapshot(second["project"]["id"])["agent_identities"]
     assert len(identities) == 1
-    assert identities[0]["active_session_count"] == 1
+    assert identities[0]["active_session_count"] == 2
 
 
 def test_mcp_room_join_uses_unique_existing_room_without_project_key(

@@ -9,11 +9,39 @@ from fastapi.testclient import TestClient
 
 from agentchatroom.api import (
     CredentialRedactingLogFilter,
+    _is_expected_windows_proactor_disconnect,
     _redact_log_line,
     create_app,
 )
 from agentchatroom.desktop import DirectoryPickerUnavailable
 from agentchatroom.local_mcp import LocalMcpConfigurator, LocalMcpEnvironment
+from agentchatroom.project_registration import (
+    PROJECT_INSTRUCTIONS_BEGIN,
+    PROJECT_INSTRUCTIONS_END,
+    project_instructions_path,
+)
+
+
+class _ExpectedProactorDisconnectHandle:
+    def __repr__(self) -> str:
+        return "<Handle _ProactorBasePipeTransport._call_connection_lost(None)>"
+
+
+def test_expected_windows_proactor_disconnect_filter_is_narrow():
+    expected = ConnectionResetError(10054, "peer closed")
+    expected.winerror = 10054
+    context = {
+        "exception": expected,
+        "handle": _ExpectedProactorDisconnectHandle(),
+    }
+    assert _is_expected_windows_proactor_disconnect(context, platform_name="nt")
+    assert not _is_expected_windows_proactor_disconnect(context, platform_name="posix")
+    assert not _is_expected_windows_proactor_disconnect(
+        {**context, "handle": object()}, platform_name="nt"
+    )
+    assert not _is_expected_windows_proactor_disconnect(
+        {**context, "exception": RuntimeError("unexpected")}, platform_name="nt"
+    )
 
 
 def _register_workspace(api_client, project):
@@ -36,6 +64,63 @@ def _join_agent(api_client, project, **payload):
         f"/api/v1/projects/{project['id']}/agents/join",
         json=payload,
     ).json()
+
+
+def test_project_api_manages_agents_instructions_on_create_rename_and_delete(
+    settings, project_dir
+):
+    instructions_path = project_instructions_path(project_dir)
+    instructions_path.write_text("# Existing project rules\n", encoding="utf-8")
+    with TestClient(create_app(settings)) as client:
+        created = client.post(
+            "/api/v1/projects",
+            json={"root_path": str(project_dir), "name": "Initial Room"},
+        )
+        assert created.status_code == 201
+        project = created.json()
+        created_text = instructions_path.read_text(encoding="utf-8")
+        assert created_text.startswith("# Existing project rules\n")
+        assert created_text.count(PROJECT_INSTRUCTIONS_BEGIN) == 1
+        assert 'room_bootstrap(project_name="Initial Room")' in created_text
+
+        renamed = client.patch(
+            f"/api/v1/projects/{project['id']}",
+            json={"name": "Renamed Room"},
+        )
+        assert renamed.status_code == 200
+        assert renamed.json()["project_instructions"]["action"] == "updated"
+        renamed_text = instructions_path.read_text(encoding="utf-8")
+        assert 'room_bootstrap(project_name="Renamed Room")' in renamed_text
+        assert "Initial Room" not in renamed_text
+
+        deleted = client.delete(
+            f"/api/v1/projects/{project['id']}?permanent=true"
+        )
+        assert deleted.status_code == 200
+        assert deleted.json()["project_instructions"]["removed"] == 1
+        assert instructions_path.read_text(encoding="utf-8") == "# Existing project rules\n"
+
+
+def test_project_api_rejects_broken_managed_agents_markers_before_database_write(
+    settings, project_dir
+):
+    instructions_path = project_instructions_path(project_dir)
+    instructions_path.write_text(
+        f"# Existing project rules\n{PROJECT_INSTRUCTIONS_END}\n",
+        encoding="utf-8",
+    )
+    with TestClient(create_app(settings)) as client:
+        created = client.post(
+            "/api/v1/projects",
+            json={"root_path": str(project_dir), "name": "Must Not Persist"},
+        )
+
+        assert created.status_code == 409
+        assert created.json()["error"]["code"] == "project_instructions_invalid"
+        assert client.get("/api/v1/projects").json()["projects"] == []
+        assert instructions_path.read_text(encoding="utf-8").endswith(
+            f"{PROJECT_INSTRUCTIONS_END}\n"
+        )
 
 
 def test_health_and_project_room_flow(settings, project_dir):
@@ -108,7 +193,7 @@ def test_health_and_project_room_flow(settings, project_dir):
         }
         integration = client.get("/api/v1/integrations/mcp")
         assert integration.status_code == 200
-        assert integration.json()["schema_version"] == 4
+        assert integration.json()["schema_version"] == 5
         assert integration.json()["transport"] == "stdio"
         assert integration.json()["generic_json"]["mcpServers"]["agentchatroom"][
             "env"
@@ -118,7 +203,9 @@ def test_health_and_project_room_flow(settings, project_dir):
         assert "[mcp_servers.agentchatroom]" in integration.json()["profiles"]["grok_build"]["config_text"]
         assert integration.json()["transports"]["streamable_http"]["enabled"] is True
         assert "bearer_token_env_var" in integration.json()["codex_streamable_http_toml"]
-        assert "<paste-issued-agent-token>" in integration.json()["streamable_http_json_text"]
+        assert "<paste-issued-project-credential-bundle>" in integration.json()[
+            "streamable_http_json_text"
+        ]
 
         created = client.post(
             "/api/v1/projects",
@@ -141,9 +228,11 @@ def test_health_and_project_room_flow(settings, project_dir):
         assert '"AGENTCHATROOM_SOFTWARE_KEY": "workbuddy"' in project_integration.json()[
             "profiles"
         ]["workbuddy"]["local_config_text"]
-        assert "<paste-issued-agent-token>" in project_integration.json()["profiles"][
-            "workbuddy"
-        ]["onboarding_prompts"]["http"]
+        http_prompt = project_integration.json()["profiles"]["workbuddy"][
+            "onboarding_prompts"
+        ]["http"]
+        assert 'room_bootstrap(project_name="API Project")' in http_prompt
+        assert "<paste-issued-project-credential-bundle>" in http_prompt
 
         joined = client.post(
             f"/api/v1/projects/{project['id']}/agents/join",
@@ -1137,6 +1226,26 @@ def test_api_manages_agent_tokens_and_workspaces(settings, project_dir):
         )
         assert audit.status_code == 200
         assert audit.json()["events"][0]["payload"]["credential_id"] == credential["id"]
+
+        permissions_updated = client.patch(
+            f"/api/v1/projects/{project['id']}/agent-tokens/{credential['id']}/permissions",
+            json={"permissions": ["room:join", "room:read"]},
+        )
+        assert permissions_updated.status_code == 200
+        assert permissions_updated.json()["credential"]["id"] == credential["id"]
+        assert permissions_updated.json()["credential"]["permissions"] == [
+            "room:join",
+            "room:read",
+        ]
+
+        extended = client.post(
+            f"/api/v1/projects/{project['id']}/agent-tokens/{credential['id']}/extend",
+            json={"extend_by_seconds": 3600},
+        )
+        assert extended.status_code == 200
+        assert extended.json()["credential"]["id"] == credential["id"]
+        assert extended.json()["token_changed"] is False
+        assert extended.json()["credential"]["expires_at"] > credential["expires_at"]
 
         rotated = client.post(
             f"/api/v1/projects/{project['id']}/agent-tokens/{credential['id']}/rotate",

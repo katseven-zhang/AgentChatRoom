@@ -1024,109 +1024,6 @@ class AgentChatRoomService:
         second_key = str(second_data.get("agent_key") or "").strip()
         return bool(first_key and second_key and first_key == second_key)
 
-    def _replace_identity_sessions(
-        self,
-        connection: Any,
-        project_id: str,
-        *,
-        member_id: str,
-        session_id: str,
-        now: str,
-    ) -> dict[str, Any]:
-        previous = connection.execute(
-            """
-            SELECT id FROM agent_sessions
-            WHERE project_id = ? AND member_id = ? AND id <> ? AND left_at IS NULL
-            ORDER BY created_at
-            """,
-            (project_id, member_id, session_id),
-        ).fetchall()
-        previous_ids = [str(row["id"]) for row in previous]
-        identity_sessions = connection.execute(
-            """
-            SELECT id FROM agent_sessions
-            WHERE project_id = ? AND member_id = ? AND id <> ?
-            ORDER BY created_at
-            """,
-            (project_id, member_id, session_id),
-        ).fetchall()
-        identity_session_ids = [str(row["id"]) for row in identity_sessions]
-        transferred_task_ids: list[str] = []
-        transferred_lease_ids: list[str] = []
-        if not identity_session_ids:
-            return {
-                "previous_session_ids": [],
-                "transferred_task_ids": [],
-                "transferred_lease_ids": [],
-            }
-
-        for previous_id in identity_session_ids:
-            task_rows = connection.execute(
-                """
-                SELECT id FROM tasks
-                WHERE project_id = ? AND owner_session_id = ?
-                  AND execution_status <> 'cancelled' AND integration_status <> 'done'
-                """,
-                (project_id, previous_id),
-            ).fetchall()
-            transferred_task_ids.extend(str(row["id"]) for row in task_rows)
-            connection.execute(
-                """
-                UPDATE tasks SET owner_session_id = ?, updated_at = ?
-                WHERE project_id = ? AND owner_session_id = ?
-                  AND execution_status <> 'cancelled' AND integration_status <> 'done'
-                """,
-                (session_id, now, project_id, previous_id),
-            )
-            lease_rows = connection.execute(
-                """
-                SELECT id FROM file_leases
-                WHERE project_id = ? AND session_id = ? AND released_at IS NULL
-                """,
-                (project_id, previous_id),
-            ).fetchall()
-            transferred_lease_ids.extend(str(row["id"]) for row in lease_rows)
-            connection.execute(
-                """
-                UPDATE file_leases SET session_id = ?, renewed_at = ?
-                WHERE project_id = ? AND session_id = ? AND released_at IS NULL
-                """,
-                (session_id, now, project_id, previous_id),
-            )
-            connection.execute(
-                """
-                UPDATE task_assignments SET assigned_to_session_id = ?
-                WHERE project_id = ? AND assigned_to_session_id = ? AND status = 'pending'
-                """,
-                (session_id, project_id, previous_id),
-            )
-            connection.execute(
-                """
-                UPDATE task_handoffs SET from_session_id = ?
-                WHERE project_id = ? AND from_session_id = ? AND status = 'pending'
-                """,
-                (session_id, project_id, previous_id),
-            )
-            connection.execute(
-                """
-                UPDATE task_handoffs SET to_session_id = ?
-                WHERE project_id = ? AND to_session_id = ? AND status = 'pending'
-                """,
-                (session_id, project_id, previous_id),
-            )
-        connection.execute(
-            """
-            UPDATE agent_sessions SET status = 'offline', left_at = ?
-            WHERE project_id = ? AND member_id = ? AND id <> ? AND left_at IS NULL
-            """,
-            (now, project_id, member_id, session_id),
-        )
-        return {
-            "previous_session_ids": previous_ids,
-            "transferred_task_ids": sorted(set(transferred_task_ids)),
-            "transferred_lease_ids": sorted(set(transferred_lease_ids)),
-        }
-
     def _host_dict(self, row: Mapping[str, Any]) -> dict[str, Any]:
         data = dict(row)
         data["metadata"] = json_load(data.pop("metadata_json"), {})
@@ -2163,6 +2060,152 @@ class AgentChatRoomService:
                 "cursor": event_id,
             }
 
+    def update_agent_token_permissions(
+        self,
+        project_id: str,
+        credential_id: str,
+        *,
+        permissions: list[str],
+    ) -> dict[str, Any]:
+        selected = sorted(set(permissions))
+        unknown = sorted(set(selected) - AGENT_PERMISSIONS)
+        if not selected or unknown:
+            raise DomainError(
+                "invalid_agent_permissions",
+                "Agent token permissions must contain only supported values",
+                details={"unknown": unknown},
+            )
+        with self.database.connect(write=True) as connection:
+            self._require_project(connection, project_id)
+            row = connection.execute(
+                """
+                SELECT * FROM agent_credentials
+                WHERE id = ? AND project_id = ?
+                """,
+                (credential_id, project_id),
+            ).fetchone()
+            if row is None:
+                raise DomainError(
+                    "agent_token_not_found",
+                    "Agent token does not exist",
+                    status_code=404,
+                )
+            if row["revoked_at"] is not None:
+                raise DomainError(
+                    "agent_token_revoked",
+                    "A revoked Agent token cannot be updated",
+                    status_code=409,
+                )
+            previous = sorted(json_load(row["permissions_json"], []))
+            if selected == previous:
+                return {
+                    "credential": self._credential_dict(row),
+                    "event_id": None,
+                    "cursor": self.latest_cursor(connection, project_id),
+                }
+            now = iso_now()
+            connection.execute(
+                "UPDATE agent_credentials SET permissions_json = ?, updated_at = ? WHERE id = ?",
+                (json_dump(selected), now, credential_id),
+            )
+            event_id = self._emit(
+                connection,
+                project_id,
+                "credential.permissions_updated",
+                payload={
+                    "credential_id": credential_id,
+                    "previous_permissions": previous,
+                    "permissions": selected,
+                },
+            )
+            updated = connection.execute(
+                "SELECT * FROM agent_credentials WHERE id = ?", (credential_id,)
+            ).fetchone()
+            return {
+                "credential": self._credential_dict(updated),
+                "event_id": event_id,
+                "cursor": event_id,
+            }
+
+    def extend_agent_token(
+        self,
+        project_id: str,
+        credential_id: str,
+        *,
+        extend_by_seconds: int,
+    ) -> dict[str, Any]:
+        if not 300 <= extend_by_seconds <= self.settings.max_agent_token_ttl_seconds:
+            raise DomainError(
+                "invalid_agent_token_extension",
+                "Agent token extension is outside the configured range",
+                details={
+                    "minimum": 300,
+                    "maximum": self.settings.max_agent_token_ttl_seconds,
+                },
+            )
+        with self.database.connect(write=True) as connection:
+            self._require_project(connection, project_id)
+            row = connection.execute(
+                """
+                SELECT * FROM agent_credentials
+                WHERE id = ? AND project_id = ?
+                """,
+                (credential_id, project_id),
+            ).fetchone()
+            if row is None:
+                raise DomainError(
+                    "agent_token_not_found",
+                    "Agent token does not exist",
+                    status_code=404,
+                )
+            if row["revoked_at"] is not None:
+                raise DomainError(
+                    "agent_token_revoked",
+                    "A revoked Agent token cannot be extended",
+                    status_code=409,
+                )
+            now_time = utc_now()
+            previous_expires_at = str(row["expires_at"])
+            base_time = max(parse_time(previous_expires_at), now_time)
+            expires_time = base_time + timedelta(seconds=extend_by_seconds)
+            remaining_seconds = int((expires_time - now_time).total_seconds())
+            if remaining_seconds > self.settings.max_agent_token_ttl_seconds:
+                raise DomainError(
+                    "invalid_agent_token_extension",
+                    "Extended Agent token expiry exceeds the configured maximum",
+                    details={
+                        "maximum": self.settings.max_agent_token_ttl_seconds,
+                        "current_expires_at": previous_expires_at,
+                    },
+                )
+            expires_at = expires_time.isoformat().replace("+00:00", "Z")
+            now = iso_now()
+            connection.execute(
+                "UPDATE agent_credentials SET expires_at = ?, updated_at = ? WHERE id = ?",
+                (expires_at, now, credential_id),
+            )
+            event_id = self._emit(
+                connection,
+                project_id,
+                "credential.extended",
+                payload={
+                    "credential_id": credential_id,
+                    "previous_expires_at": previous_expires_at,
+                    "expires_at": expires_at,
+                    "extend_by_seconds": extend_by_seconds,
+                    "token_changed": False,
+                },
+            )
+            updated = connection.execute(
+                "SELECT * FROM agent_credentials WHERE id = ?", (credential_id,)
+            ).fetchone()
+            return {
+                "credential": self._credential_dict(updated),
+                "token_changed": False,
+                "event_id": event_id,
+                "cursor": event_id,
+            }
+
     def rotate_agent_token(
         self,
         project_id: str,
@@ -2536,13 +2579,15 @@ class AgentChatRoomService:
                     now,
                 ),
             )
-            replacement = self._replace_identity_sessions(
-                connection,
-                project_id,
-                member_id=canonical_agent_key,
-                session_id=session_id,
-                now=now,
-            )
+            # One durable software identity may have several concurrent client
+            # conversations. Session ownership is intentionally independent:
+            # joining a new conversation must not close another connection or
+            # silently move its tasks and leases.
+            replacement = {
+                "previous_session_ids": [],
+                "transferred_task_ids": [],
+                "transferred_lease_ids": [],
+            }
             if member_created:
                 self._emit(
                     connection,
@@ -4012,10 +4057,16 @@ class AgentChatRoomService:
 
     @idempotent_write("task.claim")
     def claim_task(
-        self, project_id: str, task_id: str, session_id: str, token: str
+        self,
+        project_id: str,
+        task_id: str,
+        session_id: str,
+        token: str,
+        *,
+        reclaim: bool = False,
     ) -> dict[str, Any]:
         with self.database.connect(write=True) as connection:
-            self._authenticate(connection, project_id, session_id, token)
+            claimant = self._authenticate(connection, project_id, session_id, token)
             task = self._require_task(connection, project_id, task_id)
             if task["owner_session_id"] == session_id:
                 return {
@@ -4023,10 +4074,95 @@ class AgentChatRoomService:
                     "event_id": None,
                     "cursor": self.latest_cursor(connection, project_id),
                 }
-            if (
-                task["owner_session_id"] is not None
-                or task["execution_status"] != "todo"
-            ):
+            if task["owner_session_id"] is not None:
+                owner = connection.execute(
+                    """
+                    SELECT a.*,
+                           (SELECT MAX(e.created_at) FROM events e
+                            WHERE e.project_id = a.project_id
+                              AND e.actor_session_id = a.id) AS last_activity_at
+                    FROM agent_sessions a
+                    WHERE a.id = ? AND a.project_id = ?
+                    """,
+                    (task["owner_session_id"], project_id),
+                ).fetchone()
+                can_reclaim = bool(
+                    owner is not None
+                    and self._same_agent_identity(claimant, owner)
+                    and task["execution_status"] in {"claimed", "in_progress"}
+                )
+                if not reclaim:
+                    raise DomainError(
+                        "task_already_claimed",
+                        "Task is already owned by another Session",
+                        status_code=409,
+                        details={
+                            "owner_session_id": task["owner_session_id"],
+                            "status": task["status"],
+                            "can_reclaim_if_disconnected": can_reclaim,
+                        },
+                    )
+                if not can_reclaim or owner is None:
+                    raise DomainError(
+                        "task_reclaim_forbidden",
+                        "Only the same software identity can reclaim unfinished execution work",
+                        status_code=403,
+                    )
+                last_seen = parse_time(owner["last_heartbeat"])
+                if owner["last_activity_at"]:
+                    last_seen = max(last_seen, parse_time(owner["last_activity_at"]))
+                owner_connected = owner["left_at"] is None and (
+                    utc_now() - last_seen
+                    <= timedelta(seconds=self.settings.heartbeat_timeout_seconds)
+                )
+                if owner_connected:
+                    raise DomainError(
+                        "task_owner_session_connected",
+                        "The owning Session is still connected; continue in that conversation or release the task",
+                        status_code=409,
+                        details={"owner_session_id": task["owner_session_id"]},
+                    )
+                now = iso_now()
+                previous_owner = str(task["owner_session_id"])
+                connection.execute(
+                    "UPDATE tasks SET owner_session_id = ?, updated_at = ? WHERE id = ? AND project_id = ?",
+                    (session_id, now, task_id, project_id),
+                )
+                leases = connection.execute(
+                    "SELECT id FROM file_leases WHERE project_id = ? AND task_id = ? AND session_id = ? AND released_at IS NULL",
+                    (project_id, task_id, previous_owner),
+                ).fetchall()
+                lease_ids = [str(row["id"]) for row in leases]
+                connection.execute(
+                    "UPDATE file_leases SET session_id = ?, renewed_at = ? WHERE project_id = ? AND task_id = ? AND session_id = ? AND released_at IS NULL",
+                    (session_id, now, project_id, task_id, previous_owner),
+                )
+                event_id = self._emit(
+                    connection,
+                    project_id,
+                    "task.reclaimed",
+                    actor_session_id=session_id,
+                    task_id=task_id,
+                    payload={
+                        "task_number": task["task_number"],
+                        "previous_owner_session_id": previous_owner,
+                        "owner_session_id": session_id,
+                        "transferred_lease_ids": lease_ids,
+                        "execution_status": task["execution_status"],
+                    },
+                )
+                row = connection.execute(
+                    "SELECT * FROM tasks WHERE id = ?", (task_id,)
+                ).fetchone()
+                return {
+                    "task": self._task_with_dependencies(connection, row),
+                    "project_documents": self.injectable_project_documents(
+                        project_id, connection=connection
+                    ),
+                    "event_id": event_id,
+                    "cursor": event_id,
+                }
+            if task["execution_status"] != "todo":
                 raise DomainError(
                     "task_already_claimed",
                     "Task is not available for claiming",
@@ -4578,10 +4714,9 @@ class AgentChatRoomService:
                 target_offline = (
                     self._agent_dict(latest_session)["status"] == "offline"
                 )
-                # A delayed assignment targets the persistent identity but is
-                # stored on its latest session; session replacement on rejoin
-                # retargets pending assignments to the new session, so the
-                # offline Agent can acknowledge it after reconnecting.
+                # A delayed assignment records both the persistent identity and
+                # its latest Session. Any later Session of that same identity may
+                # acknowledge it without rewriting the original target history.
                 assigned_to_session_id = str(latest_session["id"])
             if assigned_to_session_id:
                 target = connection.execute(
@@ -4613,6 +4748,15 @@ class AgentChatRoomService:
                 ),
             ).fetchone()
             if existing is not None:
+                if member_target and not existing["assigned_to_member_id"]:
+                    connection.execute(
+                        "UPDATE task_assignments SET assigned_to_member_id = ? WHERE id = ?",
+                        (member_target, existing["id"]),
+                    )
+                    existing = connection.execute(
+                        "SELECT * FROM task_assignments WHERE id = ?",
+                        (existing["id"],),
+                    ).fetchone()
                 return {
                     "assignment": dict(existing),
                     "task": self._task_with_dependencies(connection, task),
@@ -4623,12 +4767,15 @@ class AgentChatRoomService:
             # 同目标重复指派已在上方幂等返回），再创建唯一的新 pending。
             stale = connection.execute(
                 """
-                SELECT id, assigned_to_session_id FROM task_assignments
+                SELECT id, assigned_to_session_id, assigned_to_member_id FROM task_assignments
                 WHERE project_id = ? AND task_id = ? AND status = 'pending'
-                  AND COALESCE(assigned_to_session_id, '') <> COALESCE(?, '')
+                  AND (
+                    COALESCE(assigned_to_session_id, '') <> COALESCE(?, '')
+                    OR COALESCE(assigned_to_member_id, '') <> COALESCE(?, '')
+                  )
                 ORDER BY created_at
                 """,
-                (project_id, task_id, assigned_to_session_id or ""),
+                (project_id, task_id, assigned_to_session_id or "", member_target),
             ).fetchall()
             now_reassign = iso_now()
             for row in stale:
@@ -4662,10 +4809,10 @@ class AgentChatRoomService:
                 """
                 INSERT INTO task_assignments(
                     id, project_id, task_id, assigned_by_session_id,
-                    assigned_to_session_id, responded_by_session_id,
+                    assigned_to_session_id, assigned_to_member_id, responded_by_session_id,
                     target_role, required_capability, status, note,
                     response_note, created_at, responded_at
-                ) VALUES (?, ?, ?, ?, ?, NULL, ?, ?, 'pending', ?, '', ?, NULL)
+                ) VALUES (?, ?, ?, ?, ?, ?, NULL, ?, ?, 'pending', ?, '', ?, NULL)
                 """,
                 (
                     assignment_id,
@@ -4673,6 +4820,7 @@ class AgentChatRoomService:
                     task_id,
                     assigned_by_session_id,
                     assigned_to_session_id,
+                    member_target or None,
                     role,
                     capability,
                     note.strip(),
@@ -4747,8 +4895,15 @@ class AgentChatRoomService:
             capability_match = not assignment["required_capability"] or bool(
                 capabilities.get(assignment["required_capability"])
             )
+            member_target_match = bool(
+                assignment["assigned_to_member_id"]
+                and assignment["assigned_to_member_id"] == agent["member_id"]
+            )
             eligible = (
-                assignment["assigned_to_session_id"] in {None, session_id}
+                (
+                    assignment["assigned_to_session_id"] in {None, session_id}
+                    or member_target_match
+                )
                 and (not assignment["target_role"] or assignment["target_role"] == agent["role"])
                 and capability_match
             )

@@ -149,7 +149,7 @@ def test_bind_runtime_arguments_does_not_inject_foreign_session_aliases():
     assert "to_session_id" not in forwarded
 
 
-def test_ready_bootstrap_is_idempotent_and_hides_token(
+def test_ready_bootstrap_creates_independent_session_and_hides_token(
     monkeypatch, service, project_dir
 ):
     _configure_software(monkeypatch)
@@ -169,7 +169,7 @@ def test_ready_bootstrap_is_idempotent_and_hides_token(
     assert first.public["connection"]["software_configured"] is True
     assert first.public["connection"]["process_connected"] is True
     assert first.public["connection"]["conversation_synced"] is True
-    assert first.public["connection"]["room_session"] in {"restored", "replaced"}
+    assert first.public["connection"]["room_session"] == "created"
     assert first.public["project"]["id"] == project["id"]
     assert "required_action" not in first.public
     assert contains_secret(first.public, token) is False
@@ -181,7 +181,7 @@ def test_ready_bootstrap_is_idempotent_and_hides_token(
     created = service.create_task(
         project["id"],
         title="Stay claimed across bootstrap",
-        acceptance_criteria=["Ownership transfers without extra task events"],
+        acceptance_criteria=["Ownership remains with the first conversation"],
     )["task"]
     service.claim_task(
         project["id"], created["id"], first.binding.session_id, first.binding.token
@@ -211,16 +211,18 @@ def test_ready_bootstrap_is_idempotent_and_hides_token(
     assert second.binding.session_id != first.binding.session_id
     assert second.binding.token != token
     stored = service.get_task(project["id"], created["id"])
-    assert stored["owner_session_id"] == second.binding.session_id
+    assert stored["owner_session_id"] == first.binding.session_id
     assert stored["execution_status"] == before_status
     snapshot = service.snapshot(project["id"])
     online = [agent for agent in snapshot["agents"] if agent["status"] == "online"]
-    assert len(online) == 1
-    assert online[0]["id"] == second.binding.session_id
+    assert {agent["id"] for agent in online} == {
+        first.binding.session_id,
+        second.binding.session_id,
+    }
     transferred_lease = next(
         item for item in snapshot["leases"] if item["id"] == lease["id"]
     )
-    assert transferred_lease["session_id"] == second.binding.session_id
+    assert transferred_lease["session_id"] == first.binding.session_id
     new_task_events = [
         event
         for event in service.query_audit(project["id"], task_id=created["id"])["events"]
@@ -239,7 +241,7 @@ def test_ready_bootstrap_is_idempotent_and_hides_token(
     assert len(members) == 1
 
 
-def test_bootstrap_transfers_pending_assignment_and_handoff(
+def test_bootstrap_keeps_pending_assignment_and_handoff_with_original_session(
     monkeypatch, service, project_dir
 ):
     _configure_software(monkeypatch)
@@ -262,7 +264,7 @@ def test_bootstrap_transfers_pending_assignment_and_handoff(
     assigned_task = service.create_task(
         project["id"],
         title="Pending assignment survives bootstrap",
-        acceptance_criteria=["Target session is transferred"],
+        acceptance_criteria=["Target session remains stable"],
     )["task"]
     assigned = service.assign_task(
         project["id"],
@@ -275,7 +277,7 @@ def test_bootstrap_transfers_pending_assignment_and_handoff(
     owned = service.create_task(
         project["id"],
         title="Pending handoff survives bootstrap",
-        acceptance_criteria=["From session is transferred"],
+        acceptance_criteria=["From session remains stable"],
     )["task"]
     service.claim_task(
         project["id"], owned["id"], first.binding.session_id, first.binding.token
@@ -305,7 +307,7 @@ def test_bootstrap_transfers_pending_assignment_and_handoff(
         if item["id"] == assigned["assignment"]["id"]
     )
     assert assignment["status"] == "pending"
-    assert assignment["assigned_to_session_id"] == second.binding.session_id
+    assert assignment["assigned_to_session_id"] == first.binding.session_id
     stored_handoff = service.get_task(project["id"], owned["id"])
     handoff = next(
         item
@@ -313,8 +315,8 @@ def test_bootstrap_transfers_pending_assignment_and_handoff(
         if item["id"] == requested["handoff"]["id"]
     )
     assert handoff["status"] == "pending"
-    assert handoff["from_session_id"] == second.binding.session_id
-    assert stored_handoff["owner_session_id"] == second.binding.session_id
+    assert handoff["from_session_id"] == first.binding.session_id
+    assert stored_handoff["owner_session_id"] == first.binding.session_id
 
 
 def test_bootstrap_does_not_create_a_room_without_registration(

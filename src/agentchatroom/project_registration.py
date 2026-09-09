@@ -13,6 +13,9 @@ from .errors import DomainError
 
 PROJECT_REGISTRATION_SCHEMA_VERSION = 1
 PROJECT_REGISTRATION_RELATIVE_PATH = Path(".agentchatroom") / "project.json"
+PROJECT_INSTRUCTIONS_FILENAME = "AGENTS.md"
+PROJECT_INSTRUCTIONS_BEGIN = "<!-- BEGIN AgentChatRoom managed coordination -->"
+PROJECT_INSTRUCTIONS_END = "<!-- END AgentChatRoom managed coordination -->"
 
 
 def normalize_logical_path(value: str) -> str:
@@ -109,6 +112,186 @@ def _git_info(root: Path) -> tuple[str, Path]:
 
 def project_registration_path(root_path: str | Path) -> Path:
     return Path(root_path).expanduser().resolve() / PROJECT_REGISTRATION_RELATIVE_PATH
+
+
+def project_instructions_path(root_path: str | Path) -> Path:
+    return Path(root_path).expanduser().resolve() / PROJECT_INSTRUCTIONS_FILENAME
+
+
+def _project_instructions_error(path: Path, message: str) -> DomainError:
+    return DomainError(
+        "project_instructions_invalid",
+        message,
+        status_code=409,
+        details={"path": str(path)},
+    )
+
+
+def _read_project_instructions(path: Path) -> str:
+    if not path.exists():
+        return ""
+    if not path.is_file():
+        raise _project_instructions_error(
+            path,
+            "Project AGENTS.md path exists but is not a regular file",
+        )
+    try:
+        return path.read_text(encoding="utf-8-sig")
+    except (OSError, UnicodeError) as error:
+        raise _project_instructions_error(
+            path,
+            "Project AGENTS.md is not readable UTF-8 text",
+        ) from error
+
+
+def _managed_instructions_range(path: Path, text: str) -> tuple[int, int] | None:
+    begin_matches = list(
+        re.finditer(rf"(?m)^{re.escape(PROJECT_INSTRUCTIONS_BEGIN)}\r?$", text)
+    )
+    end_matches = list(
+        re.finditer(rf"(?m)^{re.escape(PROJECT_INSTRUCTIONS_END)}\r?$", text)
+    )
+    if not begin_matches and not end_matches:
+        return None
+    if len(begin_matches) != 1 or len(end_matches) != 1:
+        raise _project_instructions_error(
+            path,
+            "Project AGENTS.md has incomplete or duplicate AgentChatRoom managed markers",
+        )
+    start = begin_matches[0].start()
+    end = end_matches[0].end()
+    if end_matches[0].start() <= begin_matches[0].end():
+        raise _project_instructions_error(
+            path,
+            "Project AGENTS.md AgentChatRoom managed markers are out of order",
+        )
+    return start, end
+
+
+def validate_project_coordination_instructions(root_path: str | Path) -> Path:
+    """Validate the managed marker boundary without changing the project file."""
+    root = Path(root_path).expanduser().resolve()
+    if not root.is_dir():
+        raise DomainError(
+            "project_path_not_found",
+            "Project root must be an existing directory",
+            details={"root_path": str(root)},
+        )
+    path = project_instructions_path(root)
+    _managed_instructions_range(path, _read_project_instructions(path))
+    return path
+
+
+def _write_project_instructions(path: Path, text: str) -> None:
+    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary.write_text(text, encoding="utf-8")
+        temporary.replace(path)
+    except OSError as error:
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise DomainError(
+            "project_instructions_write_failed",
+            "Project AGENTS.md managed coordination rules could not be written",
+            status_code=500,
+            details={"path": str(path)},
+        ) from error
+
+
+def write_project_coordination_instructions(
+    root_path: str | Path,
+    project: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Create or update only AgentChatRoom's marked block in project AGENTS.md."""
+    root = Path(root_path).expanduser().resolve()
+    if not root.is_dir():
+        raise DomainError(
+            "project_path_not_found",
+            "Project root must be an existing directory",
+            details={"root_path": str(root)},
+        )
+    project_name = str(project.get("name", "")).strip()
+    if not project_name:
+        raise DomainError("invalid_project", "Project has no name for AGENTS.md")
+
+    # Imported lazily so the workspace registration module stays independent of
+    # client profile construction during module initialization.
+    from .integrations import build_project_coordination_instructions
+
+    path = project_instructions_path(root)
+    existing = _read_project_instructions(path)
+    newline = "\r\n" if "\r\n" in existing else "\n"
+    body = build_project_coordination_instructions(
+        {**dict(project), "name": project_name}
+    ).strip()
+    managed = newline.join(
+        (
+            PROJECT_INSTRUCTIONS_BEGIN,
+            body.replace("\r\n", "\n").replace("\n", newline),
+            PROJECT_INSTRUCTIONS_END,
+        )
+    )
+    managed_range = _managed_instructions_range(path, existing)
+    if managed_range is None:
+        prefix = existing.rstrip("\r\n")
+        updated = f"{prefix}{newline * 2 if prefix else ''}{managed}{newline}"
+        action = "created" if not existing else "appended"
+    else:
+        start, end = managed_range
+        updated = f"{existing[:start]}{managed}{existing[end:]}"
+        if not updated.endswith(("\n", "\r")):
+            updated += newline
+        action = "updated"
+    if updated == existing:
+        action = "unchanged"
+    else:
+        _write_project_instructions(path, updated)
+    return {
+        "path": str(path),
+        "action": action,
+        "project_name": project_name,
+    }
+
+
+def remove_project_coordination_instructions(root_path: str | Path) -> bool:
+    """Remove only AgentChatRoom's marked block and preserve user instructions."""
+    path = project_instructions_path(root_path)
+    if not path.exists():
+        return False
+    existing = _read_project_instructions(path)
+    managed_range = _managed_instructions_range(path, existing)
+    if managed_range is None:
+        return False
+    start, end = managed_range
+    before = existing[:start].rstrip("\r\n")
+    after = existing[end:].lstrip("\r\n")
+    newline = "\r\n" if "\r\n" in existing else "\n"
+    if before and after:
+        updated = f"{before}{newline * 2}{after}"
+    elif before:
+        updated = f"{before}{newline}"
+    elif after:
+        updated = after
+        if not updated.endswith(("\n", "\r")):
+            updated += newline
+    else:
+        updated = ""
+    if updated:
+        _write_project_instructions(path, updated)
+    else:
+        try:
+            path.unlink(missing_ok=True)
+        except OSError as error:
+            raise DomainError(
+                "project_instructions_write_failed",
+                "Generated project AGENTS.md could not be removed",
+                status_code=500,
+                details={"path": str(path)},
+            ) from error
+    return True
 
 
 def checkout_scope(
@@ -298,6 +481,7 @@ def register_checkout_project(
 ) -> Path:
     logical = normalize_logical_path(str(project.get("logical_path", "") or ""))
     validate_project_scope(root_path, project, logical_path=logical)
+    validate_project_coordination_instructions(root_path)
     path = project_registration_path(root_path)
     document = _load_document(path)
     project_key = str(project.get("project_key", "")).strip()
@@ -343,6 +527,7 @@ def register_checkout_project(
         key=lambda registration: str(registration.get("logical_path", "")),
     )
     _write_document(path, document)
+    write_project_coordination_instructions(root_path, project)
     return path
 
 

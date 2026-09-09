@@ -9,6 +9,56 @@ from pathlib import Path
 WEB_DIR = Path(__file__).parents[1] / "src" / "agentchatroom" / "web"
 
 
+def test_http_onboarding_config_generation_and_secret_cleanup():
+    result = subprocess.run(
+        ["node", str(Path(__file__).with_name("http_onboarding_config.cjs"))],
+        capture_output=True, text=True, timeout=20,
+    )
+    assert result.returncode == 0, result.stderr
+
+
+def test_web_add_project_issues_without_pasting_raw_config():
+    """加入本项目：主流程零粘贴可签发；粘贴框只留在折叠的高级故障恢复区。"""
+    markup = (WEB_DIR / "index.html").read_text(encoding="utf-8")
+    javascript = (WEB_DIR / "app.js").read_text(encoding="utf-8")
+
+    # 粘贴框移入默认折叠、明确标注的高级故障恢复区域，且不再必填。
+    details_start = markup.index('<details id="token-existing-config-advanced"')
+    details_end = markup.index("</details>", details_start)
+    advanced_block = markup[details_start:details_end]
+    assert "高级 · 故障恢复" in advanced_block
+    assert "（可选）" in advanced_block
+    assert "留空不影响签发" in advanced_block
+    assert "required" not in advanced_block.split("<textarea", 1)[1].split(">", 1)[0]
+
+    # 提交路径不再阻塞空文本：旧的必填拦截提示必须移除，增量提示词生成器必须存在。
+    assert "请粘贴客户端当前使用的 agentchatroom HTTP 配置" not in javascript
+    assert ".required = isAddProject" not in javascript
+    assert "incrementalHttpPrompt(" in javascript
+    assert "incremental: true" in javascript
+    # 增量分支仅限加入本项目；首次配置即使留空也必须生成完整配置。
+    assert 'if (manualImportText || setup.mode !== "add_project")' in javascript
+
+    # 增量结果弹窗与场景引导按真实用户视角描述下一步。
+    assert "增量接入提示词（交给已配置的 Agent）" in javascript
+    assert "签发并生成增量提示词" in javascript
+    assert "无需粘贴现有配置" in javascript
+    # 三种场景保持可区分：首次配置仍生成完整配置；恢复连接不签发 Token。
+    assert "签发并生成接入提示词" in javascript
+    assert "生成恢复连接提示词" in javascript
+    assert 'setup.mode === "reconnect"' in javascript
+
+
+def test_frontend_exposes_only_http_while_backend_keeps_migration_support():
+    markup = (WEB_DIR / "index.html").read_text(encoding="utf-8")
+    javascript = (WEB_DIR / "app.js").read_text(encoding="utf-8")
+    assert '<option value="migrate_http">' not in markup
+    assert 'data-integration-transport="local"' not in markup
+    assert 'data-integration-transport="remote"' not in markup
+    assert 'state.integrationOnboardingMode === "migrate_http"' in javascript
+    assert 'item.dataset.integrationTransport === "http"' in javascript
+
+
 def test_web_theme_text_contrast_is_readable():
     """Check actual theme colors, including filled controls in dark mode."""
     css = (WEB_DIR / "app.css").read_text(encoding="utf-8")
@@ -100,12 +150,16 @@ def test_web_bootstrap_and_phase_one_local_agent_hooks_are_complete():
     assert 'autocomplete="current-password"' in markup
     assert "function renderIntegrationJoin()" in javascript
     assert 'data-integration-transport="http"' in markup
-    assert 'data-integration-transport="local"' in markup
-    assert 'data-integration-transport="remote"' in markup
+    assert 'data-integration-transport="local"' not in markup
+    assert 'data-integration-transport="remote"' not in markup
     assert "streamable_http_config_text" in javascript
     assert "remote_bridge_config_text" in javascript
-    assert "paste-issued-agent-token" in markup
-    assert "打开管理 Tab 签发" in markup
+    assert 'id="token-config-value"' in markup
+    assert "签发并生成接入提示词" in markup
+    assert '<section class="integration-section onboarding-section" hidden>' in markup
+    assert "project_name_${index + 1}" in javascript
+    assert "project_token_${index + 1}" in javascript
+    assert "不要命名为 agentchatroom-stdio" in javascript
     assert 'payload.host_key = "<stable-host-key>"' not in javascript
     assert 'payload.host_name = "<computer-name>"' not in javascript
     assert '"<path-to-project-on-this-computer>"' not in javascript
@@ -226,8 +280,8 @@ def test_web_supports_human_reading_and_guided_interactions():
     assert "snapshot.agent_identities" in javascript
     assert "当前连接" in javascript
     assert "累计" in javascript and "次接入" in javascript
-    assert 'app.css?v=1.0.0-central41' in markup
-    assert 'app.js?v=1.0.0-central41' in markup
+    assert 'app.css?v=1.0.0-central51' in markup
+    assert 'app.js?v=1.0.0-central51' in markup
     assert len(re.findall(r'<script\b[^>]*src="/assets/app\.js', markup)) == 1
     assert 'id="task-history-filter"' in markup
     assert "function loadTaskHistory(" in javascript
@@ -239,14 +293,37 @@ def test_web_supports_human_reading_and_guided_interactions():
     assert "state.integration.profiles" in javascript
     assert 'id="integration-onboarding-prompt"' in markup
     assert "当前场景的接入指令" in markup
-    assert "复制当前环境的 MCP 连接参数与绑定边界，Agent 接入后先零参数 room_bootstrap 核对当前项目" in markup
+    assert '<section class="integration-section onboarding-section" hidden>' in markup
+    assert "签发结果只生成一个可复制区" in markup
+    assert "Project↔Token" in javascript
     assert "受权限限制时返回可直接粘贴的配置文本" not in markup
-    assert "复制接入指令" in markup
+    assert 'id="token-config-copy"' in markup
     assert "这段提示词包含当前项目" not in markup
     assert "function renderOnboardingPrompt()" in javascript
     assert "onboarding_prompts" in javascript
     assert 'class="integration-fallback integration-advanced"' in markup
     assert "高级手动配置" in markup
+    assert 'id="token-project-context"' in markup
+    assert "所属 Project：${escapeHtml(projectName)}" in javascript
+    assert '`${projectName} · ${profile.label || "Agent"} HTTP`' in javascript
+    assert 'id="token-permissions-dialog"' in markup
+    assert 'id="token-extend-dialog"' in markup
+    assert 'data-token-action="permissions"' in javascript
+    assert 'data-token-action="extend"' in javascript
+    assert 'data-token-action="rotate"' not in javascript
+    assert "credential.permissions.map(permissionLabel).join" not in javascript
+    assert "/permissions`" in javascript
+    assert "/extend`" in javascript
+    assert "Token 未更换" in javascript
+    assert "parseExistingSoftwareIdentity" in javascript
+    assert "sameSoftwareIdentity" in javascript
+    assert "已有配置与所选项目成员不是同一个软件身份" in javascript
+    assert "不关联；首次连接时自动创建成员" in javascript
+    assert "selectedIdentity || createSoftwareIdentityForProfile(setup.profile)" in javascript
+    assert "softwareIdentity = existingIdentity" in javascript
+    assert "本工作区固定 bootstrap 参数" in javascript
+    assert 'id="token-project-credential-name" autocomplete="off" readonly' in markup
+    assert "[] if bundled_project_id" not in (WEB_DIR.parent / "mcp_server.py").read_text(encoding="utf-8")
     assert "function eventIdBadge(eventId)" in javascript
     assert "eventIdBadge(event.id)" in javascript
     assert javascript.count("eventIdBadge(event.id)") >= 4
@@ -346,6 +423,8 @@ def test_web_local_mcp_assistant_separates_write_reload_and_presence_states():
     assert '>接入 Agent</button>' in markup
     assert '<h2>接入 Agent</h2>' in markup
     assert 'data-integration-transport="http"' in markup
+    assert 'data-integration-transport="local"' not in markup
+    assert 'data-integration-transport="remote"' not in markup
     assert '连接方式' in markup
     assert 'id="integration-http-token-guide"' in markup
     assert 'id="integration-open-token-button"' in markup
@@ -1940,7 +2019,7 @@ def test_web_local_mcp_assistant_offers_generic_only():
     # named-client defaults are gone from the UI layer
     assert 'integrationFormat: "workbuddy"' not in javascript
     assert "选择客户端并完成本机 MCP 配置" not in markup
-    assert "优先用 HTTP 直连（url + Token）" in markup
+    assert "使用 HTTP 直连（url + Project 凭据包）" in markup
     # generic profile keeps the full onboarding flow wired
     assert "renderIntegrationTabs()" in javascript
     assert "integration-onboarding-prompt" in markup

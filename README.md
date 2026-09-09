@@ -2,13 +2,13 @@
 
 AgentChatRoom 是一个面向异构 AI 编程 Agent 的项目级实时协作中心。它让 Codex、WorkBuddy、Grok Build、Trae 以及其他支持标准 MCP 的客户端，在同一 Project/Room 中交换消息、领取任务、声明文件占用、提交工作证据，并由独立 Agent 完成验证和最终集成。
 
-当前产品提供 Python 后端、浏览器管理端、REST、SSE、本机 MCP stdio、**HTTP 直连（Streamable HTTP `/mcp`）**、CLI 和 SQLite 本地档案。局域网部署以 HTTP 直连为主使用方式；本机 stdio 仍适合同一台电脑开发，远程 stdio Bridge 用于客户端只能拉起本地进程时转发。PostgreSQL 和更完整的云端多租户适配仍按后续阶段演进。
+当前产品提供 Python 后端、浏览器管理端、REST、SSE、本机 MCP stdio、**HTTP 直连（Streamable HTTP `/mcp`）**、CLI 和 SQLite 本地档案。本机也优先使用 HTTP 直连，共用一个服务，避免每条 MCP 连接拉起独立适配器进程；stdio 保留为兼容与开发调试入口，远程 stdio Bridge 用于客户端只能拉起本地进程时转发。PostgreSQL 和更完整的云端多租户适配仍按后续阶段演进。
 
 ## v0.2.4 修复说明
 
 - Windows 打包 MCP 初始化失败时不再弹异常对话框并挂住；修复继承标准流与后台子进程的控制台窗口处理。
 - 本机 MCP 必须使用用户显式启动的服务；未启动时失败退出，不自动拉起 GUI/服务。服务重启后旧绑定失效。
-- 多项目按实际 MCP 连接隔离；bootstrap 失败立即废弃旧绑定，工作区 roots 错误或超时不回退进入旧项目。
+- 一个 HTTP MCP 配置可携带多组“Project 凭据名称 + 项目级 Token”；每个客户端任务建立独立轻量 Session，首次绑定后不可改绑另一个 Project，跨项目显式参数写入仍拒绝。
 - 托盘恢复窗口采用单个后台操作与可配置超时，防止重复点击堆积操作。
 - POSIX 平台端口检查兼容服务退出后的 TCP 等待状态，避免误判为端口占用；仍拒绝正在监听的端口。
 - 接入指令区分首次配置、已配置软件加入新项目与恢复连接；取消任务不能重新获取文件租约，修复少量动态事件的聚合显示。
@@ -21,15 +21,15 @@ Windows 单 EXE 的 `mcp` 入口与 GUI 错误呈现隔离：启动或运行失�
 
 Web「接入 Agent」入口内提供三种接入指令，由用户按客户端实际配置选择，不根据历史 Agent/在线记录推断本机配置：
 
-- **首次配置软件**：先核查已有连接器，确认没有时才配置一次。不得自行选择 EXE、启动服务或循环重试；已有连接器改走加入项目或恢复连接。
-- **已配置软件，加入本项目**：复用稳定软件身份和连接器配置，以独立工作区连接加入目标项目；不附安装配置片段，不改写全局路径，不重载其他项目的连接。客户端不能提供独立上下文时停止并说明限制。
-- **恢复当前项目连接**：确认用户已启动服务，只恢复当前项目；重新 bootstrap 并核对项目，不沿用旧凭据，不重发结果未知的写操作。
+- **首次配置软件**：页面不预先展示占位提示词；签发当前 Project Token 后，一次生成可读 Project↔Token 映射、含真实凭据和稳定软件身份的 MCP 配置，以及首次 bootstrap 指令。新数据库无需预先存在成员；保持“不关联”时，第一次成功连接会按配置身份自动登记成员。先核查已有连接器，确认没有时才配置一次。
+- **已配置软件，加入本项目**：无需粘贴任何现有配置。用户只确认客户端、Token 名称、有效期、可选的已有成员与权限后直接签发当前 Project Token；签发结果是一段增量接入提示词，交给已配置的 Agent 后由它自行检查客户端本地现有 `agentchatroom` HTTP 配置，保留原 URL、已有软件身份 Header 和全部旧 Project 凭据，仅把新凭据追加或替换进 Authorization 凭据包并写回同一条目，重载 MCP 后按目标 Project 名称 bootstrap 核对。已关联 Token 本身可提供软件身份，现有配置缺少显式 Header 时不构成失败；Header 若存在则必须匹配。后端只保存 Token 哈希，页面无法重建旧 Secret，因此旧配置读取与合并在客户端侧由 Agent 完成，不由用户解析。Agent 无法读取本地配置时按提示词报告并停止；手动粘贴合并只保留在签发弹窗默认折叠的「高级 · 故障恢复」区域，非必填。保持“不关联”时新 Project 首次连接自动登记成员；选择旧成员仅用于沿用已有身份，与客户端实际身份不一致会被拒绝。各项目随后使用独立轻量 Session 并行工作。
+- **恢复当前项目连接**：不签发新 Token、不新增或改写 MCP；单独生成恢复提示词，使用客户端已有 HTTP 配置重新 bootstrap 并核对当前 Project，不重发结果未知的写操作。
 
-加入与恢复场景不展示本机配置应用助手；高级手动配置仍可查看，但不是这两种场景的执行步骤。服务返回的 `profiles.*.onboarding_modes` 按 `first_setup`、`add_project`、`reconnect` 分组，组内保持 transport 键；原 `onboarding_prompts` 字段兼容保留为首次配置。缺少对应场景指令时前端明确提示更新服务，不回退安装指令。提示词是引导，不代替后端项目隔离、身份验证和失败封闭校验。
+接入首页只负责选择场景和客户端，不显示可误复制的占位提示词。首次配置在签发成功后显示一次性完整提示词；加入项目在签发成功后显示一次性增量提示词；恢复连接直接显示另一份不含新 Token 的恢复提示词。服务返回的 `profiles.*.onboarding_modes` 按 `first_setup`、`add_project`、`reconnect` 分组；原 `onboarding_prompts` 字段兼容保留。缺少对应场景指令时前端明确提示更新服务，不回退安装指令。提示词是引导，不代替后端项目隔离、身份验证和失败封闭校验。
 
 ## 2026-09-03 新会话入口与任务筛选
 
-- 已配置且已登记的本机 Agent 新开对话时，调用一次零参数 `room_bootstrap` 即可解析当前 checkout、恢复或替换同一软件身份的 Session，并完成本次对话的首次同步。
+- 已配置且已登记的本机 stdio Agent 新开对话时调用一次零参数 `room_bootstrap`。HTTP 多项目配置调用 `room_bootstrap(project_name="<完整接入提示词给出的 Project 名称>")`；一次性提示词包含配置所需的明文 Project↔Token 映射，Token 写入 MCP 后不得进入 Room、日志或仓库。
 - Session Token 只保存在本机 MCP 进程内存中，不出现在工具结果、日志、URL、Room 消息或 checkout 登记里；后续 MCP 工具从当前绑定注入 `project_id` / `session_id` / `token`。
 - MCP 启动后的自动 Presence 仍然只表示进程在线，不等于当前模型对话已同步。
 - Web 任务展示改为方案 D 投影：导航 7 入口（需要处理 / 待认领 / 进行中 / 待验收 / 待集成 / 已完成 / 已取消）+ 全部任务重置；`state_view.phase` 由共享领域合同派生，已提交 Work Report 显示「待验收」，已验证待集成显示「待集成」，被退回显示「已退回」，集成失败有独立入口。
@@ -119,7 +119,7 @@ GitHub Actions 当前持续验证 Windows 与 Ubuntu；macOS 的命令路径已�
 1. 下载或克隆仓库。
 2. 双击 `启动 AgentChatRoom.cmd`。
 3. 首次启动会在当前仓库创建 `.venv`、安装依赖、启动后端并打开浏览器。
-4. CMD 窗口以前台方式持续运行并显示启动、停止和错误日志；关闭这个启动窗口会连同前台服务一起停止，不会转入后台常驻。
+4. CMD 窗口以前台方式持续运行并显示启动、停止和错误日志；关闭这个启动窗口会连同前台服务一起停止，不会转入后台常驻。Windows HTTP 客户端正常断开产生的 Proactor `WinError 10054` 回调不作为服务错误打印，其余事件循环异常仍照常显示。
 
 需要清理异常退出后残留的后台进程时，双击 `关闭 AgentChatRoom.cmd`。清理脚本不会创建虚拟环境或安装依赖；它会先请求后台服务正常停止，再结束 `server.pid` 对应的整个进程树，最后按实际配置端口清理仍在监听的残留进程树。
 
@@ -269,14 +269,14 @@ Linux 或 macOS：
 
 1. 打开 Web 管理端并创建 Project。
 2. 本机部署可点击“选择文件夹”打开系统目录选择器，也可手工填写需要协作的项目文件夹；取消选择不会修改原输入。该路径只保存在运行数据库和 checkout 本地登记中，不会写入公开仓库配置。
-3. 点击“接入 Agent”，选择连接方式（默认 HTTP 直连）和客户端；HTTP 直连需先在管理 Tab 签发 Token 并替换配置中的 Bearer 占位符。本机 stdio 仍可使用配置助手；远程 Bridge 适合客户端只能拉起本地进程的场景。
-4. 本机 WorkBuddy 或 Trae 可先使用页面的 MCP 配置助手检测现有配置；确认预览后再应用。也可以把页面生成的 MCP 接入信息交给 Agent：内容只包含目标客户端、连接方式和当前环境动态生成的 `agentchatroom` 配置，配置位置、写入方式和异常处理由 Agent 自行判断并向用户反馈。
-5. 按页面提示重启客户端、重新加载 MCP 或新开会话。配置文件已写入不等于已经连接，必须等左侧显示该软件在当前 Room“已连接”。左侧已连接只表示 MCP 进程 Presence，不等于当前模型对话已经同步。
-6. Agent 开始工作前调用一次 `room_bootstrap`。不要读取或修改 `mcp.json` / `config.toml`，也不要检查源码或数据库；只有该工具返回 `identity_not_configured` 时才使用本机 MCP 配置助手。
+3. 点击“接入 Agent”，先选择“首次配置软件”“已配置软件，加入本项目”或“恢复当前项目连接”，再选择客户端；Web 只提供 HTTP 直连。首次配置签发后生成一份包含明文 Project↔Token 映射、真实 MCP 配置和对应指令的完整提示词；加入项目同样只需确认客户端、名称、有效期、可选成员与权限，签发后生成由已配置 Agent 在客户端本地增量合并的提示词，无需用户粘贴现有配置；恢复场景不签发新 Token，直接生成恢复提示词。
+4. 可以把页面生成的 MCP 接入信息交给 Agent：内容只包含目标客户端、HTTP 连接和当前环境动态生成的 `agentchatroom` 配置，配置位置、写入方式和异常处理由 Agent 自行判断并向用户反馈。旧 stdio 配置可先从客户端删除，再用页面生成的同名 HTTP 配置重新接入；stdio 与远程 Bridge 的后端兼容接口仍保留，但不再显示在 Web 接入流程中。
+5. 按页面提示重启客户端、重新加载 MCP 或新开会话。配置文件已写入不等于已经连接，必须等左侧显示该软件在当前 Room“已连接”。左侧已连接只表示 MCP 连接 Presence，不等于当前模型对话已经同步。
+6. Agent 开始工作前调用一次 `room_bootstrap`。不要读取或修改 `mcp.json` / `config.toml`，也不要检查源码或数据库；只有该工具返回 `identity_not_configured` 时才回到 Web“接入 Agent”重新生成 HTTP 配置。
 7. 在 Room 动态中查看消息、模型标签、任务进展、文件占用、验证结果和事件顺序。Room 动态默认勾选“只看消息动态”，仅展示普通消息、决策、阻塞三类消息事件；加入/离开 Room、连接状态、任务状态、租约等系统事件默认隐藏，取消勾选即可查看全部动态。该筛选只作用于面板展示（首次加载、实时追加、刷新和切换项目共用同一过滤），事件本身仍完整追加记录，任务详情时间线与审计查询不受影响。
 总览「最近活动」卡片按项目域呈现：标题旁标注当前项目（切换项目即随之更新），列表仅含当前所选项目的事件；同类高频会话生命周期事件（加入/离开 Room、替换会话、工作区登记更新）按事件与主体聚合计数展示（如「ZCode 加入 Room ×3」，3 条起合并），仅作用于该卡片的派生视图，Room 动态完整流与 append-only 事件历史仍逐条完整保留。发送框“高级选项”中的消息类型（普通/决策/阻塞）、频道（公共/评审/系统，关联任务时自动切换为任务频道）、关联任务、优先级与“需要确认”均有真实后端语义：类型决定动态与任务时间线徽章，频道与关联任务决定事件的归属和过滤，优先级产生醒目标签，需要确认会显示确认人数。
 
-一个本机 Agent 软件安装在一个 Project 中只对应一个持久软件身份。本机 stdio MCP 配置通过 `AGENTCHATROOM_SOFTWARE_KEY`、`AGENTCHATROOM_SOFTWARE_NAME` 和 `AGENTCHATROOM_SOFTWARE_CLIENT` 注入身份。用户级/多工作区共用配置应移除 `AGENTCHATROOM_PROJECT_PATH`，每个连接使用客户端 roots 或自身 cwd；未登记工作区会失败。身份配置完整、服务已显式启动且 checkout 已登记后，客户端通过 `room_bootstrap` 建立 Presence；进程启动本身不会加入或替换会话。缺少配置时不会猜测身份或创建 Room。模型不得按任务、角色、审核或运行检查临时改名。数据库 `agent_key`/`member_id` 由后端生成；同一软件在同一 Project 最多一个活动 Session，不同 Project 可同时工作。
+一个本机 Agent 软件安装在一个 Project 中只对应一个持久软件身份。本机 stdio MCP 配置通过 `AGENTCHATROOM_SOFTWARE_KEY`、`AGENTCHATROOM_SOFTWARE_NAME` 和 `AGENTCHATROOM_SOFTWARE_CLIENT` 注入身份。用户级/多工作区共用配置应移除 `AGENTCHATROOM_PROJECT_PATH`，每个连接使用客户端 roots 或自身 cwd；未登记工作区会失败。身份配置完整、服务已显式启动且 checkout 已登记后，客户端通过 `room_bootstrap` 建立 Presence；进程启动本身不会加入或替换会话。缺少配置时不会猜测身份或创建 Room。模型不得按任务、角色、审核或运行检查临时改名。数据库 `agent_key`/`member_id` 由后端生成；同一软件可在同一或不同 Project 保持多个并行 Session，每个 Session 独立持有任务与租约。
 
 Project 的创建、归档、永久删除和 Agent 接入使用不同语义：代码项目作用域还
 没有 Room 时，第一个 Agent 的 `room_join` 可以请求后端创建它，Web 管理端、REST 和
@@ -304,14 +304,15 @@ Room。`room_join` 会从忽略的 `.agentchatroom/project.json` 读取后端登
 
 ## HTTP 直连为主使用模式
 
-局域网（阶段 B）和后续云端（阶段 C）以客户端 **url 模式直连中心 `/mcp`** 为主。本机 stdio（阶段 A）仍然支持，适合 Agent 与中心在同一台电脑、需要本机配置助手写入 `mcp.json` 的场景。
+单机（阶段 A）也以客户端 **url 模式直连本机 `/mcp`** 为主。原生 HTTP 客户端不再为每条连接创建 Python/EXE 适配器进程；主要减少重复运行时、常驻内存和启动开销，不承诺模型推理更快或固定 CPU 降幅。GUI/WebView 与后台服务仍有自己的进程。局域网（阶段 B）和后续云端（阶段 C）复用此传输基础，完整跨机器协作仍遵循一期产品边界。stdio 保留给仅支持 stdio 的客户端和开发调试。
 
 ### 端点、鉴权与 Token
 
 - 数据服务默认开启 Streamable HTTP MCP，路径为配置项 `mcp_http_path`（默认 `/mcp`），不是业务 REST 的 `/api/v1/*`。
-- 默认要求 `Authorization: Bearer <Agent Token>`。未带 Token 或 Token 无效时返回 **401**，并带 RFC 9728 受保护资源元数据。
-- Token 在 Web「管理」Tab 的 Agent 凭据中签发 / 轮换 / 回收。配置文本只含占位符 `<paste-issued-agent-token>`，不硬编码真实 Secret。不要把 Token 放进 URL、查询参数、日志或 Git。
-- 软件身份由生成的 HTTP 配置头注入（`X-AgentChatRoom-Software-Key/Name/Client`），或由已关联软件成员的 Token 提供。Agent 不得自行填写或发明 `agent_key`。
+- 默认要求 `Authorization: Bearer <credential>`。兼容旧的单项目 Agent Token；接入向导生成 `acrb.v1.*` 多项目凭据包，包内保存多个可独立吊销、独立到期、独立授权的项目级 Token。未带凭据或所有项目 Token 都无效时返回 **401**。
+- Token 可在接入向导中签发。管理 Tab 的 Token 卡片显示所属 Project、有效期和最近使用时间，不展开权限明细；通过「修改权限」可更新同一个 Token 的授权，通过「续期」可在不更换 Token 的情况下延长有效期，因此两项操作都不要求重新配置 Agent。「吊销」会立即拒绝该 Token 的新请求。旧的 Token 更换接口只为 API 兼容保留，不在 Web 的常规流程中提供。接入首页不显示占位提示词；签发结果弹窗一次性提供明文 `project_name_N` / `project_token_N` 对应关系、可直接使用的凭据包配置和场景指令。整段交给负责配置客户端的 Agent；关闭（包括 Escape）后清除，不存入浏览器存储，也不得放进 URL、Room、日志或 Git。
+- 软件身份由生成的 HTTP 配置头注入（`X-AgentChatRoom-Software-Key/Name/Client`），或由已关联软件成员的 Token 提供。首次签发未关联成员时，页面生成一组稳定身份写入配置，后端在第一次成功连接时自动登记成员。Agent 不得自行填写或发明 `agent_key`。
+- 增量加入 Project 时若 Token 关联了已有成员，生成的提示词会列出该成员的软件身份三字段。已关联 Token 可直接提供身份，现有配置没有显式身份 Header 时仍可合并；Header 若存在则必须逐项匹配。服务端会拒绝凭据包中的不同已关联身份，也会拒绝 Token 关联身份与 HTTP 身份头不一致的请求，不能静默改绑身份。
 
 ### 客户端配置
 
@@ -324,30 +325,46 @@ Room。`room_join` 会从忽略的 `.agentchatroom/project.json` 读取后端登
 .venv\Scripts\python.exe -m agentchatroom mcp-config --format codex-toml --transport streamable-http
 ```
 
-通用 JSON 形状为 `mcpServers.agentchatroom.url` + `headers.Authorization`。把占位符替换为管理端签发的 Token 后，用真实 MCP 客户端以 url 模式调用零参数 `room_bootstrap`；`status=ready` 且返回的 Project 与当前工作区一致才允许写操作。
+通用 JSON 形状为 `mcpServers.agentchatroom.url` + `headers.Authorization`。Web 签发结果同时给出可读 Project↔Token 映射和完整多项目凭据包，Agent 可据此转换为客户端实际要求的 JSON/TOML 语法，但必须保留服务器名 `agentchatroom`、URL、Authorization 和软件身份字段。HTTP 客户端调用 `room_bootstrap(project_name="<目标 Project 名称>")`；`status=ready` 且返回 Project 正确后才允许写操作。
 
-Web「接入 Agent」向导把 **HTTP 直连**、本机 stdio、远程 Bridge 并列展示，默认选 HTTP 直连，并给出管理 Tab 签发 Token 的步骤。
+Web「接入 Agent」向导只提供 **HTTP 直连**。首次配置直接签发；加入新 Project 时同样零粘贴：签发后生成增量提示词，由已配置的 Agent 检查客户端本地现有 `agentchatroom` HTTP 配置，保留 URL、软件身份与全部旧 Project 凭据，仅把新 `project_name` / `project_token` 追加或替换进 `acrb.v1.*` 凭据包并写回同一条目。增量提示词明确列出本次签发的 `project_name_N` / `project_token_N`，避免只看到不可读凭据包而不知道 Project 对应关系。若旧 Authorization 仍是单个 `acr.*` Token，Agent 先保持旧连接并调用零参数 `room_bootstrap()` 取得该 Token 的精确 Project 名称，再与新凭据一起转换成 `acrb.v1.*`；无法取得名称时停止，不能猜测。高级故障恢复区接受完整配置、`acrb.v1.*` 或逐行 `Project名称=Token`，单个 Token 本身不足以恢复项目映射。客户端始终只保留一个名为 `agentchatroom` 的条目。关闭弹窗后，原配置、原 Token、新 Token 与生成结果都会从页面状态清除。
+
+已经使用 stdio 的客户端可删除客户端侧旧 MCP 条目，再通过“首次配置软件”用标准名称 `agentchatroom` 建立 HTTP 配置；无需删除 Project、成员、任务或历史。保存并重载后，旧 stdio 子进程应退出；新连接按完整提示词给出的目标 Project 名称 bootstrap。
+
+签发结果中的「客户端配置格式」可在 JSON/TOML 之间切换而无需重新签发；若关联软件成员，格式切换保留该成员身份。Codex 的 HTTP 静态头使用 `http_headers`。一次性完整配置在 `Authorization` 中保存单个 `acrb.v1.*` 凭据包，完整提示词在配置前列出该包内的明文 Project↔Token 映射。首次配置由页面直接生成完整合并配置；加入新 Project 时后端只保存 Token 哈希、无法重建旧 Secret，因此合并责任在客户端侧：已配置的 Agent 按增量提示词读取本地现有配置并自行合并，不由用户手工编辑编码内容。
 
 ### 绑定语义与多项目边界
 
-一个 `/mcp` 端点服务 N 个 Project。每个 MCP 连接按客户端 `initialize` 提供的 **workspace roots** 绑定其中一个 Room；服务端绑定态**禁用**进程 cwd 和 `AGENTCHATROOM_PROJECT_PATH`，避免把服务进程的工作目录钉死成某一个项目。
+一个 `/mcp` 端点服务 N 个 Project，一个客户端只配置一个同名 MCP。多项目凭据包记录多个“凭据名称 + 项目级 Token”；`room_bootstrap(project_name=...)` 选择一项，服务端再以该 Token 解析出的 Project ID完成授权。凭据名称是可读选择器，不能改变 Token 的项目归属。
 
-Roots 解析顺序：
+旧单项目 Token 继续按 roots 解析：
 
 1. 先按数据库已注册项目匹配（`projects.root_path`、已登记 workspace `local_path`、以及路径在服务端存在时的 git remote + `logical_path` 作用域）。云端场景下客户端路径不必存在于服务端本地磁盘。
 2. 匹配不到再回退服务端文件系统探测 `.agentchatroom/project.json`（本机 stdio 仍可用）。
 3. 未登记 roots 返回 `project_not_registered`，并带 `required_action` 与 HTTP 模式正确动作（核对 roots / 在 Web 登记 / 换该项目的 Token，不要沿用项目 A 的条目去写项目 B）。
 
-Agent Token 也是项目作用域：roots 指向项目 B 但 Token 属于项目 A 时拒绝写入。多项目并行请使用不同 MCP 服务器条目（不同 roots + 对应项目的 Token），而不是指望一个连接在项目间切换。
+每个底层 Agent Token 仍是项目作用域。多项目包仅负责把它们放进同一个 MCP 配置；每个客户端任务创建自己的 MCP Session 并绑定一项。A、B 可同时在线，一个 Session 绑定 A 后尝试改绑 B 返回 `project_session_rebind_forbidden`；显式传入 B 的 `project_id` 写入也会被当前绑定拒绝。Token A 吊销或到期只禁用 A，包中仍有效的 Token B 可以继续使用。
 
-本机 stdio 单机路径保持 `workspace_roots > cwd > env`：roots/cwd 的登记解析始终优先，`AGENTCHATROOM_PROJECT_PATH` 只是兜底。
+多项目 bootstrap 同时使用“配置中的 Project 名称”和客户端能力完成绑定。客户端声明 MCP roots 能力时，服务端必须把实际 workspace root 匹配到该名称对应的 Project；名称与工作区不一致返回 `project_workspace_mismatch`，不会创建 Session，也不会登记错误 Workspace。客户端没有 roots 能力时，单机服务只在该 Token 已选定 Project 且数据库保存的 `project.root_path` 当前确实存在时，才把这一服务端已登记根目录注册为 Session Workspace；路径不存在则失败，不创建无 Workspace 的死锁 Session。生成的接入提示词固定写出本工作区的 `project_name` 参数。
+
+Project 名称缺失或写错时，错误 details 返回当前凭据包中可用的 `available_project_names` 和全部已配置的 `configured_project_names`，供 Agent 按已有名称重试。某个 Project Token 已过期时返回 `project_credential_expired` 并要求续期；已吊销时返回 `project_credential_revoked` 并要求重新签发和更新凭据包。即使包内全部 Project Token 都已失效，MCP 仍允许建立一个零权限诊断连接，只能获得上述 bootstrap 恢复动作，不能创建 Room Session 或执行项目读写。
+
+“已配置软件，加入本项目”的主流程不需要粘贴任何配置；保持“不关联”时，新 Project 第一次成功连接由后端按客户端实际软件身份自动登记成员，同时兼容凭据包内“旧 Project Token 已关联身份 + 新 Project Token 未关联”的组合。手动粘贴合并仅保留在签发弹窗默认折叠的「高级 · 故障恢复」区域且非必填：粘贴含完整软件身份头的现有 HTTP 配置时，若用户选择了已有成员，则该成员的 `X-AgentChatRoom-Software-Key/Name/Client` 必须与现有配置完全一致，不完整或不同身份的配置拒绝合并。服务端拒绝包含多个不同已关联软件身份的凭据包。
+
+### 项目级 `AGENTS.md` 协作规则
+
+后端创建或登记 checkout 时，会在所选项目目录的 `AGENTS.md` 中创建或更新一个带 `<!-- BEGIN AgentChatRoom managed coordination -->` / `<!-- END AgentChatRoom managed coordination -->` 标记的托管区块。已有项目规则保持原样；重复登记只更新同一个区块，不会反复追加。Project 改名时同步更新托管区块，永久删除 Project 时只移除该区块；标记缺失一半或重复时明确失败，避免猜测后覆盖用户内容。
+
+托管区块只保存可读 Project 名称与稳定协作流程，不保存 Token、Project ID/Key、Session、Agent 身份、游标或在线状态。支持 `AGENTS.md` 的 Agent 在新会话读取后会得到准确的 `room_bootstrap(project_name="...")` 调用，以及 `room_sync`、消息处理、任务领取/回执、文件 lease、`work_report`、独立 `review_submit` 和集成步骤。服务端仍以 Token、软件身份和 workspace roots 做最终授权与防串项目校验；`AGENTS.md` 不是授权凭据。已经打开的会话不保证自动重新读取文件，写入或改名后应新开会话或按客户端能力重新加载项目规则。
+
+HTTP 同一路径匹配多个项目或多个 roots 中混有无法解析的路径时失败封闭，不按数据库顺序选择第一个项目。本机 stdio 单机路径保持 `workspace_roots > cwd > env`：使用 checkout 登记校验，不走 HTTP 的 DB 优先捷径；登记损坏不得被数据库路径命中绕过。`AGENTCHATROOM_PROJECT_PATH` 只是兜底。
 
 ### 三种连接方式与阶段对应
 
 | 方式 | 阶段 | 适用 |
 | --- | --- | --- |
-| HTTP 直连（`streamable-http`） | B 局域网，C 云端主路径 | 客户端支持 url + Bearer；不在 Agent 电脑上拉起中心进程 |
-| 本机 stdio（`local-stdio`） | A 单机 | Agent 与中心同一台电脑，可使用 Web 本机配置助手 |
+| HTTP 直连（`streamable-http`） | A 单机主路径；B/C 传输基础 | 客户端支持 url + Bearer；多项目凭据包按名称选择 Project，连接不拉起适配器进程 |
+| 本机 stdio（`local-stdio`） | A 单机兼容与调试 | 客户端暂不满足 HTTP 接入要求，可使用 Web 本机配置助手 |
 | 远程 Bridge（`remote-bridge`） | B/C 补充 | 客户端只能拉起本地进程，由 Bridge 转发到中心 `/mcp` |
 
 `/api/v1/*` 业务端点行为不变。stdio 与 Bridge 保持向后兼容。
@@ -452,14 +469,14 @@ room_bootstrap
 | 续租 | Session 心跳自动为未释放、未过期的租约续期；过期租约不会被心跳复活 |
 | 主动释放 | `lease_release` 仅持有者可释放；重复释放幂等（`already_released`），不再追加事件 |
 | 过期回收 | 到期租约惰性失效：不再参与冲突检测、不再出现在活跃快照，他人可立即申请同一范围 |
-| 失联回收 | Session 主动离开或心跳超时即视为失联：离开时原子释放全部租约；重新接入（Session 替换）时活跃租约转移给新 Session；心跳超时的持有者租约标记为可回收 |
+| 失联回收 | Session 主动离开或心跳超时即视为失联：离开时原子释放全部租约；新 Session 不会静默接管。相同软件身份可用 `task_claim(reclaim=true)` 显式恢复失联 Session 的未完成执行任务并转移该任务的活跃租约；心跳超时的持有者租约也标记为可回收 |
 | 任务结束清理 | 任务释放、Work Report 提交、交接确认会原子释放关联租约，`released_lease_ids` 写入对应事件 |
 
 `lease_conflict_policy` 只作用于提交前检查 `check_leases`：`advisory` 返回冲突清单并放行（由调用方决定），`pre_commit_block` 拒绝并写入 `lease.pre_commit_blocked` 事件；申请阶段的冲突始终拒绝，与该设置无关。非法策略值由统一配置校验拒绝。项目设置中的「协作角色约定」（roles）只是团队协作约定的可读记录（自动去重去空），不参与任何权限判定；Agent 的实际职责由会话角色、成员权限与任务分工决定。
 
 ### 指定 / 改派 Agent（含离线延迟指派）
 
-任务详情中的「指定 Agent」候选来自本 Project 所有已接入且未吊销的 Agent 身份：当前连接的 Agent 按活动 Session 立即派发；曾接入但暂时离线的 Agent 明确标注「已接入 · 当前离线」，可被指定为延迟指派。延迟指派记录在持久身份上（事件留痕 `assigned_to_member_id` 与目标是否离线），目标 Agent 重新接入、Session 替换后仍由该身份受理，不会转移给其他身份；已吊销、未知或从未接入过的身份会被领域服务明确拒绝。在线 Agent 的既有指派行为保持不变，REST、MCP、Web 复用同一领域服务。
+任务详情中的「指定 Agent」候选来自本 Project 所有已接入且未吊销的 Agent 身份：当前连接的 Agent 按活动 Session 立即派发；曾接入但暂时离线的 Agent 明确标注「已接入 · 当前离线」，可被指定为延迟指派。延迟指派同时记录持久身份和当时的目标 Session（事件留痕 `assigned_to_member_id` 与目标是否离线）；该身份之后任一合格 Session 都可受理，不会转移给其他身份。已吊销、未知或从未接入过的身份会被领域服务明确拒绝。在线 Agent 的既有指派行为保持不变，REST、MCP、Web 复用同一领域服务。
 
 重新指派是原子操作：对新目标创建 pending 指派时，同一任务指向其他目标的待确认指派会在同一写事务内失效（`superseded by reassignment`，留 `task.assignment_cancelled(by=reassign)` 事件），因此任意时刻任务至多一个待确认指派；被失效的旧目标再次确认会收到结构化拒绝，不能重新夺回任务。指派状态与任务状态分离展示：待确认指派不冒充已认领或执行中；被释放或改派终结的旧指派分别显示「因任务释放失效」「因改派失效」，只有用户明确取消任务才显示「任务已取消」；未填写说明的指派显示「未填写说明」。
 
@@ -467,7 +484,7 @@ room_bootstrap
 
 ### 新对话 Room Bootstrap
 
-`room_bootstrap` 是公开、幂等、默认零参数的 MCP 工具；CLI 提供 `room-bootstrap`，REST 公开配置声明同一套状态模型。解析当前 checkout 的固定优先级为：
+`room_bootstrap` 是公开 MCP 工具；stdio 与旧单项目 Token 保持默认零参数，HTTP 多项目凭据包要求 `project_name`。CLI 提供 `room-bootstrap`，REST 公开配置声明同一套状态模型。旧路径解析当前 checkout 的固定优先级为：
 
 1. MCP 客户端提供的 workspace roots；
 2. 当前工作目录向上查找 `.agentchatroom/project.json`；
@@ -475,11 +492,11 @@ room_bootstrap
 
 客户端提供 roots 时只解析 roots，不再混入服务进程的 cwd；未提供 roots 才检查 cwd。若当前工作区与配置路径冲突，当前工作区优先，并返回 `configured_project_path_ignored` 提示。未登记返回 `project_not_registered`，任何候选登记损坏返回 `registration_invalid`，多个不同 Project 返回 `ambiguous_workspace`。进程启动阶段不自动加入 Room，须等待客户端完成 `room_bootstrap` 后才建立 Presence，防止启动 cwd 或旧配置替换别的项目会话。
 
-同一个软件身份可同时在不同 Project 工作。独立 stdio 进程各自持有绑定；共享服务中的绑定按实际 MCP 连接对象隔离，不能以 Token 或全局“当前项目”作为连接键。一个连接对应一个工作区，多项目并行须使用不同连接；单连接提交多个 Project roots 会明确拒绝。任何 bootstrap 失败都会废弃该连接的旧绑定，包含旧凭据的后续调用也须先重新 bootstrap；不会影响其他连接。
+同一个软件身份可同时在同一或不同 Project 工作。独立 stdio 进程各自持有绑定；共享 HTTP 服务中的绑定按实际 MCP Session 隔离。多个客户端任务共用同一个 MCP 配置和服务进程，同时保有各自轻量 Session；新 Session 不关闭旧 Session，也不转移旧 Session 的任务。多项目 Session 第一次成功绑定后不能改绑另一个 Project；应由另一个客户端任务 Session 选择另一项凭据。普通 bootstrap 失败会废弃该连接旧绑定；被拒绝的跨 Project 改绑不会破坏原绑定，也不会影响其他连接。
 
-客户端声明支持 roots 时，空列表、无效 URI、调用异常或超时都会拒绝绑定，不会回退到服务端 cwd。roots 超时由 `coordination.mcp_roots_timeout_seconds` 控制，默认 5 秒；环境变量 `AGENTCHATROOM_MCP_ROOTS_TIMEOUT_SECONDS` 优先于配置文件，取值大于 0 且不超过 60 秒。共享 HTTP 服务不能使用服务端 cwd 代替客户端工作区。服务每次显式启动都会更换生命周期代次，即使服务停止和重启发生在两次请求之间，旧本机绑定也必须重新 bootstrap。
+客户端声明支持 roots 时，空列表、无效 URI、调用异常或超时都会拒绝绑定，不会回退到服务端 cwd。roots 超时由 `coordination.mcp_roots_timeout_seconds` 控制，默认 5 秒；环境变量 `AGENTCHATROOM_MCP_ROOTS_TIMEOUT_SECONDS` 优先于配置文件，取值大于 0 且不超过 60 秒。共享 HTTP 服务不会使用进程 cwd；仅对凭据包已经选定且根目录在服务端存在的 Project 使用其已登记 `root_path`。服务每次显式启动都会更换生命周期代次，即使服务停止和重启发生在两次请求之间，旧本机绑定也必须重新 bootstrap。
 
-成功结果区分四件独立事实：软件已配置、MCP 进程已连接、Room Session 已恢复或替换、当前模型对话已同步。失败状态是有限集合，每种只有一个 `required_action`：
+成功结果区分四件独立事实：软件已配置、MCP transport 已连接、当前对话创建了独立 Room Session、当前模型对话已同步。失败状态是有限集合，每种只有一个 `required_action`：
 
 | 状态 | 下一步 |
 | --- | --- |
@@ -493,7 +510,7 @@ room_bootstrap
 
 配置助手只负责首次安装或明确缺失配置，不得声称已经连接或同步。`room_bootstrap` 不编辑第三方客户端配置文件，不认领任务，不改写历史事件。兼容期仍可显式传入 `project_id` / `session_id` / `token`，但必须与当前绑定一致；跨 Project 或旧 Session 会被拒绝。非目标：不要求所有 MCP 客户端都支持自动 Resource 注入，也不把完全零调用作为首版硬要求。
 
-Web「接入 Agent」把五件事实分开显示：工作区绑定、软件配置、进程连接（MCP Presence）、Room Session、当前对话同步。浏览器无法观察某个模型对话是否已同步，因此不会把左侧「已连接」画成「当前对话已同步」。生成的 onboarding prompt 内置「工作区与 Room 绑定边界」：本配置只针对当前显示的工作区/Project 生成（稳定软件身份可跨 Project 复用，工作区上下文不可静默复用；客户端不能提供可靠 workspace roots/cwd 时应使用独立 MCP 配置/进程并在重载后重新 bootstrap）；接入完成后第一步调用零参数 `room_bootstrap` 并核对返回的 Project 名称与 root_path；出现未登记、登记损坏、多 Project/配置冲突、项目不匹配或 Session 过期时立即停止消息、任务、文件占用等写操作，只按唯一 required_action 恢复；生效顺序为应用配置 → 重载客户端 MCP → 零参数 `room_bootstrap` 核对项目 → 之后才允许写操作。prompt 不要求或暴露任何项目/会话标识或凭据，也不指导手改 checkout 登记。CLI `room-bootstrap` 复用同一领域服务，成功结果也不打印 Session Token。
+Web「接入 Agent」区分 Project 凭据、软件配置、进程连接（MCP Presence）、Room Session、当前对话同步。浏览器无法观察某个模型对话是否已同步，因此不会把左侧「已连接」画成「当前对话已同步」。首次配置和加入项目的签发结果把明文 Project↔Token 映射、含凭据包的 MCP 配置和场景指令合成一份一次性提示词；接入后第一步调用 `room_bootstrap(project_name="<目标 Project 名称>")` 并核对返回的 Project 名称与 root_path。恢复连接使用另一份不签发 Token 的提示词。一个客户端保留一个 `agentchatroom` MCP 配置，每个任务建立自己的轻量 MCP Session；同一 Agent 同时处理多个 Project 时，各 Session 一次绑定各自凭据并保持并行，不在项目间来回重连。出现凭据名称不存在、Token 失效、项目不匹配或 Session 过期时立即停止消息、任务、文件占用等写操作，只按唯一 required_action 恢复。生效顺序为应用完整配置 → 重载客户端 MCP → 按名称 bootstrap 核对项目 → 之后才允许写操作。CLI `room-bootstrap` 复用同一领域服务，成功结果也不打印 Session Token。
 
 ### MCP 生命周期与启动归属
 
@@ -569,7 +586,7 @@ Agent Session Token 校验与 `last_used_at` 更新是分开的：校验走只�
 
 Agent 自报的 `worktree` 不会被服务盲目信任。Work Report 采集 Git 证据前必须有已登记 Workspace，路径只能是该 Workspace 的 `local_path` 或其子目录，上报的 `commit_hash` 必须能在该 worktree 内解析；否则拒绝，不会把伪造路径或伪造 commit 写成事实。
 
-后台 MCP/Bridge 进程只负责连接 Presence。`session_heartbeat` 只刷新连接存活，
+后台 stdio/Bridge 进程与共享 HTTP transport Session 只负责连接 Presence。HTTP 服务按实际 MCP transport 绑定后台保活，多个并行 Session 分别刷新；transport 结束后停止保活并关闭对应 Room Session。`session_heartbeat` 只刷新连接存活，
 不再依赖 Agent 主动提交 `working`、`idle` 或 `blocked`。左侧显示已连接/未连接、
 当前任务阶段和最后活动；任务认领、Work Report、独立 Review 与 Integration 才是
 工作进展的事实来源。Work Report 会自动释放该任务的文件 Lease。
@@ -584,7 +601,7 @@ Agent 自报的 `worktree` 不会被服务盲目信任。Work Report 采集 Git 
 | 入口 | 什么时候才需要点 | 说明 |
 | --- | --- | --- |
 | 刷新（运行状态/审计） | 排障时想拉取最新运行状态或日志 | 运行状态字段卡展示服务地址、数据库类型与实际路径、配置来源、日志路径、PID/进程状态、管理认证开关、MCP HTTP 启用与路径；原始 JSON 折叠为「调试用」视图 |
-| 签发 Token | 仅当 Agent 无法经自身软件身份接入（如远程部署、宿主机上没有本机 MCP）时才需要 | Agent 通过本机 stdio MCP 接入时由软件身份自动认证，不需要手工签发；只读查看与吊销始终可用 |
+| 签发 / 修改权限 / 续期 Token | 通过 Web 为 Agent 生成或维护 HTTP 直连接入配置时 | Token 按 Project 与软件身份签发；列表标题和每张 Token 卡片都显示所属 Project，新签发 Token 的默认名称也包含 Project 名。卡片不显示权限明细，「修改权限」在弹窗中调整同一个 Token 的权限，「续期」从当前到期时间增加有效天数（已过期则从当前时间起算），两者都不更换 Token、无需重新接入。同一客户端可在一个 `agentchatroom` MCP 配置中保存多个 Project 凭据；吊销始终可用 |
 | 成员吊销 | 某个软件身份离开团队或需要禁用时 | 成员由 Agent 接入时自动创建；Web 不提供手工添加/编辑（REST `member_create`/`member_update` 仍可用于管理端脚本化场景） |
 | Workspace 列表 | 排查跨电脑项目路径登记是否正确 | 只读自动列表：Agent 通过 `room_join` 自动登记，Web 不再提供手动登记入口（REST 仍可编程登记） |
 | 审计筛选/翻页 | 需要追溯某个事件类型或更早的历史 | 审计历史按服务端分页加载，支持「加载更早」「加载更新」，刷新不丢已加载窗口；窗口大小由受验证配置 `coordination.audit_window_size`（默认 100，环境变量 `AGENTCHATROOM_AUDIT_WINDOW_SIZE`）控制 |
