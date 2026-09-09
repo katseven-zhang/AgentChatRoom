@@ -13,6 +13,7 @@ from .project_registration import (
     checkout_scope,
     resolve_checkout_project_key,
     stored_project_scope,
+    write_project_coordination_instructions,
 )
 from .services import AgentChatRoomService
 
@@ -540,6 +541,25 @@ def bootstrap_local_room(
                 )
             )
 
+    instructions_notice = None
+    if checkout is not None:
+        # 老项目的 checkout 可能登记于本能力上线之前：绑定即确保托管协作块
+        # 存在并与最新规则一致（幂等，内容未变时不写盘）；云端不可达根目录
+        # 或只读目录静默跳过，绝不阻塞绑定。
+        try:
+            instructions = write_project_coordination_instructions(checkout, project)
+            action = instructions.get("action")
+            if action and action != "unchanged":
+                instructions_notice = {
+                    "code": f"project_instructions_{action}",
+                    "message": (
+                        "Project AGENTS.md AgentChatRoom coordination block was "
+                        f"{action} for this checkout"
+                    ),
+                }
+        except DomainError:
+            pass
+
     workspace_path = str(checkout) if checkout is not None else ""
     try:
         if authorize_project is not None:
@@ -597,6 +617,17 @@ def bootstrap_local_room(
     )
     notices = [ignored_notice] if ignored_notice is not None else []
     if used_selected_project_root:
+        notices.append(
+            {
+                "code": "server_project_root_registered",
+                "message": (
+                    "The client did not advertise workspace roots; the selected "
+                    "Project's existing server-local root was registered as this Session's Workspace"
+                ),
+            }
+        )
+    if instructions_notice is not None:
+        notices.append(instructions_notice)
         notices.append(
             {
                 "code": "server_project_root_registered",

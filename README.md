@@ -356,6 +356,8 @@ Project 名称缺失或写错时，错误 details 返回当前凭据包中可用
 
 后端创建或登记 checkout 时，会在所选项目目录的 `AGENTS.md` 中创建或更新一个带 `<!-- BEGIN AgentChatRoom managed coordination -->` / `<!-- END AgentChatRoom managed coordination -->` 标记的托管区块。已有项目规则保持原样；重复登记只更新同一个区块，不会反复追加。Project 改名时同步更新托管区块，永久删除 Project 时只移除该区块；标记缺失一半或重复时明确失败，避免猜测后覆盖用户内容。
 
+`room_bootstrap` 绑定成功时也会对服务器本地可访问的 checkout 确保该托管区块存在且与最新规则一致：缺失则创建、内容落后则更新（幂等，内容未变不写盘），并通过 `project_instructions_created` / `project_instructions_updated` 通知呈现；云端不可达或只读的根目录静默跳过，绝不阻塞绑定。该规则覆盖在本能力上线前登记的老项目。
+
 托管区块只保存可读 Project 名称与稳定协作流程，不保存 Token、Project ID/Key、Session、Agent 身份、游标或在线状态。支持 `AGENTS.md` 的 Agent 在新会话读取后会得到准确的 `room_bootstrap(project_name="...")` 调用，以及 `room_sync`、消息处理、任务领取/回执、文件 lease、`work_report`、独立 `review_submit` 和集成步骤。服务端仍以 Token、软件身份和 workspace roots 做最终授权与防串项目校验；`AGENTS.md` 不是授权凭据。已经打开的会话不保证自动重新读取文件，写入或改名后应新开会话或按客户端能力重新加载项目规则。
 
 HTTP 同一路径匹配多个项目或多个 roots 中混有无法解析的路径时失败封闭，不按数据库顺序选择第一个项目。本机 stdio 单机路径保持 `workspace_roots > cwd > env`：使用 checkout 登记校验，不走 HTTP 的 DB 优先捷径；登记损坏不得被数据库路径命中绕过。`AGENTCHATROOM_PROJECT_PATH` 只是兜底。

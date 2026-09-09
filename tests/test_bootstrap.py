@@ -805,3 +805,81 @@ def test_auto_join_prefers_cwd_checkout_over_pinned_path(
     assert joined is not None
     assert joined["project"]["id"] == other["id"]
     assert joined["project"]["id"] != pinned["id"]
+
+
+def test_bootstrap_ensures_missing_agents_coordination_block(
+    monkeypatch, service, project_dir
+):
+    """老项目：登记早于托管块能力（或文件被删）时，绑定即补写。"""
+    from agentchatroom.integrations import build_project_coordination_instructions
+
+    _configure_software(monkeypatch)
+    project = _register_project(service, project_dir)
+    instructions_path = project_dir / "AGENTS.md"
+    instructions_path.unlink()
+
+    outcome = bootstrap_local_room(
+        service,
+        software_key="boot-agent",
+        software_name="Boot Agent",
+        client="codex",
+        model="unknown",
+        cwd=project_dir,
+    )
+    assert outcome.public["status"] == "ready"
+    restored = instructions_path.read_text(encoding="utf-8")
+    assert "BEGIN AgentChatRoom managed coordination" in restored
+    assert "END AgentChatRoom managed coordination" in restored
+    assert "room_sync" in restored
+    codes = [
+        notice["code"]
+        for notice in outcome.public.get("notices", [])
+    ]
+    assert "project_instructions_created" in codes
+
+    second = bootstrap_local_room(
+        service,
+        software_key="boot-agent",
+        software_name="Boot Agent",
+        client="codex",
+        model="unknown",
+        cwd=project_dir,
+    )
+    second_codes = [
+        notice["code"]
+        for notice in second.public.get("notices", [])
+        if notice["code"].startswith("project_instructions_")
+    ]
+    assert second_codes == []
+    assert build_project_coordination_instructions(project) in restored
+
+
+def test_bootstrap_updates_stale_agents_coordination_block(
+    monkeypatch, service, project_dir
+):
+    """托管块内容落后于当前规则时，绑定即更新为最新生成内容。"""
+    _configure_software(monkeypatch)
+    project = _register_project(service, project_dir)
+    instructions_path = project_dir / "AGENTS.md"
+    current = instructions_path.read_text(encoding="utf-8")
+    instructions_path.write_text(
+        current.replace("room_sync", "legacy-sync-marker"), encoding="utf-8"
+    )
+
+    outcome = bootstrap_local_room(
+        service,
+        software_key="boot-agent",
+        software_name="Boot Agent",
+        client="codex",
+        model="unknown",
+        cwd=project_dir,
+    )
+    assert outcome.public["status"] == "ready"
+    codes = [
+        notice["code"]
+        for notice in outcome.public.get("notices", [])
+    ]
+    assert "project_instructions_updated" in codes
+    restored = instructions_path.read_text(encoding="utf-8")
+    assert "legacy-sync-marker" not in restored
+    assert restored == current
