@@ -1747,3 +1747,82 @@ def test_snapshot_and_tasks_cache_control_headers(settings, project_dir):
         assert tasks_res.status_code == 200
         assert "no-cache" in tasks_res.headers.get("Cache-Control", "")
         assert "no-store" in tasks_res.headers.get("Cache-Control", "")
+
+
+def test_task_claim_reclaim_passes_through_rest_api(settings, project_dir):
+    """REST 认领端点必须把 reclaim 透传给领域服务，否则服务重启后同身份
+    Session 无法通过 reclaim 恢复自己断线前认领的任务（MCP 具备该能力）。"""
+    stale_settings = replace(settings, heartbeat_timeout_seconds=0)
+    with TestClient(create_app(stale_settings)) as client:
+        created = client.post(
+            "/api/v1/projects",
+            json={"root_path": str(project_dir), "name": "Reclaim Room"},
+        )
+        assert created.status_code == 201
+        project = created.json()
+
+        joined_a = _join_agent(
+            client,
+            project,
+            software_key="codex",
+            name="Codex",
+            client="codex",
+            model="unknown",
+            role="executor",
+        )
+        task_response = client.post(
+            f"/api/v1/projects/{project['id']}/tasks",
+            json={
+                "title": "Reclaim through REST",
+                "acceptance_criteria": ["Reclaim works over REST"],
+                "actor_session_id": joined_a["agent"]["id"],
+                "token": joined_a["token"],
+            },
+        )
+        assert task_response.status_code == 201
+        task = task_response.json()["task"]
+        task_id = task["id"]
+
+        first_claim = client.post(
+            f"/api/v1/projects/{project['id']}/tasks/{task_id}/claim",
+            json={"session_id": joined_a["agent"]["id"], "token": joined_a["token"]},
+        )
+        assert first_claim.status_code == 200
+
+        joined_b = _join_agent(
+            client,
+            project,
+            software_key="codex",
+            name="Codex",
+            client="codex",
+            model="unknown",
+            role="executor",
+        )
+        denied = client.post(
+            f"/api/v1/projects/{project['id']}/tasks/{task_id}/claim",
+            json={"session_id": joined_b["agent"]["id"], "token": joined_b["token"]},
+        )
+        assert denied.status_code == 409
+        assert denied.json()["error"]["code"] == "task_already_claimed"
+
+        # 让原认领会话心跳过期，模拟断线。
+        import sqlite3
+
+        connection = sqlite3.connect(settings.database_path)
+        connection.execute(
+            "UPDATE agent_sessions SET last_heartbeat = ? WHERE id = ?",
+            ("2020-01-01T00:00:00Z", joined_a["agent"]["id"]),
+        )
+        connection.commit()
+        connection.close()
+
+        reclaimed = client.post(
+            f"/api/v1/projects/{project['id']}/tasks/{task_id}/claim",
+            json={
+                "session_id": joined_b["agent"]["id"],
+                "token": joined_b["token"],
+                "reclaim": True,
+            },
+        )
+        assert reclaimed.status_code == 200, reclaimed.text
+        assert reclaimed.json()["task"]["owner_session_id"] == joined_b["agent"]["id"]

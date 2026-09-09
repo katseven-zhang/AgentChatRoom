@@ -1992,6 +1992,7 @@ def create_app(
             task_id,
             body.session_id,
             body.token,
+            reclaim=body.reclaim,
             request_id=request.state.request_id,
         )
 
