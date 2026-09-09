@@ -3402,3 +3402,41 @@ def test_snapshot_agents_projection_is_slimmed_for_frontend(service, project, tm
         "agent_key",
     ):
         assert heavy_field not in agent, heavy_field
+
+
+def test_register_workspace_rejects_control_characters_and_relative_paths(
+    service, project, tmp_path
+):
+    bell_path = "D:\claw\x07gentchatroom"
+    with pytest.raises(DomainError) as control_error:
+        service.register_workspace(
+            project["id"], host_key="h1", host_name="H1", local_path=bell_path
+        )
+    assert control_error.value.code == "invalid_workspace"
+    assert "control characters" in control_error.value.message
+
+    with pytest.raises(DomainError) as relative_error:
+        service.register_workspace(
+            project["id"], host_key="h2", host_name="H2", local_path="relative/path"
+        )
+    assert relative_error.value.code == "invalid_workspace"
+    assert "absolute path" in relative_error.value.message
+
+    with pytest.raises(DomainError) as worktree_error:
+        service.register_workspace(
+            project["id"],
+            host_key="h3",
+            host_name="H3",
+            local_path=str(tmp_path),
+            worktree="bad\x1fpath",
+        )
+    assert worktree_error.value.code == "invalid_workspace"
+
+    registered = service.register_workspace(
+        project["id"],
+        host_key="h4",
+        host_name="H4",
+        local_path=str(tmp_path),
+        worktree=str(tmp_path),
+    )
+    assert registered["workspace"]["local_path"] == str(tmp_path)

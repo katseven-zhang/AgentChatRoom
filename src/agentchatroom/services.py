@@ -2357,6 +2357,29 @@ class AgentChatRoomService:
                 "cursor": event_id,
             }
 
+    @staticmethod
+    def _validate_workspace_path(field: str, value: str) -> str:
+        """Reject malformed workspace paths before they poison git evidence.
+
+        Control characters (C0 and DEL) in a registered path silently break
+        the server-side git evidence capture, which later fails every work
+        report from sessions bound to that workspace with an unrelated
+        invalid_commit_hash error. Relative paths are equally meaningless for
+        a host-anchored workspace registration.
+        """
+        text = value.strip()
+        if any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in text):
+            raise DomainError(
+                "invalid_workspace",
+                f"{field} contains control characters",
+            )
+        if not os.path.isabs(text):
+            raise DomainError(
+                "invalid_workspace",
+                f"{field} must be an absolute path",
+            )
+        return text
+
     def register_workspace(
         self,
         project_id: str,
@@ -2375,6 +2398,11 @@ class AgentChatRoomService:
                 "invalid_workspace",
                 "Host key, Host name, and local workspace path are required",
             )
+        local_path = self._validate_workspace_path("local_path", local_path)
+        if str(worktree or "").strip():
+            worktree = self._validate_workspace_path("worktree", worktree)
+        else:
+            worktree = ""
         now = iso_now()
         with self.database.connect(write=True) as connection:
             self._require_project(connection, project_id)
