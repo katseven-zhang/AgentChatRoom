@@ -280,8 +280,8 @@ def test_web_supports_human_reading_and_guided_interactions():
     assert "snapshot.agent_identities" in javascript
     assert "当前连接" in javascript
     assert "累计" in javascript and "次接入" in javascript
-    assert 'app.css?v=1.0.0-central51' in markup
-    assert 'app.js?v=1.0.0-central51' in markup
+    assert 'app.css?v=1.0.0-central52' in markup
+    assert 'app.js?v=1.0.0-central52' in markup
     assert len(re.findall(r'<script\b[^>]*src="/assets/app\.js', markup)) == 1
     assert 'id="task-history-filter"' in markup
     assert "function loadTaskHistory(" in javascript
@@ -324,9 +324,9 @@ def test_web_supports_human_reading_and_guided_interactions():
     assert "本工作区固定 bootstrap 参数" in javascript
     assert 'id="token-project-credential-name" autocomplete="off" readonly' in markup
     assert "[] if bundled_project_id" not in (WEB_DIR.parent / "mcp_server.py").read_text(encoding="utf-8")
-    assert "function eventIdBadge(eventId)" in javascript
-    assert "eventIdBadge(event.id)" in javascript
-    assert javascript.count("eventIdBadge(event.id)") >= 4
+    assert "function eventIdBadge(projectSeq, eventId)" in javascript
+    assert "eventIdBadge(event.project_seq, event.id)" in javascript
+    assert javascript.count("eventIdBadge(event.project_seq, event.id)") >= 4
     # Navigation labels describe user destinations, not internal release status.
     assert 'class="tab-status"' not in markup
     assert 'aria-label="文件占用，只读视图"' in markup

@@ -11,7 +11,7 @@ if TYPE_CHECKING:
     from .config import Settings
 
 
-SCHEMA_VERSION = 21
+SCHEMA_VERSION = 22
 
 
 class DatabaseBackend(Protocol):
@@ -295,6 +295,7 @@ CREATE TABLE IF NOT EXISTS events (
     actor_session_id TEXT REFERENCES agent_sessions(id),
     task_id TEXT REFERENCES tasks(id),
     payload_json TEXT NOT NULL DEFAULT '{}',
+    project_seq INTEGER,
     created_at TEXT NOT NULL
 );
 
@@ -303,6 +304,11 @@ ON events(project_id, id);
 
 CREATE INDEX IF NOT EXISTS idx_events_project_actor_time
 ON events(project_id, actor_session_id, created_at);
+
+CREATE TABLE IF NOT EXISTS event_number_sequences (
+    project_id TEXT PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,
+    next_value INTEGER NOT NULL
+);
 
 CREATE TABLE IF NOT EXISTS idempotency_records (
     scope TEXT NOT NULL,
@@ -763,7 +769,49 @@ MIGRATIONS = {
         CREATE INDEX IF NOT EXISTS idx_task_assignments_member
         ON task_assignments(project_id, assigned_to_member_id, status, created_at);
     """,
+    22: """
+        UPDATE events SET project_seq = (
+            SELECT COUNT(*) FROM events e2
+            WHERE e2.project_id = events.project_id AND e2.id <= events.id
+        )
+        WHERE project_seq IS NULL;
+        INSERT INTO event_number_sequences(project_id, next_value)
+        SELECT project_id, COALESCE(MAX(project_seq), 0) + 1
+        FROM events GROUP BY project_id
+        ON CONFLICT(project_id) DO NOTHING;
+    """,
 }
+
+
+def ensure_event_number_schema(connection: Any, *, postgres: bool = False) -> None:
+    """Add the Project-scoped event number column and its unique index.
+
+    Runs for fresh and legacy databases alike so both shapes end up with the
+    same column and index regardless of which migration path they took.
+    """
+    if postgres:
+        row = connection.execute(
+            """
+            SELECT 1 FROM information_schema.columns
+            WHERE table_schema = current_schema()
+              AND table_name = 'events'
+              AND column_name = 'project_seq'
+            """
+        ).fetchone()
+        exists = row is not None
+    else:
+        exists = any(
+            row["name"] == "project_seq"
+            for row in connection.execute("PRAGMA table_info(events)").fetchall()
+        )
+    if not exists:
+        connection.execute("ALTER TABLE events ADD COLUMN project_seq INTEGER")
+    connection.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_events_project_seq
+        ON events(project_id, project_seq)
+        """
+    )
 
 
 def ensure_task_assignment_member_column(
@@ -913,6 +961,7 @@ class Database:
             ensure_agent_identity_columns(connection)
             ensure_task_number_schema(connection)
             ensure_task_assignment_member_column(connection)
+            ensure_event_number_schema(connection)
             row = connection.execute("SELECT version FROM schema_meta LIMIT 1").fetchone()
             if row is None:
                 connection.execute(

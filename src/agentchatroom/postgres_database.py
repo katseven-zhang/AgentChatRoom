@@ -11,6 +11,7 @@ from .database import (
     SCHEMA,
     SCHEMA_VERSION,
     ensure_agent_identity_columns,
+    ensure_event_number_schema,
     ensure_project_member_columns,
     ensure_task_assignment_member_column,
     ensure_task_number_schema,
@@ -135,6 +136,7 @@ class PostgresDatabase:
             ensure_agent_identity_columns(connection, postgres=True)
             ensure_task_number_schema(connection, postgres=True)
             ensure_task_assignment_member_column(connection, postgres=True)
+            ensure_event_number_schema(connection, postgres=True)
             row = connection.execute(
                 "SELECT version FROM schema_meta LIMIT 1"
             ).fetchone()

@@ -302,6 +302,7 @@ def project_history_item(
     item = {
         "schema_version": TASK_HISTORY_SCHEMA_VERSION,
         "event_id": int(event.get("id") or 0),
+        "project_seq": int(event.get("project_seq") or 0),
         "event_type": event_type,
         "occurred_at": event.get("created_at"),
         "actor": actor,

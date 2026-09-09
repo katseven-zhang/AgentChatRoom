@@ -533,10 +533,15 @@ function messageModelBadge(event) {
   return `<span class="model-badge${missing ? " is-missing" : ""}" title="${escapeHtml(details)}">${escapeHtml(label)}</span>`;
 }
 
-function eventIdBadge(eventId) {
-  const value = Number(eventId);
-  if (!Number.isFinite(value)) return "";
-  return `<button type="button" class="event-id" data-open-event="${value}" title="打开并定位事件 #${value}" aria-label="事件 ID ${value}">#${value}</button>`;
+function eventIdBadge(projectSeq, eventId) {
+  const internalId = Number(eventId);
+  if (!Number.isFinite(internalId)) return "";
+  const seq = Number(projectSeq);
+  // 用户可见编号是项目级序号；全局 event_id 只作内部深链定位。
+  if (!Number.isFinite(seq) || seq <= 0) {
+    return `<button type="button" class="event-id" data-open-event="${internalId}" title="打开并定位事件（全局 ID ${internalId}）" aria-label="事件 全局 ID ${internalId}">#${internalId}</button>`;
+  }
+  return `<button type="button" class="event-id" data-open-event="${internalId}" title="事件编号 #${seq}（项目内序号，全局 ID ${internalId}）" aria-label="事件编号 ${seq}">#${seq}</button>`;
 }
 
 function avatarColorClass(seed) {
@@ -1377,7 +1382,7 @@ function renderMetrics(agents, tasks, leases) {
       if (item.merged && item.count >= 3) {
         return `
       <div class="compact-item merged-activity">
-        <div class="compact-heading"><span><strong>${escapeHtml(lifecycleActivitySummary(item))}</strong></span>${eventIdBadge(item.last.id)}</div>
+        <div class="compact-heading"><span><strong>${escapeHtml(lifecycleActivitySummary(item))}</strong></span>${eventIdBadge(item.last.project_seq, item.last.id)}</div>
         <div class="compact-body"><div class="msg-line">${escapeHtml(formatTime(item.last.created_at))}</div></div>
       </div>`;
       }
@@ -1389,7 +1394,7 @@ function renderMetrics(agents, tasks, leases) {
         : `<div class="msg-line">${escapeHtml(event.payload?.title || event.payload?.path_pattern || formatTime(event.created_at))}</div>`;
       return `
       <div class="compact-item ${isMessage ? `kind-${escapeHtml(event.event_type.split(".")[1])}` : ""}">
-        <div class="compact-heading"><span><strong>${escapeHtml(eventLabel(event.event_type))}</strong>${modelBadge}</span>${eventIdBadge(event.id)}</div>
+        <div class="compact-heading"><span><strong>${escapeHtml(eventLabel(event.event_type))}</strong>${modelBadge}</span>${eventIdBadge(event.project_seq, event.id)}</div>
         <div class="compact-body">${preview}</div>
       </div>`;
     }).join("")
@@ -2049,7 +2054,7 @@ function renderAudit() {
       <article class="management-item">
         <time class="audit-time">${escapeHtml(formatTime(event.created_at))}</time>
         <div>
-          <h4>${escapeHtml(eventLabel(event.event_type))} ${eventIdBadge(event.id)}</h4>
+          <h4>${escapeHtml(eventLabel(event.event_type))} ${eventIdBadge(event.project_seq, event.id)}</h4>
           <p>${escapeHtml(event.task_id ? `任务 ${shortId(event.task_id)}` : event.actor_session_id ? `接入 ${shortId(event.actor_session_id)}` : "管理主体")}</p>
         </div>
       </article>`).join("")
@@ -2143,7 +2148,7 @@ function renderEvents(agents, tasks) {
         return `<article class="event-item kind-${escapeHtml(kind)}">
           <span class="event-avatar ${avatarColorClass(event.actor_session_id || agent?.name)}">${escapeHtml(initials(agent?.name || "用户"))}</span>
           <div class="event-content">
-            <div class="event-meta"><span class="event-author"><strong>${escapeHtml(agent?.name || "用户")}</strong>${messageModelBadge(event)}${kind !== "message" ? ` <span class="type-badge ${escapeHtml(kind)}">${escapeHtml(messageKind(kind))}</span>` : ""}${event.payload?.priority <= 1 ? ` <span class="type-badge urgent">${event.payload.priority === 0 ? "紧急" : "高优先级"}</span>` : ""}</span><span class="event-stamp">${eventIdBadge(event.id)}<time title="${escapeHtml(event.created_at)}">${escapeHtml(formatTime(event.created_at))}</time></span></div>
+            <div class="event-meta"><span class="event-author"><strong>${escapeHtml(agent?.name || "用户")}</strong>${messageModelBadge(event)}${kind !== "message" ? ` <span class="type-badge ${escapeHtml(kind)}">${escapeHtml(messageKind(kind))}</span>` : ""}${event.payload?.priority <= 1 ? ` <span class="type-badge urgent">${event.payload.priority === 0 ? "紧急" : "高优先级"}</span>` : ""}</span><span class="event-stamp">${eventIdBadge(event.project_seq, event.id)}<time title="${escapeHtml(event.created_at)}">${escapeHtml(formatTime(event.created_at))}</time></span></div>
             ${renderMessageBodySafely(event.id, event.payload?.body || "")}
             <p class="secondary-text">${escapeHtml(messageChannel(event.channel))}频道${event.payload?.requires_ack ? ` · 需要确认 · 已确认 ${ackCount}` : ""}${event.payload?.mentions?.length ? ` · @${escapeHtml(event.payload.mentions.join("、"))}` : ""}</p>
             ${event.payload?.files?.length ? `<p class="secondary-text">关联文件：${escapeHtml(event.payload.files.join("、"))}</p>` : ""}
@@ -2154,7 +2159,7 @@ function renderEvents(agents, tasks) {
       const conflict = event.event_type === "lease.conflict"
         ? ` · ${escapeHtml(event.payload?.path_pattern || "")} 与 ${escapeHtml((event.payload?.conflicts || []).map((item) => `${item.agent_name}:${item.path_pattern}`).join("、"))} 冲突`
         : "";
-      return `<div class="system-event">${eventIdBadge(event.id)} <strong>${escapeHtml(agent?.name || "系统")}</strong> ${escapeHtml(eventLabel(event.event_type))}${task ? ` · ${escapeHtml(task.title)} · ${escapeHtml(taskPhaseLabel(task))}` : ""}${conflict} <span>· ${escapeHtml(formatTime(event.created_at))}</span></div>`;
+      return `<div class="system-event">${eventIdBadge(event.project_seq, event.id)} <strong>${escapeHtml(agent?.name || "系统")}</strong> ${escapeHtml(eventLabel(event.event_type))}${task ? ` · ${escapeHtml(task.title)} · ${escapeHtml(taskPhaseLabel(task))}` : ""}${conflict} <span>· ${escapeHtml(formatTime(event.created_at))}</span></div>`;
     }).join("")
     : '<div class="empty-state">当前筛选下没有动态</div>';
   const notice = elements["new-message-notice"];
@@ -2797,7 +2802,7 @@ elements["task-timeline"].addEventListener("click", (event) => {
   }
   const copy = event.target.closest("[data-copy-event]");
   if (copy) {
-    copyEventReference(copy.dataset.copyEvent, copy.dataset.taskNumber);
+    copyEventReference(copy.dataset.copyEvent, copy.dataset.taskNumber, copy.dataset.copySeq);
   }
 });
 
@@ -3627,7 +3632,7 @@ function renderTaskTimeline(task) {
           ${item.result ? `<p>集成结果：${escapeHtml(item.result)}。验证通过不等于最终完成。</p>` : ""}
           ${renderHistoryEvidence(item)}
           ${renderHistoryAcknowledgements(item)}
-          <small class="secondary-text">${eventIdBadge(item.event_id)}${item.task_number ? ` · 任务 #${escapeHtml(item.task_number)}` : ""} <button type="button" class="link-button" data-copy-event="${item.event_id}" data-task-number="${item.task_number || ""}">复制引用</button></small>
+          <small class="secondary-text">${eventIdBadge(item.project_seq, item.event_id)}${item.task_number ? ` · 任务 #${escapeHtml(item.task_number)}` : ""} <button type="button" class="link-button" data-copy-event="${item.event_id}" data-copy-seq="${item.project_seq || ""}" data-task-number="${item.task_number || ""}">复制引用</button></small>
         </div>
       </li>`).join("")}</ol>`
     : '<div class="empty-state">尚无协作事件</div>';
@@ -3762,8 +3767,11 @@ async function loadTaskHistoryUntil(taskId, eventId) {
   }
 }
 
-async function copyEventReference(eventId, taskNumber) {
-  const text = taskNumber ? `任务 #${taskNumber} / 事件 #${eventId}` : `事件 #${eventId}`;
+async function copyEventReference(eventId, taskNumber, projectSeq) {
+  // 用户可读编号是项目内序号；全局 ID 保留在深链里用于内部定位。
+  const seq = Number(projectSeq);
+  const label = Number.isFinite(seq) && seq > 0 ? `事件 #${seq}` : `事件 #${eventId}`;
+  const text = taskNumber ? `任务 #${taskNumber} / ${label}` : label;
   location.hash = `event-${eventId}`;
   try {
     await navigator.clipboard.writeText(text);

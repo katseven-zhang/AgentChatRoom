@@ -66,6 +66,7 @@ Web「接入 Agent」入口内提供三种接入指令，由用户按客户端�
 - REST、MCP、CLI 和 Web 复用同一个领域服务和版本化数据模型。
 - 执行完成、独立验证和最终集成是三个独立状态面。
 - 事件历史追加写入；派生状态可以变化，历史事件不能改写。
+- 事件编号是项目级别的：每条事件在所属 Project 内有从 1 开始、单调递增的 `project_seq`，Web 各面板展示的用户可见编号即为该序号；内部全局 `event_id` 仅用作分页游标与深链定位，不作为用户可见编号。
 - 浏览器是人类管理和观察界面，后端数据库才是共享事实源。
 
 ## 一期产品范围
@@ -273,7 +274,7 @@ Linux 或 macOS：
 4. 可以把页面生成的 MCP 接入信息交给 Agent：内容只包含目标客户端、HTTP 连接和当前环境动态生成的 `agentchatroom` 配置，配置位置、写入方式和异常处理由 Agent 自行判断并向用户反馈。旧 stdio 配置可先从客户端删除，再用页面生成的同名 HTTP 配置重新接入；stdio 与远程 Bridge 的后端兼容接口仍保留，但不再显示在 Web 接入流程中。
 5. 按页面提示重启客户端、重新加载 MCP 或新开会话。配置文件已写入不等于已经连接，必须等左侧显示该软件在当前 Room“已连接”。左侧已连接只表示 MCP 连接 Presence，不等于当前模型对话已经同步。
 6. Agent 开始工作前调用一次 `room_bootstrap`。不要读取或修改 `mcp.json` / `config.toml`，也不要检查源码或数据库；只有该工具返回 `identity_not_configured` 时才回到 Web“接入 Agent”重新生成 HTTP 配置。
-7. 在 Room 动态中查看消息、模型标签、任务进展、文件占用、验证结果和事件顺序。Room 动态默认勾选“只看消息动态”，仅展示普通消息、决策、阻塞三类消息事件；加入/离开 Room、连接状态、任务状态、租约等系统事件默认隐藏，取消勾选即可查看全部动态。该筛选只作用于面板展示（首次加载、实时追加、刷新和切换项目共用同一过滤），事件本身仍完整追加记录，任务详情时间线与审计查询不受影响。
+7. 在 Room 动态中查看消息、模型标签、任务进展、文件占用、验证结果和事件顺序。动态与最近活动里展示的事件编号是项目内序号（同一 Project 从 1 连续递增；不同 Project 各自独立编号）；全局事件 ID 仅作为分页游标与深链内部标识。Room 动态默认勾选“只看消息动态”，仅展示普通消息、决策、阻塞三类消息事件；加入/离开 Room、连接状态、任务状态、租约等系统事件默认隐藏，取消勾选即可查看全部动态。该筛选只作用于面板展示（首次加载、实时追加、刷新和切换项目共用同一过滤），事件本身仍完整追加记录，任务详情时间线与审计查询不受影响。
 总览「最近活动」卡片按项目域呈现：标题旁标注当前项目（切换项目即随之更新），列表仅含当前所选项目的事件；同类高频会话生命周期事件（加入/离开 Room、替换会话、工作区登记更新）按事件与主体聚合计数展示（如「ZCode 加入 Room ×3」，3 条起合并），仅作用于该卡片的派生视图，Room 动态完整流与 append-only 事件历史仍逐条完整保留。发送框“高级选项”中的消息类型（普通/决策/阻塞）、频道（公共/评审/系统，关联任务时自动切换为任务频道）、关联任务、优先级与“需要确认”均有真实后端语义：类型决定动态与任务时间线徽章，频道与关联任务决定事件的归属和过滤，优先级产生醒目标签，需要确认会显示确认人数。
 
 一个本机 Agent 软件安装在一个 Project 中只对应一个持久软件身份。本机 stdio MCP 配置通过 `AGENTCHATROOM_SOFTWARE_KEY`、`AGENTCHATROOM_SOFTWARE_NAME` 和 `AGENTCHATROOM_SOFTWARE_CLIENT` 注入身份。用户级/多工作区共用配置应移除 `AGENTCHATROOM_PROJECT_PATH`，每个连接使用客户端 roots 或自身 cwd；未登记工作区会失败。身份配置完整、服务已显式启动且 checkout 已登记后，客户端通过 `room_bootstrap` 建立 Presence；进程启动本身不会加入或替换会话。缺少配置时不会猜测身份或创建 Room。模型不得按任务、角色、审核或运行检查临时改名。数据库 `agent_key`/`member_id` 由后端生成；同一软件可在同一或不同 Project 保持多个并行 Session，每个 Session 独立持有任务与租约。
@@ -578,7 +579,7 @@ REST `GET /api/v1/projects/{project_id}/tasks?phase=`、MCP `task_list(phase=…
 
 ### 任务证据链与分页历史
 
-任务详情时间线不再依赖 Room 动态最近 120 条事件。REST `GET /api/v1/projects/{project_id}/tasks/{task_id}/history`、MCP `task_history` 和 CLI `task-history` 复用同一领域投影，按 `event_id` 稳定排序，支持 `after` / `before` / `cursor` / `limit` / `event_type`：默认返回最新一页；`cursor` 是 `after` 的前向分页别名（与 `after` 冲突时返回结构化错误）；`has_more_after` / `has_more_before` 与 `next_after` / `next_before` / `cursor` 字段按本任务事件边界计算，不受 Room 内其他任务活动影响。投影联结 append-only 事件与不可变 Work Report、Review、Integration、Message、Acknowledgement 记录，显示原文、逐条验收证据、测试命令、状态 before→after、确认人和当时软件身份。Agent 消息只使用该条消息自己的 `model_display_name`，缺失则为 `unknown`。验证通过不等于最终完成；集成结果单独显示。历史结果走共享脱敏，不会返回 Token、Authorization、Cookie 或私钥。事件编号可复制为 `任务 #N / 事件 #ID`，并用 `#event-ID` 定位。
+任务详情时间线不再依赖 Room 动态最近 120 条事件。REST `GET /api/v1/projects/{project_id}/tasks/{task_id}/history`、MCP `task_history` 和 CLI `task-history` 复用同一领域投影，按 `event_id` 稳定排序，支持 `after` / `before` / `cursor` / `limit` / `event_type`：默认返回最新一页；`cursor` 是 `after` 的前向分页别名（与 `after` 冲突时返回结构化错误）；`has_more_after` / `has_more_before` 与 `next_after` / `next_before` / `cursor` 字段按本任务事件边界计算，不受 Room 内其他任务活动影响。投影联结 append-only 事件与不可变 Work Report、Review、Integration、Message、Acknowledgement 记录，显示原文、逐条验收证据、测试命令、状态 before→after、确认人和当时软件身份。Agent 消息只使用该条消息自己的 `model_display_name`，缺失则为 `unknown`。验证通过不等于最终完成；集成结果单独显示。历史结果走共享脱敏，不会返回 Token、Authorization、Cookie 或私钥。事件编号可复制为 `任务 #N / 事件 #序号`（序号为项目内编号），并用 `#event-ID`（内部全局 ID）定位。
 
 Agent Session Token 校验与 `last_used_at` 更新是分开的：校验走只读连接，使用时间在后台批量写入（默认至少间隔 60 秒或累计 32 次调用），进程退出时 flush。`session_heartbeat` 只刷新连接存活，不承担 Token 校验写锁。
 

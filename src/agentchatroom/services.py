@@ -614,6 +614,65 @@ class AgentChatRoomService:
             (project_id,),
         ).fetchone()
 
+    def _lock_event_number_sequence(
+        self, connection: Any, project_id: str
+    ) -> Mapping[str, Any] | None:
+        if getattr(self.database, "backend", "sqlite") == "postgresql":
+            return connection.execute(
+                """
+                SELECT next_value FROM event_number_sequences
+                WHERE project_id = ? FOR UPDATE
+                """,
+                (project_id,),
+            ).fetchone()
+        return connection.execute(
+            "SELECT next_value FROM event_number_sequences WHERE project_id = ?",
+            (project_id,),
+        ).fetchone()
+
+    def _next_event_number(self, connection: Any, project_id: str) -> int:
+        """Allocate the next Project-scoped event number inside the caller's write transaction.
+
+        The counter seeds itself from the current maximum when a Project emits
+        its first event after this feature, so databases migrated by schema 22
+        and databases created fresh behave identically.
+        """
+        for _ in range(5):
+            row = self._lock_event_number_sequence(connection, project_id)
+            if row is None:
+                maximum = int(
+                    connection.execute(
+                        """
+                        SELECT COALESCE(MAX(project_seq), 0) AS project_seq
+                        FROM events WHERE project_id = ?
+                        """,
+                        (project_id,),
+                    ).fetchone()["project_seq"]
+                )
+                connection.execute(
+                    """
+                    INSERT INTO event_number_sequences(project_id, next_value)
+                    VALUES (?, ?)
+                    ON CONFLICT(project_id) DO NOTHING
+                    """,
+                    (project_id, maximum + 1),
+                )
+                continue
+            allocated = int(row["next_value"])
+            connection.execute(
+                """
+                UPDATE event_number_sequences
+                SET next_value = ? WHERE project_id = ?
+                """,
+                (allocated + 1, project_id),
+            )
+            return allocated
+        raise DomainError(
+            "event_number_allocation_failed",
+            "Could not allocate a Project-scoped event number",
+            status_code=500,
+        )
+
     def _next_task_number(self, connection: Any, project_id: str) -> int:
         """Allocate the next Project-scoped number inside the caller's write transaction."""
         for _ in range(5):
@@ -727,8 +786,8 @@ class AgentChatRoomService:
                 event_payload["task_number"] = int(task["task_number"])
         row = connection.execute(
             """
-            INSERT INTO events(project_id, event_type, actor_session_id, task_id, payload_json, created_at)
-            VALUES (?, ?, ?, ?, ?, ?)
+            INSERT INTO events(project_id, event_type, actor_session_id, task_id, payload_json, project_seq, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
             RETURNING id
             """,
             (
@@ -737,6 +796,7 @@ class AgentChatRoomService:
                 actor_session_id,
                 task_id,
                 json_dump(event_payload),
+                self._next_event_number(connection, project_id),
                 iso_now(),
             ),
         ).fetchone()
