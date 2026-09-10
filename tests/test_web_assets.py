@@ -280,8 +280,8 @@ def test_web_supports_human_reading_and_guided_interactions():
     assert "snapshot.agent_identities" in javascript
     assert "当前连接" in javascript
     assert "累计" in javascript and "次接入" in javascript
-    assert 'app.css?v=1.0.0-central52' in markup
-    assert 'app.js?v=1.0.0-central52' in markup
+    assert 'app.css?v=1.0.0-central53' in markup
+    assert 'app.js?v=1.0.0-central53' in markup
     assert len(re.findall(r'<script\b[^>]*src="/assets/app\.js', markup)) == 1
     assert 'id="task-history-filter"' in markup
     assert "function loadTaskHistory(" in javascript
