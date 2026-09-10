@@ -191,6 +191,13 @@ assert.equal(
   cleanDatabaseConfig.mcpServers.agentchatroom.headers['X-AgentChatRoom-Software-Key'],
   genericIdentity.softwareKey,
 );
+const encodedGenericName = cleanDatabaseConfig.mcpServers.agentchatroom.headers['X-AgentChatRoom-Software-Name'];
+assert.match(encodedGenericName, /^acr-utf8\.v1\.[A-Za-z0-9_-]+$/);
+assert.equal(context.decodeHttpIdentityHeaderValue(encodedGenericName), genericIdentity.softwareName);
+assert.deepEqual(
+  JSON.parse(JSON.stringify(context.parseExistingSoftwareIdentity(JSON.stringify(cleanDatabaseConfig)))),
+  JSON.parse(JSON.stringify(genericIdentity)),
+);
 
 assert.throws(
   () => context.normalizedSoftwareIdentity({softwareKey: 'only-key'}),

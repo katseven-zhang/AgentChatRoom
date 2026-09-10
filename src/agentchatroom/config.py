@@ -22,6 +22,7 @@ CONFIG_FILE_SCHEMA: dict[str, dict[str, tuple[type, ...]]] = {
         "mcp_http_path": (str,),
         "mcp_http_stateless": (bool,),
         "mcp_http_json_response": (bool,),
+        "mcp_http_session_idle_timeout_seconds": (int, float),
         "mcp_bridge_command": (str,),
         "external_base_url": (str,),
         "trusted_proxy_headers": (bool,),
@@ -146,6 +147,7 @@ class Settings:
     mcp_http_path: str = "/mcp"
     mcp_http_stateless: bool = False
     mcp_http_json_response: bool = True
+    mcp_http_session_idle_timeout_seconds: float = 300.0
     mcp_bridge_command: str = "python"
     external_base_url: str = ""
     trusted_proxy_headers: bool = True
@@ -248,6 +250,9 @@ def _merge_toml(path: Path) -> dict[str, Any]:
         "mcp_http_stateless": raw.get("server", {}).get("mcp_http_stateless"),
         "mcp_http_json_response": raw.get("server", {}).get(
             "mcp_http_json_response"
+        ),
+        "mcp_http_session_idle_timeout_seconds": raw.get("server", {}).get(
+            "mcp_http_session_idle_timeout_seconds"
         ),
         "mcp_bridge_command": raw.get("server", {}).get("mcp_bridge_command"),
         "external_base_url": raw.get("server", {}).get("external_base_url"),
@@ -391,6 +396,12 @@ def load_settings(
         "mcp_http_json_response": environment_bool(
             "AGENTCHATROOM_MCP_HTTP_JSON_RESPONSE",
             file_values.get("mcp_http_json_response", True),
+        ),
+        "mcp_http_session_idle_timeout_seconds": float(
+            os.getenv(
+                "AGENTCHATROOM_MCP_HTTP_SESSION_IDLE_TIMEOUT_SECONDS",
+                file_values.get("mcp_http_session_idle_timeout_seconds", 300.0),
+            )
         ),
         "mcp_bridge_command": os.getenv(
             "AGENTCHATROOM_MCP_BRIDGE_COMMAND",
@@ -604,6 +615,8 @@ def load_settings(
         raise ValueError("MCP HTTP path must start with / and have no trailing /")
     if not str(values["mcp_bridge_command"]).strip():
         raise ValueError("MCP Bridge command must not be empty")
+    if values["mcp_http_session_idle_timeout_seconds"] <= 0:
+        raise ValueError("MCP HTTP session idle timeout must be positive")
     external_base_url = str(values["external_base_url"])
     if external_base_url and not external_base_url.startswith(("http://", "https://")):
         raise ValueError("external base URL must start with http:// or https://")

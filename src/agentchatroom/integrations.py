@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from .config import Settings
+from .http_identity import encode_http_identity_value
 
 
 MCP_SERVER_NAME = "agentchatroom"
@@ -139,14 +140,17 @@ def _build_toml(server: dict[str, Any], environment: dict[str, str]) -> str:
 
 def _streamable_http_identity_headers(identity_env: Mapping[str, str]) -> dict[str, str]:
     return {
-        SOFTWARE_KEY_HEADER: str(
-            identity_env.get(SOFTWARE_KEY_ENV_VAR) or "<stable-software-key>"
+        SOFTWARE_KEY_HEADER: encode_http_identity_value(
+            str(identity_env.get(SOFTWARE_KEY_ENV_VAR) or "<stable-software-key>")
         ),
-        SOFTWARE_NAME_HEADER: str(
-            identity_env.get(SOFTWARE_NAME_ENV_VAR) or "<Software name>"
+        SOFTWARE_NAME_HEADER: encode_http_identity_value(
+            str(identity_env.get(SOFTWARE_NAME_ENV_VAR) or "<Software name>")
         ),
-        SOFTWARE_CLIENT_HEADER: str(
-            identity_env.get(SOFTWARE_CLIENT_ENV_VAR) or "<software-client-code>"
+        SOFTWARE_CLIENT_HEADER: encode_http_identity_value(
+            str(
+                identity_env.get(SOFTWARE_CLIENT_ENV_VAR)
+                or "<software-client-code>"
+            )
         ),
     }
 

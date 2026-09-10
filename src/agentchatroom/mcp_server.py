@@ -29,6 +29,7 @@ from .credential_bundle import (
 )
 from .database import create_database
 from .errors import DomainError
+from .http_identity import decode_http_identity_value
 from .mcp_compat import CompatibleToolManager
 from .presence import LocalPresenceManager
 from .service_lifetime import require_running_service
@@ -89,6 +90,8 @@ _bootstrap_http_identity: ContextVar[tuple[str, str, str] | None] = ContextVar(
 SOFTWARE_KEY_HEADER = "x-agentchatroom-software-key"
 SOFTWARE_NAME_HEADER = "x-agentchatroom-software-name"
 SOFTWARE_CLIENT_HEADER = "x-agentchatroom-software-client"
+MCP_SESSION_ID_HEADER = "mcp-session-id"
+HTTP_TRANSPORT_KEY_PREFIX = "http-session:"
 HTTP_UNREGISTERED_ROOTS_ACTION = (
     "Confirm the MCP client advertised workspace roots match a Project already "
     "registered on this server (root_path, logical_path, or a previously "
@@ -318,11 +321,24 @@ def _software_identity_from_http(context: Any) -> tuple[str, str, str] | None:
     headers = getattr(request, "headers", None)
     if headers is None:
         return credential_identity
-    header_identity = _identity_tuple(
-        headers.get(SOFTWARE_KEY_HEADER),
-        headers.get(SOFTWARE_NAME_HEADER),
-        headers.get(SOFTWARE_CLIENT_HEADER),
-    )
+    try:
+        header_values = tuple(
+            decode_http_identity_value(value)
+            if (value := headers.get(header_name)) is not None
+            else None
+            for header_name in (
+                SOFTWARE_KEY_HEADER,
+                SOFTWARE_NAME_HEADER,
+                SOFTWARE_CLIENT_HEADER,
+            )
+        )
+    except ValueError as error:
+        raise DomainError(
+            "invalid_software_identity_header",
+            str(error),
+            status_code=400,
+        ) from error
+    header_identity = _identity_tuple(*header_values)
     if (
         credential_identity is not None
         and header_identity is not None
@@ -343,6 +359,12 @@ def mcp_session_key(context: Any = None) -> str:
     request_context = getattr(context, "request_context", None) if context is not None else None
     if request_context is None and context is not None:
         request_context = getattr(context, "_request_context", None)
+    request = getattr(request_context, "request", None) if request_context is not None else None
+    headers = getattr(request, "headers", None)
+    if headers is not None:
+        http_session_id = str(headers.get(MCP_SESSION_ID_HEADER) or "").strip()
+        if http_session_id:
+            return f"{HTTP_TRANSPORT_KEY_PREFIX}{http_session_id}"
     session = getattr(request_context, "session", None) if request_context is not None else None
     if session is None and context is not None:
         session = getattr(context, "session", None)
@@ -390,6 +412,22 @@ def transport_binding_alive(session_key: str) -> bool:
             reference() is not None and key == session_key
             for reference, key in _transport_keys.values()
         )
+
+
+def http_transport_binding_alive(session_manager: Any, session_key: str) -> bool:
+    """Check a stateful HTTP binding against the SDK's active transport map."""
+    if not session_key.startswith(HTTP_TRANSPORT_KEY_PREFIX):
+        return transport_binding_alive(session_key)
+    http_session_id = session_key[len(HTTP_TRANSPORT_KEY_PREFIX) :]
+    active = getattr(session_manager, "_server_instances", {})
+    transport = active.get(http_session_id) if isinstance(active, dict) else None
+    alive = transport is not None and not bool(
+        getattr(transport, "is_terminated", False)
+    )
+    if not alive:
+        with _session_bindings_lock:
+            _session_bindings.pop(session_key, None)
+    return alive
 
 
 def get_runtime_binding(session_key: str | None = None) -> RuntimeBinding | None:

@@ -3259,6 +3259,28 @@ const SOFTWARE_IDENTITY_HEADER_NAMES = Object.freeze({
   softwareClient: "X-AgentChatRoom-Software-Client",
 });
 
+const HTTP_IDENTITY_UTF8_PREFIX = "acr-utf8.v1.";
+
+function encodeHttpIdentityHeaderValue(value) {
+  const normalized = String(value || "").trim();
+  if (!normalized || /[\x00-\x1f\x7f]/.test(normalized)) {
+    throw new Error("软件身份 Header 必须是非空且不含控制字符的文本");
+  }
+  return /^[\x20-\x7e]+$/.test(normalized)
+    ? normalized
+    : `${HTTP_IDENTITY_UTF8_PREFIX}${encodeBase64UrlUtf8(normalized)}`;
+}
+
+function decodeHttpIdentityHeaderValue(value) {
+  const normalized = String(value || "").trim();
+  if (!normalized.startsWith(HTTP_IDENTITY_UTF8_PREFIX)) return normalized;
+  try {
+    return decodeBase64UrlUtf8(normalized.slice(HTTP_IDENTITY_UTF8_PREFIX.length));
+  } catch (_error) {
+    throw new Error("已有配置包含无效的软件身份 Header 编码");
+  }
+}
+
 function normalizedSoftwareIdentity(identity) {
   if (!identity) return null;
   const normalized = Object.fromEntries(
@@ -3314,7 +3336,7 @@ function parseExistingSoftwareIdentity(input) {
     const values = new Set();
     for (const pattern of patterns) {
       for (const match of value.matchAll(pattern)) {
-        if (match[1].trim()) values.add(match[1].trim());
+        if (match[1].trim()) values.add(decodeHttpIdentityHeaderValue(match[1]));
       }
     }
     if (values.size > 1) throw new Error(`已有配置包含冲突的 ${header}`);
@@ -3424,15 +3446,16 @@ function issuedHttpConfig(profile, projectCredentials, softwareIdentity) {
     const parsed = JSON.parse(config);
     for (const server of Object.values(parsed.mcpServers || {})) {
       server.headers.Authorization = `Bearer ${bundle}`;
-      server.headers["X-AgentChatRoom-Software-Key"] = identity.softwareKey;
-      server.headers["X-AgentChatRoom-Software-Name"] = identity.softwareName;
-      server.headers["X-AgentChatRoom-Software-Client"] = identity.softwareClient;
+      server.headers["X-AgentChatRoom-Software-Key"] = encodeHttpIdentityHeaderValue(identity.softwareKey);
+      server.headers["X-AgentChatRoom-Software-Name"] = encodeHttpIdentityHeaderValue(identity.softwareName);
+      server.headers["X-AgentChatRoom-Software-Client"] = encodeHttpIdentityHeaderValue(identity.softwareClient);
     }
     return JSON.stringify(parsed, null, 2);
   }
   const authorization = `Authorization = ${JSON.stringify(`Bearer ${bundle}`)}`;
-  const identityHeaders = {"X-AgentChatRoom-Software-Key": identity.softwareKey,
-    "X-AgentChatRoom-Software-Name": identity.softwareName, "X-AgentChatRoom-Software-Client": identity.softwareClient};
+  const identityHeaders = {"X-AgentChatRoom-Software-Key": encodeHttpIdentityHeaderValue(identity.softwareKey),
+    "X-AgentChatRoom-Software-Name": encodeHttpIdentityHeaderValue(identity.softwareName),
+    "X-AgentChatRoom-Software-Client": encodeHttpIdentityHeaderValue(identity.softwareClient)};
   for (const [key, value] of Object.entries(identityHeaders)) {
       const line = `${key} = ${JSON.stringify(value)}`;
       const existing = new RegExp(`^${key} = .*$`, "m");

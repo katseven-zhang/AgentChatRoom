@@ -16,6 +16,7 @@ schema_version = 1
 host = "0.0.0.0"
 port = 9100
 mcp_http_json_response = false
+mcp_http_session_idle_timeout_seconds = 90
 mcp_bridge_command = "python-from-file"
 
 [database]
@@ -47,6 +48,7 @@ default_theme = "dark"
     monkeypatch.setenv("AGENTCHATROOM_DATA_DIR", str(tmp_path / "data"))
     monkeypatch.setenv("AGENTCHATROOM_PORT", "9200")
     monkeypatch.setenv("AGENTCHATROOM_MCP_HTTP_JSON_RESPONSE", "true")
+    monkeypatch.setenv("AGENTCHATROOM_MCP_HTTP_SESSION_IDLE_TIMEOUT_SECONDS", "120")
     monkeypatch.setenv("AGENTCHATROOM_MCP_BRIDGE_COMMAND", "python-from-env")
 
     settings = load_settings(config_path)
@@ -55,6 +57,7 @@ default_theme = "dark"
     assert settings.port == 9200
     assert settings.deployment_profile == "local"
     assert settings.mcp_http_json_response is True
+    assert settings.mcp_http_session_idle_timeout_seconds == 120
     assert settings.mcp_bridge_command == "python-from-env"
     assert settings.product_name == "Configured Room"
     assert settings.default_lease_ttl_seconds == 120
@@ -135,6 +138,14 @@ def test_presence_keepalive_interval_must_be_less_than_timeout(monkeypatch, tmp_
     monkeypatch.setenv("AGENTCHATROOM_PRESENCE_KEEPALIVE_INTERVAL_SECONDS", "10")
 
     with pytest.raises(ValueError, match="less than heartbeat timeout"):
+        load_settings()
+
+
+def test_mcp_http_session_idle_timeout_must_be_positive(monkeypatch, tmp_path):
+    monkeypatch.setenv("AGENTCHATROOM_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("AGENTCHATROOM_MCP_HTTP_SESSION_IDLE_TIMEOUT_SECONDS", "0")
+
+    with pytest.raises(ValueError, match="session idle timeout must be positive"):
         load_settings()
 
 

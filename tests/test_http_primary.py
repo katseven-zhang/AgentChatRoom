@@ -61,6 +61,27 @@ def _boot(service, *, key, name, client, **kwargs):
     )
 
 
+def test_http_identity_recovers_legacy_utf8_header_bytes():
+    name = "通用（标准 MCP）"
+    context = SimpleNamespace(
+        request_context=SimpleNamespace(
+            request=SimpleNamespace(
+                headers={
+                    mcp_server.SOFTWARE_KEY_HEADER: "standard-mcp-installation",
+                    mcp_server.SOFTWARE_NAME_HEADER: name.encode("utf-8").decode("latin-1"),
+                    mcp_server.SOFTWARE_CLIENT_HEADER: "standard-mcp",
+                }
+            )
+        )
+    )
+
+    assert mcp_server._software_identity_from_http(context) == (
+        "standard-mcp-installation",
+        name,
+        "standard-mcp",
+    )
+
+
 def test_db_root_match_does_not_need_checkout_file(service, project_dir):
     project = service.create_project(root_path=str(project_dir), name="HTTP Room")
     assert not (project_dir / ".agentchatroom" / "project.json").exists()
@@ -697,8 +718,10 @@ async def test_http_transport_presence_keeps_idle_session_online_and_closes_on_d
         settings,
         heartbeat_timeout_seconds=1,
         presence_keepalive_interval_seconds=0.05,
+        mcp_http_session_idle_timeout_seconds=0.5,
     )
     app = create_app(tuned)
+    assert app.state.mcp_server.session_manager.session_idle_timeout == 0.5
     project = app.state.service.create_project(
         root_path=str(project_dir), name="HTTP Presence"
     )
@@ -760,6 +783,111 @@ async def test_http_transport_presence_keeps_idle_session_online_and_closes_on_d
                     break
                 await asyncio.sleep(0.05)
             assert agent["status"] == "offline"
+    finally:
+        server.should_exit = True
+        await server_task
+        _clear_http_mcp_context()
+
+
+@pytest.mark.asyncio
+async def test_abandoned_http_transport_is_reaped_and_stops_presence(
+    settings, project_dir
+):
+    tuned = replace(
+        settings,
+        heartbeat_timeout_seconds=1,
+        presence_keepalive_interval_seconds=0.05,
+        mcp_http_session_idle_timeout_seconds=0.3,
+    )
+    app = create_app(tuned)
+    project = app.state.service.create_project(
+        root_path=str(project_dir), name="Abandoned HTTP Presence"
+    )
+    credential = app.state.service.issue_agent_token(
+        project["id"], name="Abandoned HTTP Presence"
+    )
+    bundle = encode_project_credential_bundle(
+        [{"name": project["name"], "token": credential["token"]}]
+    )
+    with socket.socket() as listener:
+        listener.bind(("127.0.0.1", 0))
+        port = listener.getsockname()[1]
+    server = uvicorn.Server(
+        uvicorn.Config(app, host="127.0.0.1", port=port, log_level="error")
+    )
+    server_task = asyncio.create_task(server.serve())
+    deadline = asyncio.get_running_loop().time() + 10
+    while not server.started and asyncio.get_running_loop().time() < deadline:
+        await asyncio.sleep(0.02)
+    assert server.started
+    url = f"http://127.0.0.1:{port}{tuned.mcp_http_path}"
+    headers = {
+        "Authorization": f"Bearer {bundle}",
+        "X-AgentChatRoom-Software-Key": "abandoned-http",
+        "X-AgentChatRoom-Software-Name": "Abandoned HTTP",
+        "X-AgentChatRoom-Software-Client": "test-http",
+        "accept": "application/json, text/event-stream",
+        "content-type": "application/json",
+    }
+    try:
+        async with httpx.AsyncClient(headers=headers, timeout=10.0) as client:
+            initialized = await client.post(
+                url,
+                json={
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "initialize",
+                    "params": {
+                        "protocolVersion": "2025-06-18",
+                        "capabilities": {},
+                        "clientInfo": {"name": "abandoning-client", "version": "1"},
+                    },
+                },
+            )
+            assert initialized.status_code == 200, initialized.text
+            transport_session_id = initialized.headers["mcp-session-id"]
+            transport_headers = {"mcp-session-id": transport_session_id}
+            notified = await client.post(
+                url,
+                headers=transport_headers,
+                json={"jsonrpc": "2.0", "method": "notifications/initialized"},
+            )
+            assert notified.status_code == 202, notified.text
+            booted = await client.post(
+                url,
+                headers=transport_headers,
+                json={
+                    "jsonrpc": "2.0",
+                    "id": 2,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "room_bootstrap",
+                        "arguments": {"project_name": project["name"]},
+                    },
+                },
+            )
+            assert booted.status_code == 200, booted.text
+            tool_payload = json.loads(booted.json()["result"]["content"][0]["text"])
+            assert tool_payload["ok"], tool_payload
+            room_session_id = tool_payload["result"]["session"]["id"]
+            # Intentionally omit the MCP DELETE request used by compliant clients.
+
+        deadline = asyncio.get_running_loop().time() + 3
+        agent = None
+        while asyncio.get_running_loop().time() < deadline:
+            agent = next(
+                item
+                for item in app.state.service.snapshot(project["id"])["agents"]
+                if item["id"] == room_session_id
+            )
+            if agent["status"] == "offline":
+                break
+            await asyncio.sleep(0.05)
+        assert agent is not None
+        assert agent["status"] == "offline"
+        assert mcp_server.get_runtime_binding(
+            f"{mcp_server.HTTP_TRANSPORT_KEY_PREFIX}{transport_session_id}"
+        ) is None
     finally:
         server.should_exit = True
         await server_task

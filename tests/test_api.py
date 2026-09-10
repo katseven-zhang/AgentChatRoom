@@ -144,6 +144,9 @@ def test_health_and_project_room_flow(settings, project_dir):
         assert public_config.json()["capabilities"]["local_folder_picker"] is True
         assert public_config.json()["capabilities"]["local_mcp_config_assistant"] is True
         assert public_config.json()["capabilities"]["room_bootstrap"] is True
+        assert public_config.json()["mcp_http_session_idle_timeout_seconds"] == (
+            settings.mcp_http_session_idle_timeout_seconds
+        )
         assert public_config.json()["domain"]["bootstrap_schema_version"] == 1
         assert "ready" in public_config.json()["domain"]["bootstrap_states"]
         assert public_config.json()["domain"]["bootstrap_required_actions"][

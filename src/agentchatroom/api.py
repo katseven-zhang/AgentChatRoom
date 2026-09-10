@@ -28,7 +28,7 @@ from .desktop import DirectoryPickerUnavailable, pick_directory
 from .errors import DomainError
 from .integrations import build_mcp_integration
 from .local_mcp import LocalMcpConfigurator
-from .mcp_server import create_mcp, transport_binding_alive
+from .mcp_server import create_mcp, http_transport_binding_alive
 from .presence import LocalPresenceManager
 from .service_lifetime import running_service
 from .project_registration import (
@@ -893,7 +893,6 @@ def create_app(
         service,
         enabled=resolved.mcp_http_enabled and resolved.presence_keepalive_enabled,
         interval_seconds=resolved.presence_keepalive_interval_seconds,
-        transport_check=transport_binding_alive,
     )
     mcp_server = create_mcp(
         service,
@@ -910,6 +909,16 @@ def create_app(
     mcp_http_app = (
         mcp_server.streamable_http_app() if resolved.mcp_http_enabled else None
     )
+    if mcp_http_app is not None:
+        # Stateful HTTP clients are expected to terminate their MCP Session.
+        # Reap abandoned transports as a bounded fallback so their background
+        # presence heartbeat cannot keep an old task owner online forever.
+        mcp_server.session_manager.session_idle_timeout = (
+            resolved.mcp_http_session_idle_timeout_seconds
+        )
+        http_presence_manager.transport_check = lambda key: http_transport_binding_alive(
+            mcp_server.session_manager, key
+        )
 
     auto_backup_stop = threading.Event()
 
@@ -1199,6 +1208,9 @@ def create_app(
             "presence_keepalive_enabled": resolved.presence_keepalive_enabled,
             "presence_keepalive_interval_seconds": (
                 resolved.presence_keepalive_interval_seconds
+            ),
+            "mcp_http_session_idle_timeout_seconds": (
+                resolved.mcp_http_session_idle_timeout_seconds
             ),
             "config_schema_version": resolved.config_schema_version,
             "default_lease_ttl_seconds": resolved.default_lease_ttl_seconds,

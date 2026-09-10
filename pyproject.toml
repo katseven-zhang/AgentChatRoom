@@ -11,7 +11,7 @@ license = "MIT"
 authors = [{ name = "AgentChatRoom Contributors" }]
 dependencies = [
   "fastapi>=0.116,<1",
-  "mcp>=1.12,<2",
+  "mcp>=1.29.1,<2",
   "typing-extensions>=4.12,<5",
   "uvicorn[standard]>=0.35,<1",
 ]
