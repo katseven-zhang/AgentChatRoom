@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import json
 import os
+import platform
 import signal
 import subprocess
 import sys
@@ -103,6 +105,272 @@ def print_server_log(settings, *, lines: int = 80, follow: bool = False) -> None
                 return
             else:
                 time.sleep(0.2)
+
+
+class SubmitError(Exception):
+    """A structured, machine-readable failure of the one-shot submit command."""
+
+    def __init__(self, code: str, message: str, required_action: str = "") -> None:
+        super().__init__(message)
+        self.code = code
+        self.message = message
+        self.required_action = required_action
+
+    def payload(self) -> dict[str, Any]:
+        error: dict[str, Any] = {"code": self.code, "message": self.message}
+        if self.required_action:
+            error["required_action"] = self.required_action
+        return {"ok": False, "error": error}
+
+
+def _decode_submit_bundle(value: str) -> list[dict[str, str]]:
+    """Decode an acrb.v1 bundle literal or file into its project entries."""
+    text = value.strip()
+    path = Path(text)
+    if path.is_file():
+        text = path.read_text(encoding="utf-8").strip()
+    if not text.startswith("acrb.v1."):
+        raise SubmitError(
+            "submit_bundle_invalid",
+            "The --bundle value must be an acrb.v1 bundle literal or a file "
+            "containing one",
+        )
+    raw = text[len("acrb.v1.") :]
+    try:
+        decoded = json.loads(
+            base64.urlsafe_b64decode(raw + "=" * (-len(raw) % 4)).decode("utf-8")
+        )
+    except (ValueError, UnicodeDecodeError) as error:
+        raise SubmitError(
+            "submit_bundle_invalid", "The acrb.v1 bundle is not decodable"
+        ) from error
+    entries: list[dict[str, str]] = []
+    for item in decoded.get("projects") or []:
+        name = str(item.get("name") or "").strip()
+        token = str(item.get("token") or "").strip()
+        if name and token:
+            entries.append({"name": name, "token": token})
+    if not entries:
+        raise SubmitError("submit_bundle_invalid", "The bundle carries no projects")
+    return entries
+
+
+def run_submit(args: argparse.Namespace, base_url: str) -> dict[str, Any]:
+    """One-shot REST submission fallback for when the MCP transport is down.
+
+    Joins exactly once with a project credential (auto-registering the
+    workspace first, mirroring ``room_bootstrap``), optionally posts one room
+    message and/or one work report, then leaves. Everything happens over the
+    REST API of the running service, so a dead MCP transport cannot block the
+    evidence submission loop.
+    """
+    has_message = bool(str(args.message or "").strip())
+    has_report = bool(str(args.report_task or "").strip())
+    if not has_message and not has_report:
+        raise SubmitError(
+            "submit_noop", "Provide --message and/or --report-task with its evidence"
+        )
+    if has_report and not str(args.summary or "").strip():
+        raise SubmitError(
+            "submit_report_evidence_required", "Work report needs --summary"
+        )
+    if has_report and not (args.file or args.test or str(args.no_code_change or "").strip()):
+        raise SubmitError(
+            "submit_report_evidence_required",
+            "Work report needs --file, --test, or --no-code-change evidence",
+        )
+
+    projects = request_json(base_url, "GET", "/api/v1/projects")["projects"]
+    wanted = str(args.project).strip()
+    project = next(
+        (
+            item
+            for item in projects
+            if item.get("id") == wanted
+            or str(item.get("name") or "").strip().casefold() == wanted.casefold()
+        ),
+        None,
+    )
+    if project is None:
+        known = ", ".join(sorted(str(item.get("name") or "") for item in projects))
+        raise SubmitError(
+            "submit_project_not_found",
+            f"Project {wanted!r} was not found on the service (known: {known})",
+        )
+    project_id = str(project["id"])
+    project_name = str(project.get("name") or "")
+
+    if args.token:
+        token = str(args.token).strip()
+    else:
+        entries = _decode_submit_bundle(str(args.bundle))
+        entry = next(
+            (
+                item
+                for item in entries
+                if item["name"].casefold() == project_name.casefold()
+            ),
+            None,
+        )
+        if entry is None:
+            raise SubmitError(
+                "submit_project_not_in_bundle",
+                "The bundle carries no credential for "
+                f"{project_name!r} (known: {', '.join(sorted(item['name'] for item in entries))})",
+                "issue_new_project_token_and_update_bundle",
+            )
+        token = entry["token"]
+
+    match = __import__("re").match(r"acr\.credential_([0-9a-f]+)\.", token)
+    if match is None:
+        raise SubmitError("submit_token_invalid", "The project credential is malformed")
+    credential_id = f"credential_{match.group(1)}"
+    credentials = request_json(
+        base_url, "GET", f"/api/v1/projects/{project_id}/agent-tokens"
+    )["credentials"]
+    credential = next(
+        (item for item in credentials if item.get("id") == credential_id), None
+    )
+    if credential is None or not credential.get("active"):
+        raise SubmitError(
+            "submit_credential_invalid",
+            "The presented project credential is unknown, revoked, or expired",
+            "issue_new_project_token_and_update_bundle",
+        )
+
+    local_path = str(Path(args.cwd or os.getcwd()).resolve())
+    registered = request_json(
+        base_url,
+        "POST",
+        f"/api/v1/projects/{project_id}/workspaces",
+        {
+            "host_key": f"submit-{platform.node()}",
+            "host_name": platform.node(),
+            "local_path": local_path,
+        },
+    )
+    workspace_id = str(registered.get("workspace", {}).get("id") or "")
+    host_id = str(registered.get("host", {}).get("id") or "")
+
+    member_id = credential.get("member_id")
+    members = request_json(
+        base_url, "GET", f"/api/v1/projects/{project_id}/members"
+    ).get("members", [])
+    member = next(
+        (item for item in members if item.get("id") == member_id), None
+    ) if member_id else None
+    member_key = str((member or {}).get("member_key") or "").strip()
+    name = str(args.name or (member or {}).get("name") or "CLI submit").strip()
+    client = str(args.client or member_key.removeprefix("software:") or "cli-submit").strip()
+
+    joined = request_json(
+        base_url,
+        "POST",
+        f"/api/v1/projects/{project_id}/agents/join",
+        {
+            "name": name,
+            "client": client,
+            "model": str(args.model or "unknown"),
+            "credential_id": credential_id,
+            "member_id": member_id,
+            "workspace_id": workspace_id,
+            "host_id": host_id,
+        },
+    )
+    session_id = str(joined["agent"]["id"])
+    session_token = str(joined.get("token") or joined.get("session_token") or "")
+    result: dict[str, Any] = {
+        "ok": True,
+        "project": {"id": project_id, "name": project_name},
+        "session": {"id": session_id, "member_id": member_id},
+        "workspace_id": workspace_id,
+    }
+
+    if has_message:
+        posted = request_json(
+            base_url,
+            "POST",
+            f"/api/v1/projects/{project_id}/messages",
+            {
+                "body": str(args.message).strip(),
+                "session_id": session_id,
+                "token": session_token,
+                "model_display_name": str(
+                    args.model_display_name or args.model or "unknown"
+                ),
+            },
+        )
+        result["message_event_id"] = posted.get("event", {}).get("id") or posted.get(
+            "event_id"
+        )
+
+    if has_report:
+        task_ref = str(args.report_task).strip()
+        if task_ref.isdigit():
+            try:
+                task = request_json(
+                    base_url,
+                    "GET",
+                    f"/api/v1/projects/{project_id}/tasks/by-number/{task_ref}",
+                )
+                task_id = str(task.get("task", {}).get("id") or task.get("id") or "")
+            except SystemExit:
+                task_id = task_ref
+        else:
+            task_id = task_ref
+        # A dead transport usually means the task was claimed by the previous
+        # session of this same identity: reclaim it explicitly instead of
+        # failing the report with not_task_owner.
+        try:
+            request_json(
+                base_url,
+                "POST",
+                f"/api/v1/projects/{project_id}/tasks/{task_id}/claim",
+                {"session_id": session_id, "token": session_token, "reclaim": True},
+            )
+            result["task_reclaimed"] = True
+        except SystemExit:
+            result["task_reclaimed"] = False
+        tests: list[dict[str, Any]] = []
+        for spec in args.test:
+            command, _, exit_code = str(spec).rpartition("::")
+            tests.append(
+                {
+                    "command": command or str(spec),
+                    "exit_code": int(exit_code) if exit_code.lstrip("-").isdigit() else 0,
+                }
+            )
+        report = request_json(
+            base_url,
+            "POST",
+            f"/api/v1/projects/{project_id}/tasks/{task_id}/reports",
+            {
+                "session_id": session_id,
+                "token": session_token,
+                "summary": str(args.summary).strip(),
+                "files": list(args.file),
+                "tests": tests,
+                "commit_hash": str(args.commit or ""),
+                "no_code_change_reason": str(args.no_code_change or ""),
+            },
+        )
+        result["report"] = {
+            "task_id": task_id,
+            "report_id": report.get("report", {}).get("id") or report.get("report_id"),
+            "task_status": report.get("task_status"),
+        }
+
+    if not args.keep_session:
+        request_json(
+            base_url,
+            "POST",
+            f"/api/v1/projects/{project_id}/agents/{session_id}/leave",
+            {"token": session_token},
+        )
+        result["left"] = True
+    else:
+        result["left"] = False
+    return result
 
 
 def validate_runtime_settings(settings) -> dict[str, Any]:
@@ -642,6 +910,76 @@ def build_parser() -> argparse.ArgumentParser:
     leave.add_argument("project_id")
     leave.add_argument("--session-id", required=True)
     leave.add_argument("--token", required=True)
+
+    submit = commands.add_parser(
+        "submit",
+        help=(
+            "One-shot submission fallback over REST when the MCP transport is "
+            "unavailable"
+        ),
+        description=(
+            "Join once with a project credential (auto-registering the workspace "
+            "first, mirroring room_bootstrap), optionally post one room message "
+            "and/or one work report over REST, then leave. Use this when every "
+            "MCP tool call fails (reaped transport session, dead connector): the "
+            "same project credential is accepted by the running service's REST "
+            "API, so evidence submission is never blocked."
+        ),
+    )
+    submit.add_argument("--project", required=True, help="Target Project name or id")
+    submit.add_argument(
+        "--bundle",
+        default="",
+        help="acrb.v1 bundle: a file path or the literal value; omit with --token",
+    )
+    submit.add_argument("--token", default="", help="Single project credential (acr.*)")
+    submit.add_argument("--message", default="", help="Room message body to post")
+    submit.add_argument(
+        "--report-task", default="", help="Task id or number for the work report"
+    )
+    submit.add_argument("--summary", default="", help="Work report summary")
+    submit.add_argument(
+        "--file", action="append", default=[], help="Changed file pattern; repeatable"
+    )
+    submit.add_argument(
+        "--test",
+        action="append",
+        default=[],
+        help="Test evidence as 'command::exit_code'; repeatable",
+    )
+    submit.add_argument(
+        "--commit", default="", help="Commit hash to reference in the report"
+    )
+    submit.add_argument(
+        "--no-code-change", default="", help="Reason when the task changed no code"
+    )
+    submit.add_argument(
+        "--name", default="", help="Session name; defaults to the linked member name"
+    )
+    submit.add_argument(
+        "--client",
+        default="",
+        help="Client code; defaults to the linked member's software key",
+    )
+    submit.add_argument(
+        "--model", default="unknown", help="Model code for the session"
+    )
+    submit.add_argument(
+        "--model-display-name",
+        default="",
+        help="Model label for messages; defaults to --model",
+    )
+    submit.add_argument(
+        "--cwd",
+        default="",
+        help="Workspace path to register; defaults to the current directory",
+    )
+    submit.add_argument(
+        "--keep-session",
+        action="store_true",
+        help="Do not leave the session after submitting",
+    )
+    submit.add_argument("--json", action="store_true")
 
     message = commands.add_parser("message-post", help="Post a room message")
     message.add_argument("project_id")
@@ -1223,6 +1561,12 @@ def main(argv: list[str] | None = None) -> None:
                 "token": args.token,
             },
         )
+    elif args.command == "submit":
+        try:
+            result = run_submit(args, base)
+        except SubmitError as error:
+            print(json.dumps(error.payload(), ensure_ascii=False, indent=2))
+            sys.exit(2)
     elif args.command == "room-leave":
         result = call_api(
             "POST",

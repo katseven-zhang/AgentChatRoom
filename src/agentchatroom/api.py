@@ -35,6 +35,7 @@ from .mcp_server import (
     http_transport_binding_alive,
     lookup_transport_tombstone,
     retain_transport_tombstone,
+    session_transport_state,
     transport_session_active,
 )
 from .mcp_http_adoption import with_session_adoption
@@ -940,6 +941,9 @@ def create_app(
         http_presence_manager.transport_check = lambda key: http_transport_binding_alive(
             mcp_server.session_manager, key
         )
+        # Task reclaim and lease takeover consult real transport state
+        # (tombstones): presence heartbeats alone are display-only.
+        service.transport_liveness_check = session_transport_state
         configure_transport_tombstones(
             limit=resolved.mcp_http_tombstone_limit,
             ttl_seconds=resolved.mcp_http_tombstone_ttl_seconds,

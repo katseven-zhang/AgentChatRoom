@@ -514,6 +514,34 @@ def clear_transport_tombstones() -> None:
         _transport_tombstones.clear()
 
 
+def session_transport_state(project_id: str, session_id: str) -> str:
+    """Report whether a Room Session's HTTP transport is 'alive', 'gone', or
+    'unknown'.
+
+    A session whose transport binding now lives in the tombstone table is
+    'gone': hard evidence the owning client disconnected, which lets the same
+    software identity reclaim immediately. Sessions without any HTTP transport
+    binding (stdio, tests) are 'unknown' so callers fall back to the heartbeat
+    window.
+    """
+    with _session_bindings_lock:
+        for key, binding in _session_bindings.items():
+            if (
+                key.startswith(HTTP_TRANSPORT_KEY_PREFIX)
+                and binding is not None
+                and str(getattr(binding, "project_id", "")) == str(project_id)
+                and str(getattr(binding, "session_id", "")) == str(session_id)
+            ):
+                return "alive"
+        for _transport_id, (binding, _recorded) in _transport_tombstones.items():
+            if (
+                str(getattr(binding, "project_id", "")) == str(project_id)
+                and str(getattr(binding, "session_id", "")) == str(session_id)
+            ):
+                return "gone"
+    return "unknown"
+
+
 def http_transport_binding_alive(session_manager: Any, session_key: str) -> bool:
     """Check a stateful HTTP binding against the SDK's active transport map.
 

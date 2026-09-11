@@ -482,6 +482,12 @@ class AgentChatRoomService:
         self.database = database
         self.settings = settings
         self._retention_last_run: dict[str, float] = {}
+        # Wired by the API layer to the MCP transport state lookup: "alive",
+        # "gone" (reaped transport, tombstone retained) or "unknown" for
+        # sessions without an HTTP transport. Presence heartbeats are
+        # display-only, but reclaim and lease takeover need the harder
+        # "is the owning transport actually gone" signal.
+        self.transport_liveness_check: Callable[[str, str], str] | None = None
         self._token_touch = TokenTouchBuffer(
             self,
             interval_seconds=settings.token_touch_interval_seconds,
@@ -1344,16 +1350,16 @@ class AgentChatRoomService:
 
     def _lease_dict(self, row: Mapping[str, Any]) -> dict[str, Any]:
         data = dict(row)
-        owner_last_heartbeat = data.pop("owner_last_heartbeat", None)
-        owner_online = owner_last_heartbeat is None or (
-            utc_now() - parse_time(owner_last_heartbeat)
-            <= timedelta(seconds=self.settings.heartbeat_timeout_seconds)
-        )
+        # Presence is display-only: a lease is active purely by its own TTL and
+        # ends by expiry or explicit release. A silent owner (long quiet
+        # computation past the heartbeat window) keeps its lease, so the
+        # heartbeat must never invalidate or hand out the lease here.
+        data.pop("owner_last_heartbeat", None)
+        data.pop("owner_member_id", None)
         ttl_active = data["released_at"] is None and parse_time(
             data["expires_at"]
         ) > utc_now()
-        data["active"] = ttl_active and owner_online
-        data["reclaimable"] = ttl_active and not owner_online
+        data["active"] = ttl_active
         return data
 
     def create_project(
@@ -4204,6 +4210,16 @@ class AgentChatRoomService:
                     <= timedelta(seconds=self.settings.heartbeat_timeout_seconds)
                 )
                 if owner_connected:
+                    # Presence is display-only, but a reaped transport is hard
+                    # evidence the owning client is gone: allow the same
+                    # identity to reclaim immediately instead of waiting out
+                    # the heartbeat window.
+                    state_check = self.transport_liveness_check
+                    if state_check is not None and state_check(
+                        project_id, str(owner["id"])
+                    ) == "gone":
+                        owner_connected = False
+                if owner_connected:
                     raise DomainError(
                         "task_owner_session_connected",
                         "The owning Session is still connected; continue in that conversation or release the task",
@@ -5742,40 +5758,74 @@ class AgentChatRoomService:
             )
         now = utc_now()
         expires = now + timedelta(seconds=ttl)
-        online_cutoff = (
-            now - timedelta(seconds=self.settings.heartbeat_timeout_seconds)
-        ).isoformat().replace("+00:00", "Z")
         with self.database.connect(write=True) as connection:
-            self._authenticate(connection, project_id, session_id, token)
+            claimant = self._authenticate(connection, project_id, session_id, token)
+            claimant_member_id = (
+                claimant["member_id"] if "member_id" in claimant.keys() else None
+            )
             if task_id:
                 task = self._require_task(connection, project_id, task_id)
                 if task["execution_status"] in {"cancelled", "completed"}:
                     raise DomainError("task_not_leasable", "Terminal tasks cannot acquire file leases", status_code=409)
                 if task["owner_session_id"] not in {None, session_id}:
                     raise DomainError("not_task_owner", "Lease task belongs to another agent", status_code=403)
+            # Leases are active purely by their own TTL: an owner that is
+            # merely silent (long quiet work past the heartbeat window) keeps
+            # the lease enforced. Only expiry or explicit release ends it.
             active = connection.execute(
                 """
-                SELECT l.*, a.name AS agent_name FROM file_leases l
+                SELECT l.*, a.name AS agent_name, a.member_id AS owner_member_id
+                FROM file_leases l
                 JOIN agent_sessions a ON a.id = l.session_id
                 WHERE l.project_id = ? AND l.released_at IS NULL AND l.expires_at > ?
-                  AND a.last_heartbeat >= ?
                 """,
-                (project_id, now.isoformat().replace("+00:00", "Z"), online_cutoff),
+                (project_id, now.isoformat().replace("+00:00", "Z")),
             ).fetchall()
-            conflicts = [
-                {
-                    "lease_id": row["id"],
-                    "session_id": row["session_id"],
-                    "agent_name": row["agent_name"],
-                    "path_pattern": row["path_pattern"],
-                    "mode": row["mode"],
-                    "expires_at": row["expires_at"],
-                }
-                for row in active
-                if row["session_id"] != session_id
-                and patterns_overlap(pattern, row["path_pattern"])
-                and lease_modes_conflict(mode, row["mode"])
-            ]
+            conflicts = []
+            superseded: list[dict[str, Any]] = []
+            for row in active:
+                if row["session_id"] == session_id:
+                    continue
+                if not patterns_overlap(pattern, row["path_pattern"]):
+                    continue
+                if not lease_modes_conflict(mode, row["mode"]):
+                    continue
+                if (
+                    claimant_member_id
+                    and row["owner_member_id"]
+                    and row["owner_member_id"] == claimant_member_id
+                ):
+                    # Same software identity, new session: the successor
+                    # transparently takes over the stale lease of its own
+                    # identity (a reaped transport cannot release it itself).
+                    superseded.append(dict(row))
+                    continue
+                conflicts.append(
+                    {
+                        "lease_id": row["id"],
+                        "session_id": row["session_id"],
+                        "agent_name": row["agent_name"],
+                        "path_pattern": row["path_pattern"],
+                        "mode": row["mode"],
+                        "expires_at": row["expires_at"],
+                    }
+                )
+            for stale in superseded:
+                connection.execute(
+                    "UPDATE file_leases SET released_at = ? WHERE id = ?",
+                    (now.isoformat().replace("+00:00", "Z"), stale["id"]),
+                )
+                self._emit(
+                    connection,
+                    project_id,
+                    "lease.released",
+                    actor_session_id=session_id,
+                    payload={
+                        "lease_id": stale["id"],
+                        "path_pattern": stale["path_pattern"],
+                        "reason": "same_member_takeover",
+                    },
+                )
             if conflicts:
                 event_id = self._emit(
                     connection,

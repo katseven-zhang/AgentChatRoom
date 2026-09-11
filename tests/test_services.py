@@ -2486,9 +2486,10 @@ def test_agent_stays_online_with_recent_activity_despite_stale_heartbeat(
     assert current["status"] != "offline"
 
 
-def test_offline_agent_lease_becomes_reclaimable(
+def test_silent_owner_lease_stays_enforced_until_ttl_or_same_member_takeover(
     service, project, joined_agents
 ):
+    """#119: presence 窗口不再使租约失效；同成员新会话接管，他成员仍被挡。"""
     first, second = joined_agents
     lease = service.acquire_lease(
         project["id"],
@@ -2507,18 +2508,44 @@ def test_offline_agent_lease_becomes_reclaimable(
 
     history = service.list_leases(project["id"], include_inactive=True)
     stale_lease = next(item for item in history if item["id"] == lease["id"])
-    assert stale_lease["active"] is False
-    assert stale_lease["reclaimable"] is True
-    assert service.list_leases(project["id"]) == []
+    assert stale_lease["active"] is True
+    assert "reclaimable" not in stale_lease
+    # 静默 owner 的租约仍然挡住他成员的同范围申请。
+    with pytest.raises(DomainError) as excinfo:
+        service.acquire_lease(
+            project["id"],
+            session_id=second["agent"]["id"],
+            token=second["token"],
+            path_pattern="src/reclaimable/file.py",
+        )
+    assert excinfo.value.code == "lease_conflict"
 
+    # 同一软件身份的新会话接管同成员遗留租约（自动释放旧租约并授予新租约）。
+    successor = service.join_room(
+        project["id"],
+        name="Builder successor",
+        client="codex",
+        model="test-model",
+        role="executor",
+    )
     acquired = service.acquire_lease(
         project["id"],
-        session_id=second["agent"]["id"],
-        token=second["token"],
+        session_id=successor["agent"]["id"],
+        token=successor["token"],
         path_pattern="src/reclaimable/file.py",
     )
     assert acquired["lease"]["active"] is True
-    assert acquired["event_id"] == acquired["cursor"]
+
+    history = service.list_leases(project["id"], include_inactive=True)
+    released = next(item for item in history if item["id"] == lease["id"])
+    assert released["released_at"] is not None
+    takeover_event = next(
+        event
+        for event in service.list_events(project["id"], after=0)["events"]
+        if event["event_type"] == "lease.released"
+        and (event.get("payload") or {}).get("reason") == "same_member_takeover"
+    )
+    assert takeover_event["actor_session_id"] == successor["agent"]["id"]
 
 
 def test_git_worktrees_share_room_and_logical_projects_remain_distinct(
