@@ -1038,12 +1038,16 @@ def _http_tool_payload(response: httpx.Response) -> dict:
 async def test_expired_http_session_reports_recovery_and_reclaims_unfinished_task(
     settings, project_dir
 ):
-    """#116: 过期 transport 保持规范 404 且可识别；新会话恢复原 Project 并可同身份 reclaim。"""
+    """#116: 过期 transport 保持规范 404 且可识别；新会话恢复原 Project 并可同身份 reclaim。
+
+    #117 之后默认模式会透明收养，因此这里显式使用严格模式验证 #116 契约。
+    """
     tuned = replace(
         settings,
         heartbeat_timeout_seconds=0.5,
         presence_keepalive_interval_seconds=0.05,
         mcp_http_session_idle_timeout_seconds=0.3,
+        mcp_http_session_adoption=False,
     )
     app = create_app(tuned)
     project = app.state.service.create_project(

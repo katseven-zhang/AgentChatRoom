@@ -77,7 +77,10 @@ def test_recovered_and_new_same_identity_sessions_remain_independent(service, pr
     manager.stop()
 
 
-def test_transport_cleanup_closes_only_its_room_session(service, project):
+def test_transport_cleanup_stops_keepalive_without_closing_the_room_session(
+    service, project
+):
+    """#117: 传输回收只停止保活；Room Session 保持可提交，显式离开才关闭它。"""
     first = service.join_room(
         project["id"], name="Codex", client="codex", model="unknown"
     )
@@ -104,9 +107,26 @@ def test_transport_cleanup_closes_only_its_room_session(service, project):
     manager.heartbeat_once()
     agents = {agent["id"]: agent for agent in service.snapshot(project["id"])["agents"]}
 
-    assert agents[first["agent"]["id"]]["status"] == "offline"
+    # Reaping a transport no longer closes the Room Session: the client that
+    # comes back on the same credential is adopted and must still submit.
+    assert agents[first["agent"]["id"]]["status"] == "online"
+    assert agents[first["agent"]["id"]]["left_at"] is None
     assert agents[second["agent"]["id"]]["status"] == "online"
+    posted = service.post_message(
+        project["id"],
+        body="#117 keepalive stopped but the session stays open",
+        session_id=first["agent"]["id"],
+        token=first["token"],
+        model_display_name="test",
+    )
+    assert posted["event_id"]
+
+    # An explicit stop (session_leave / server shutdown) remains the only path
+    # that closes sessions, and it only closes the ones still kept alive.
     manager.stop()
+    agents = {agent["id"]: agent for agent in service.snapshot(project["id"])["agents"]}
+    assert agents[first["agent"]["id"]]["left_at"] is None
+    assert agents[second["agent"]["id"]]["status"] == "offline"
 
 
 def test_heartbeat_is_connection_liveness_not_manual_activity(service, project):

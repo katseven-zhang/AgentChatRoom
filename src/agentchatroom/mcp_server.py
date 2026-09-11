@@ -8,6 +8,7 @@ import os
 import socket
 import sys
 import threading
+import time
 import weakref
 from collections.abc import Callable
 from contextvars import ContextVar
@@ -73,6 +74,15 @@ _runtime_binding: ContextVar[RuntimeBinding | None] = ContextVar(
 )
 _session_bindings: dict[str, RuntimeBinding | None] = {}
 _session_bindings_lock = threading.RLock()
+# Bounded tombstone table: transport session id -> (Room Session binding, recorded
+# at). It lets a request that presents a reaped mcp-session-id adopt a fresh
+# transport while resuming the same Room Session. The transport id is only a
+# client bookmark; identity is always re-derived from credentials and headers.
+_transport_tombstones: dict[str, tuple[RuntimeBinding, float]] = {}
+_TOMBSTONE_DEFAULT_LIMIT = 256
+_TOMBSTONE_DEFAULT_TTL_SECONDS = 86400.0
+_tombstone_limit = _TOMBSTONE_DEFAULT_LIMIT
+_tombstone_ttl_seconds = _TOMBSTONE_DEFAULT_TTL_SECONDS
 _transport_keys: dict[int, tuple[weakref.ReferenceType, str]] = {}
 _active_binding_key: ContextVar[str | None] = ContextVar("mcp_binding_key", default=None)
 _loaded_identity: tuple[str, str, str] | None = None
@@ -414,20 +424,110 @@ def transport_binding_alive(session_key: str) -> bool:
         )
 
 
+def transport_session_active(session_manager: Any, transport_session_id: str) -> bool:
+    """Return whether the SDK still owns this stateful HTTP transport."""
+    if not transport_session_id:
+        return False
+    active = getattr(session_manager, "_server_instances", {})
+    transport = active.get(transport_session_id) if isinstance(active, dict) else None
+    return transport is not None and not bool(
+        getattr(transport, "is_terminated", False)
+    )
+
+
+def configure_transport_tombstones(
+    *,
+    limit: int | None = None,
+    ttl_seconds: float | None = None,
+) -> None:
+    """Bound the adoption tombstone table (count and age)."""
+    global _tombstone_limit, _tombstone_ttl_seconds
+    with _session_bindings_lock:
+        if limit is not None and limit > 0:
+            _tombstone_limit = int(limit)
+        if ttl_seconds is not None and ttl_seconds > 0:
+            _tombstone_ttl_seconds = float(ttl_seconds)
+        _prune_transport_tombstones_locked()
+
+
+def _prune_transport_tombstones_locked() -> None:
+    now = time.monotonic()
+    for key, (_, recorded) in list(_transport_tombstones.items()):
+        if now - recorded > _tombstone_ttl_seconds:
+            _transport_tombstones.pop(key, None)
+    while len(_transport_tombstones) > _tombstone_limit:
+        oldest = min(_transport_tombstones.items(), key=lambda item: item[1][1])[0]
+        _transport_tombstones.pop(oldest, None)
+
+
+def retain_transport_tombstone(transport_session_id: str) -> RuntimeBinding | None:
+    """Move a reaped transport's Room Session binding into the tombstone table."""
+    if not transport_session_id:
+        return None
+    key = f"{HTTP_TRANSPORT_KEY_PREFIX}{transport_session_id}"
+    with _session_bindings_lock:
+        binding = _session_bindings.pop(key, None)
+        if binding is not None:
+            _transport_tombstones[transport_session_id] = (binding, time.monotonic())
+        _prune_transport_tombstones_locked()
+        return binding
+
+
+def lookup_transport_tombstone(
+    transport_session_id: str,
+    software_key: str = "",
+) -> RuntimeBinding | None:
+    """Return a retained binding, refusing any identity that does not match it.
+
+    The presented transport id is only a bookmark: adoption must never move a
+    Room Session to a different software identity.
+    """
+    if not transport_session_id:
+        return None
+    with _session_bindings_lock:
+        _prune_transport_tombstones_locked()
+        entry = _transport_tombstones.get(transport_session_id)
+    if entry is None:
+        return None
+    binding = entry[0]
+    expected = software_key.strip()
+    # Identity is mandatory for adoption: a request that presents no verifiable
+    # software key must never resume somebody else's Room Session, so an
+    # empty or mismatching key both refuse the binding.
+    if not expected or not binding.software_key or binding.software_key != expected:
+        return None
+    return binding
+
+
+def adopt_transport_binding(
+    transport_session_id: str,
+    binding: RuntimeBinding | None,
+) -> None:
+    """Attach a retained Room Session binding to an adopted transport."""
+    if not transport_session_id or binding is None:
+        return
+    persist_runtime_binding(f"{HTTP_TRANSPORT_KEY_PREFIX}{transport_session_id}", binding)
+
+
+def clear_transport_tombstones() -> None:
+    with _session_bindings_lock:
+        _transport_tombstones.clear()
+
+
 def http_transport_binding_alive(session_manager: Any, session_key: str) -> bool:
-    """Check a stateful HTTP binding against the SDK's active transport map."""
+    """Check a stateful HTTP binding against the SDK's active transport map.
+
+    A binding whose transport is gone is retained as a tombstone instead of being
+    dropped, so a later request presenting that (now unknown) id can adopt a fresh
+    transport and resume the same Room Session.
+    """
     if not session_key.startswith(HTTP_TRANSPORT_KEY_PREFIX):
         return transport_binding_alive(session_key)
     http_session_id = session_key[len(HTTP_TRANSPORT_KEY_PREFIX) :]
-    active = getattr(session_manager, "_server_instances", {})
-    transport = active.get(http_session_id) if isinstance(active, dict) else None
-    alive = transport is not None and not bool(
-        getattr(transport, "is_terminated", False)
-    )
-    if not alive:
-        with _session_bindings_lock:
-            _session_bindings.pop(session_key, None)
-    return alive
+    if transport_session_active(session_manager, http_session_id):
+        return True
+    retain_transport_tombstone(http_session_id)
+    return False
 
 
 def get_runtime_binding(session_key: str | None = None) -> RuntimeBinding | None:
@@ -458,6 +558,7 @@ def clear_runtime_binding(session_key: str | None = None) -> None:
     if session_key is None:
         with _session_bindings_lock:
             _session_bindings.clear()
+            _transport_tombstones.clear()
         return
     persist_runtime_binding(session_key, None)
 

@@ -23,6 +23,9 @@ CONFIG_FILE_SCHEMA: dict[str, dict[str, tuple[type, ...]]] = {
         "mcp_http_stateless": (bool,),
         "mcp_http_json_response": (bool,),
         "mcp_http_session_idle_timeout_seconds": (int, float),
+        "mcp_http_session_adoption": (bool,),
+        "mcp_http_tombstone_limit": (int,),
+        "mcp_http_tombstone_ttl_seconds": (int, float),
         "mcp_bridge_command": (str,),
         "external_base_url": (str,),
         "trusted_proxy_headers": (bool,),
@@ -151,6 +154,17 @@ class Settings:
     # deployments. A shorter default reaped healthy clients during ordinary long
     # local builds/tests (8-15 minutes) and left them replaying a stale session.
     mcp_http_session_idle_timeout_seconds: float = 1800.0
+    # Tolerant adoption: a request that presents an unknown or reaped
+    # mcp-session-id but valid credentials rebuilds the transport binding on the
+    # spot instead of failing every subsequent tool call. Client bookmarks that
+    # are no longer recognised are not credentials; identity still comes only
+    # from the credential and identity headers. Strict mode keeps the #116
+    # 404 + mcp_session_expired contract for spec-only clients.
+    mcp_http_session_adoption: bool = True
+    # Bounded tombstone table: transport session id -> Room Session binding, kept
+    # so an adopted session can resume the same Room Session after reaping.
+    mcp_http_tombstone_limit: int = 256
+    mcp_http_tombstone_ttl_seconds: float = 86400.0
     mcp_bridge_command: str = "python"
     external_base_url: str = ""
     trusted_proxy_headers: bool = True
@@ -256,6 +270,15 @@ def _merge_toml(path: Path) -> dict[str, Any]:
         ),
         "mcp_http_session_idle_timeout_seconds": raw.get("server", {}).get(
             "mcp_http_session_idle_timeout_seconds"
+        ),
+        "mcp_http_session_adoption": raw.get("server", {}).get(
+            "mcp_http_session_adoption"
+        ),
+        "mcp_http_tombstone_limit": raw.get("server", {}).get(
+            "mcp_http_tombstone_limit"
+        ),
+        "mcp_http_tombstone_ttl_seconds": raw.get("server", {}).get(
+            "mcp_http_tombstone_ttl_seconds"
         ),
         "mcp_bridge_command": raw.get("server", {}).get("mcp_bridge_command"),
         "external_base_url": raw.get("server", {}).get("external_base_url"),
@@ -404,6 +427,22 @@ def load_settings(
             os.getenv(
                 "AGENTCHATROOM_MCP_HTTP_SESSION_IDLE_TIMEOUT_SECONDS",
                 file_values.get("mcp_http_session_idle_timeout_seconds", 1800.0),
+            )
+        ),
+        "mcp_http_session_adoption": environment_bool(
+            "AGENTCHATROOM_MCP_HTTP_SESSION_ADOPTION",
+            file_values.get("mcp_http_session_adoption", True),
+        ),
+        "mcp_http_tombstone_limit": int(
+            os.getenv(
+                "AGENTCHATROOM_MCP_HTTP_TOMBSTONE_LIMIT",
+                file_values.get("mcp_http_tombstone_limit", 256),
+            )
+        ),
+        "mcp_http_tombstone_ttl_seconds": float(
+            os.getenv(
+                "AGENTCHATROOM_MCP_HTTP_TOMBSTONE_TTL_SECONDS",
+                file_values.get("mcp_http_tombstone_ttl_seconds", 86400.0),
             )
         ),
         "mcp_bridge_command": os.getenv(
@@ -620,6 +659,10 @@ def load_settings(
         raise ValueError("MCP Bridge command must not be empty")
     if values["mcp_http_session_idle_timeout_seconds"] <= 0:
         raise ValueError("MCP HTTP session idle timeout must be positive")
+    if values["mcp_http_tombstone_limit"] <= 0:
+        raise ValueError("MCP HTTP tombstone limit must be positive")
+    if values["mcp_http_tombstone_ttl_seconds"] <= 0:
+        raise ValueError("MCP HTTP tombstone TTL must be positive")
     external_base_url = str(values["external_base_url"])
     if external_base_url and not external_base_url.startswith(("http://", "https://")):
         raise ValueError("external base URL must start with http:// or https://")

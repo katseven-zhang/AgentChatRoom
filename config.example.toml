@@ -16,6 +16,17 @@ mcp_http_json_response = true
 # An expired/unknown session id still returns the specification 404 with
 # code=mcp_session_expired and required_action=reconnect_mcp_session.
 mcp_http_session_idle_timeout_seconds = 1800.0
+# Tolerant adoption (default true): a request that presents an unknown or reaped
+# mcp-session-id but valid credentials rebuilds the transport binding on the spot
+# and answers 200, resuming the same Room Session when the identity matches, so a
+# host client that never re-initialises is not locked out after an idle reap.
+# false = strict mode: keep the specification 404 plus the #116
+# mcp_session_expired / reconnect_mcp_session recovery contract.
+mcp_http_session_adoption = true
+# Bounded tombstone table that maps a reaped transport session id to its Room
+# Session binding (count and age limits; oldest entries are evicted first).
+mcp_http_tombstone_limit = 256
+mcp_http_tombstone_ttl_seconds = 86400.0
 # Command used by a remote stdio Bridge on each Agent computer.
 mcp_bridge_command = "python"
 external_base_url = ""

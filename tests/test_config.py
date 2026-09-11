@@ -173,6 +173,48 @@ def test_default_http_session_idle_timeout_covers_long_local_runs(
     assert load_settings().mcp_http_session_idle_timeout_seconds == 600.0
 
 
+def test_mcp_http_session_adoption_defaults_and_bounds(monkeypatch, tmp_path):
+    """#117: 默认开启透明收养；严格模式与有界墓碑表都可配置。"""
+    monkeypatch.setenv("AGENTCHATROOM_DATA_DIR", str(tmp_path / "data"))
+
+    settings = load_settings()
+
+    assert settings.mcp_http_session_adoption is True
+    assert settings.mcp_http_tombstone_limit == 256
+    assert settings.mcp_http_tombstone_ttl_seconds == 86400.0
+
+    monkeypatch.setenv("AGENTCHATROOM_MCP_HTTP_SESSION_ADOPTION", "false")
+    monkeypatch.setenv("AGENTCHATROOM_MCP_HTTP_TOMBSTONE_LIMIT", "8")
+    monkeypatch.setenv("AGENTCHATROOM_MCP_HTTP_TOMBSTONE_TTL_SECONDS", "60")
+
+    tuned = load_settings()
+
+    assert tuned.mcp_http_session_adoption is False
+    assert tuned.mcp_http_tombstone_limit == 8
+    assert tuned.mcp_http_tombstone_ttl_seconds == 60.0
+
+    example = (Path(__file__).parents[1] / "config.example.toml").read_text(
+        encoding="utf-8"
+    )
+    assert "mcp_http_session_adoption = true" in example
+    assert "mcp_http_tombstone_limit = 256" in example
+    assert "mcp_http_tombstone_ttl_seconds = 86400.0" in example
+
+
+def test_mcp_http_tombstone_bounds_must_be_positive(monkeypatch, tmp_path):
+    monkeypatch.setenv("AGENTCHATROOM_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("AGENTCHATROOM_MCP_HTTP_TOMBSTONE_LIMIT", "0")
+
+    with pytest.raises(ValueError, match="tombstone limit must be positive"):
+        load_settings()
+
+    monkeypatch.setenv("AGENTCHATROOM_MCP_HTTP_TOMBSTONE_LIMIT", "8")
+    monkeypatch.setenv("AGENTCHATROOM_MCP_HTTP_TOMBSTONE_TTL_SECONDS", "0")
+
+    with pytest.raises(ValueError, match="tombstone TTL must be positive"):
+        load_settings()
+
+
 def test_unknown_or_mistyped_file_configuration_is_rejected(monkeypatch, tmp_path):
     monkeypatch.setenv("AGENTCHATROOM_DATA_DIR", str(tmp_path / "data"))
     config_path = tmp_path / "invalid.toml"

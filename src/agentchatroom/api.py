@@ -28,7 +28,16 @@ from .desktop import DirectoryPickerUnavailable, pick_directory
 from .errors import DomainError
 from .integrations import build_mcp_integration
 from .local_mcp import LocalMcpConfigurator
-from .mcp_server import create_mcp, http_transport_binding_alive
+from .mcp_server import (
+    adopt_transport_binding,
+    configure_transport_tombstones,
+    create_mcp,
+    http_transport_binding_alive,
+    lookup_transport_tombstone,
+    retain_transport_tombstone,
+    transport_session_active,
+)
+from .mcp_http_adoption import with_session_adoption
 from .mcp_http_recovery import with_expired_session_hints
 from .presence import LocalPresenceManager
 from .service_lifetime import running_service
@@ -874,6 +883,17 @@ def create_app(
     directory_picker: Callable[[str], str | None] | None = None,
     local_mcp_configurator: LocalMcpConfigurator | None = None,
 ) -> FastAPI:
+    # sse_starlette latches a global "should exit" flag the first time one of
+    # its watchers observes any uvicorn server shutting down, and never clears
+    # it. In a long-lived process that serves, stops and serves again (desktop
+    # GUI restart, test suite), the stale latch instantly cancels every later
+    # SSE response, so each new application resets it.
+    try:
+        from sse_starlette.sse import AppStatus
+
+        AppStatus.should_exit = False
+    except ImportError:  # pragma: no cover - sse_starlette ships with the MCP SDK
+        pass
     resolved = settings or load_settings()
     resolved_directory_picker = directory_picker or pick_directory
     resolved_local_mcp_configurator = (
@@ -920,11 +940,35 @@ def create_app(
         http_presence_manager.transport_check = lambda key: http_transport_binding_alive(
             mcp_server.session_manager, key
         )
-        # Keep the specification-compatible 404 for an unknown or reaped
-        # mcp-session-id, but make the response machine-readable and actionable
-        # so a client that never re-initialises can recover instead of failing
-        # every tool call forever.
-        mcp_http_app = with_expired_session_hints(mcp_http_app)
+        configure_transport_tombstones(
+            limit=resolved.mcp_http_tombstone_limit,
+            ttl_seconds=resolved.mcp_http_tombstone_ttl_seconds,
+        )
+        # Tolerant adoption sits inside the #116 expiry contract: in the default
+        # mode an unknown/reaped bookmark is adopted transparently (200, same
+        # Room Session when the identity matches), while strict mode lets the
+        # spec-compatible 404 plus mcp_session_expired contract through.
+        def _adoption_binding(old_session_id: str, software_key: str):
+            # The presence heartbeat normally retains tombstones while polling
+            # transport liveness; retain here as well so adoption also works
+            # when presence keepalive is disabled.
+            retain_transport_tombstone(old_session_id)
+            return lookup_transport_tombstone(old_session_id, software_key)
+
+        mcp_http_app = with_expired_session_hints(
+            with_session_adoption(
+                mcp_http_app,
+                session_manager=mcp_server.session_manager,
+                enabled=resolved.mcp_http_session_adoption,
+                is_active=lambda transport_id: transport_session_active(
+                    mcp_server.session_manager, transport_id
+                ),
+                lookup_binding=_adoption_binding,
+                adopt_binding=adopt_transport_binding,
+                map_limit=resolved.mcp_http_tombstone_limit,
+                map_ttl_seconds=resolved.mcp_http_tombstone_ttl_seconds,
+            )
+        )
 
     auto_backup_stop = threading.Event()
 

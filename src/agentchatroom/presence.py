@@ -155,15 +155,20 @@ class LocalPresenceManager:
                 and session.transport_key
                 and not self.transport_check(session.transport_key)
             ):
+                # The transport is gone (idle reap, server restart, client
+                # reload). Stop the keepalive so the session cannot stay online
+                # forever, but keep the Room Session itself: presence is derived
+                # from the last proof of life, so it is reported offline once the
+                # window lapses, while a client that returns on the same
+                # credential is adopted at the transport layer and must still be
+                # able to submit. Explicit leave (session_leave, server shutdown,
+                # token revocation) remains the only event that closes a session
+                # and releases its leases.
                 self.unregister(session.session_id)
-                try:
-                    self.room_service.leave_session(
-                        session.project_id,
-                        session.session_id,
-                        session.token,
-                    )
-                except DomainError:
-                    pass
+                logger.info(
+                    "Transport for session %s is gone; keepalive stopped",
+                    session.session_id,
+                )
                 continue
             try:
                 self.room_service.heartbeat(
