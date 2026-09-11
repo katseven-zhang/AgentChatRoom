@@ -96,6 +96,7 @@ const elements = Object.fromEntries(
     "refresh-runtime-button", "runtime-status", "runtime-config", "runtime-config-raw", "runtime-log",
     "login-dialog", "login-form", "login-token", "login-error",
     "token-dialog", "token-form", "token-name", "token-member", "token-days", "token-permissions",
+    "token-agent-name", "token-agent-name-group",
     "token-dialog-context", "token-dialog-title", "token-submit-button",
     "token-existing-config-advanced", "token-existing-config-group", "token-project-credential-name", "token-existing-config",
     "token-permissions-dialog", "token-permissions-form", "token-permissions-project",
@@ -1717,12 +1718,21 @@ function memberStatusClass(status) {
 function renderTokenMemberOptions(selected = "") {
   const activeMembers = state.members.filter((member) => member.status === "active");
   elements["token-member"].innerHTML = [
-    '<option value="">不关联；首次连接时自动创建成员</option>',
+    '<option value="">不关联；首次连接时按下面填写的显示名称自动创建成员</option>',
     ...activeMembers.map((member) => `<option value="${escapeHtml(member.id)}">${escapeHtml(member.name)} · ${escapeHtml(member.member_key)}</option>`),
   ].join("");
   if (activeMembers.some((member) => member.id === selected)) {
     elements["token-member"].value = selected;
   }
+}
+
+function syncTokenAgentNameVisibility() {
+  // 首次接入且未关联成员时必须由用户给出实际显示名称；增量加入 Project 与
+  // 已关联成员场景沿用现有身份，不生成第二套身份，因此不显示该字段。
+  const setup = state.pendingHttpSetup;
+  const needsAgentName = Boolean(setup) && setup.mode !== "add_project"
+    && !elements["token-member"].value;
+  elements["token-agent-name-group"].hidden = !needsAgentName;
 }
 
 function renderManagement() {
@@ -2259,6 +2269,8 @@ elements["create-token-button"].addEventListener("click", () => {
     </label>`).join("");
   elements["token-form"].reset();
   elements["token-existing-config-advanced"].hidden = true;
+  elements["token-agent-name-group"].hidden = true;
+  elements["token-agent-name"].value = "";
   elements["token-project-credential-name"].value = "";
   elements["token-existing-config"].value = "";
   elements["token-dialog-context"].textContent = "Agent 凭据";
@@ -2268,6 +2280,7 @@ elements["create-token-button"].addEventListener("click", () => {
   elements["token-days"].value = "30";
   elements["token-dialog"].showModal();
 });
+elements["token-member"].addEventListener("change", () => syncTokenAgentNameVisibility());
 elements["refresh-audit-button"].addEventListener("click", () => refreshManagement().catch(handleError));
 elements["audit-event-filter"].addEventListener("change", () => refreshManagement().catch(handleError));
 elements["audit-list"].addEventListener("click", (event) => {
@@ -2456,12 +2469,14 @@ elements["integration-open-token-button"].addEventListener("click", () => {
   elements["token-existing-config-advanced"].hidden = !isAddProject;
   elements["token-project-credential-name"].value = projectName;
   elements["token-name"].value = `${projectName} · ${profile.label || "Agent"} HTTP`;
+  elements["token-agent-name"].value = concreteIdentityValue(profile.software_name);
   elements["token-dialog-context"].textContent = isAddProject ? "加入当前 Project（增量）" : "首次接入";
   elements["token-dialog-title"].textContent = isAddProject ? "签发本项目 Token 并生成增量提示词" : "签发首次 HTTP 凭据";
   elements["token-submit-button"].textContent = isAddProject ? "签发并生成增量提示词" : "签发并生成接入提示词";
   const member = state.members.find((item) => item.active !== false
     && item.metadata?.software_key === profile.software_key);
   if (member) elements["token-member"].value = member.id;
+  syncTokenAgentNameVisibility();
 });
 
 elements["integration-local-refresh"].addEventListener("click", () => {
@@ -3034,8 +3049,27 @@ elements["token-form"].addEventListener("submit", async (event) => {
         return;
       }
       softwareIdentity = existingIdentity;
+    } else if (selectedIdentity) {
+      // 关联已有成员：沿用该成员现有软件身份，不新建身份。
+      softwareIdentity = selectedIdentity;
+    } else if (member) {
+      showToast("所选项目成员的软件身份不完整，请改选成员，或改为不关联并填写 Agent 显示名称", "error");
+      return;
+    } else if (setup.mode === "add_project") {
+      // 已配置软件增量加入 Project：客户端原身份由 Agent 在本地保留，
+      // 服务端按现有身份登记，这里不生成第二套身份。
+      softwareIdentity = null;
     } else {
-      softwareIdentity = selectedIdentity || createSoftwareIdentityForProfile(setup.profile);
+      // 首次接入且不关联成员：名称必须由用户明确填写，禁止用接入格式标签兜底。
+      try {
+        softwareIdentity = createSoftwareIdentityForProfile(
+          setup.profile,
+          elements["token-agent-name"].value,
+        );
+      } catch (error) {
+        showToast(error.message || "Agent 显示名称无效，请填写实际接入端名称", "error");
+        return;
+      }
     }
   }
   const permissions = [...elements["token-permissions"].querySelectorAll("input:checked")]
@@ -3308,11 +3342,24 @@ function concreteIdentityValue(value) {
   return normalized && !normalized.startsWith("<") ? normalized : "";
 }
 
-function createSoftwareIdentityForProfile(profile) {
+function accessFormatProfileLabel(profile) {
+  // 参考配置里软件身份仍是占位符的 profile（如“通用（标准 MCP）”）：
+  // 它的 label 只描述接入格式/接入方式，不能当作软件身份显示名称。
+  return concreteIdentityValue(profile?.software_name)
+    ? ""
+    : String(profile?.label || "").trim();
+}
+
+function createSoftwareIdentityForProfile(profile, agentName) {
   const client = concreteIdentityValue(profile?.software_client) || "standard-mcp";
-  const name = concreteIdentityValue(profile?.software_name)
-    || concreteIdentityValue(profile?.label)
-    || "Standard MCP Agent";
+  const name = concreteIdentityValue(agentName);
+  const formatLabel = accessFormatProfileLabel(profile);
+  if (!name) {
+    throw new Error("请填写实际的 Agent 显示名称；接入格式标签不能作为软件身份名称");
+  }
+  if (name === formatLabel) {
+    throw new Error(`“${formatLabel}”是接入格式标签，请填写实际的 Agent 显示名称`);
+  }
   const prefix = concreteIdentityValue(profile?.software_key) || client;
   const suffix = globalThis.crypto?.randomUUID?.()
     || `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;

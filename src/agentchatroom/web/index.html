@@ -6,8 +6,8 @@
     <meta name="color-scheme" content="light">
     <title>AgentChatRoom</title>
     <link rel="icon" href="/assets/favicon.svg?v=1.0.0-central1" type="image/svg+xml">
-    <link rel="stylesheet" href="/assets/app.css?v=1.0.0-central53">
-    <script src="/assets/app.js?v=1.0.0-central53" defer></script>
+    <link rel="stylesheet" href="/assets/app.css?v=1.0.0-central54">
+    <script src="/assets/app.js?v=1.0.0-central54" defer></script>
   </head>
   <body>
     <div class="app-shell" id="app-shell">
@@ -738,13 +738,19 @@
           </div>
           <button type="button" class="icon-button dialog-close" title="关闭" aria-label="关闭">×</button>
         </div>
-        <label>名称 <input id="token-name" autocomplete="off" required></label>
+        <label>凭据名称（只用于管理这个 Token，不会成为 Agent 名称） <input id="token-name" autocomplete="off" required></label>
         <label>关联已有成员（可选）
           <select id="token-member">
-            <option value="">不关联；首次连接时自动创建成员</option>
+            <option value="">不关联；首次连接时按下面填写的显示名称自动创建成员</option>
           </select>
         </label>
         <p class="form-hint">新项目无需预先创建成员。保持不关联时，Agent 首次成功连接会按生成配置中的软件身份自动登记；选择旧成员仅用于沿用已有身份。“已配置软件，加入本项目”建议保持不关联：Agent 合并时会保留客户端原身份，与所选成员不一致会被拒绝，选旧成员仅限确认身份相同时。</p>
+        <section id="token-agent-name-group" hidden>
+          <label>Agent 显示名称（首次接入且不关联成员时必填）
+            <input id="token-agent-name" autocomplete="off" placeholder="例如 Hermes、Grok、OpenCode">
+          </label>
+          <p class="form-hint">该名称会写入生成配置的 X-AgentChatRoom-Software-Name，并在首次成功连接时登记为软件成员与 Session 的显示名称。“通用（标准 MCP）”等接入格式标签不是身份名称，不能填写或代替。</p>
+        </section>
         <label>有效天数 <input id="token-days" type="number" min="1" max="365" value="30" required></label>
         <details id="token-existing-config-advanced" class="integration-fallback" hidden>
           <summary>高级 · 故障恢复：手动粘贴已有配置合并（可选）</summary>

@@ -347,3 +347,6 @@ def test_onboarding_prompt_states_lifecycle_and_pin_semantics(tmp_path):
         assert "立即停止消息、任务、文件占用等一切写操作" in text, transport
         assert "「AgentChatRoom」" in text, transport
         assert "生效顺序" in text, transport
+    # #115: 首次配置提示词要求用户给出实际接入端显示名称，格式标签与占位符原文不可沿用。
+    assert "实际接入端显示名称" in prompt
+    assert "接入格式标签" in prompt

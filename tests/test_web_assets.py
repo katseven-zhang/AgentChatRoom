@@ -49,6 +49,34 @@ def test_web_add_project_issues_without_pasting_raw_config():
     assert 'setup.mode === "reconnect"' in javascript
 
 
+def test_web_first_setup_requires_a_real_agent_display_name():
+    """首次接入不关联成员时必须由用户给出实际 Agent 名称，接入格式标签不得兜底。"""
+    markup = (WEB_DIR / "index.html").read_text(encoding="utf-8")
+    javascript = (WEB_DIR / "app.js").read_text(encoding="utf-8")
+
+    # UI 三要素语义分离：凭据名称只管理 Token，成员关联沿用旧身份，
+    # 显示名称才是新成员/Session 的名称。
+    assert "凭据名称（只用于管理这个 Token，不会成为 Agent 名称）" in markup
+    assert "Agent 显示名称（首次接入且不关联成员时必填）" in markup
+    assert 'id="token-agent-name"' in markup
+    assert 'id="token-agent-name-group" hidden' in markup
+    assert "接入格式标签不是身份名称" in markup
+
+    # generic profile.label（“通用（标准 MCP）”）不再回退为软件身份名称。
+    assert "|| concreteIdentityValue(profile?.label)" not in javascript
+    assert '|| "Standard MCP Agent"' not in javascript
+    assert "function accessFormatProfileLabel(profile)" in javascript
+    assert "请填写实际的 Agent 显示名称；接入格式标签不能作为软件身份名称" in javascript
+    assert "是接入格式标签，请填写实际的 Agent 显示名称" in javascript
+
+    # 首次路径把用户填写值交给身份生成；增量路径不生成第二套身份。
+    assert "elements[\"token-agent-name\"].value," in javascript
+    assert "已配置软件增量加入 Project：客户端原身份由 Agent 在本地保留" in javascript
+    assert "所选项目成员的软件身份不完整" in javascript
+    assert "function syncTokenAgentNameVisibility()" in javascript
+    assert 'elements["token-member"].addEventListener("change"' in javascript
+
+
 def test_frontend_exposes_only_http_while_backend_keeps_migration_support():
     markup = (WEB_DIR / "index.html").read_text(encoding="utf-8")
     javascript = (WEB_DIR / "app.js").read_text(encoding="utf-8")
@@ -280,8 +308,8 @@ def test_web_supports_human_reading_and_guided_interactions():
     assert "snapshot.agent_identities" in javascript
     assert "当前连接" in javascript
     assert "累计" in javascript and "次接入" in javascript
-    assert 'app.css?v=1.0.0-central53' in markup
-    assert 'app.js?v=1.0.0-central53' in markup
+    assert 'app.css?v=1.0.0-central54' in markup
+    assert 'app.js?v=1.0.0-central54' in markup
     assert len(re.findall(r'<script\b[^>]*src="/assets/app\.js', markup)) == 1
     assert 'id="task-history-filter"' in markup
     assert "function loadTaskHistory(" in javascript
@@ -318,8 +346,8 @@ def test_web_supports_human_reading_and_guided_interactions():
     assert "parseExistingSoftwareIdentity" in javascript
     assert "sameSoftwareIdentity" in javascript
     assert "已有配置与所选项目成员不是同一个软件身份" in javascript
-    assert "不关联；首次连接时自动创建成员" in javascript
-    assert "selectedIdentity || createSoftwareIdentityForProfile(setup.profile)" in javascript
+    assert "不关联；首次连接时按下面填写的显示名称自动创建成员" in javascript
+    assert 'elements["token-agent-name"].value' in javascript
     assert "softwareIdentity = existingIdentity" in javascript
     assert "本工作区固定 bootstrap 参数" in javascript
     assert 'id="token-project-credential-name" autocomplete="off" readonly' in markup

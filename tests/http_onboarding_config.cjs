@@ -168,17 +168,26 @@ for (const header of ['http_headers', 'headers']) {
   );
 }
 
-const genericIdentity = context.createSoftwareIdentityForProfile({
+const genericProfile = {
   label: '通用（标准 MCP）',
   software_key: '<stable-software-key>',
   software_name: '<Software name>',
   software_client: '<software-client-code>',
-});
+};
+// 通用 profile 的 label 只是接入格式标签：既不能作为软件身份名称，也不能兜底成名称。
+assert.equal(context.accessFormatProfileLabel(genericProfile), '通用（标准 MCP）');
+assert.throws(() => context.createSoftwareIdentityForProfile(genericProfile), /显示名称/);
+assert.throws(() => context.createSoftwareIdentityForProfile(genericProfile, '   '), /显示名称/);
+assert.throws(
+  () => context.createSoftwareIdentityForProfile(genericProfile, '通用（标准 MCP）'),
+  /接入格式标签/,
+);
+const genericIdentity = context.createSoftwareIdentityForProfile(genericProfile, 'Hermes');
 assert.deepEqual(
   JSON.parse(JSON.stringify(genericIdentity)),
   {
     softwareKey: 'standard-mcp-11111111-2222-4333-8444-555555555555',
-    softwareName: '通用（标准 MCP）',
+    softwareName: 'Hermes',
     softwareClient: 'standard-mcp',
   },
 );
@@ -191,12 +200,36 @@ assert.equal(
   cleanDatabaseConfig.mcpServers.agentchatroom.headers['X-AgentChatRoom-Software-Key'],
   genericIdentity.softwareKey,
 );
-const encodedGenericName = cleanDatabaseConfig.mcpServers.agentchatroom.headers['X-AgentChatRoom-Software-Name'];
-assert.match(encodedGenericName, /^acr-utf8\.v1\.[A-Za-z0-9_-]+$/);
-assert.equal(context.decodeHttpIdentityHeaderValue(encodedGenericName), genericIdentity.softwareName);
+// ASCII 名称在配置里保持明文。
+assert.equal(
+  cleanDatabaseConfig.mcpServers.agentchatroom.headers['X-AgentChatRoom-Software-Name'],
+  'Hermes',
+);
 assert.deepEqual(
   JSON.parse(JSON.stringify(context.parseExistingSoftwareIdentity(JSON.stringify(cleanDatabaseConfig)))),
   JSON.parse(JSON.stringify(genericIdentity)),
+);
+// 中文名称只在线路层编码，解析与展示必须还原原文。
+const chineseIdentity = context.createSoftwareIdentityForProfile(genericProfile, '猎鹰');
+const chineseConfig = JSON.parse(context.issuedHttpConfig(profile, [entries[0]], chineseIdentity));
+const encodedChineseName = chineseConfig.mcpServers.agentchatroom.headers['X-AgentChatRoom-Software-Name'];
+assert.match(encodedChineseName, /^acr-utf8\.v1\.[A-Za-z0-9_-]+$/);
+assert.equal(context.decodeHttpIdentityHeaderValue(encodedChineseName), '猎鹰');
+assert.deepEqual(
+  JSON.parse(JSON.stringify(context.parseExistingSoftwareIdentity(JSON.stringify(chineseConfig)))),
+  JSON.parse(JSON.stringify(chineseIdentity)),
+);
+// 具名客户端 profile 自带确定身份，其 label 不是格式标签，可直接作为显示名称。
+const namedProfile = {
+  label: 'WorkBuddy',
+  software_key: 'workbuddy',
+  software_name: 'WorkBuddy',
+  software_client: 'workbuddy',
+};
+assert.equal(context.accessFormatProfileLabel(namedProfile), '');
+assert.equal(
+  context.createSoftwareIdentityForProfile(namedProfile, 'WorkBuddy').softwareName,
+  'WorkBuddy',
 );
 
 assert.throws(
