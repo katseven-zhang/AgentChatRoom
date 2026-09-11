@@ -77,6 +77,36 @@ def test_web_first_setup_requires_a_real_agent_display_name():
     assert 'elements["token-member"].addEventListener("change"' in javascript
 
 
+def test_web_agent_name_field_follows_setup_scenario(tmp_path):
+    """DOM 行为：首次接入未关联成员时显示名称必填，增量与关联成员场景隐藏。"""
+    javascript = (WEB_DIR / "app.js").read_text(encoding="utf-8")
+    start = javascript.index("function syncTokenAgentNameVisibility()")
+    end = javascript.index("\n}\n", start) + 3
+    harness = tmp_path / "token_agent_name.js"
+    harness.write_text("""
+const assert = require('node:assert/strict');
+const nameGroup = {hidden: true, value: ''};
+const memberSelect = {value: ''};
+const elements = {'token-agent-name-group': nameGroup, 'token-member': memberSelect};
+const state = {pendingHttpSetup: null};
+""" + javascript[start:end] + """
+syncTokenAgentNameVisibility();
+assert.equal(nameGroup.hidden, true, 'no HTTP setup keeps the field hidden');
+state.pendingHttpSetup = {mode: 'first_setup'};
+syncTokenAgentNameVisibility();
+assert.equal(nameGroup.hidden, false, 'first setup without member asks for a name');
+memberSelect.value = 'member-1';
+syncTokenAgentNameVisibility();
+assert.equal(nameGroup.hidden, true, 'linked member reuses its identity');
+memberSelect.value = '';
+state.pendingHttpSetup = {mode: 'add_project'};
+syncTokenAgentNameVisibility();
+assert.equal(nameGroup.hidden, true, 'incremental join keeps the client identity');
+""", encoding="utf-8")
+    run = subprocess.run(["node", str(harness)], capture_output=True, text=True)
+    assert run.returncode == 0, run.stderr
+
+
 def test_frontend_exposes_only_http_while_backend_keeps_migration_support():
     markup = (WEB_DIR / "index.html").read_text(encoding="utf-8")
     javascript = (WEB_DIR / "app.js").read_text(encoding="utf-8")
