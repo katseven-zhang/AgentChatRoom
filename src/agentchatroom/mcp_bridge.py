@@ -21,6 +21,12 @@ from mcp.server.lowlevel import NotificationOptions, Server
 from mcp.server.stdio import stdio_server
 
 from . import __version__
+from .mcp_http_recovery import (
+    DIRECT_CLIENT_RECONNECT_HINT,
+    MCP_SESSION_EXPIRED_CODE,
+    MCP_SESSION_RECONNECT_ACTION,
+    expired_session_exception,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -65,6 +71,10 @@ AUTO_IDEMPOTENCY_TOOL_NAMES = frozenset(
 )
 ResultT = TypeVar("ResultT")
 RETRYABLE_HTTP_STATUS_CODES = frozenset({408, 425, 429, 500, 502, 503, 504})
+# An expired upstream MCP session may be re-initialised automatically, but only
+# this many times: each attempt opens a fresh session with the same credentials
+# and software identity, and reuses the request id, so a repeat is idempotent.
+MAX_EXPIRED_REINITIALISATIONS = 1
 
 
 def parse_bridge_settings(argv: list[str] | None = None) -> BridgeSettings:
@@ -225,6 +235,40 @@ def retryable_bridge_error(error: Exception) -> bool:
     return False
 
 
+def expired_session_tool_payload(*, reconnect_hint: str, detail: str) -> dict[str, Any]:
+    """Tool result used when the manual reload step is the only way forward."""
+    return {
+        "ok": False,
+        "error": {
+            "code": MCP_SESSION_EXPIRED_CODE,
+            "message": (
+                "AgentChatRoom center no longer recognises this MCP HTTP "
+                "session; reload the client connector once and retry, do not loop"
+            ),
+            "required_action": MCP_SESSION_RECONNECT_ACTION,
+            "reconnect_hint": reconnect_hint,
+            "detail": detail,
+        },
+    }
+
+
+class BridgeSessionExpiredError(RuntimeError):
+    """The center no longer recognises the MCP HTTP session this Bridge used.
+
+    Raised after the single automatic re-initialisation has already been tried,
+    so the caller must report the manual reload step instead of looping.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        reconnect_hint: str = DIRECT_CLIENT_RECONNECT_HINT,
+    ) -> None:
+        super().__init__(message)
+        self.reconnect_hint = reconnect_hint
+
+
 class ReconnectingUpstream:
     def __init__(
         self,
@@ -256,48 +300,67 @@ class ReconnectingUpstream:
         ) as http_client:
             yield http_client
 
+    async def _attempt(
+        self,
+        operation: Callable[[ClientSession], Awaitable[ResultT]],
+    ) -> ResultT:
+        # Use a fresh HTTP pool for every attempt. A center restart can leave a
+        # keep-alive socket in the old pool that otherwise waits forever instead
+        # of failing fast and being retried.
+        async with self._http_client() as http_client:
+            with anyio.fail_after(self.settings.timeout_seconds):
+                async with streamable_http_client(
+                    self.settings.server_url,
+                    http_client=http_client,
+                ) as (upstream_read, upstream_write, _session_id):
+                    async with ClientSession(
+                        upstream_read,
+                        upstream_write,
+                        client_info=types.Implementation(
+                            name="AgentChatRoom stdio Bridge",
+                            version=__version__,
+                        ),
+                    ) as session:
+                        await session.initialize()
+                        return await operation(session)
+
     async def _run(
         self,
         operation: Callable[[ClientSession], Awaitable[ResultT]],
     ) -> ResultT:
-        last_error: Exception | None = None
-        for attempt in range(self.settings.retry_attempts):
+        expired_budget = MAX_EXPIRED_REINITIALISATIONS
+        plain_attempts = self.settings.retry_attempts
+        plain_index = 0
+        while True:
             try:
-                # Use a fresh HTTP pool for every attempt. A center restart can
-                # leave a keep-alive socket in the old pool that otherwise
-                # waits forever instead of failing fast and being retried.
-                async with self._http_client() as http_client:
-                    with anyio.fail_after(self.settings.timeout_seconds):
-                        async with streamable_http_client(
-                            self.settings.server_url,
-                            http_client=http_client,
-                        ) as (upstream_read, upstream_write, _session_id):
-                            async with ClientSession(
-                                upstream_read,
-                                upstream_write,
-                                client_info=types.Implementation(
-                                    name="AgentChatRoom stdio Bridge",
-                                    version=__version__,
-                                ),
-                            ) as session:
-                                await session.initialize()
-                                return await operation(session)
+                return await self._attempt(operation)
             except Exception as error:
-                if not retryable_bridge_error(error):
+                if expired_session_exception(error):
+                    # The center reaped this MCP transport session. Re-initialising
+                    # once is safe: every attempt opens a fresh session with the
+                    # same credentials and software identity, and reuses the
+                    # request id, so the replay stays idempotent. After that the
+                    # manual reload step must be reported instead of looping.
+                    if expired_budget <= 0:
+                        raise BridgeSessionExpiredError(str(error)) from error
+                    expired_budget -= 1
+                    logger.warning(
+                        "Upstream MCP session expired; re-initialising once "
+                        "before retrying the same request"
+                    )
+                    continue
+                if not retryable_bridge_error(error) or plain_index + 1 >= plain_attempts:
                     raise
-                last_error = error
+                plain_index += 1
                 logger.warning(
                     "Upstream MCP attempt %d/%d failed; retrying if possible: %s",
-                    attempt + 1,
-                    self.settings.retry_attempts,
+                    plain_index,
+                    plain_attempts,
                     type(error).__name__,
                 )
-                if attempt + 1 < self.settings.retry_attempts:
-                    await anyio.sleep(
-                        self.settings.retry_backoff_seconds * (2**attempt)
-                    )
-        assert last_error is not None
-        raise last_error
+                await anyio.sleep(
+                    self.settings.retry_backoff_seconds * (2 ** (plain_index - 1))
+                )
 
     async def list_tools(self) -> types.ListToolsResult:
         return await self._run(lambda session: session.list_tools())
@@ -427,6 +490,19 @@ async def run_bridge(settings: BridgeSettings) -> None:
         forwarded = prepare_tool_arguments(name, arguments)
         try:
             result = await upstream.call_tool(name, forwarded)
+        except BridgeSessionExpiredError as error:
+            # The single automatic re-initialisation already failed. Report the
+            # one manual step instead of retrying the expired session forever.
+            logger.warning("Upstream MCP session expired for tool %s", name)
+            payload = expired_session_tool_payload(
+                reconnect_hint=error.reconnect_hint,
+                detail=type(error.__cause__ or error).__name__,
+            )
+            return types.CallToolResult(
+                content=[
+                    types.TextContent(type="text", text=json.dumps(payload))
+                ]
+            )
         except Exception as error:  # noqa: BLE001 - fail closed per request
             logger.warning(
                 "Upstream call_tool %s failed: %s", name, type(error).__name__

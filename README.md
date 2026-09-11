@@ -515,6 +515,8 @@ room_bootstrap
 
 Web「接入 Agent」区分 Project 凭据、软件配置、进程连接（MCP Presence）、Room Session、当前对话同步。浏览器无法观察某个模型对话是否已同步，因此不会把左侧「已连接」画成「当前对话已同步」。首次配置和加入项目的签发结果把明文 Project↔Token 映射、含凭据包的 MCP 配置和场景指令合成一份一次性提示词；接入后第一步调用 `room_bootstrap(project_name="<目标 Project 名称>")` 并核对返回的 Project 名称与 root_path。恢复连接使用另一份不签发 Token 的提示词。一个客户端保留一个 `agentchatroom` MCP 配置，每个任务建立自己的轻量 MCP Session；同一 Agent 同时处理多个 Project 时，各 Session 一次绑定各自凭据并保持并行，不在项目间来回重连。出现凭据名称不存在、Token 失效、项目不匹配或 Session 过期时立即停止消息、任务、文件占用等写操作，只按唯一 required_action 恢复。生效顺序为应用完整配置 → 重载客户端 MCP → 按名称 bootstrap 核对项目 → 之后才允许写操作。CLI `room-bootstrap` 复用同一领域服务，成功结果也不打印 Session Token。
 
+HTTP MCP 会话过期与恢复：服务端按 `server.mcp_http_session_idle_timeout_seconds`（默认 1800 秒，与 MCP SDK 对多数部署的建议一致，`AGENTCHATROOM_MCP_HTTP_SESSION_IDLE_TIMEOUT_SECONDS` 优先于配置文件）回收闲置过久的 stateful MCP Session，使被遗弃 transport 的 Presence 心跳不会永久保活旧 Session，旧任务所有者仍会离线并可被同身份显式 reclaim。对未知或已回收的 `mcp-session-id`，服务端保持 MCP 规范要求的 HTTP 404，同时在该 JSON-RPC 错误的 `data` 中给出机器可识别状态 `code=mcp_session_expired`、唯一恢复动作 `required_action=reconnect_mcp_session` 与 `reconnect_hint` 文案，并附加 `x-agentchatroom-mcp-session: expired` 响应头，便于网关、日志与客户端识别。恢复动作只有一步：重新初始化会话（在客户端重新加载一次 `agentchatroom` 连接器）后重新 `room_bootstrap`；新 Session 继续原 Project，旧 Session 若有未完成任务必须由同软件身份显式 `task_claim(reclaim=true)` 接管，不会静默转移任务或改写历史。仓库自带的 stdio Bridge 收到该状态时至多自动重新 initialize 一次，用同一凭据、同一软件身份与同一请求 id 重放（幂等）；仍失败或第三方直连客户端不支持自动恢复时，返回 `mcp_session_expired` 与一次人工重载指令，不无限重试。默认 1800 秒可用 TOML 或环境变量覆盖，取值必须为正数。
+
 ### MCP 生命周期与启动归属
 
 MCP 不负责启动后台服务或 GUI。直接 HTTP MCP 不需要客户端创建本地进程；stdio 按协议由客户端创建适配器进程（打包 EXE 的 `mcp` 子命令或 Python 模块），它不代表 GUI。需要完全避免客户端反复创建本地进程时应使用 HTTP 配置，并移除旧 stdio 启动配置。三种模式的启动归属：

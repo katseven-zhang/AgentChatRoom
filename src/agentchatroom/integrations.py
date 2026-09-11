@@ -237,6 +237,16 @@ def build_onboarding_prompt(
             "GUI 或托盘；目标服务必须由用户显式启动。服务未启动或已停止时"
             "返回 service_unavailable，不能继续写入。"
         )
+    if transport in {"http", "remote"}:
+        lifecycle_note += (
+            "\n\nMCP 会话过期恢复：服务端会回收闲置过久的 MCP HTTP 会话"
+            "（默认 1800 秒，可通过配置覆盖）。收到 code=mcp_session_expired / "
+            "required_action=reconnect_mcp_session（HTTP 404）表示该会话已不可用："
+            "本仓库自带的 stdio Bridge 会自动重新初始化一次并重放同一请求；"
+            "直连客户端不支持自动恢复时，请在客户端重新加载一次 agentchatroom "
+            "连接器，然后重新调用 room_bootstrap 继续原 Project。不要无限重试"
+            "过期会话，也不要更换项目凭据或软件身份。"
+        )
     pin_warning = ""
     if transport == "local" and PROJECT_PATH_ENV_VAR in config_text:
         pin_warning = (

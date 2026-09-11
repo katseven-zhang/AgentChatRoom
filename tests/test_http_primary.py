@@ -1015,3 +1015,183 @@ async def test_one_http_mcp_credential_bundle_keeps_parallel_projects_isolated(
         server.should_exit = True
         await server_task
         _clear_http_mcp_context()
+
+
+def _initialize_request(request_id: int, client_name: str) -> dict:
+    return {
+        "jsonrpc": "2.0",
+        "id": request_id,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "2025-06-18",
+            "capabilities": {},
+            "clientInfo": {"name": client_name, "version": "1"},
+        },
+    }
+
+
+def _http_tool_payload(response: httpx.Response) -> dict:
+    return json.loads(response.json()["result"]["content"][0]["text"])
+
+
+@pytest.mark.asyncio
+async def test_expired_http_session_reports_recovery_and_reclaims_unfinished_task(
+    settings, project_dir
+):
+    """#116: 过期 transport 保持规范 404 且可识别；新会话恢复原 Project 并可同身份 reclaim。"""
+    tuned = replace(
+        settings,
+        heartbeat_timeout_seconds=0.5,
+        presence_keepalive_interval_seconds=0.05,
+        mcp_http_session_idle_timeout_seconds=0.3,
+    )
+    app = create_app(tuned)
+    project = app.state.service.create_project(
+        root_path=str(project_dir), name="Expired Session"
+    )
+    credential = app.state.service.issue_agent_token(
+        project["id"], name="Expired Session"
+    )
+    bundle = encode_project_credential_bundle(
+        [{"name": project["name"], "token": credential["token"]}]
+    )
+    with socket.socket() as listener:
+        listener.bind(("127.0.0.1", 0))
+        port = listener.getsockname()[1]
+    server = uvicorn.Server(
+        uvicorn.Config(app, host="127.0.0.1", port=port, log_level="error")
+    )
+    server_task = asyncio.create_task(server.serve())
+    deadline = asyncio.get_running_loop().time() + 10
+    while not server.started and asyncio.get_running_loop().time() < deadline:
+        await asyncio.sleep(0.02)
+    assert server.started
+    url = f"http://127.0.0.1:{port}{tuned.mcp_http_path}"
+    headers = {
+        "Authorization": f"Bearer {bundle}",
+        "X-AgentChatRoom-Software-Key": "expired-http",
+        "X-AgentChatRoom-Software-Name": "Expired HTTP",
+        "X-AgentChatRoom-Software-Client": "test-http",
+        "accept": "application/json, text/event-stream",
+        "content-type": "application/json",
+    }
+    request_ids = iter(range(100, 200))
+
+    async def open_transport(client: httpx.AsyncClient) -> str:
+        initialized = await client.post(
+            url, json=_initialize_request(next(request_ids), "expiring-client")
+        )
+        assert initialized.status_code == 200, initialized.text
+        transport_id = initialized.headers["mcp-session-id"]
+        notified = await client.post(
+            url,
+            headers={"mcp-session-id": transport_id},
+            json={"jsonrpc": "2.0", "method": "notifications/initialized"},
+        )
+        assert notified.status_code == 202, notified.text
+        return transport_id
+
+    async def call_tool(
+        client: httpx.AsyncClient, transport_id: str, name: str, arguments: dict
+    ) -> httpx.Response:
+        return await client.post(
+            url,
+            headers={"mcp-session-id": transport_id},
+            json={
+                "jsonrpc": "2.0",
+                "id": next(request_ids),
+                "method": "tools/call",
+                "params": {"name": name, "arguments": arguments},
+            },
+        )
+
+    try:
+        async with httpx.AsyncClient(headers=headers, timeout=10.0) as client:
+            stale_transport = await open_transport(client)
+            booted = _http_tool_payload(
+                await call_tool(
+                    client,
+                    stale_transport,
+                    "room_bootstrap",
+                    {"project_name": project["name"]},
+                )
+            )
+            assert booted["ok"], booted
+
+            created = _http_tool_payload(
+                await call_tool(
+                    client,
+                    stale_transport,
+                    "task_create",
+                    {
+                        "title": "#116 expiry probe",
+                        "description": "owned by the session that expires",
+                        "acceptance_criteria": ["an expired session keeps its task"],
+                    },
+                )
+            )
+            assert created["ok"], created
+            task_id = created["result"]["task"]["id"]
+            claimed = _http_tool_payload(
+                await call_tool(
+                    client, stale_transport, "task_claim", {"task_id": task_id}
+                )
+            )
+            assert claimed["ok"], claimed
+
+            # Exceed the configured idle timeout without any request at all.
+            await asyncio.sleep(0.6)
+
+            expired = await client.post(
+                url,
+                headers={"mcp-session-id": stale_transport},
+                json={"jsonrpc": "2.0", "id": 90, "method": "tools/list"},
+            )
+            assert expired.status_code == 404, expired.text
+            assert expired.headers.get("x-agentchatroom-mcp-session") == "expired"
+            error = expired.json()["error"]
+            assert error["message"] == "Session not found"
+            assert error["data"]["code"] == "mcp_session_expired"
+            assert error["data"]["required_action"] == "reconnect_mcp_session"
+            assert error["data"]["reconnect_hint"]
+
+            fresh_transport = await open_transport(client)
+            assert fresh_transport != stale_transport
+            rebound = _http_tool_payload(
+                await call_tool(
+                    client,
+                    fresh_transport,
+                    "room_bootstrap",
+                    {"project_name": project["name"]},
+                )
+            )
+            assert rebound["ok"], rebound
+            assert rebound["result"]["project"]["name"] == project["name"]
+            assert (
+                rebound["result"]["session"]["id"] != booted["result"]["session"]["id"]
+            )
+
+            reclaimed = None
+            deadline = asyncio.get_running_loop().time() + 5
+            while asyncio.get_running_loop().time() < deadline:
+                reclaimed = _http_tool_payload(
+                    await call_tool(
+                        client,
+                        fresh_transport,
+                        "task_claim",
+                        {"task_id": task_id, "reclaim": True},
+                    )
+                )
+                if reclaimed["ok"]:
+                    break
+                await asyncio.sleep(0.1)
+            assert reclaimed is not None and reclaimed["ok"], reclaimed
+            snapshot = app.state.service.snapshot(project["id"])
+            task_state = next(
+                item for item in snapshot["tasks"] if item["id"] == task_id
+            )
+            assert task_state["owner_session_id"] == rebound["result"]["session"]["id"]
+    finally:
+        server.should_exit = True
+        await server_task
+        _clear_http_mcp_context()

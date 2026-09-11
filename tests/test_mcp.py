@@ -1760,3 +1760,115 @@ def test_mcp_task_release_enforces_owner_and_idempotent_repeat(monkeypatch, serv
     )
     assert repeated["ok"] is True
     assert repeated["result"]["already_released"] is True
+
+
+def _expired_session_http_error() -> httpx.HTTPStatusError:
+    request = httpx.Request("POST", "http://127.0.0.1:8765/mcp")
+    return httpx.HTTPStatusError(
+        "Session not found",
+        request=request,
+        response=httpx.Response(
+            404,
+            json={
+                "jsonrpc": "2.0",
+                "id": "server-error",
+                "error": {"code": -32600, "message": "Session not found"},
+            },
+            request=request,
+        ),
+    )
+
+
+def _stub_upstream_transport(monkeypatch, *, always_expired: bool):
+    connect_attempts = 0
+    call_arguments: list[dict] = []
+
+    class FakeStream:
+        async def __aenter__(self):
+            nonlocal connect_attempts
+            connect_attempts += 1
+            return object(), object(), None
+
+        async def __aexit__(self, *_args):
+            return False
+
+    class FakeSession:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return False
+
+        async def initialize(self):
+            return None
+
+        async def call_tool(self, _name, arguments):
+            call_arguments.append(dict(arguments))
+            if always_expired or len(call_arguments) == 1:
+                raise _expired_session_http_error()
+            return "ok"
+
+    monkeypatch.setattr(
+        mcp_bridge, "streamable_http_client", lambda *_args, **_kwargs: FakeStream()
+    )
+    monkeypatch.setattr(mcp_bridge, "ClientSession", FakeSession)
+    return lambda: connect_attempts, call_arguments
+
+
+@pytest.mark.asyncio
+async def test_bridge_reinitialises_once_when_center_reports_expired_session(monkeypatch):
+    """#116: 上游会话过期时至多自动重新 initialize 一次，并复用同一请求 id。"""
+    attempts, call_arguments = _stub_upstream_transport(monkeypatch, always_expired=False)
+    forwarded = prepare_tool_arguments("work_report", {"task_id": "task_1"})
+    upstream = ReconnectingUpstream(
+        BridgeSettings(
+            server_url="http://127.0.0.1:8765/mcp",
+            retry_attempts=1,
+            retry_backoff_seconds=0,
+        ),
+        http_client=None,
+    )
+
+    assert await upstream.call_tool("work_report", forwarded) == "ok"
+    # retry_attempts=1 still allows the single expired-session re-initialisation.
+    assert attempts() == 2
+    assert len(call_arguments) == 2
+    assert call_arguments[0]["request_id"] == forwarded["request_id"]
+    assert call_arguments[1]["request_id"] == forwarded["request_id"]
+
+
+@pytest.mark.asyncio
+async def test_bridge_stops_after_one_expired_session_reinitialisation(monkeypatch):
+    """#116: 持续过期时抛出 BridgeSessionExpiredError，不无限重试。"""
+    attempts, call_arguments = _stub_upstream_transport(monkeypatch, always_expired=True)
+    upstream = ReconnectingUpstream(
+        BridgeSettings(
+            server_url="http://127.0.0.1:8765/mcp",
+            retry_attempts=3,
+            retry_backoff_seconds=0,
+        ),
+        http_client=None,
+    )
+
+    with pytest.raises(mcp_bridge.BridgeSessionExpiredError):
+        await upstream.call_tool("work_report", {"request_id": "request_fixed"})
+
+    assert attempts() == 2
+    assert len(call_arguments) == 2
+
+
+def test_bridge_expired_session_payload_carries_one_manual_reload_step():
+    payload = mcp_bridge.expired_session_tool_payload(
+        reconnect_hint=mcp_bridge.DIRECT_CLIENT_RECONNECT_HINT,
+        detail="HTTPStatusError",
+    )
+
+    assert payload["ok"] is False
+    error = payload["error"]
+    assert error["code"] == "mcp_session_expired"
+    assert error["required_action"] == "reconnect_mcp_session"
+    assert "重新加载" in error["reconnect_hint"]
+    assert error["detail"] == "HTTPStatusError"

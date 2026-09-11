@@ -147,7 +147,10 @@ class Settings:
     mcp_http_path: str = "/mcp"
     mcp_http_stateless: bool = False
     mcp_http_json_response: bool = True
-    mcp_http_session_idle_timeout_seconds: float = 300.0
+    # MCP SDK guidance for stateful HTTP sessions: 1800s (30 minutes) suits most
+    # deployments. A shorter default reaped healthy clients during ordinary long
+    # local builds/tests (8-15 minutes) and left them replaying a stale session.
+    mcp_http_session_idle_timeout_seconds: float = 1800.0
     mcp_bridge_command: str = "python"
     external_base_url: str = ""
     trusted_proxy_headers: bool = True
@@ -400,7 +403,7 @@ def load_settings(
         "mcp_http_session_idle_timeout_seconds": float(
             os.getenv(
                 "AGENTCHATROOM_MCP_HTTP_SESSION_IDLE_TIMEOUT_SECONDS",
-                file_values.get("mcp_http_session_idle_timeout_seconds", 300.0),
+                file_values.get("mcp_http_session_idle_timeout_seconds", 1800.0),
             )
         ),
         "mcp_bridge_command": os.getenv(

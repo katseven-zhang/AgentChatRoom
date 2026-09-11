@@ -29,6 +29,7 @@ from .errors import DomainError
 from .integrations import build_mcp_integration
 from .local_mcp import LocalMcpConfigurator
 from .mcp_server import create_mcp, http_transport_binding_alive
+from .mcp_http_recovery import with_expired_session_hints
 from .presence import LocalPresenceManager
 from .service_lifetime import running_service
 from .project_registration import (
@@ -919,6 +920,11 @@ def create_app(
         http_presence_manager.transport_check = lambda key: http_transport_binding_alive(
             mcp_server.session_manager, key
         )
+        # Keep the specification-compatible 404 for an unknown or reaped
+        # mcp-session-id, but make the response machine-readable and actionable
+        # so a client that never re-initialises can recover instead of failing
+        # every tool call forever.
+        mcp_http_app = with_expired_session_hints(mcp_http_app)
 
     auto_backup_stop = threading.Event()
 

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 from agentchatroom.config import default_data_dir, load_settings
@@ -147,6 +149,28 @@ def test_mcp_http_session_idle_timeout_must_be_positive(monkeypatch, tmp_path):
 
     with pytest.raises(ValueError, match="session idle timeout must be positive"):
         load_settings()
+
+
+def test_default_http_session_idle_timeout_covers_long_local_runs(
+    monkeypatch, tmp_path
+):
+    """#116: 默认闲置上限覆盖常规 8-15 分钟本地构建/测试，并仍可覆盖面。"""
+    monkeypatch.setenv("AGENTCHATROOM_DATA_DIR", str(tmp_path / "data"))
+
+    settings = load_settings()
+
+    # MCP SDK 建议多数部署使用 1800 秒（30 分钟）。
+    assert settings.mcp_http_session_idle_timeout_seconds == 1800.0
+
+    # 公开示例配置必须与服务端默认值一致，避免运维按过期文档调小上限。
+    example = (Path(__file__).parents[1] / "config.example.toml").read_text(
+        encoding="utf-8"
+    )
+    assert "mcp_http_session_idle_timeout_seconds = 1800.0" in example
+
+    # TOML 与环境变量仍可覆盖默认值。
+    monkeypatch.setenv("AGENTCHATROOM_MCP_HTTP_SESSION_IDLE_TIMEOUT_SECONDS", "600")
+    assert load_settings().mcp_http_session_idle_timeout_seconds == 600.0
 
 
 def test_unknown_or_mistyped_file_configuration_is_rejected(monkeypatch, tmp_path):

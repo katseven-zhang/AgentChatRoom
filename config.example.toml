@@ -11,7 +11,11 @@ mcp_http_stateless = false
 # JSON responses avoid long-lived SSE cleanup races for short tool calls.
 mcp_http_json_response = true
 # Reap clients that abandon a stateful MCP Session without sending DELETE.
-mcp_http_session_idle_timeout_seconds = 300.0
+# 1800s (30 minutes) follows the MCP SDK recommendation for most deployments and
+# keeps ordinary 8-15 minute local builds/tests from losing a healthy session.
+# An expired/unknown session id still returns the specification 404 with
+# code=mcp_session_expired and required_action=reconnect_mcp_session.
+mcp_http_session_idle_timeout_seconds = 1800.0
 # Command used by a remote stdio Bridge on each Agent computer.
 mcp_bridge_command = "python"
 external_base_url = ""
