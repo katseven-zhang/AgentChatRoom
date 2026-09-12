@@ -111,11 +111,18 @@ def print_server_log(settings, *, lines: int = 80, follow: bool = False) -> None
 class SubmitError(Exception):
     """A structured, machine-readable failure of the one-shot submit command."""
 
-    def __init__(self, code: str, message: str, required_action: str = "") -> None:
+    def __init__(
+        self,
+        code: str,
+        message: str,
+        required_action: str = "",
+        detail: str = "",
+    ) -> None:
         super().__init__(message)
         self.code = code
         self.message = message
         self.required_action = required_action
+        self.detail = detail
 
     def payload(self) -> dict[str, Any]:
         error: dict[str, Any] = {"code": self.code, "message": self.message}
@@ -336,9 +343,18 @@ def run_submit(args: argparse.Namespace, base_url: str) -> dict[str, Any]:
                     "GET",
                     f"/api/v1/projects/{project_id}/tasks/by-number/{task_ref}",
                 )
-                task_id = str(task.get("task", {}).get("id") or task.get("id") or "")
-            except SystemExit:
-                task_id = task_ref
+            except SystemExit as error:
+                # A missing task number (404) or any other server error must
+                # surface to the caller: silently falling back to treating the
+                # number as a task UUID would only produce a more confusing
+                # failure later (task_not_found on claim/report).
+                raise SubmitError(
+                    "submit_task_not_resolved",
+                    f"Could not resolve task number {task_ref!r} via "
+                    "tasks/by-number; do not pass it on as a task id",
+                    detail=str(error),
+                )
+            task_id = str(task.get("task", {}).get("id") or task.get("id") or "")
         else:
             task_id = task_ref
         # A dead transport usually means the task was claimed by the previous

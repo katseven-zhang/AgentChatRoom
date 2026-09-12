@@ -3941,7 +3941,7 @@ class AgentChatRoomService:
                 )
             next_status = response
             now = iso_now()
-            connection.execute(
+            cursor = connection.execute(
                 """
                 UPDATE task_intakes
                 SET target_session_id = ?, status = ?, note = ?, updated_at = ?
@@ -3949,6 +3949,12 @@ class AgentChatRoomService:
                 """,
                 (session_id, next_status, note.strip(), now, intake_id, project_id),
             )
+            if cursor.rowcount != 1:
+                raise DomainError(
+                    "task_intake_already_acknowledged",
+                    "Task intake already has a response",
+                    status_code=409,
+                )
             event_id = self._emit(
                 connection,
                 project_id,
@@ -3998,6 +4004,23 @@ class AgentChatRoomService:
                     "The intake must be accepted before its formal task can be defined",
                     status_code=409,
                 )
+            # Optimistic lock BEFORE creating the task: two concurrent defines
+            # must not both mint formal tasks (the loser must not leave an
+            # orphan duplicate behind).
+            claim = connection.execute(
+                """
+                UPDATE task_intakes
+                SET status = 'defining', updated_at = ?
+                WHERE id = ? AND project_id = ? AND status = 'accepted'
+                """,
+                (iso_now(), intake_id, project_id),
+            )
+            if claim.rowcount != 1:
+                raise DomainError(
+                    "task_intake_already_defined",
+                    "This intake has already been defined into a formal task",
+                    status_code=409,
+                )
             created = self.create_task(
                 project_id,
                 title=title,
@@ -4014,7 +4037,7 @@ class AgentChatRoomService:
                 """
                 UPDATE task_intakes
                 SET status = 'defined', formal_task_id = ?, note = ?, updated_at = ?
-                WHERE id = ? AND project_id = ? AND status = 'accepted'
+                WHERE id = ? AND project_id = ? AND status = 'defining'
                 """,
                 (task["id"], note.strip(), now, intake_id, project_id),
             )
@@ -5590,6 +5613,32 @@ class AgentChatRoomService:
                 self._authenticate(connection, project_id, session_id, token or "")
             task = self._require_task(connection, project_id, task_id)
             next_status = status or task["status"]
+            text_limit = self.settings.task_text_max_length
+            for field_name, value in (
+                ("title", title),
+                ("description", description),
+                ("current_step", current_step),
+                ("blocker_reason", blocker_reason),
+                ("next_step", next_step),
+            ):
+                if value is not None and len(str(value)) > text_limit:
+                    raise DomainError(
+                        "task_text_too_long",
+                        f"Task {field_name} exceeds task_text_max_length ({text_limit})",
+                        details={"field": field_name, "limit": text_limit},
+                    )
+            if acceptance_criteria is not None:
+                for item in acceptance_criteria:
+                    if len(str(item)) > text_limit:
+                        raise DomainError(
+                            "task_text_too_long",
+                            "Acceptance criterion exceeds task_text_max_length "
+                            f"({text_limit})",
+                            details={
+                                "field": "acceptance_criteria",
+                                "limit": text_limit,
+                            },
+                        )
             if (
                 status is not None
                 and status != task["status"]
@@ -6100,18 +6149,18 @@ class AgentChatRoomService:
             if session_id:
                 self._authenticate(connection, project_id, session_id, token or "")
             now = iso_now()
-            online_cutoff = (
-                utc_now() - timedelta(seconds=self.settings.heartbeat_timeout_seconds)
-            ).isoformat().replace("+00:00", "Z")
+            # Presence is display-only (#119): a silent lease owner still
+            # enforces its lease until the TTL lapses or it releases, so
+            # conflict checking must not consult last_heartbeat — otherwise
+            # check_leases and acquire_lease would disagree.
             active = connection.execute(
                 """
                 SELECT l.*, a.name AS agent_name FROM file_leases l
                 JOIN agent_sessions a ON a.id = l.session_id
                 WHERE l.project_id = ? AND l.released_at IS NULL
                   AND l.expires_at > ? AND l.mode = 'exclusive'
-                  AND a.last_heartbeat >= ?
                 """,
-                (project_id, now, online_cutoff),
+                (project_id, now),
             ).fetchall()
             conflicts = [
                 {
@@ -7130,14 +7179,20 @@ class AgentChatRoomService:
                     now,
                 ),
             )
-            connection.execute(
+            reviewed = connection.execute(
                 """
                 UPDATE knowledge_assets
                 SET status = ?, updated_at = ?
-                WHERE id = ? AND project_id = ?
+                WHERE id = ? AND project_id = ? AND status = ?
                 """,
-                (next_status, now, asset_id, project_id),
+                (next_status, now, asset_id, project_id, asset["status"]),
             )
+            if reviewed.rowcount != 1:
+                raise DomainError(
+                    "knowledge_concurrent_transition",
+                    "The knowledge asset status changed concurrently; retry",
+                    status_code=409,
+                )
             review_event_id = self._emit(
                 connection,
                 project_id,
@@ -7211,14 +7266,20 @@ class AgentChatRoomService:
                     },
                 )
             now = iso_now()
-            connection.execute(
+            superseded = connection.execute(
                 """
                 UPDATE knowledge_assets
                 SET status = 'superseded', updated_at = ?
-                WHERE id = ? AND project_id = ?
+                WHERE id = ? AND project_id = ? AND status = ?
                 """,
-                (now, asset_id, project_id),
+                (now, asset_id, project_id, asset["status"]),
             )
+            if superseded.rowcount != 1:
+                raise DomainError(
+                    "knowledge_concurrent_transition",
+                    "The knowledge asset status changed concurrently; retry",
+                    status_code=409,
+                )
             event_id = self._emit(
                 connection,
                 project_id,
@@ -7268,14 +7329,20 @@ class AgentChatRoomService:
                     },
                 )
             now = iso_now()
-            connection.execute(
+            archived = connection.execute(
                 """
                 UPDATE knowledge_assets
                 SET status = 'archived', updated_at = ?
-                WHERE id = ? AND project_id = ?
+                WHERE id = ? AND project_id = ? AND status = ?
                 """,
-                (now, asset_id, project_id),
+                (now, asset_id, project_id, asset["status"]),
             )
+            if archived.rowcount != 1:
+                raise DomainError(
+                    "knowledge_concurrent_transition",
+                    "The knowledge asset status changed concurrently; retry",
+                    status_code=409,
+                )
             event_id = self._emit(
                 connection,
                 project_id,
@@ -8188,7 +8255,8 @@ class AgentChatRoomService:
                 connection.execute(
                     """
                     UPDATE project_document_heads
-                    SET current_version = ?, kind = ?, title = ?, updated_at = ?
+                    SET current_version = ?, kind = ?, title = ?, updated_at = ?,
+                        archived_at = NULL
                     WHERE project_id = ? AND doc_key = ?
                     """,
                     (next_version, kind, clean_title, now, project_id, key),

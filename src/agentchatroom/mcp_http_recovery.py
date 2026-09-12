@@ -173,19 +173,28 @@ class ExpiredSessionHintMiddleware:
         start: dict[str, Any] = {}
         chunks: list[bytes] = []
         buffering = False
+        passthrough_after_overflow = False
 
         async def send_wrapper(message: MutableMapping[str, Any]) -> None:
-            nonlocal buffering
+            nonlocal buffering, passthrough_after_overflow
             message_type = message.get("type")
             if message_type == "http.response.start":
                 start.clear()
                 start.update(message)
                 buffering = int(message.get("status") or 200) == HTTP_404
+                passthrough_after_overflow = False
                 if not buffering:
                     await send(message)
                 return
             if message_type == "http.response.body":
                 body = message.get("body") or b""
+                if passthrough_after_overflow:
+                    # The response outgrew the buffer: it cannot be an
+                    # expired-session JSON-RPC error (those are tiny), so keep
+                    # streaming the untouched ASGI messages verbatim instead of
+                    # sending more body after a final more_body=False.
+                    await send(message)
+                    return
                 if not buffering:
                     await send(message)
                     return
@@ -193,12 +202,36 @@ class ExpiredSessionHintMiddleware:
                 buffered = sum(len(chunk) for chunk in chunks)
                 if message.get("more_body") and buffered <= _MAX_BUFFERED_BODY:
                     return
+                if message.get("more_body") and not self._is_expired_session_buffer(
+                    b"".join(chunks)
+                ):
+                    # Overflow before the upstream finished: switch to verbatim
+                    # streaming for the rest of the response (starting with the
+                    # already-buffered prefix, byte-identical to the original).
+                    passthrough_after_overflow = True
+                    await send(start)
+                    for chunk in chunks:
+                        await send(
+                            {
+                                "type": "http.response.body",
+                                "body": chunk,
+                                "more_body": True,
+                            }
+                        )
+                    if body:
+                        await send(message)
+                    chunks.clear()
+                    buffering = False
+                    return
                 await self._emit(start, b"".join(chunks), send)
                 buffering = False
                 return
             await send(message)
 
         await self.app(scope, receive, send_wrapper)
+
+    def _is_expired_session_buffer(self, body: bytes) -> bool:
+        return is_expired_session_payload(body)
 
     async def _emit(
         self,
