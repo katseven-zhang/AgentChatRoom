@@ -2232,6 +2232,12 @@ class AgentChatRoomService:
                     "A revoked Agent token cannot be extended",
                     status_code=409,
                 )
+            if parse_time(str(row["expires_at"])) <= utc_now():
+                raise DomainError(
+                    "agent_token_expired",
+                    "An expired Agent token cannot be extended",
+                    status_code=409,
+                )
             now_time = utc_now()
             previous_expires_at = str(row["expires_at"])
             base_time = max(parse_time(previous_expires_at), now_time)

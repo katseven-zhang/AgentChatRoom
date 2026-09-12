@@ -513,6 +513,26 @@ def test_agent_token_host_workspace_and_remote_session_flow(service, project):
     assert rejected.value.code == "agent_token_revoked"
 
 
+def test_extend_agent_token_rejects_expired_token(service, project):
+    issued = service.issue_agent_token(
+        project["id"],
+        name="short-lived-token",
+        permissions=["room:read"],
+        expires_in_seconds=300,
+    )
+    cred_id = issued["credential"]["id"]
+    with service.database.connect(write=True) as conn:
+        conn.execute(
+            "UPDATE agent_credentials SET expires_at = '2000-01-01T00:00:00Z' WHERE id = ?",
+            (cred_id,),
+        )
+    with pytest.raises(DomainError) as error:
+        service.extend_agent_token(project["id"], cred_id, extend_by_seconds=3600)
+    assert error.value.code == "agent_token_expired"
+    assert error.value.status_code == 409
+
+
+
 def test_project_members_are_versioned_audited_and_linked_to_tokens(
     service, project
 ):
