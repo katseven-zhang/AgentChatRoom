@@ -7,7 +7,9 @@ import hmac
 import inspect
 import json
 import logging
+import ntpath
 import os
+import posixpath
 import re
 import secrets
 import sqlite3
@@ -2379,7 +2381,7 @@ class AgentChatRoomService:
                 "invalid_workspace",
                 f"{field} contains control characters",
             )
-        if not os.path.isabs(text):
+        if not (posixpath.isabs(text) or ntpath.isabs(text)):
             raise DomainError(
                 "invalid_workspace",
                 f"{field} must be an absolute path",

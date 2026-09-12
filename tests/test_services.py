@@ -3467,3 +3467,19 @@ def test_register_workspace_rejects_control_characters_and_relative_paths(
         worktree=str(tmp_path),
     )
     assert registered["workspace"]["local_path"] == str(tmp_path)
+
+
+def test_register_workspace_accepts_cross_platform_absolute_paths(
+    service, project
+):
+    windows_path = r"C:\workspace\project"
+    reg_win = service.register_workspace(
+        project["id"], host_key="win_host", host_name="WinHost", local_path=windows_path
+    )
+    assert reg_win["workspace"]["local_path"] == windows_path
+
+    posix_path = "/home/agent/workspace"
+    reg_posix = service.register_workspace(
+        project["id"], host_key="posix_host", host_name="PosixHost", local_path=posix_path
+    )
+    assert reg_posix["workspace"]["local_path"] == posix_path
