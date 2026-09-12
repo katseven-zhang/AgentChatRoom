@@ -58,6 +58,8 @@ CONFIG_FILE_SCHEMA: dict[str, dict[str, tuple[type, ...]]] = {
         "token_touch_interval_seconds": (int, float),
         "token_touch_min_calls": (int,),
         "mcp_message_limit": (int,),
+        "message_max_body_length": (int,),
+        "task_text_max_length": (int,),
         "mcp_message_context_limit": (int,),
     },
     "security": {
@@ -204,6 +206,10 @@ class Settings:
     product_name: str = "AgentChatRoom"
     default_theme: str = "system"
     mcp_message_limit: int = 5
+    # Room submissions are size-bounded so an oversized payload cannot bloat
+    # the append-only event store or every client's next sync.
+    message_max_body_length: int = 65536
+    task_text_max_length: int = 32768
 
     @property
     def mcp_message_context_limit(self) -> int:
@@ -332,6 +338,12 @@ def _merge_toml(path: Path) -> dict[str, Any]:
         ),
         "token_touch_min_calls": raw.get("coordination", {}).get(
             "token_touch_min_calls"
+        ),
+        "message_max_body_length": raw.get("coordination", {}).get(
+            "message_max_body_length"
+        ),
+        "task_text_max_length": raw.get("coordination", {}).get(
+            "task_text_max_length"
         ),
         "mcp_message_limit": (
             raw.get("coordination", {}).get("mcp_message_limit")
@@ -644,7 +656,23 @@ def load_settings(
                 ),
             )
         ),
+        "message_max_body_length": int(
+            os.getenv(
+                "AGENTCHATROOM_MESSAGE_MAX_BODY_LENGTH",
+                file_values.get("message_max_body_length", 65536),
+            )
+        ),
+        "task_text_max_length": int(
+            os.getenv(
+                "AGENTCHATROOM_TASK_TEXT_MAX_LENGTH",
+                file_values.get("task_text_max_length", 32768),
+            )
+        ),
     }
+    if values["message_max_body_length"] <= 0:
+        raise ValueError("message_max_body_length must be positive")
+    if values["task_text_max_length"] <= 0:
+        raise ValueError("task_text_max_length must be positive")
     if not 1 <= values["port"] <= 65535:
         raise ValueError("port must be between 1 and 65535")
     if not str(values["host"]).strip():

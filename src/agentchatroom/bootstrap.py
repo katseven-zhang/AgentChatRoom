@@ -380,7 +380,7 @@ def bootstrap_local_room(
     authorize_project: Callable[[str], Any] | None = None,
     database_first: bool = False,
     selected_project_id: str | None = None,
-) -> BootstrapOutcome:
+    credential_id: str | None = None,) -> BootstrapOutcome:
     current_identity = (software_key, software_name, client)
     if loaded_identity is not None and loaded_identity != current_identity:
         return BootstrapOutcome(bootstrap_status_payload("mcp_restart_required"))
@@ -575,6 +575,43 @@ def bootstrap_local_room(
             if workspace_path
             else None
         )
+        pinned_member_id = None
+        if credential_id:
+            credential = next(
+                (
+                    item
+                    for item in service.list_agent_tokens(project["id"])
+                    if item.get("id") == credential_id
+                ),
+                None,
+            )
+            if credential is not None and credential.get("member_id"):
+                pinned = next(
+                    (
+                        item
+                        for item in service.list_project_members(project["id"])
+                        if item.get("id") == credential["member_id"]
+                    ),
+                    None,
+                )
+                if pinned is not None:
+                    pinned_key = str(
+                        (pinned.get("metadata") or {}).get("software_key")
+                        or pinned.get("member_key")
+                        or ""
+                    ).strip()
+                    if pinned_key.startswith("software:"):
+                        pinned_key = pinned_key[len("software:") :]
+                    requested_key = str(software_key or client or "").strip()
+                    if pinned_key and pinned_key.casefold() != requested_key.casefold():
+                        raise DomainError(
+                            "software_identity_mismatch",
+                            "This credential is pinned to a different software "
+                            "identity; restore the original identity headers or "
+                            "issue a new credential",
+                            status_code=403,
+                        )
+                    pinned_member_id = pinned["id"]
         joined = service.join_room(
             project["id"],
             software_key=software_key,
@@ -584,9 +621,20 @@ def bootstrap_local_room(
             role=role,
             worktree=workspace_path,
             capabilities={"mcp": True},
+            member_id=pinned_member_id,
             host_id=registered["host"]["id"] if registered else None,
             workspace_id=registered["workspace"]["id"] if registered else None,
         )
+        if credential_id and joined.get("member_created"):
+            member_id = str(
+                joined.get("agent", {}).get("member_id")
+                or joined.get("identity", {}).get("id")
+                or ""
+            )
+            if member_id:
+                service.link_credential_member(
+                    project["id"], credential_id, member_id
+                )
         synced = service.room_sync(
             project["id"],
             session_id=joined["agent"]["id"],

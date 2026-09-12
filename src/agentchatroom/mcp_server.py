@@ -1117,6 +1117,12 @@ def room_bootstrap(model: str = "", project_name: str = "") -> dict[str, Any]:
         if access is not None and (access.claims or {}).get("credential_bundle")
         else None
     )
+    selected_credential_id = None
+    if access is not None:
+        selected_claims = access.claims or {}
+        selected_credential_id = (
+            str(selected_claims.get("credential_id") or "").strip() or None
+        )
     outcome = bootstrap_local_room(
         get_service(),
         software_key=software_key,
@@ -1135,6 +1141,7 @@ def room_bootstrap(model: str = "", project_name: str = "") -> dict[str, Any]:
         ),
         database_first=bound,
         selected_project_id=selected_project_id,
+        credential_id=selected_credential_id,
     )
     if outcome.binding is None:
         payload = dict(outcome.public)

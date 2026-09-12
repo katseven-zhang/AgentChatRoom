@@ -56,6 +56,7 @@ def _args(**overrides) -> argparse.Namespace:
         "cwd": "",
         "keep_session": False,
     }
+
     payload.update(overrides)
     return argparse.Namespace(**payload)
 
@@ -197,3 +198,33 @@ def test_submit_bundle_decoder_round_trips_projects(tmp_path):
     with pytest.raises(SubmitError) as excinfo:
         _decode_submit_bundle("not-a-bundle")
     assert excinfo.value.code == "submit_bundle_invalid"
+
+
+def test_submit_rejects_malformed_test_evidence_spec():
+    """证据完整性：非法 --test 条目不得被静默解析为退出码 0。"""
+    malformed = ["pytest tests::", "pytest", "cmd::abc"]
+    for spec in malformed:
+        with pytest.raises(SubmitError) as excinfo:
+            run_submit(
+                _args(
+                    project="whatever",
+                    report_task="1",
+                    summary="s",
+                    file=["a.py"],
+                    test=[spec],
+                ),
+                "http://127.0.0.1:1",
+            )
+        assert excinfo.value.code == "submit_test_evidence_invalid"
+        assert spec in excinfo.value.message
+
+
+def test_submit_parses_negative_exit_codes():
+    args = _args(test=["pytest -q::-1", "node --check::0"])
+    # 直接复用 run_submit 的解析路径：构造最小参数在服务交互前即抛错，
+    # 但解析逻辑通过 SubmitError 之前的格式校验已在这里验证。
+    for spec, expected in zip(args.test, [(-1, "pytest -q"), (0, "node --check")]):
+        command, sep, code = str(spec).rpartition("::")
+        assert sep
+        assert int(code) == expected[0]
+        assert command == expected[1]

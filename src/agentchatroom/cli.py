@@ -5,6 +5,7 @@ import base64
 import json
 import os
 import platform
+import re
 import signal
 import subprocess
 import sys
@@ -155,6 +156,27 @@ def _decode_submit_bundle(value: str) -> list[dict[str, str]]:
     return entries
 
 
+def _parse_test_specs(specs: list[str]) -> list[dict[str, Any]]:
+    """Validate --test entries up front: 'command::exit_code' with an integer
+    exit code. Malformed entries must fail before any server interaction
+    instead of being silently rewritten to exit code 0."""
+    parsed: list[dict[str, Any]] = []
+    for spec in specs:
+        command, separator, exit_code_text = str(spec).rpartition("::")
+        if (
+            not separator
+            or not command.strip()
+            or not exit_code_text.lstrip("-").isdigit()
+        ):
+            raise SubmitError(
+                "submit_test_evidence_invalid",
+                f"Invalid --test entry {spec!r}: expected the format "
+                "'command::exit_code' with an integer exit code",
+            )
+        parsed.append({"command": command, "exit_code": int(exit_code_text)})
+    return parsed
+
+
 def run_submit(args: argparse.Namespace, base_url: str) -> dict[str, Any]:
     """One-shot REST submission fallback for when the MCP transport is down.
 
@@ -179,6 +201,7 @@ def run_submit(args: argparse.Namespace, base_url: str) -> dict[str, Any]:
             "submit_report_evidence_required",
             "Work report needs --file, --test, or --no-code-change evidence",
         )
+    parsed_tests = _parse_test_specs(args.test)
 
     projects = request_json(base_url, "GET", "/api/v1/projects")["projects"]
     wanted = str(args.project).strip()
@@ -221,7 +244,7 @@ def run_submit(args: argparse.Namespace, base_url: str) -> dict[str, Any]:
             )
         token = entry["token"]
 
-    match = __import__("re").match(r"acr\.credential_([0-9a-f]+)\.", token)
+    match = re.match(r"acr\.credential_([0-9a-f]+)\.", token)
     if match is None:
         raise SubmitError("submit_token_invalid", "The project credential is malformed")
     credential_id = f"credential_{match.group(1)}"
@@ -331,15 +354,7 @@ def run_submit(args: argparse.Namespace, base_url: str) -> dict[str, Any]:
             result["task_reclaimed"] = True
         except SystemExit:
             result["task_reclaimed"] = False
-        tests: list[dict[str, Any]] = []
-        for spec in args.test:
-            command, _, exit_code = str(spec).rpartition("::")
-            tests.append(
-                {
-                    "command": command or str(spec),
-                    "exit_code": int(exit_code) if exit_code.lstrip("-").isdigit() else 0,
-                }
-            )
+        tests: list[dict[str, Any]] = parsed_tests
         report = request_json(
             base_url,
             "POST",

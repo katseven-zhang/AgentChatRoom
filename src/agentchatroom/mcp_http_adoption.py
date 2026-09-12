@@ -157,6 +157,7 @@ class TolerantSessionAdoptionMiddleware:
         map_limit: int = ADOPTION_MAP_LIMIT,
         map_ttl_seconds: float = ADOPTION_MAP_TTL_SECONDS,
         handshake_timeout_seconds: float = ADOPTION_HANDSHAKE_TIMEOUT_SECONDS,
+        max_parked_handshakes: int = 32,
     ) -> None:
         self.app = app
         self.session_manager = session_manager
@@ -167,6 +168,7 @@ class TolerantSessionAdoptionMiddleware:
         self._map_limit = max(1, int(map_limit))
         self._map_ttl_seconds = float(map_ttl_seconds)
         self._handshake_timeout_seconds = float(handshake_timeout_seconds)
+        self._max_parked = max(1, int(max_parked_handshakes))
         self._adopted: dict[str, tuple[str, float]] = {}
         # Parked synthetic handshake tasks (kept referenced so they are never
         # garbage-collected while still running; each ends when its transport
@@ -350,7 +352,16 @@ class TolerantSessionAdoptionMiddleware:
         # (the next business call then loses its result: "Request stream not
         # found"). So the handshake task is parked instead: it holds the
         # synthetic response open and ends only when the transport itself is
-        # reaped.
+        # reaped. The parked set is bounded; when it is full the adoption fails
+        # closed (the original request is replayed untouched) rather than
+        # letting parked tasks accumulate without limit.
+        if len(self._parked) >= self._max_parked:
+            logger.warning(
+                "Adoption parked-handshake limit reached (%d); failing closed",
+                self._max_parked,
+            )
+            task.cancel()
+            return False
         try:
             await asyncio.wait_for(
                 asyncio.shield(task), timeout=self._handshake_timeout_seconds
@@ -447,6 +458,7 @@ def with_session_adoption(
     adopt_binding: Callable[[str, Any], None] | None = None,
     map_limit: int = ADOPTION_MAP_LIMIT,
     map_ttl_seconds: float = ADOPTION_MAP_TTL_SECONDS,
+    max_parked_handshakes: int = 32,
 ) -> TolerantSessionAdoptionMiddleware:
     """Wrap a Streamable HTTP MCP ASGI app with tolerant session adoption."""
     return TolerantSessionAdoptionMiddleware(
@@ -458,4 +470,5 @@ def with_session_adoption(
         adopt_binding=adopt_binding,
         map_limit=map_limit,
         map_ttl_seconds=map_ttl_seconds,
+        max_parked_handshakes=max_parked_handshakes,
     )

@@ -2733,8 +2733,71 @@ class AgentChatRoomService:
             return {
                 "agent": self._agent_dict(row),
                 "identity": self._member_dict(member),
+                "member_created": member_created,
                 "replaced": replacement,
                 "token": token,
+                "event_id": event_id,
+                "cursor": event_id,
+            }
+
+    def link_credential_member(
+        self,
+        project_id: str,
+        credential_id: str,
+        member_id: str,
+        *,
+        actor_session_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Pin an auto-registered software member to the credential that
+        bootstrapped it, so later requests presenting this credential with a
+        different software identity are rejected instead of drifting."""
+        with self.database.connect(write=True) as connection:
+            self._require_project(connection, project_id)
+            credential = connection.execute(
+                "SELECT * FROM agent_credentials WHERE id = ? AND project_id = ?",
+                (credential_id, project_id),
+            ).fetchone()
+            if credential is None:
+                raise DomainError(
+                    "agent_token_not_found",
+                    "Agent credential does not belong to this Project",
+                    status_code=404,
+                )
+            if credential["member_id"] == member_id:
+                return {"credential": self._credential_dict(credential), "linked": False}
+            if credential["member_id"] is not None:
+                raise DomainError(
+                    "credential_already_linked",
+                    "Agent credential is already linked to a project member",
+                    status_code=409,
+                )
+            member = connection.execute(
+                "SELECT * FROM project_members WHERE id = ? AND project_id = ?",
+                (member_id, project_id),
+            ).fetchone()
+            if member is None or member["status"] != "active":
+                raise DomainError(
+                    "project_member_inactive",
+                    "Credential can only be linked to an active project member",
+                    status_code=409,
+                )
+            connection.execute(
+                "UPDATE agent_credentials SET member_id = ?, updated_at = ? WHERE id = ?",
+                (member_id, iso_now(), credential_id),
+            )
+            event_id = self._emit(
+                connection,
+                project_id,
+                "agent.credential_linked",
+                actor_session_id=actor_session_id,
+                payload={"credential_id": credential_id, "member_id": member_id},
+            )
+            updated = connection.execute(
+                "SELECT * FROM agent_credentials WHERE id = ?", (credential_id,)
+            ).fetchone()
+            return {
+                "credential": self._credential_dict(updated),
+                "linked": True,
                 "event_id": event_id,
                 "cursor": event_id,
             }
@@ -3483,6 +3546,13 @@ class AgentChatRoomService:
             raise DomainError("invalid_message_kind", "Unsupported message kind")
         if not body.strip():
             raise DomainError("empty_message", "Message body is required")
+        if len(body) > self.settings.message_max_body_length:
+            raise DomainError(
+                "message_body_too_long",
+                "Message body exceeds message_max_body_length "
+                f"({self.settings.message_max_body_length})",
+                details={"limit": self.settings.message_max_body_length},
+            )
         if not 0 <= priority <= 4:
             raise DomainError("invalid_priority", "Priority must be between 0 and 4")
         if channel not in MESSAGE_CHANNELS:
@@ -3984,9 +4054,28 @@ class AgentChatRoomService:
     ) -> dict[str, Any]:
         if not title.strip():
             raise DomainError("invalid_task", "Task title is required")
+        text_limit = self.settings.task_text_max_length
+        for field_name, value in (
+            ("title", title),
+            ("description", description),
+        ):
+            if len(str(value)) > text_limit:
+                raise DomainError(
+                    "task_text_too_long",
+                    f"Task {field_name} exceeds task_text_max_length ({text_limit})",
+                    details={"field": field_name, "limit": text_limit},
+                )
         if priority is not None and not 0 <= priority <= 4:
             raise DomainError("invalid_priority", "Priority must be between 0 and 4")
         criteria = [item.strip() for item in (acceptance_criteria or []) if item.strip()]
+        for item in criteria:
+            if len(item) > self.settings.task_text_max_length:
+                raise DomainError(
+                    "task_text_too_long",
+                    "Acceptance criterion exceeds task_text_max_length "
+                    f"({self.settings.task_text_max_length})",
+                    details={"field": "acceptance_criteria", "limit": self.settings.task_text_max_length},
+                )
         if not criteria:
             raise DomainError(
                 "missing_acceptance_criteria",

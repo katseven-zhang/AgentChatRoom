@@ -274,3 +274,82 @@ async def test_non_http_scopes_are_forwarded():
     middleware = _middleware(app)
     await middleware({"type": "lifespan"}, None, None)
     assert seen == ["lifespan"]
+
+
+class HangingInitApp(FakeMcpApp):
+    """Answers the handshake but never finishes its SSE response."""
+
+    async def __call__(self, scope, receive, send) -> None:
+        chunks = bytearray()
+        while True:
+            message = await receive()
+            if message.get("type") != "http.request":
+                if message.get("type") == "http.disconnect":
+                    return
+                break
+            chunks.extend(message.get("body") or b"")
+            if not message.get("more_body"):
+                break
+        headers = {
+            bytes(key).decode("latin-1"): bytes(value).decode("latin-1")
+            for key, value in scope.get("headers") or ()
+        }
+        payload = json.loads(bytes(chunks) or b"{}")
+        self.requests.append(
+            {"method": scope["method"], "headers": headers, "payload": payload}
+        )
+        method = payload.get("method")
+        if method == "initialize":
+            self._counter += 1
+            session_id = f"synthetic-{self._counter}"
+            self.active[session_id] = True
+            await send(
+                {
+                    "type": "http.response.start",
+                    "status": 200,
+                    "headers": [
+                        (b"content-type", b"text/event-stream"),
+                        (MCP_SESSION_ID.encode(), session_id.encode()),
+                    ],
+                }
+            )
+            await send(
+                {
+                    "type": "http.response.body",
+                    "body": b'event: message\ndata: {"result":{}}\n\n',
+                    "more_body": True,
+                }
+            )
+            # Mimic an SSE POST stream that stays open: park until disconnect.
+            while True:
+                message = await receive()
+                if message.get("type") == "http.disconnect":
+                    return
+        await send(
+            {
+                "type": "http.response.start",
+                "status": 202,
+                "headers": [],
+            }
+        )
+        await send({"type": "http.response.body", "body": b""})
+
+
+@pytest.mark.asyncio
+async def test_parked_handshakes_are_bounded_and_fail_closed():
+    app = HangingInitApp()
+    middleware = _middleware(app, max_parked_handshakes=1)
+
+    # First adoption parks its non-terminating handshake task.
+    first = await _call(middleware, headers={MCP_SESSION_ID: "reaped-1"}, payload=_business_call("reaped-1"))
+    assert len(middleware._parked) == 1
+    assert app.requests[-1]["payload"].get("method") == "tools/call"
+
+    # Second adoption: the parked set is full, so the adoption fails closed
+    # and the original request is replayed untouched with its own bookmark.
+    second = await _call(middleware, headers={MCP_SESSION_ID: "reaped-2"}, payload=_business_call("reaped-2"))
+    assert len(middleware._parked) == 1
+    # Fail-closed passthrough: the original request is replayed with its own
+    # (still unknown) bookmark instead of being adopted.
+    assert app.requests[-1]["headers"][MCP_SESSION_ID] == "reaped-2"
+    assert app.requests[-1]["payload"].get("method") == "tools/call"

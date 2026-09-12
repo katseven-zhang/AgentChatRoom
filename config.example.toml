@@ -51,7 +51,11 @@ default_lease_ttl_seconds = 1800
 max_lease_ttl_seconds = 86400
 sse_poll_interval_seconds = 0.5
 presence_refresh_interval_seconds = 1.0
-
+# Size bounds for room submissions: oversized message bodies / task texts are
+# rejected with message_body_too_long / task_text_too_long instead of being
+# stored and re-downloaded by every client.
+message_max_body_length = 65536
+task_text_max_length = 32768
 [knowledge]
 # Knowledge Asset kinds enabled for this deployment. Each kind must match
 # ^[a-z][a-z0-9_-]{0,63}$ and at least one kind is required.
