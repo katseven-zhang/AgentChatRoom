@@ -999,12 +999,11 @@ class AgentCredentialTokenVerifier:
                         entry["token"], touch=False
                     )
                 except DomainError as error:
-                    # Expired or revoked credentials disable only their Project;
+                    # Expired, revoked, or invalid credentials disable only their Project;
                     # other valid entries in the same client configuration remain usable.
-                    if error.code in {"agent_token_expired", "agent_token_revoked"}:
-                        unavailable_project_credentials[entry["name"]] = {
-                            "reason": error.code,
-                        }
+                    unavailable_project_credentials[entry["name"]] = {
+                        "reason": error.code,
+                    }
                     continue
                 project_id = str(credential["project_id"])
                 if project_id in project_credentials:

@@ -445,6 +445,8 @@ async def test_bundle_reports_configured_names_and_inactive_project_tokens(
         issued["Project B"]["credential"]["id"],
     )
 
+    entries.append({"name": "Project D", "token": "acr.nonexistent.fake_secret"})
+
     access = await mcp_server.AgentCredentialTokenVerifier(service).verify_token(
         encode_project_credential_bundle(entries)
     )
@@ -452,6 +454,7 @@ async def test_bundle_reports_configured_names_and_inactive_project_tokens(
     assert sorted(access.claims["unavailable_project_credentials"]) == [
         "Project A",
         "Project B",
+        "Project D",
     ]
 
     with pytest.raises(DomainError) as missing_name:
@@ -462,6 +465,7 @@ async def test_bundle_reports_configured_names_and_inactive_project_tokens(
         "Project A",
         "Project B",
         "Project C",
+        "Project D",
     ]
 
     with pytest.raises(DomainError) as expired:
@@ -476,12 +480,26 @@ async def test_bundle_reports_configured_names_and_inactive_project_tokens(
         "issue_new_project_token_and_update_bundle"
     )
 
+    with pytest.raises(DomainError) as invalid:
+        mcp_server._bundle_project_for_name(access, "Project D")
+    assert invalid.value.code == "project_credential_invalid"
+    assert invalid.value.details["required_action"] == (
+        "replace_project_token_in_bundle"
+    )
+
     inactive_only = await mcp_server.AgentCredentialTokenVerifier(
         service
     ).verify_token(encode_project_credential_bundle(entries[:2]))
     assert inactive_only is not None
     assert inactive_only.expires_at is None
     assert inactive_only.scopes == []
+
+    invalid_only = await mcp_server.AgentCredentialTokenVerifier(
+        service
+    ).verify_token(encode_project_credential_bundle([{"name": "Project D", "token": "acr.nonexistent.fake_secret"}]))
+    assert invalid_only is not None
+    assert invalid_only.claims["unavailable_project_credentials"]["Project D"]["reason"] == "invalid_agent_token"
+
 
 
 @pytest.mark.asyncio
