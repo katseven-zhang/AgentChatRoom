@@ -4325,10 +4325,16 @@ class AgentChatRoomService:
                     )
                 now = iso_now()
                 previous_owner = str(task["owner_session_id"])
-                connection.execute(
-                    "UPDATE tasks SET owner_session_id = ?, updated_at = ? WHERE id = ? AND project_id = ?",
-                    (session_id, now, task_id, project_id),
+                updated_reclaim = connection.execute(
+                    "UPDATE tasks SET owner_session_id = ?, updated_at = ? WHERE id = ? AND project_id = ? AND owner_session_id = ?",
+                    (session_id, now, task_id, project_id, previous_owner),
                 )
+                if updated_reclaim.rowcount != 1:
+                    raise DomainError(
+                        "task_already_claimed",
+                        "Task was modified concurrently",
+                        status_code=409,
+                    )
                 leases = connection.execute(
                     "SELECT id FROM file_leases WHERE project_id = ? AND task_id = ? AND session_id = ? AND released_at IS NULL",
                     (project_id, task_id, previous_owner),
@@ -5160,25 +5166,51 @@ class AgentChatRoomService:
                         "Task is not available for assignment acceptance",
                         status_code=409,
                     )
-                connection.execute(
-                    """
+                if task["owner_session_id"] is None:
+                    owner_clause = "owner_session_id IS NULL"
+                    owner_params: tuple[Any, ...] = ()
+                else:
+                    owner_clause = "owner_session_id = ?"
+                    owner_params = (task["owner_session_id"],)
+                updated_task = connection.execute(
+                    f"""
                     UPDATE tasks
                     SET owner_session_id = ?, status = 'claimed',
                         execution_status = 'claimed', updated_at = ?
-                    WHERE id = ?
+                    WHERE id = ? AND project_id = ? AND {owner_clause}
+                      AND execution_status = ?
                     """,
-                    (session_id, iso_now(), task_id),
+                    (
+                        session_id,
+                        iso_now(),
+                        task_id,
+                        project_id,
+                        *owner_params,
+                        task["execution_status"],
+                    ),
                 )
+                if updated_task.rowcount != 1:
+                    raise DomainError(
+                        "task_already_claimed",
+                        "Task was modified concurrently",
+                        status_code=409,
+                    )
             now = iso_now()
-            connection.execute(
+            updated_assignment = connection.execute(
                 """
                 UPDATE task_assignments
                 SET status = ?, responded_by_session_id = ?, response_note = ?,
                     responded_at = ?
-                WHERE id = ?
+                WHERE id = ? AND status = 'pending'
                 """,
                 (response, session_id, note.strip(), now, assignment_id),
             )
+            if updated_assignment.rowcount != 1:
+                raise DomainError(
+                    "assignment_already_acknowledged",
+                    "Task assignment was updated concurrently",
+                    status_code=409,
+                )
             event_id = self._emit(
                 connection,
                 project_id,
@@ -5477,25 +5509,37 @@ class AgentChatRoomService:
                         """,
                         (now, project_id, task_id, handoff["from_session_id"]),
                     )
-                connection.execute(
+                updated_task = connection.execute(
                     """
                     UPDATE tasks
                     SET owner_session_id = ?, current_step = ?, next_step = '',
                         updated_at = ?
-                    WHERE id = ?
+                    WHERE id = ? AND project_id = ? AND owner_session_id = ?
                     """,
-                    (session_id, handoff["next_step"], now, task_id),
+                    (session_id, handoff["next_step"], now, task_id, project_id, handoff["from_session_id"]),
                 )
+                if updated_task.rowcount != 1:
+                    raise DomainError(
+                        "task_handoff_conflict",
+                        "Task ownership changed concurrently",
+                        status_code=409,
+                    )
             now = iso_now()
-            connection.execute(
+            updated_handoff = connection.execute(
                 """
                 UPDATE task_handoffs
                 SET status = ?, responded_by_session_id = ?, response_note = ?,
                     responded_at = ?
-                WHERE id = ?
+                WHERE id = ? AND status = 'pending'
                 """,
                 (response, session_id, note.strip(), now, handoff_id),
             )
+            if updated_handoff.rowcount != 1:
+                raise DomainError(
+                    "handoff_already_acknowledged",
+                    "Task handoff was updated concurrently",
+                    status_code=409,
+                )
             event_id = self._emit(
                 connection,
                 project_id,
@@ -5741,8 +5785,15 @@ class AgentChatRoomService:
                 )
                 if old != new
             ]
-            connection.execute(
-                """
+            if task["owner_session_id"] is None:
+                owner_clause = "owner_session_id IS NULL"
+                owner_params: tuple[Any, ...] = ()
+            else:
+                owner_clause = "owner_session_id = ?"
+                owner_params = (task["owner_session_id"],)
+
+            updated = connection.execute(
+                f"""
                 UPDATE tasks SET status = ?, execution_status = ?,
                                  verification_status = ?, integration_status = ?,
                                  title = ?, description = ?,
@@ -5750,7 +5801,7 @@ class AgentChatRoomService:
                                  owner_session_id = ?, progress_percent = ?,
                                  current_step = ?, blocker_reason = ?, next_step = ?,
                                  updated_at = ?
-                WHERE id = ?
+                WHERE id = ? AND project_id = ? AND status = ? AND {owner_clause}
                 """,
                 (
                     next_status,
@@ -5768,8 +5819,17 @@ class AgentChatRoomService:
                     next_step.strip() if next_step is not None else task["next_step"],
                     iso_now(),
                     task_id,
+                    project_id,
+                    task["status"],
+                    *owner_params,
                 ),
             )
+            if updated.rowcount != 1:
+                raise DomainError(
+                    "task_modified_concurrently",
+                    "Task was modified concurrently; reload the task and retry",
+                    status_code=409,
+                )
             if depends_on is not None:
                 connection.execute(
                     "DELETE FROM task_dependencies WHERE task_id = ?", (task_id,)
@@ -6240,16 +6300,23 @@ class AgentChatRoomService:
                     now,
                 ),
             )
-            connection.execute(
+            updated_task = connection.execute(
                 """
                 UPDATE tasks
                 SET status = 'awaiting_review', execution_status = 'completed',
                     verification_status = 'pending', integration_status = 'pending',
                     progress_percent = 100, blocker_reason = '', updated_at = ?
-                WHERE id = ?
+                WHERE id = ? AND project_id = ? AND owner_session_id = ?
+                  AND execution_status IN ('claimed', 'in_progress', 'blocked')
                 """,
-                (now, task_id),
+                (now, task_id, project_id, session_id),
             )
+            if updated_task.rowcount != 1:
+                raise DomainError(
+                    "task_modified_concurrently",
+                    "Task was modified concurrently; reload the task and retry",
+                    status_code=409,
+                )
             active_leases = connection.execute(
                 """
                 SELECT id FROM file_leases
@@ -6395,12 +6462,13 @@ class AgentChatRoomService:
                     now,
                 ),
             )
-            connection.execute(
+            updated_task = connection.execute(
                 """
                 UPDATE tasks
                 SET status = ?, execution_status = ?, verification_status = ?,
                     integration_status = 'pending', progress_percent = ?, updated_at = ?
-                WHERE id = ?
+                WHERE id = ? AND project_id = ? AND status = 'awaiting_review'
+                  AND verification_status = 'pending'
                 """,
                 (
                     next_status,
@@ -6409,8 +6477,15 @@ class AgentChatRoomService:
                     next_progress,
                     now,
                     task_id,
+                    project_id,
                 ),
             )
+            if updated_task.rowcount != 1:
+                raise DomainError(
+                    "task_modified_concurrently",
+                    "Task was modified concurrently; reload the task and retry",
+                    status_code=409,
+                )
             event_id = self._emit(
                 connection,
                 project_id,
@@ -6533,14 +6608,21 @@ class AgentChatRoomService:
                 ),
             )
             next_status = "done" if result == "done" else "verified"
-            connection.execute(
+            updated_task = connection.execute(
                 """
                 UPDATE tasks
                 SET status = ?, integration_status = ?, updated_at = ?
-                WHERE id = ?
+                WHERE id = ? AND project_id = ? AND status = 'verified'
+                  AND verification_status = 'approved'
                 """,
-                (next_status, result, now, task_id),
+                (next_status, result, now, task_id, project_id),
             )
+            if updated_task.rowcount != 1:
+                raise DomainError(
+                    "task_modified_concurrently",
+                    "Task was modified concurrently; reload the task and retry",
+                    status_code=409,
+                )
             event_type = (
                 "task.integration_completed"
                 if result == "done"

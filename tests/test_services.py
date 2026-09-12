@@ -3503,3 +3503,119 @@ def test_register_workspace_accepts_cross_platform_absolute_paths(
         project["id"], host_key="posix_host", host_name="PosixHost", local_path=posix_path
     )
     assert reg_posix["workspace"]["local_path"] == posix_path
+
+
+def test_update_task_optimistic_lock_rejects_concurrent_changes(service, project):
+    from contextlib import contextmanager
+
+    agent = service.join_room(
+        project["id"], name="Agent 1", role="executor", client="test", model="unknown"
+    )
+    task = service.create_task(
+        project["id"],
+        title="Concurrent task",
+        acceptance_criteria=["Criterion 1"],
+    )["task"]
+    service.claim_task(project["id"], task["id"], agent["agent"]["id"], agent["token"])
+
+    real_connect = service.database.connect
+
+    class InterceptingConnection:
+        def __init__(self, conn):
+            self._conn = conn
+            self._interrupted = False
+
+        def __getattr__(self, name):
+            return getattr(self._conn, name)
+
+        def execute(self, sql, params=()):
+            if "UPDATE tasks SET status =" in str(sql) and not self._interrupted:
+                self._interrupted = True
+                with real_connect(write=True) as other_conn:
+                    other_conn.execute(
+                        "UPDATE tasks SET status = 'blocked', blocker_reason = 'race' WHERE id = ?",
+                        (task["id"],),
+                    )
+            return self._conn.execute(sql, params)
+
+    @contextmanager
+    def mock_connect(write=False):
+        with real_connect(write=write) as conn:
+            yield InterceptingConnection(conn)
+
+    service.database.connect = mock_connect
+    try:
+        with pytest.raises(DomainError) as err:
+            service.update_task(
+                project["id"],
+                task["id"],
+                session_id=agent["agent"]["id"],
+                token=agent["token"],
+                current_step="Step 1",
+            )
+        assert err.value.code == "task_modified_concurrently"
+        assert err.value.status_code == 409
+    finally:
+        service.database.connect = real_connect
+
+
+def test_acknowledge_assignment_optimistic_lock_rejects_concurrent_ack(
+    service, project, joined_agents
+):
+    from contextlib import contextmanager
+
+    assigner, worker = joined_agents
+    task = service.create_task(
+        project["id"],
+        title="Assignment race",
+        acceptance_criteria=["Criterion 1"],
+    )["task"]
+    assigned = service.assign_task(
+        project["id"],
+        task["id"],
+        assigned_by_session_id=assigner["agent"]["id"],
+        token=assigner["token"],
+        assigned_to_session_id=worker["agent"]["id"],
+    )
+    assignment_id = assigned["assignment"]["id"]
+
+    real_connect = service.database.connect
+
+    class InterceptingConnection:
+        def __init__(self, conn):
+            self._conn = conn
+            self._interrupted = False
+
+        def __getattr__(self, name):
+            return getattr(self._conn, name)
+
+        def execute(self, sql, params=()):
+            if "UPDATE task_assignments" in str(sql) and not self._interrupted:
+                self._interrupted = True
+                with real_connect(write=True) as other_conn:
+                    other_conn.execute(
+                        "UPDATE task_assignments SET status = 'declined' WHERE id = ?",
+                        (assignment_id,),
+                    )
+            return self._conn.execute(sql, params)
+
+    @contextmanager
+    def mock_connect(write=False):
+        with real_connect(write=write) as conn:
+            yield InterceptingConnection(conn)
+
+    service.database.connect = mock_connect
+    try:
+        with pytest.raises(DomainError) as err:
+            service.acknowledge_task_assignment(
+                project["id"],
+                task["id"],
+                assignment_id,
+                session_id=worker["agent"]["id"],
+                token=worker["token"],
+                response="accepted",
+            )
+        assert err.value.code == "assignment_already_acknowledged"
+        assert err.value.status_code == 409
+    finally:
+        service.database.connect = real_connect
