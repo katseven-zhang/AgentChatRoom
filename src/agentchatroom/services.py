@@ -5678,6 +5678,8 @@ class AgentChatRoomService:
             is_owner = bool(session_id) and task["owner_session_id"] == session_id
             if session_id and task["owner_session_id"] not in {None, session_id}:
                 raise DomainError("not_task_owner", "Only the task owner can update this task", status_code=403)
+            if not session_id and not management_authorized:
+                raise _management_authorization_required("update this task")
             next_status = status or task["status"]
             text_limit = self.settings.task_text_max_length
             for field_name, value in (
