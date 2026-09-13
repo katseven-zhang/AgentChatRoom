@@ -294,3 +294,146 @@ def test_foreign_identity_cannot_reclaim_a_live_sessions_task(quiet_service, pro
     assert denied.value.code == "task_reclaim_forbidden"
     stored = quiet_service.get_task(project["id"], task["id"])
     assert stored["owner_session_id"] == owner["agent"]["id"]
+
+
+# --- 普通字段更新同样受授权约束 ---------------------------------------------
+# 此前只有一个 status="todo" 的兼容释放分支检查管理授权，因此“不带凭据的
+# 普通字段更新”能绕过所有权改写他人任务（独立验收在 e12af62 上复现过）。
+# 下面把该高风险路径固化为回归：无凭据、同软件 sibling、异身份都不能改字段，
+# 只有任务 owner 或显式管理授权可以。
+
+MUTABLE_FIELD_MUTATIONS = (
+    {"title": "Unauthenticated mutation"},
+    {"description": "Unauthenticated mutation"},
+    {"priority": 4},
+    {"progress_percent": 99},
+    {"acceptance_criteria": ["Unauthenticated mutation"]},
+    {"current_step": "Unauthenticated mutation"},
+    {"blocker_reason": "Unauthenticated mutation"},
+    {"next_step": "Unauthenticated mutation"},
+)
+
+TASK_FIELD_SNAPSHOT_KEYS = (
+    "title",
+    "description",
+    "acceptance_criteria",
+    "priority",
+    "progress_percent",
+    "current_step",
+    "blocker_reason",
+    "next_step",
+    "depends_on",
+    "status",
+    "execution_status",
+    "verification_status",
+    "integration_status",
+    "owner_session_id",
+)
+
+
+def _field_snapshot(service, project_id: str, task_id: str) -> dict:
+    task = service.get_task(project_id, task_id)
+    return {key: task[key] for key in TASK_FIELD_SNAPSHOT_KEYS}
+
+
+def _assert_management_denied(error: DomainError) -> None:
+    assert error.code == "management_auth_required"
+    assert (
+        error.details["required_action"]
+        == "authenticate_management_or_use_owner_credentials"
+    )
+
+
+def test_missing_credentials_cannot_mutate_ordinary_task_fields(
+    quiet_service, project
+):
+    """无凭据调用不能改任何普通字段（逐字段验证，拒绝且无副作用）。"""
+    owner, _, _ = _two_sessions(quiet_service, project["id"])
+    task = _claimed_task(quiet_service, project["id"], owner)
+    baseline = _field_snapshot(quiet_service, project["id"], task["id"])
+
+    for payload in MUTABLE_FIELD_MUTATIONS:
+        with pytest.raises(DomainError) as denied:
+            quiet_service.update_task(project["id"], task["id"], **payload)
+        _assert_management_denied(denied.value)
+
+    assert _field_snapshot(quiet_service, project["id"], task["id"]) == baseline
+
+
+def test_missing_credentials_cannot_rewrite_task_dependencies(quiet_service, project):
+    owner, _, _ = _two_sessions(quiet_service, project["id"])
+    task = _claimed_task(quiet_service, project["id"], owner)
+    dependency = quiet_service.create_task(
+        project["id"],
+        title="Dependency target",
+        acceptance_criteria=["Exists only to be referenced"],
+    )["task"]
+
+    with pytest.raises(DomainError) as denied:
+        quiet_service.update_task(
+            project["id"], task["id"], depends_on=[dependency["id"]]
+        )
+
+    _assert_management_denied(denied.value)
+    assert quiet_service.get_task(project["id"], task["id"])["depends_on"] == []
+
+
+def test_non_owner_cannot_mutate_ordinary_task_fields(quiet_service, project):
+    """同软件 sibling 与异身份 Session 都不能改字段（不只是 status）。"""
+    owner, sibling, foreign = _two_sessions(quiet_service, project["id"])
+    task = _claimed_task(quiet_service, project["id"], owner)
+    baseline = _field_snapshot(quiet_service, project["id"], task["id"])
+
+    for intruder in (sibling, foreign):
+        for payload in MUTABLE_FIELD_MUTATIONS:
+            with pytest.raises(DomainError) as denied:
+                quiet_service.update_task(
+                    project["id"],
+                    task["id"],
+                    session_id=intruder["agent"]["id"],
+                    token=intruder["token"],
+                    **payload,
+                )
+            assert denied.value.code == "not_task_owner"
+
+    assert _field_snapshot(quiet_service, project["id"], task["id"]) == baseline
+
+
+def test_owner_can_still_update_ordinary_task_fields(quiet_service, project):
+    """守卫不能误伤正常流程：owner 用会话凭据照常更新字段。"""
+    owner, _, _ = _two_sessions(quiet_service, project["id"])
+    task = _claimed_task(quiet_service, project["id"], owner)
+
+    updated = quiet_service.update_task(
+        project["id"],
+        task["id"],
+        title="Owner edit",
+        progress_percent=40,
+        current_step="Owner is working",
+        session_id=owner["agent"]["id"],
+        token=owner["token"],
+    )
+
+    stored = updated["task"]
+    assert stored["title"] == "Owner edit"
+    assert stored["progress_percent"] == 40
+    assert stored["current_step"] == "Owner is working"
+    assert stored["owner_session_id"] == owner["agent"]["id"]
+
+
+def test_explicit_management_authority_can_still_update_ordinary_fields(
+    quiet_service, project
+):
+    """显式管理授权（由已认证适配器设置）仍可代为修改，且不改所有权。"""
+    owner, _, _ = _two_sessions(quiet_service, project["id"])
+    task = _claimed_task(quiet_service, project["id"], owner)
+
+    updated = quiet_service.update_task(
+        project["id"],
+        task["id"],
+        title="Management edit",
+        management_authorized=True,
+    )
+
+    assert updated["task"]["title"] == "Management edit"
+    assert updated["task"]["owner_session_id"] == owner["agent"]["id"]

@@ -16,6 +16,7 @@ from agentchatroom.bootstrap import (
     SOFTWARE_CLIENT_ENV,
     SOFTWARE_KEY_ENV,
     SOFTWARE_NAME_ENV,
+    RuntimeBinding,
     bind_runtime_arguments,
     bootstrap_local_room,
     bootstrap_status_payload,
@@ -443,6 +444,72 @@ def test_mcp_room_bootstrap_injects_runtime_and_rejects_mismatch(
 
     token_mismatch = _call_tool("room_sync", {"token": "other-token-value-not-the-binding"})
     assert token_mismatch["error"]["code"] == "runtime_context_mismatch"
+
+
+def test_mcp_task_update_cannot_change_another_sessions_task(
+    monkeypatch, service, project_dir
+):
+    """#136 回归：MCP 只能以本运行时绑定的 Session 身份行动。
+
+    工具层会自动注入绑定的会话凭据，因此调用方既不能匿名改写他人任务，也不能
+    自带 management_authorized 自我提权；非 owner 绑定更新普通字段必须被拒绝。
+    """
+    _configure_software(monkeypatch)
+    project = _register_project(service, project_dir)
+    monkeypatch.setattr(mcp_server, "service", service)
+
+    owner = service.join_room(
+        project["id"],
+        name="Codex",
+        client="codex",
+        model="unknown",
+        member_id=service.create_project_member(
+            project["id"], member_key="codex", name="Codex"
+        )["member"]["id"],
+    )
+    intruder = service.join_room(
+        project["id"],
+        name="Grok Build",
+        client="grok-build",
+        model="unknown",
+        member_id=service.create_project_member(
+            project["id"], member_key="grok-build", name="Grok Build"
+        )["member"]["id"],
+    )
+    task = service.create_task(
+        project["id"],
+        title="MCP authority target",
+        acceptance_criteria=["Only the owner may edit this task"],
+    )["task"]
+    service.claim_task(project["id"], task["id"], owner["agent"]["id"], owner["token"])
+
+    # 本运行时绑定的是“非 owner”会话，工具调用必须被拒绝且无副作用。
+    mcp_server.persist_runtime_binding(
+        "stdio:local",
+        RuntimeBinding(
+            project_id=project["id"],
+            session_id=intruder["agent"]["id"],
+            token=intruder["token"],
+            cursor=0,
+            software_key="grok-build",
+            agent_key="grok-build",
+            conversation_synced=True,
+        ),
+    )
+
+    denied = _call_tool(
+        "task_update", {"task_id": task["id"], "title": "Intruder mutation"}
+    )
+    assert denied["ok"] is False
+    assert denied["error"]["code"] == "not_task_owner"
+    stored = service.get_task(project["id"], task["id"])
+    assert stored["title"] == "MCP authority target"
+    assert stored["owner_session_id"] == owner["agent"]["id"]
+
+    # MCP 的输入模型不暴露管理授权开关，调用方无法自我提权。
+    tools = {tool.name: tool for tool in mcp_server.mcp._tool_manager.list_tools()}
+    properties = tools["task_update"].parameters.get("properties", {})
+    assert "management_authorized" not in properties
 
 
 def test_mcp_call_tool_keeps_explicit_join_credentials_without_bootstrap(

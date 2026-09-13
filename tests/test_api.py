@@ -1847,3 +1847,110 @@ def test_task_claim_reclaim_passes_through_rest_api(settings, project_dir):
         )
         assert reclaimed.status_code == 200, reclaimed.text
         assert reclaimed.json()["task"]["owner_session_id"] == joined_b["agent"]["id"]
+
+
+def test_task_update_over_rest_requires_owner_credentials_or_management(
+    monkeypatch, settings, project_dir
+):
+    """#136 回归：REST 入口不能靠“不带凭据”改写他人任务（普通字段也不行）。
+
+    受保护的部署下，匿名 PATCH 必须在触达领域层前被管理认证拦下；携带非 owner
+    会话凭据则得到 not_task_owner；owner 凭据与已认证管理仍然可用。
+    """
+    admin_token = "test-management-token-with-adequate-length"
+    monkeypatch.setenv("TEST_AGENTCHATROOM_ADMIN_TOKEN", admin_token)
+    protected = replace(
+        settings,
+        management_auth_required=True,
+        management_token_env="TEST_AGENTCHATROOM_ADMIN_TOKEN",
+    )
+    app = create_app(protected)
+    with TestClient(app) as admin:
+        logged_in = admin.post("/api/v1/auth/login", json={"token": admin_token})
+        assert logged_in.status_code == 200
+
+        created = admin.post(
+            "/api/v1/projects",
+            json={"root_path": str(project_dir), "name": "Authority Room"},
+        )
+        assert created.status_code == 201
+        project = created.json()
+
+        owner = _join_agent(
+            admin,
+            project,
+            software_key="codex",
+            name="Codex",
+            client="codex",
+            model="unknown",
+            role="executor",
+        )
+        intruder = _join_agent(
+            admin,
+            project,
+            software_key="grok-build",
+            name="Grok Build",
+            client="grok-build",
+            model="unknown",
+            role="executor",
+        )
+        task = admin.post(
+            f"/api/v1/projects/{project['id']}/tasks",
+            json={
+                "title": "Authority target",
+                "acceptance_criteria": ["Only authorized callers may edit this task"],
+            },
+        ).json()["task"]
+        claimed = admin.post(
+            f"/api/v1/projects/{project['id']}/tasks/{task['id']}/claim",
+            json={"session_id": owner["agent"]["id"], "token": owner["token"]},
+        )
+        assert claimed.status_code == 200, claimed.text
+
+        task_url = f"/api/v1/projects/{project['id']}/tasks/{task['id']}"
+
+        # 第一层：匿名写请求（无管理 Cookie、无 Session 凭据）在进入端点前就被
+        # 管理认证中间件拦下，根本触达不到领域层。
+        anonymous = TestClient(app)
+        denied = anonymous.patch(task_url, json={"title": "Unauthenticated mutation"})
+        assert denied.status_code == 401, denied.text
+        assert denied.json()["error"]["code"] == "management_auth_required"
+
+        # 第二层：端点放行（已认证管理 Cookie）但调用方只带非 owner 会话凭据时，
+        # 该请求按调用方身份处理，领域层仍必须拒绝改写字段。
+        intruder_edit = admin.patch(
+            task_url,
+            json={
+                "title": "Intruder mutation",
+                "session_id": intruder["agent"]["id"],
+                "token": intruder["token"],
+            },
+        )
+        assert intruder_edit.status_code == 403, intruder_edit.text
+        assert intruder_edit.json()["error"]["code"] == "not_task_owner"
+
+        unchanged = admin.get(task_url)
+        assert unchanged.status_code == 200
+        assert unchanged.json()["task"]["title"] == "Authority target"
+        assert unchanged.json()["task"]["owner_session_id"] == owner["agent"]["id"]
+
+        # owner 凭据照常可用。
+        owner_edit = admin.patch(
+            task_url,
+            json={
+                "title": "Owner edit",
+                "session_id": owner["agent"]["id"],
+                "token": owner["token"],
+            },
+        )
+        assert owner_edit.status_code == 200, owner_edit.text
+        assert owner_edit.json()["task"]["title"] == "Owner edit"
+
+        # 已认证管理入口照常可用，且不改所有权。
+        management_edit = admin.patch(task_url, json={"title": "Management edit"})
+        assert management_edit.status_code == 200, management_edit.text
+        assert management_edit.json()["task"]["title"] == "Management edit"
+        assert (
+            management_edit.json()["task"]["owner_session_id"]
+            == owner["agent"]["id"]
+        )
