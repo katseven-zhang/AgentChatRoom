@@ -81,7 +81,25 @@ def test_project_api_manages_agents_instructions_on_create_rename_and_delete(
         created_text = instructions_path.read_text(encoding="utf-8")
         assert created_text.startswith("# Existing project rules\n")
         assert created_text.count(PROJECT_INSTRUCTIONS_BEGIN) == 1
+        assert created_text.count(PROJECT_INSTRUCTIONS_END) == 1
         assert 'room_bootstrap(project_name="Initial Room")' in created_text
+        assert "room_sync" in created_text
+        assert "task_claim" in created_text
+        assert "work_report" in created_text
+        assert "the workspace this Agent conversation is actually running in" in created_text
+        assert "the target project the user asked you to work on" in created_text
+        assert "the Room Project this Session is bound to" in created_text
+        assert "stop and do not execute that work in this conversation" in created_text
+        assert "switch to the correct project workspace in the Agent client" in created_text
+        assert "Never resolve a workspace/project mismatch by rebinding the Room Session" in created_text
+        assert created_text.index("the workspace this Agent conversation is actually running in") < created_text.index("call `room_bootstrap(")
+        assert project["id"] not in created_text
+        assert project["project_key"] not in created_text
+        assert "Authorization" not in created_text
+        assert "Bearer " not in created_text
+        assert "session_id=" not in created_text.lower()
+        assert "token=" not in created_text.lower()
+        assert "token_" not in created_text.lower()
 
         renamed = client.patch(
             f"/api/v1/projects/{project['id']}",
