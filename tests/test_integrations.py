@@ -200,6 +200,13 @@ def test_project_integration_builds_stable_workbuddy_memory_without_live_state(t
     assert "use `unknown`" in memory
     assert ".agentchatroom/project.json" in memory
     assert "must not edit it, supply a key" in memory
+    # #135：同一规则源也进入接入载荷，覆盖生成以外的下发入口。
+    assert (
+        "Never resolve a workspace/project mismatch by rebinding the Room Session, "
+        "switching the Room Project, changing the working directory, or operating "
+        "on another directory" in memory
+    )
+    assert "switch to the correct project workspace in the Agent client" in memory
 
     prompt = result["onboarding_prompt"]
     assert "接入名为 `agentchatroom` 的 MCP Server" in prompt

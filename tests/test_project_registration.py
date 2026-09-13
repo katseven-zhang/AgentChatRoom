@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+from pathlib import Path
 
 import pytest
 
@@ -93,6 +94,81 @@ def test_checkout_registration_creates_managed_project_agents_instructions(
     assert project["id"] not in text
     assert project["project_key"] not in text
     assert "Bearer " not in text
+
+
+# #135：托管规则必须覆盖“Agent 客户端对话选错项目工作空间”这一场景。
+# 逐条短语对应任务验收标准：三事实核对、停止执行、明确提示与切换指引、
+# 目标不明确先澄清、禁止重绑 Room/切换 Project/改工作目录绕过、Room 与错误
+# 工作区匹配也不构成授权。
+WORKSPACE_MISMATCH_RULE_PHRASES = (
+    "the workspace this Agent conversation is actually running in",
+    "the target project the user asked you to work on",
+    "the Room Project this Session is bound to",
+    "A matching Room binding never substitutes for a matching conversation workspace",
+    "stop and do not execute that work in this conversation",
+    "do not claim or acknowledge its tasks, do not acquire leases, and do not read or modify its files",
+    "switch to the correct project workspace in the Agent client",
+    "ask for clarification first; never guess a project identity",
+    "Never resolve a workspace/project mismatch by rebinding the Room Session, switching the Room Project, changing the working directory, or operating on another directory",
+    "not authorization to work on a different requested project",
+)
+
+
+def test_managed_instructions_stop_on_wrong_conversation_workspace(service, project_dir):
+    project = service.create_project(root_path=str(project_dir), name="Project Alpha")
+
+    register_checkout_project(project_dir, project)
+
+    text = project_instructions_path(project_dir).read_text(encoding="utf-8")
+    for phrase in WORKSPACE_MISMATCH_RULE_PHRASES:
+        assert phrase in text
+    # 工作空间核对必须排在 Room 接入之前，否则会先绑定再判断。
+    assert text.index(WORKSPACE_MISMATCH_RULE_PHRASES[0]) < text.index(
+        "call `room_bootstrap("
+    )
+    # 匹配时正常流程保留：规则不能退化成“任何情况都不做”。
+    assert "`COORDINATE`" in text
+    assert "task_claim" in text
+    assert "work_report" in text
+    # 不硬编码本机路径与具体项目身份。
+    assert "C:\\" not in text
+    assert "D:\\" not in text
+    assert project["id"] not in text
+
+
+def test_managed_instructions_keep_workspace_mismatch_rule_across_refresh(
+    service, project_dir
+):
+    project = service.create_project(root_path=str(project_dir), name="Refresh One")
+
+    first = write_project_coordination_instructions(project_dir, project)
+    second = write_project_coordination_instructions(project_dir, project)
+    renamed = write_project_coordination_instructions(
+        project_dir, {**project, "name": "Refresh Two"}
+    )
+
+    text = project_instructions_path(project_dir).read_text(encoding="utf-8")
+    assert first["action"] == "created"
+    assert second["action"] == "unchanged"
+    assert renamed["action"] == "updated"
+    assert text.count(PROJECT_INSTRUCTIONS_BEGIN) == 1
+    assert "Refresh Two" in text
+    assert "Refresh One" not in text
+    for phrase in WORKSPACE_MISMATCH_RULE_PHRASES:
+        assert phrase in text
+
+
+def test_repository_agents_md_carries_workspace_mismatch_stop_rule():
+    """本仓库自带的托管区块（Agent 实际读取的规则）必须与生成源一致。"""
+    text = (Path(__file__).resolve().parents[1] / "AGENTS.md").read_text(
+        encoding="utf-8"
+    )
+
+    managed = text[
+        text.index(PROJECT_INSTRUCTIONS_BEGIN) : text.index(PROJECT_INSTRUCTIONS_END)
+    ]
+    for phrase in WORKSPACE_MISMATCH_RULE_PHRASES:
+        assert phrase in managed
 
 
 def test_managed_project_agents_instructions_preserve_user_rules_and_update_name(
