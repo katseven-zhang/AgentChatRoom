@@ -67,6 +67,9 @@ class RuntimeBinding:
     software_key: str
     agent_key: str
     conversation_synced: bool
+    # Kept so an existing runtime can restore its Session without a new join.
+    role: str = ""
+    model: str = "unknown"
 
 
 @dataclass(frozen=True, slots=True)
@@ -365,6 +368,134 @@ def _configured_path_ignored_notice(
     }
 
 
+def _ready_outcome(
+    *,
+    project: Mapping[str, Any],
+    session_id: str,
+    token: str,
+    role: str | None,
+    model: str | None,
+    software_key: str,
+    software_name: str,
+    client: str,
+    agent_key: str,
+    synced: Mapping[str, Any],
+    cursor: int,
+    notices: list[dict[str, Any]],
+    room_session: str,
+) -> BootstrapOutcome:
+    """Build the ready payload plus the in-memory binding for one Session.
+
+    ``room_session`` distinguishes creating a new Room Session from restoring
+    the Session this runtime already held (``created`` / ``restored``); callers
+    must not treat bootstrap itself as proof that task ownership was recovered.
+    """
+    public = bootstrap_status_payload("ready")
+    if notices:
+        public["notices"] = notices
+    public["conversation_synced"] = True
+    public["connection"] = {
+        "software_configured": True,
+        "process_connected": True,
+        "room_session": room_session,
+        "conversation_synced": True,
+    }
+    snapshot = compact_room_snapshot(synced.get("snapshot") or {}, cursor=cursor)
+    public["project"] = snapshot["project"]
+    public["session"] = {"id": session_id, "role": role, "model": model}
+    public["identity"] = {
+        "name": software_name,
+        "software_key": software_key,
+        "client": client,
+    }
+    public["cursor"] = cursor
+    public["snapshot"] = snapshot
+    public["unread_count"] = synced.get("unread_count")
+    public["messages"] = synced.get("messages", [])
+    public["events"] = synced.get("events", [])
+    public = redact_runtime_value(public)
+    if contains_secret(public, token):
+        raise DomainError(
+            "runtime_secret_leaked",
+            "Bootstrap result must not include a live Session Token",
+            status_code=500,
+        )
+    return BootstrapOutcome(
+        public,
+        RuntimeBinding(
+            project_id=str(project["id"]),
+            session_id=session_id,
+            token=token,
+            cursor=cursor,
+            software_key=software_key,
+            agent_key=agent_key,
+            conversation_synced=True,
+            role=role or "",
+            model=model or "unknown",
+        ),
+    )
+
+
+def restore_runtime_binding(
+    service: AgentChatRoomService,
+    binding: RuntimeBinding,
+    *,
+    project: Mapping[str, Any],
+    software_key: str,
+    software_name: str,
+    client: str,
+) -> BootstrapOutcome | None:
+    """Reuse the Session this runtime already holds instead of creating a new one.
+
+    A new Agent conversation (or a cleared model context) in the same live
+    runtime must not abandon its Room Session: the abandoned Session keeps its
+    task ownership and stays connected, so the new Session could neither release
+    nor reclaim that work. Restore only when the binding belongs to the same
+    Project and software identity and the Session credential still authenticates;
+    otherwise return ``None`` so the caller creates a new Session.
+    """
+    if binding.project_id != str(project["id"]):
+        return None
+    if binding.software_key and software_key and binding.software_key != software_key:
+        return None
+    try:
+        synced = service.room_sync(
+            str(project["id"]),
+            session_id=binding.session_id,
+            token=binding.token,
+            after=0,
+            mcp_context=True,
+            initial_inject=True,
+        )
+    except DomainError:
+        return None
+    cursor = int(synced.get("cursor") or binding.cursor or 0)
+    return _ready_outcome(
+        project=project,
+        session_id=binding.session_id,
+        token=binding.token,
+        role=binding.role,
+        model=binding.model,
+        software_key=software_key,
+        software_name=software_name,
+        client=client,
+        agent_key=binding.agent_key,
+        synced=synced,
+        cursor=cursor,
+        notices=[
+            {
+                "code": "runtime_session_restored",
+                "message": (
+                    "This runtime already held a live Room Session for this "
+                    "Project; the existing Session was restored instead of "
+                    "creating a new one. Task ownership is unchanged."
+                ),
+            }
+        ],
+        room_session="restored",
+    )
+
+
 def bootstrap_local_room(
     service: AgentChatRoomService,
     *,
@@ -380,7 +511,8 @@ def bootstrap_local_room(
     authorize_project: Callable[[str], Any] | None = None,
     database_first: bool = False,
     selected_project_id: str | None = None,
-    credential_id: str | None = None,) -> BootstrapOutcome:
+    credential_id: str | None = None,
+    restore_binding: RuntimeBinding | None = None,) -> BootstrapOutcome:
     current_identity = (software_key, software_name, client)
     if loaded_identity is not None and loaded_identity != current_identity:
         return BootstrapOutcome(bootstrap_status_payload("mcp_restart_required"))
@@ -564,6 +696,21 @@ def bootstrap_local_room(
     try:
         if authorize_project is not None:
             authorize_project(project["id"])
+        # A conversation that lost its model context (or was restarted inside
+        # the same live runtime) must not abandon the Session it already holds:
+        # the abandoned Session would keep its task ownership and stay
+        # connected, leaving the new Session unable to release or reclaim it.
+        if restore_binding is not None:
+            restored_outcome = restore_runtime_binding(
+                service,
+                restore_binding,
+                project=project,
+                software_key=software_key,
+                software_name=software_name,
+                client=client,
+            )
+            if restored_outcome is not None:
+                return restored_outcome
         registered = (
             service.register_workspace(
                 project["id"],
@@ -655,7 +802,6 @@ def bootstrap_local_room(
 
     token = str(joined["token"])
     cursor = int(synced.get("cursor") or joined.get("cursor") or 0)
-    public = bootstrap_status_payload("ready")
     ignored_notice = (
         _configured_path_ignored_notice(
             workspace_candidates, configured_checkout, checkout, project
@@ -685,49 +831,20 @@ def bootstrap_local_room(
                 ),
             }
         )
-    if notices:
-        public["notices"] = notices
-    public["conversation_synced"] = True
-    public["connection"] = {
-        "software_configured": True,
-        "process_connected": True,
-        "room_session": "created",
-        "conversation_synced": True,
-    }
-    public["project"] = compact_room_snapshot(synced.get("snapshot") or {}, cursor=cursor)["project"]
-    public["session"] = {
-        "id": joined["agent"]["id"],
-        "role": joined["agent"].get("role"),
-        "model": joined["agent"].get("model"),
-    }
-    public["identity"] = {
-        "name": software_name,
-        "software_key": software_key,
-        "client": client,
-    }
-    public["cursor"] = cursor
-    public["snapshot"] = compact_room_snapshot(synced.get("snapshot") or {}, cursor=cursor)
-    public["unread_count"] = synced.get("unread_count")
-    public["messages"] = synced.get("messages", [])
-    public["events"] = synced.get("events", [])
-    public = redact_runtime_value(public)
-    if contains_secret(public, token):
-        raise DomainError(
-            "runtime_secret_leaked",
-            "Bootstrap result must not include a live Session Token",
-            status_code=500,
-        )
-    return BootstrapOutcome(
-        public,
-        RuntimeBinding(
-            project_id=str(project["id"]),
-            session_id=str(joined["agent"]["id"]),
-            token=token,
-            cursor=cursor,
-            software_key=software_key,
-            agent_key=str(joined["agent"].get("agent_key") or joined["agent"]["id"]),
-            conversation_synced=True,
-        ),
+    return _ready_outcome(
+        project=project,
+        session_id=str(joined["agent"]["id"]),
+        token=token,
+        role=joined["agent"].get("role"),
+        model=joined["agent"].get("model"),
+        software_key=software_key,
+        software_name=software_name,
+        client=client,
+        agent_key=str(joined["agent"].get("agent_key") or joined["agent"]["id"]),
+        synced=synced,
+        cursor=cursor,
+        notices=notices,
+        room_session="created",
     )
 
 

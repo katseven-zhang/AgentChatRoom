@@ -158,6 +158,52 @@ def test_managed_instructions_keep_workspace_mismatch_rule_across_refresh(
         assert phrase in text
 
 
+# #136：托管规则必须说明会话恢复语义、禁止伪造旧绑定、禁止用 task_update
+# 绕过授权，并区分“恢复原会话”与“新建会话后仍需 reclaim”。
+RECOVERY_RULE_PHRASES = (
+    "`connection.room_session`",
+    "`restored` means the same Room Session and unchanged task ownership",
+    "a new Session that inherits no task",
+    "Never fabricate the previous binding",
+    "`runtime_context_mismatch`",
+    "bootstrap itself is not proof that task ownership was recovered",
+    "the heartbeat window lapses",
+    "`required_action` and `retry_after_seconds`",
+    "`task_owner_session_connected`",
+    "`task_reclaim_forbidden`",
+    "Do not try to bypass this with `task_update(status=todo)`",
+    "A missing Session credential is not management authority",
+    "`management_auth_required`",
+)
+
+
+def test_managed_instructions_document_recovery_and_authority_rules(
+    service, project_dir
+):
+    project = service.create_project(root_path=str(project_dir), name="Recovery")
+
+    register_checkout_project(project_dir, project)
+
+    text = project_instructions_path(project_dir).read_text(encoding="utf-8")
+    for phrase in RECOVERY_RULE_PHRASES:
+        assert phrase in text
+    # 恢复语义必须排在“打断/新开会话”之后仍沿用普通任务流程，不能取消正常流程。
+    assert "room_bootstrap" in text
+    assert "task_claim" in text
+
+
+def test_repository_agents_md_carries_recovery_and_authority_rules():
+    text = (Path(__file__).resolve().parents[1] / "AGENTS.md").read_text(
+        encoding="utf-8"
+    )
+
+    managed = text[
+        text.index(PROJECT_INSTRUCTIONS_BEGIN) : text.index(PROJECT_INSTRUCTIONS_END)
+    ]
+    for phrase in RECOVERY_RULE_PHRASES:
+        assert phrase in managed
+
+
 def test_repository_agents_md_carries_workspace_mismatch_stop_rule():
     """本仓库自带的托管区块（Agent 实际读取的规则）必须与生成源一致。"""
     text = (Path(__file__).resolve().parents[1] / "AGENTS.md").read_text(

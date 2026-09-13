@@ -119,6 +119,25 @@ logger = logging.getLogger(__name__)
 _UNCLASSIFIED_TASK_VIEW_WARNED: set[str] = set()
 
 
+def _management_authorization_required(action: str) -> DomainError:
+    """Build the explicit-authority error for a management task mutation.
+
+    A missing Session credential is not management authority. Adapters that
+    expose a real management surface (authenticated management token, browser
+    management session, or an equivalent local management command) must mark
+    the call; anything else is rejected so a bare Session id or an anonymous
+    request can never release, reassign, or rewrite another Session's task.
+    """
+    return DomainError(
+        "management_auth_required",
+        f"Owner credentials or an authenticated management request are required to {action}",
+        status_code=401,
+        details={
+            "required_action": "authenticate_management_or_use_owner_credentials",
+        },
+    )
+
+
 def _warn_unclassified_task_view(task: Mapping[str, Any]) -> None:
     """Alert once per task when the (E,V,I) triple maps to unclassified.
 
@@ -4329,22 +4348,50 @@ class AgentChatRoomService:
                     utc_now() - last_seen
                     <= timedelta(seconds=self.settings.heartbeat_timeout_seconds)
                 )
+                transport_state = "not_checked"
                 if owner_connected:
                     # Presence is display-only, but a reaped transport is hard
                     # evidence the owning client is gone: allow the same
                     # identity to reclaim immediately instead of waiting out
                     # the heartbeat window.
                     state_check = self.transport_liveness_check
-                    if state_check is not None and state_check(
-                        project_id, str(owner["id"])
-                    ) == "gone":
-                        owner_connected = False
+                    if state_check is None:
+                        transport_state = "unavailable"
+                    else:
+                        transport_state = (
+                            str(state_check(project_id, str(owner["id"])) or "")
+                            or "unknown"
+                        )
+                        if transport_state == "gone":
+                            owner_connected = False
                 if owner_connected:
+                    # Bound and actionable: the caller cannot bypass this with
+                    # task_update(status=todo), so it must know exactly when the
+                    # owner stops being treated as connected and what to do.
+                    stale_after = last_seen + timedelta(
+                        seconds=self.settings.heartbeat_timeout_seconds
+                    )
+                    retry_after = max(
+                        1, int((stale_after - utc_now()).total_seconds() + 0.999)
+                    )
                     raise DomainError(
                         "task_owner_session_connected",
-                        "The owning Session is still connected; continue in that conversation or release the task",
+                        "The owning Session is still connected; continue in that conversation, release the task there, or wait for it to be treated as disconnected",
                         status_code=409,
-                        details={"owner_session_id": task["owner_session_id"]},
+                        details={
+                            "owner_session_id": task["owner_session_id"],
+                            "owner_last_seen_at": last_seen.isoformat().replace(
+                                "+00:00", "Z"
+                            ),
+                            "owner_considered_disconnected_at": stale_after.isoformat().replace(
+                                "+00:00", "Z"
+                            ),
+                            "retry_after_seconds": retry_after,
+                            "owner_transport_state": transport_state,
+                            "heartbeat_timeout_seconds": self.settings.heartbeat_timeout_seconds,
+                            "required_action": "wait_for_owner_release_or_reclaim",
+                            "forbidden_bypass": "task_update(status=todo)",
+                        },
                     )
                 now = iso_now()
                 previous_owner = str(task["owner_session_id"])
@@ -4812,12 +4859,19 @@ class AgentChatRoomService:
         reason: str = "",
         session_id: str | None = None,
         token: str | None = None,
+        management_authorized: bool = False,
     ) -> dict[str, Any]:
         """Release an owned task back to the claimable pool.
 
         The current owner may release its own task; management may release on
         behalf of an owner that is offline, unreachable, or out of quota. The
         task returns to todo with its contract, progress, and history intact.
+
+        ``management_authorized`` is set only by an adapter that has already
+        verified an explicit management credential (or an equivalent local
+        management surface). A missing Session credential is not management
+        authority: without this flag the release is rejected instead of being
+        attributed to an unauthenticated caller.
         """
         with self.database.connect(write=True) as connection:
             task = self._require_task(connection, project_id, task_id)
@@ -4851,6 +4905,8 @@ class AgentChatRoomService:
                     )
                 initiator = "owner"
                 actor_session_id = session_id
+            elif not management_authorized:
+                raise _management_authorization_required("release this task")
             return self._release_task_locked(
                 connection,
                 project_id,
@@ -4874,6 +4930,7 @@ class AgentChatRoomService:
         target_role: str = "",
         required_capability: str = "",
         note: str = "",
+        management_authorized: bool = False,
     ) -> dict[str, Any]:
         role = target_role.strip()
         capability = required_capability.strip()
@@ -4902,6 +4959,8 @@ class AgentChatRoomService:
                     assigned_by_session_id,
                     token or "",
                 )
+            elif not management_authorized:
+                raise _management_authorization_required("assign this task")
             task = self._require_task(connection, project_id, task_id)
             if task["execution_status"] in {"completed", "cancelled"}:
                 raise DomainError(
@@ -5607,11 +5666,18 @@ class AgentChatRoomService:
         next_step: str | None = None,
         session_id: str | None = None,
         token: str | None = None,
+        management_authorized: bool = False,
     ) -> dict[str, Any]:
         with self.database.connect(write=True) as connection:
             if session_id:
                 self._authenticate(connection, project_id, session_id, token or "")
             task = self._require_task(connection, project_id, task_id)
+            # Ownership is checked before any field or status handling: the
+            # status=todo compatibility release below must never become an
+            # unaudited way for another Session to release someone else's task.
+            is_owner = bool(session_id) and task["owner_session_id"] == session_id
+            if session_id and task["owner_session_id"] not in {None, session_id}:
+                raise DomainError("not_task_owner", "Only the task owner can update this task", status_code=403)
             next_status = status or task["status"]
             text_limit = self.settings.task_text_max_length
             for field_name, value in (
@@ -5662,6 +5728,10 @@ class AgentChatRoomService:
                 and task["owner_session_id"] is not None
                 and task["execution_status"] in TASK_RELEASE_EXECUTION_STATUSES
             ):
+                if not (is_owner or management_authorized):
+                    raise _management_authorization_required(
+                        "release this task through task_update(status=todo)"
+                    )
                 release_result = self._release_task_locked(
                     connection,
                     project_id,
@@ -5669,8 +5739,8 @@ class AgentChatRoomService:
                     reason_code=TASK_RELEASE_COMPAT_REASON_CODE,
                     reason="released through task_update(status=todo); "
                     "prefer task_release for an explicit reason code",
-                    initiator="owner" if session_id else "management",
-                    actor_session_id=session_id,
+                    initiator="owner" if is_owner else "management",
+                    actor_session_id=session_id if is_owner else None,
                 )
                 task = connection.execute(
                     "SELECT * FROM tasks WHERE id = ?", (task_id,)
@@ -5698,8 +5768,6 @@ class AgentChatRoomService:
                 next_status,
                 previous_verification=task["verification_status"],
             )
-            if session_id and task["owner_session_id"] not in {None, session_id}:
-                raise DomainError("not_task_owner", "Only the task owner can update this task", status_code=403)
             if priority is not None and not 0 <= priority <= 4:
                 raise DomainError("invalid_priority", "Priority must be between 0 and 4")
             if progress_percent is not None and not 0 <= progress_percent <= 100:

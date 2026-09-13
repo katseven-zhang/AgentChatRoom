@@ -96,6 +96,13 @@ _bootstrap_http_identity: ContextVar[tuple[str, str, str] | None] = ContextVar(
     "agentchatroom_bootstrap_http_identity",
     default=None,
 )
+# The binding this runtime already held before room_bootstrap cleared it, so a
+# repeated bootstrap can restore the existing Room Session instead of creating
+# a new one and stranding that Session's task ownership.
+_bootstrap_restore_binding: ContextVar[RuntimeBinding | None] = ContextVar(
+    "agentchatroom_bootstrap_restore_binding",
+    default=None,
+)
 
 SOFTWARE_KEY_HEADER = "x-agentchatroom-software-key"
 SOFTWARE_NAME_HEADER = "x-agentchatroom-software-name"
@@ -132,6 +139,7 @@ class ServiceBoundToolManager(CompatibleToolManager):
         roots_token = None
         http_identity_token = None
         presence_token = None
+        restore_token = None
         try:
             session_key = mcp_session_key(context)
         except DomainError as error:
@@ -157,7 +165,15 @@ class ServiceBoundToolManager(CompatibleToolManager):
             with _session_bindings_lock:
                 invalidated = session_key in _session_bindings and restored is None
             if invalidated and name != "room_bootstrap":
-                raise DomainError("session_expired", "Bootstrap must succeed before using this connection", status_code=401)
+                raise DomainError(
+                    "session_expired",
+                    "Call room_bootstrap to restore the current Room session",
+                    status_code=401,
+                    details={
+                        "required_action": REQUIRED_ACTIONS["session_expired"],
+                        "session_state": "invalidated",
+                    },
+                )
             if name == "room_bootstrap":
                 access = get_access_token() if self.service_provider is not None else None
                 bundled_project_id = None
@@ -179,6 +195,10 @@ class ServiceBoundToolManager(CompatibleToolManager):
                 # Rebinding must fail closed, including identity and roots errors.
                 persist_runtime_binding(session_key, None)
                 _runtime_binding.set(None)
+                # The pre-clear binding is offered to the domain so a live
+                # runtime restores its existing Session instead of creating a
+                # new one; a failed bootstrap still leaves no binding behind.
+                restore_token = _bootstrap_restore_binding.set(restored)
                 roots_token = _bootstrap_workspace_roots.set(
                     await collect_mcp_workspace_roots(
                         context,
@@ -217,6 +237,8 @@ class ServiceBoundToolManager(CompatibleToolManager):
                 _bootstrap_http_identity.reset(http_identity_token)
             if roots_token is not None:
                 _bootstrap_workspace_roots.reset(roots_token)
+            if restore_token is not None:
+                _bootstrap_restore_binding.reset(restore_token)
             if name == "session_leave":
                 _runtime_binding.set(None)
             else:
@@ -1141,6 +1163,7 @@ def room_bootstrap(model: str = "", project_name: str = "") -> dict[str, Any]:
         database_first=bound,
         selected_project_id=selected_project_id,
         credential_id=selected_credential_id,
+        restore_binding=_bootstrap_restore_binding.get(),
     )
     if outcome.binding is None:
         payload = dict(outcome.public)

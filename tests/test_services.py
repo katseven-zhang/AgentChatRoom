@@ -936,6 +936,7 @@ def test_offline_member_assignment_targets_persistent_identity_and_survives_rejo
         task["id"],
         assigned_to_member_id=member_id,
         note="Handle this when you are back online",
+        management_authorized=True,
     )
 
     # The delayed assignment resolves the persistent identity to its latest
@@ -983,7 +984,8 @@ def test_member_assignment_rejects_revoked_unknown_or_never_joined_targets(
 
     with pytest.raises(DomainError) as unknown:
         service.assign_task(
-            project["id"], task["id"], assigned_to_member_id="member_missing"
+            project["id"], task["id"], assigned_to_member_id="member_missing",
+            management_authorized=True,
         )
     assert unknown.value.code == "assignment_target_not_found"
 
@@ -994,7 +996,8 @@ def test_member_assignment_rejects_revoked_unknown_or_never_joined_targets(
     )
     with pytest.raises(DomainError) as revoked:
         service.assign_task(
-            project["id"], task["id"], assigned_to_member_id=worker["agent"]["member_id"]
+            project["id"], task["id"], assigned_to_member_id=worker["agent"]["member_id"],
+            management_authorized=True,
         )
     assert revoked.value.code == "assignment_target_revoked"
 
@@ -1006,7 +1009,8 @@ def test_member_assignment_rejects_revoked_unknown_or_never_joined_targets(
     ghost_member_id = never_joined["member"]["id"]
     with pytest.raises(DomainError) as no_session:
         service.assign_task(
-            project["id"], task["id"], assigned_to_member_id=ghost_member_id
+            project["id"], task["id"], assigned_to_member_id=ghost_member_id,
+            management_authorized=True,
         )
     assert no_session.value.code == "assignment_target_not_found"
 
@@ -1026,6 +1030,7 @@ def test_assign_task_rejects_session_and_member_targets_together(
             task["id"],
             assigned_to_session_id=worker["agent"]["id"],
             assigned_to_member_id=worker["agent"]["member_id"],
+            management_authorized=True,
         )
     assert conflict.value.code == "invalid_assignment_target"
 
@@ -1045,6 +1050,7 @@ def test_manager_can_assign_without_impersonating_an_agent(
         task["id"],
         assigned_to_session_id=worker["agent"]["id"],
         note="Assigned from the management console",
+        management_authorized=True,
     )
 
     assert assigned["assignment"]["assigned_by_session_id"] is None
@@ -1336,7 +1342,9 @@ def test_work_must_be_independently_reviewed(service, project, joined_agents):
     assert completion_event["id"] < review_event["id"]
 
     with pytest.raises(DomainError) as direct_done:
-        service.update_task(project["id"], task["id"], status="done")
+        service.update_task(project["id"], task["id"], status="done",
+            management_authorized=True,
+        )
     assert direct_done.value.code == "structured_transition_required"
 
     with pytest.raises(DomainError) as failed_tests:
@@ -1657,6 +1665,7 @@ def test_changes_requested_task_can_be_reassigned_after_owner_leaves(
         task["id"],
         assigned_to_session_id=replacement["agent"]["id"],
         note="Continue the revision after the original session left.",
+        management_authorized=True,
     )
     accepted = service.acknowledge_task_assignment(
         project["id"],
@@ -2111,12 +2120,15 @@ def test_task_can_be_edited_released_and_cannot_form_dependency_cycle(
         progress_percent=10,
         current_step="Inspecting",
         next_step="Implement",
+        management_authorized=True,
     )["task"]
     assert edited["title"] == "First edited"
     assert edited["progress_percent"] == 10
 
     with pytest.raises(DomainError) as cycle:
-        service.update_task(project["id"], first["id"], depends_on=[second["id"]])
+        service.update_task(project["id"], first["id"], depends_on=[second["id"]],
+            management_authorized=True,
+        )
     assert cycle.value.code == "task_dependency_cycle"
 
     service.claim_task(
@@ -2223,6 +2235,7 @@ def test_release_task_management_releases_for_offline_owner_with_full_event(
         task["id"],
         reason_code="agent_unavailable",
         reason="Owner lost connection",
+        management_authorized=True,
     )
     assert released["released"] is True
     assert released["invalidated_assignment_ids"] == [assignment["assignment"]["id"]]
@@ -2320,6 +2333,7 @@ def test_release_task_after_changes_requested_preserves_verification_state(
         task["id"],
         reason_code="reassignment_needed",
         reason="Hand the fixes to someone else",
+        management_authorized=True,
     )
     assert released["task"]["status"] == "todo"
     assert released["task"]["verification_status"] == "changes_requested"
@@ -2337,12 +2351,14 @@ def test_release_task_is_idempotent_for_todo_and_rejects_terminal_phases(
     )["task"]
 
     first_release = service.release_task(
-        project["id"], task["id"], reason_code="other"
+        project["id"], task["id"], reason_code="other",
+        management_authorized=True,
     )
     assert first_release["released"] is False
     assert first_release["already_released"] is True
     second_release = service.release_task(
-        project["id"], task["id"], reason_code="other"
+        project["id"], task["id"], reason_code="other",
+        management_authorized=True,
     )
     assert second_release["released"] is False
     assert second_release["already_released"] is True
@@ -2363,7 +2379,8 @@ def test_release_task_is_idempotent_for_todo_and_rejects_terminal_phases(
     assert awaiting["execution_status"] == "completed"
     with pytest.raises(DomainError) as terminal:
         service.release_task(
-            project["id"], task["id"], reason_code="other"
+            project["id"], task["id"], reason_code="other",
+            management_authorized=True,
         )
     assert terminal.value.code == "task_not_releasable"
 
@@ -2376,6 +2393,7 @@ def test_release_task_is_idempotent_for_todo_and_rejects_terminal_phases(
                 acceptance_criteria=["c"],
             )["task"]["id"],
             reason_code="because",
+            management_authorized=True,
         )
     assert bad_reason.value.code == "invalid_release_reason_code"
 
@@ -2803,6 +2821,7 @@ def test_task_release_payload_reports_released_lease_ids(
         task["id"],
         reason_code="other",
         reason="lease cleanup check",
+        management_authorized=True,
     )
     assert lease_id in released["released_lease_ids"]
 
@@ -2961,7 +2980,8 @@ def test_concurrent_release_has_single_winner_and_idempotent_loser(
     def attempt():
         outcomes.append(
             service.release_task(
-                project["id"], task["id"], reason_code="other"
+                project["id"], task["id"], reason_code="other",
+                management_authorized=True,
             )
         )
 
@@ -3055,6 +3075,7 @@ def test_release_task_supports_blocked_tasks_and_clears_blocker_reason(
         task["id"],
         reason_code="agent_unavailable",
         reason="Cannot proceed while blocked",
+        management_authorized=True,
     )
     assert released["released"] is True
     assert released["task"]["status"] == "todo"
@@ -3086,6 +3107,7 @@ def test_release_request_id_replay_does_not_duplicate_release_event(
         reason_code="user_requested",
         reason="replay check",
         request_id="req-release-replay",
+        management_authorized=True,
     )
     assert first["released"] is True
     replay = service.release_task(
@@ -3094,6 +3116,7 @@ def test_release_request_id_replay_does_not_duplicate_release_event(
         reason_code="user_requested",
         reason="replay check",
         request_id="req-release-replay",
+        management_authorized=True,
     )
     assert replay["event_id"] == first["event_id"]
     events = service.list_events(project["id"], after=0)["events"]
@@ -3129,6 +3152,7 @@ def test_release_invalidates_pending_handoff_and_keeps_history(
         task["id"],
         reason_code="reassignment_needed",
         reason="Release invalidates the pending handoff",
+        management_authorized=True,
     )
     assert released["invalidated_handoff_ids"] == [handoff_id]
     events = service.list_events(project["id"], after=0)["events"]
@@ -3174,7 +3198,8 @@ def test_release_keeps_other_task_leases_of_the_same_session(
     )
 
     service.release_task(
-        project["id"], released_task["id"], reason_code="other"
+        project["id"], released_task["id"], reason_code="other",
+        management_authorized=True,
     )
     # 同 Session 为其他任务持有的租约必须存活。
     leases = service.list_leases(project["id"])
@@ -3203,7 +3228,9 @@ def test_cancelled_tasks_reject_release(service, project, joined_agents):
         token=owner["token"],
     )
     with pytest.raises(DomainError) as terminal:
-        service.release_task(project["id"], task["id"], reason_code="other")
+        service.release_task(project["id"], task["id"], reason_code="other",
+            management_authorized=True,
+        )
     assert terminal.value.code == "task_not_releasable"
 
 
@@ -3238,7 +3265,8 @@ def test_release_and_claim_race_admits_exactly_one_successor(
         gate.wait()
         try:
             result = service.release_task(
-                project["id"], task["id"], reason_code="other"
+                project["id"], task["id"], reason_code="other",
+                management_authorized=True,
             )
             outcomes.append("released" if result["released"] else "already")
         except DomainError as error:

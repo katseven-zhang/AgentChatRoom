@@ -2070,10 +2070,17 @@ def create_app(
         body: TaskRelease,
     ) -> dict[str, Any]:
         _reject_credentials_in_query(request)
+        payload = body.model_dump()
+        # 无 Session 凭据 = 管理侧代为释放，必须显式通过管理认证；
+        # 缺少凭据不构成管理权限（域层同样拒绝未标记的调用）。
+        management = not str(payload.get("session_id") or "").strip()
+        if management:
+            _require_management(request)
         return service.release_task(
             project_id,
             task_id,
-            **body.model_dump(),
+            **payload,
+            management_authorized=management,
             request_id=request.state.request_id,
         )
 
@@ -2087,10 +2094,15 @@ def create_app(
         task_id: str,
         body: TaskAssign,
     ) -> dict[str, Any]:
+        payload = body.model_dump()
+        management = not str(payload.get("assigned_by_session_id") or "").strip()
+        if management:
+            _require_management(request)
         return service.assign_task(
             project_id,
             task_id,
-            **body.model_dump(),
+            **payload,
+            management_authorized=management,
             request_id=request.state.request_id,
         )
 
@@ -2156,10 +2168,16 @@ def create_app(
         task_id: str,
         body: TaskUpdate,
     ) -> dict[str, Any]:
+        payload = body.model_dump()
+        # 无 Session 凭据的字段/状态更新（含 status=todo 兼容释放）属于管理操作。
+        management = not str(payload.get("session_id") or "").strip()
+        if management:
+            _require_management(request)
         return service.update_task(
             project_id,
             task_id,
-            **body.model_dump(),
+            **payload,
+            management_authorized=management,
             request_id=request.state.request_id,
         )
 

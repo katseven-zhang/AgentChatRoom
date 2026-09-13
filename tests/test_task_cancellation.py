@@ -74,7 +74,9 @@ def test_cancel_cleans_up_leases_assignments_and_handoffs(service, project_dir):
         token=owner["token"],
     )
 
-    service.update_task(project_id, task["id"], status="cancelled")
+    service.update_task(project_id, task["id"], status="cancelled",
+        management_authorized=True,
+    )
 
     stored = service.get_task(project_id, task["id"])
     assert stored["execution_status"] == "cancelled"
@@ -99,7 +101,9 @@ def test_cancelled_task_cannot_be_claimed_or_recancelled_with_new_event(
     agent = _join_agent(service, project_id, "worker-a")
     task = _make_task(service, project_id, "Terminal cancel")
 
-    service.update_task(project_id, task["id"], status="cancelled")
+    service.update_task(project_id, task["id"], status="cancelled",
+        management_authorized=True,
+    )
     with pytest.raises(DomainError):
         service.claim_task(
             project_id, task["id"], agent["agent"]["id"], agent["token"]
@@ -109,7 +113,9 @@ def test_cancelled_task_cannot_be_claimed_or_recancelled_with_new_event(
     cancel_count_before = sum(
         1 for event in before if event["event_type"] == "task.cancelled"
     )
-    service.update_task(project_id, task["id"], status="cancelled")
+    service.update_task(project_id, task["id"], status="cancelled",
+        management_authorized=True,
+    )
     after = service.query_audit(project_id, task_id=task["id"])["events"]
     cancel_count_after = sum(
         1 for event in after if event["event_type"] == "task.cancelled"

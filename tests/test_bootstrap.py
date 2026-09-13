@@ -883,3 +883,172 @@ def test_bootstrap_updates_stale_agents_coordination_block(
     restored = instructions_path.read_text(encoding="utf-8")
     assert "legacy-sync-marker" not in restored
     assert restored == current
+
+
+def _bootstrap(service, project_dir, **overrides):
+    arguments = {
+        "software_key": "boot-agent",
+        "software_name": "Boot Agent",
+        "client": "codex",
+        "model": "unknown",
+        "cwd": project_dir,
+    }
+    arguments.update(overrides)
+    return bootstrap_local_room(service, **arguments)
+
+
+def test_bootstrap_restores_the_runtime_session_instead_of_creating_one(
+    monkeypatch, service, project_dir
+):
+    """#136：同一运行时再次 bootstrap 恢复原 Session，不累积孤儿会话。"""
+    _configure_software(monkeypatch)
+    project = _register_project(service, project_dir)
+
+    first = _bootstrap(service, project_dir)
+    assert first.binding is not None
+    assert first.public["connection"]["room_session"] == "created"
+    sessions_before = len(service.snapshot(project["id"])["agents"])
+
+    restored = _bootstrap(service, project_dir, restore_binding=first.binding)
+
+    assert restored.binding is not None
+    assert restored.public["connection"]["room_session"] == "restored"
+    assert restored.binding.session_id == first.binding.session_id
+    assert restored.binding.token == first.binding.token
+    assert "runtime_session_restored" in [
+        notice["code"] for notice in restored.public.get("notices", [])
+    ]
+    assert len(service.snapshot(project["id"])["agents"]) == sessions_before
+    # 恢复的是可用会话，而不是只连上不能写。
+    posted = service.post_message(
+        project["id"],
+        body="restored session still writes",
+        session_id=restored.binding.session_id,
+        token=restored.binding.token,
+        model_display_name="test",
+    )
+    assert posted["event_id"]
+
+
+def test_restored_session_keeps_task_ownership_after_a_cleared_context(
+    monkeypatch, service, project_dir
+):
+    """#136 报告场景：上下文被清空但运行时仍在，任务所有权不得被搁置。"""
+    _configure_software(monkeypatch)
+    project = _register_project(service, project_dir)
+    first = _bootstrap(service, project_dir)
+    assert first.binding is not None
+    task = service.create_task(
+        project["id"],
+        title="Survives a new conversation",
+        acceptance_criteria=["Ownership is unchanged"],
+    )["task"]
+    service.claim_task(
+        project["id"], task["id"], first.binding.session_id, first.binding.token
+    )
+
+    restored = _bootstrap(service, project_dir, restore_binding=first.binding)
+
+    assert restored.binding.session_id == first.binding.session_id
+    assert (
+        service.get_task(project["id"], task["id"])["owner_session_id"]
+        == first.binding.session_id
+    )
+    released = service.release_task(
+        project["id"],
+        task["id"],
+        reason_code="other",
+        session_id=restored.binding.session_id,
+        token=restored.binding.token,
+    )
+    assert released["released"] is True
+
+
+def test_bootstrap_creates_a_new_session_when_the_previous_one_is_closed(
+    monkeypatch, service, project_dir
+):
+    """旧 Session 真的失效时不得假装恢复，应新建并保持原任务不动。"""
+    _configure_software(monkeypatch)
+    project = _register_project(service, project_dir)
+    first = _bootstrap(service, project_dir)
+    binding = first.binding
+    task = service.create_task(
+        project["id"],
+        title="Left behind",
+        acceptance_criteria=["Owner stays the closed session until reclaim"],
+    )["task"]
+    service.claim_task(project["id"], task["id"], binding.session_id, binding.token)
+    service.leave_session(project["id"], binding.session_id, binding.token)
+
+    second = _bootstrap(service, project_dir, restore_binding=binding)
+
+    assert second.binding is not None
+    assert second.binding.session_id != binding.session_id
+    assert second.public["connection"]["room_session"] == "created"
+    assert (
+        service.get_task(project["id"], task["id"])["owner_session_id"]
+        == binding.session_id
+    )
+
+
+def test_mcp_room_bootstrap_restores_the_same_session_for_a_live_runtime(
+    monkeypatch, service, project_dir
+):
+    """#136：MCP 工具层的重复 bootstrap 同样走恢复路径（接线回归）。"""
+    _configure_software(monkeypatch)
+    _register_project(service, project_dir)
+    monkeypatch.setattr(mcp_server, "service", service)
+    monkeypatch.chdir(project_dir)
+
+    first = _call_tool("room_bootstrap", {})
+    assert first["ok"] is True
+    assert first["result"]["connection"]["room_session"] == "created"
+    binding = mcp_server.get_runtime_binding()
+    assert binding is not None
+
+    second = _call_tool("room_bootstrap", {})
+
+    assert second["ok"] is True
+    assert second["result"]["connection"]["room_session"] == "restored"
+    assert second["result"]["session"]["id"] == binding.session_id
+    restored_binding = mcp_server.get_runtime_binding()
+    assert restored_binding is not None
+    assert restored_binding.session_id == binding.session_id
+    assert restored_binding.token == binding.token
+
+
+def test_runtime_binding_restore_requires_the_same_project_and_identity():
+    from agentchatroom.bootstrap import RuntimeBinding, restore_runtime_binding
+
+    binding = RuntimeBinding(
+        project_id="project_bound",
+        session_id="agent_bound",
+        token="bound-token",
+        cursor=0,
+        software_key="boot-agent",
+        agent_key="member_bound",
+        conversation_synced=True,
+    )
+
+    assert (
+        restore_runtime_binding(
+            None,
+            binding,
+            project={"id": "project_other", "name": "Other"},
+            software_key="boot-agent",
+            software_name="Boot Agent",
+            client="codex",
+        )
+        is None
+    )
+    assert (
+        restore_runtime_binding(
+            None,
+            binding,
+            project={"id": "project_bound", "name": "Bound"},
+            software_key="other-software",
+            software_name="Other",
+            client="codex",
+        )
+        is None
+    )
