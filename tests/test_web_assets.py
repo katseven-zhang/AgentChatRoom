@@ -2084,17 +2084,21 @@ def test_web_local_mcp_assistant_offers_generic_only():
 
 
 def test_web_recent_activity_shows_project_and_merges_lifecycle_noise(tmp_path):
-    """#100: overview card carries the project domain and de-noises lifecycle
-    events; the append-only feed path stays untouched."""
+    """#100/#138: overview card carries the project domain, resolves actor
+    names from actor_session_id, and de-noises lifecycle events; the
+    append-only feed path stays untouched."""
     javascript = (WEB_DIR / "app.js").read_text(encoding="utf-8")
     markup = (WEB_DIR / "index.html").read_text(encoding="utf-8")
 
     assert '"recent-activity-project"' in javascript
     assert 'id="recent-activity-project"' in markup
     assert "当前项目：" in javascript
-    assert "function mergeLifecycleActivity(events)" in javascript
+    assert "function mergeLifecycleActivity(events, resolveActorName)" in javascript
+    assert "function snapshotAgentName(sessionId)" in javascript
     # The merge is a view-layer concern for the overview card only.
     assert javascript.count("mergeLifecycleActivity(") == 2  # definition + 1 call
+    # Events only carry actor_session_id; the broken event.actor access is gone.
+    assert "event.actor?" not in javascript
 
     start = javascript.index("const LIFECYCLE_ACTIVITY_TYPES")
     end = javascript.index("function renderMetrics(", start)
@@ -2106,27 +2110,41 @@ def test_web_recent_activity_shows_project_and_merges_lifecycle_noise(tmp_path):
         "const eventLabel = (type) => type;\n"
         + snippet
         + """
+const names = {'s-zcode': 'ZCode', 's-opencode': 'OpenCode'};
+const resolveActorName = (sessionId) => names[sessionId] || '';
 const events = [
-  {id: 1, event_type: 'agent.joined', actor: {name: 'ZCode'}},
-  {id: 2, event_type: 'task.created', actor: {name: 'ZCode'}},
-  {id: 3, event_type: 'agent.session_replaced', actor: {name: 'ZCode'}},
-  {id: 4, event_type: 'agent.joined', actor: {name: 'ZCode'}},
-  {id: 5, event_type: 'agent.joined', actor: {name: 'ZCode'}},
-  {id: 6, event_type: 'message.message', actor: {name: 'ZCode'}},
+  {id: 1, event_type: 'agent.joined', actor_session_id: 's-zcode'},
+  {id: 2, event_type: 'task.created', actor_session_id: 's-zcode'},
+  {id: 3, event_type: 'agent.session_replaced', actor_session_id: 's-zcode'},
+  {id: 4, event_type: 'agent.joined', actor_session_id: 's-opencode'},
+  {id: 5, event_type: 'agent.joined', actor_session_id: 's-zcode'},
+  {id: 6, event_type: 'message.message', actor_session_id: 's-zcode'},
 ];
-const merged = mergeLifecycleActivity(events);
-const joined = merged.find((item) => item.merged && item.event_type === 'agent.joined');
-assert.equal(joined.count, 3);
+const merged = mergeLifecycleActivity(events, resolveActorName);
+const joined = merged.find((item) => item.merged && item.event_type === 'agent.joined' && item.actor === 'ZCode');
+assert.equal(joined.count, 2);
 assert.equal(joined.actor, 'ZCode');
 assert.equal(joined.last.id, 5);
+const opencodeJoined = merged.find((item) => item.merged && item.event_type === 'agent.joined' && item.actor === 'OpenCode');
+assert.equal(opencodeJoined.count, 1);
+assert.equal(opencodeJoined.last.id, 4);
 const replaced = merged.find((item) => item.merged && item.event_type === 'agent.session_replaced');
+assert.equal(replaced.actor, 'ZCode');
 assert.equal(replaced.count, 1);
 assert.equal(merged.find((item) => !item.merged).event.id, 2);
 // entries keep chronological order by their latest event
 const refs = merged.map((item) => (item.merged ? item.last.id : item.event.id));
 assert.deepEqual(refs, [...refs].sort((a, b) => a - b));
-assert.equal(lifecycleActivitySummary(joined), 'ZCode 加入 Room ×3');
+assert.equal(lifecycleActivitySummary(joined), 'ZCode 加入 Room');
+const tripleJoined = mergeLifecycleActivity(
+  [1, 2, 3].map((id) => ({id, event_type: 'agent.joined', actor_session_id: 's-zcode'})),
+  resolveActorName,
+).find((item) => item.merged);
+assert.equal(lifecycleActivitySummary(tripleJoined), 'ZCode 加入 Room ×3');
 assert.equal(lifecycleActivitySummary(replaced), 'ZCode 替换会话');
+// unknown actors degrade to 系统, never undefined
+assert.equal(lifecycleActivitySummary({...replaced, actor: ''}), '系统 替换会话');
+assert.equal(lifecycleActivitySummary({...replaced, actor: undefined}), '系统 替换会话');
 // aggregate counts only; individual events still exist in the raw feed
 assert.equal(events.filter((event) => event.event_type === 'agent.joined').length, 3);
 """,
@@ -2150,7 +2168,7 @@ def test_web_recent_activity_switch_projects_without_crosstalk(tmp_path):
         "const assert = require('node:assert/strict');\n"
         "const escapeHtml = (value) => String(value);\n"
         "const formatTime = () => '12:00';\n"
-        "const eventIdBadge = (id) => `#${id}`;\n"
+        "const eventIdBadge = (seq, id) => `#${seq || id}`;\n"
         "const messageModelBadge = () => '';\n"
         "const renderMessageLines = (lines) => lines.join('<br>');\n"
         "const eventLabel = (type) => type;\n"
@@ -2160,15 +2178,15 @@ def test_web_recent_activity_switch_projects_without_crosstalk(tmp_path):
                 javascript.index("const LIFECYCLE_ACTIVITY_TYPES"),
             )
         ] + "\n"
-        "const state = {snapshot: {project: {name: ''}}, events: []};\n"
+        "const state = {snapshot: {project: {name: ''}, agents: [{id: 'A', name: 'Agent A'}, {id: 'B', name: 'Agent B'}]}, events: []};\n"
         "const elements = {\n"
         "  'recent-activity-project': {textContent: ''},\n"
         "  'recent-event-list': {innerHTML: ''},\n"
         "};\n"
         "const renderRecent = () => {\n" + block + "\n};\n"
         "const eventsFor = (projectId, count) => Array.from({length: count}, (_, index) => ({\n"
-        "  id: index + 1, event_type: 'task.created', project_id: projectId,\n"
-        "  actor: {name: projectId}, payload: {title: `${projectId}-event-${index + 1}`},\n"
+        "  id: index + 1, project_seq: index + 1, event_type: 'task.created', project_id: projectId,\n"
+        "  actor_session_id: projectId, payload: {title: `${projectId}-event-${index + 1}`},\n"
         "}));\n"
         "// project A renders A events and the A badge\n"
         "state.snapshot.project.name = 'A';\n"
@@ -2176,14 +2194,82 @@ def test_web_recent_activity_switch_projects_without_crosstalk(tmp_path):
         "renderRecent();\n"
         "assert.equal(elements['recent-activity-project'].textContent, '当前项目：A · 实时更新');\n"
         "assert.equal(elements['recent-event-list'].innerHTML.includes('A-event-4'), true);\n"
+        "assert.equal(elements['recent-event-list'].innerHTML.includes('<strong>Agent A</strong> task.created'), true);\n"
         "assert.equal(elements['recent-event-list'].innerHTML.includes('B-event'), false);\n"
+        "assert.equal(elements['recent-event-list'].innerHTML.includes('Agent B'), false);\n"
+        "assert.equal(elements['recent-event-list'].innerHTML.includes('undefined'), false);\n"
         "// switch to B: badge and items fully switch, no A residue\n"
         "state.snapshot.project.name = 'B';\n"
         "state.events = eventsFor('B', 2);\n"
         "renderRecent();\n"
         "assert.equal(elements['recent-activity-project'].textContent, '当前项目：B · 实时更新');\n"
         "assert.equal(elements['recent-event-list'].innerHTML.includes('A-event'), false);\n"
-        "assert.equal(elements['recent-event-list'].innerHTML.includes('B-event-2'), true);\n",
+        "assert.equal(elements['recent-event-list'].innerHTML.includes('Agent A'), false);\n"
+        "assert.equal(elements['recent-event-list'].innerHTML.includes('B-event-2'), true);\n"
+        "assert.equal(elements['recent-event-list'].innerHTML.includes('<strong>Agent B</strong> task.created'), true);\n",
+        encoding="utf-8",
+    )
+    run = subprocess.run(["node", str(harness)], capture_output=True, text=True)
+    assert run.returncode == 0, run.stderr
+
+
+def test_web_recent_activity_headings_carry_agent_names(tmp_path):
+    """#138: every overview-card heading shows the acting agent resolved from
+    actor_session_id, degrades to 系统/用户 for unknown sessions, and keeps
+    the event-id and model badges without ever printing undefined."""
+    javascript = (WEB_DIR / "app.js").read_text(encoding="utf-8")
+    start = javascript.index("const projectName = state.snapshot")
+    end_marker = "提交报告都会按时间显示在这里。</div>';"
+    end = javascript.index(end_marker, start) + len(end_marker)
+    block = javascript[start:end]
+
+    harness = tmp_path / "recent-actor-names.js"
+    harness.write_text(
+        "const assert = require('node:assert/strict');\n"
+        "const escapeHtml = (value) => String(value);\n"
+        "const formatTime = () => '12:00';\n"
+        "const eventIdBadge = (seq, id) => `#${seq || id}`;\n"
+        "const messageModelBadge = () => ' [model]';\n"
+        "const renderMessageLines = (lines) => lines.join('<br>');\n"
+        "const eventLabel = (type) => type;\n"
+        + javascript[
+            javascript.index("const LIFECYCLE_ACTIVITY_TYPES"):javascript.index(
+                "function renderMetrics(",
+                javascript.index("const LIFECYCLE_ACTIVITY_TYPES"),
+            )
+        ] + "\n"
+        "const state = {snapshot: {project: {name: ''}, agents: [{id: 's-opencode', name: 'OpenCode'}, {id: 's-codex', name: 'Codex'}]}, events: []};\n"
+        "const elements = {\n"
+        "  'recent-activity-project': {textContent: ''},\n"
+        "  'recent-event-list': {innerHTML: ''},\n"
+        "};\n"
+        "const renderRecent = () => {\n" + block + "\n};\n"
+        "// regular, message and unknown-session events all carry an actor heading\n"
+        "state.events = [\n"
+        "  {id: 1, project_seq: 11, event_type: 'task.claimed', actor_session_id: 's-opencode', payload: {title: 'T1'}},\n"
+        "  {id: 2, project_seq: 12, event_type: 'message.message', actor_session_id: 's-codex', payload: {body: 'hello'}},\n"
+        "  {id: 3, project_seq: 13, event_type: 'lease.acquired', actor_session_id: '', payload: {path_pattern: 'p'}},\n"
+        "  {id: 4, project_seq: 14, event_type: 'message.message', actor_session_id: 's-gone', payload: {body: 'hi'}},\n"
+        "];\n"
+        "renderRecent();\n"
+        "let html = elements['recent-event-list'].innerHTML;\n"
+        "assert.equal(html.includes('<strong>OpenCode</strong> task.claimed'), true);\n"
+        "assert.equal(html.includes('<strong>Codex</strong> message.message [model]'), true);\n"
+        "assert.equal(html.includes('<strong>系统</strong> lease.acquired'), true);\n"
+        "assert.equal(html.includes('<strong>用户</strong> message.message [model]'), true);\n"
+        "assert.equal(html.includes('#11'), true);\n"
+        "assert.equal(html.includes('undefined'), false);\n"
+        "// merged lifecycle headings carry the resolved agent name\n"
+        "state.events = [1, 2, 3].map((id) => ({id, project_seq: id, event_type: 'agent.joined', actor_session_id: 's-opencode'}));\n"
+        "renderRecent();\n"
+        "html = elements['recent-event-list'].innerHTML;\n"
+        "assert.equal(html.includes('<strong>OpenCode 加入 Room ×3</strong>'), true);\n"
+        "// unknown sessions merge separately and degrade to 系统\n"
+        "state.events = [1, 2, 3].map((id) => ({id, project_seq: id, event_type: 'agent.joined', actor_session_id: ''}));\n"
+        "renderRecent();\n"
+        "html = elements['recent-event-list'].innerHTML;\n"
+        "assert.equal(html.includes('<strong>系统 加入 Room ×3</strong>'), true);\n"
+        "assert.equal(html.includes('undefined'), false);\n",
         encoding="utf-8",
     )
     run = subprocess.run(["node", str(harness)], capture_output=True, text=True)

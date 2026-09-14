@@ -1319,7 +1319,7 @@ const LIFECYCLE_ACTIVITY_TYPES = new Set([
 // Aggregate high-frequency session lifecycle events per (type, actor) for the
 // overview card only; the append-only event history and the Room feed stay
 // complete. Entries keep the position of their latest event.
-function mergeLifecycleActivity(events) {
+function mergeLifecycleActivity(events, resolveActorName) {
   const entries = [];
   const byKey = new Map();
   for (const event of events) {
@@ -1327,11 +1327,16 @@ function mergeLifecycleActivity(events) {
       entries.push({ event });
       continue;
     }
-    const actor = event.actor?.name || "";
-    const key = `${event.event_type}|${actor}`;
+    const key = `${event.event_type}|${event.actor_session_id || ""}`;
     let entry = byKey.get(key);
     if (!entry) {
-      entry = { merged: true, event_type: event.event_type, actor, count: 0, last: event };
+      entry = {
+        merged: true,
+        event_type: event.event_type,
+        actor: resolveActorName(event.actor_session_id),
+        count: 0,
+        last: event,
+      };
       byKey.set(key, entry);
       entries.push(entry);
     }
@@ -1343,9 +1348,15 @@ function mergeLifecycleActivity(events) {
   return entries;
 }
 
+function snapshotAgentName(sessionId) {
+  if (!sessionId) return "";
+  const agent = (state.snapshot?.agents || []).find((item) => item.id === sessionId);
+  return agent?.name || "";
+}
+
 function lifecycleActivitySummary(item) {
   const times = item.count >= 3 ? ` ×${item.count}` : "";
-  const who = item.actor ? `${item.actor} ` : "";
+  const who = item.actor ? `${item.actor} ` : "系统 ";
   const verbs = {
     "agent.joined": "加入 Room",
     "agent.left": "离开 Room",
@@ -1377,7 +1388,7 @@ function renderMetrics(agents, tasks, leases) {
       ? `当前项目：${projectName} · 实时更新`
       : "实时更新";
   }
-  const recent = mergeLifecycleActivity(state.events).slice(-6).reverse();
+  const recent = mergeLifecycleActivity(state.events, snapshotAgentName).slice(-6).reverse();
   elements["recent-event-list"].innerHTML = recent.length
     ? recent.map((item) => {
       if (item.merged && item.count >= 3) {
@@ -1389,13 +1400,14 @@ function renderMetrics(agents, tasks, leases) {
       }
       const event = item.merged ? item.last : item.event;
       const isMessage = event.event_type.startsWith("message.") && event.payload?.body !== undefined;
+      const actorName = snapshotAgentName(event.actor_session_id) || (isMessage ? "用户" : "系统");
       const modelBadge = isMessage ? messageModelBadge(event) : "";
       const preview = isMessage
         ? renderMessageLines(String(event.payload.body).split("\n").slice(0, 3))
         : `<div class="msg-line">${escapeHtml(event.payload?.title || event.payload?.path_pattern || formatTime(event.created_at))}</div>`;
       return `
       <div class="compact-item ${isMessage ? `kind-${escapeHtml(event.event_type.split(".")[1])}` : ""}">
-        <div class="compact-heading"><span><strong>${escapeHtml(eventLabel(event.event_type))}</strong>${modelBadge}</span>${eventIdBadge(event.project_seq, event.id)}</div>
+        <div class="compact-heading"><span><strong>${escapeHtml(actorName)}</strong> ${escapeHtml(eventLabel(event.event_type))}${modelBadge}</span>${eventIdBadge(event.project_seq, event.id)}</div>
         <div class="compact-body">${preview}</div>
       </div>`;
     }).join("")
