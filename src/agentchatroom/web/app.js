@@ -95,7 +95,7 @@ const elements = Object.fromEntries(
     "create-backup-button", "backup-list",
     "refresh-runtime-button", "runtime-status", "runtime-config", "runtime-config-raw", "runtime-log",
     "login-dialog", "login-form", "login-token", "login-error",
-    "token-dialog", "token-form", "token-name", "token-member", "token-days", "token-permissions",
+    "token-dialog", "token-form", "token-name", "token-form-error", "token-member", "token-days", "token-permissions",
     "token-agent-name", "token-agent-name-group",
     "token-dialog-context", "token-dialog-title", "token-submit-button",
     "token-permissions-dialog", "token-permissions-form", "token-permissions-project",
@@ -682,6 +682,15 @@ function showToast(message, type = "success") {
   region.setAttribute("aria-live", type === "error" ? "assertive" : "polite");
   region.append(item);
   setTimeout(() => item.remove(), 3600);
+}
+
+function setTokenFormError(message) {
+  // #142：弹窗处于顶层（top-layer），body 底部的 toast 会被
+  // dialog::backdrop 的模糊滤镜虚化；签发表单的校验错误必须写在
+  // 弹窗内部的内联横幅里才能被看清。
+  const banner = elements["token-form-error"];
+  banner.textContent = message || "";
+  banner.hidden = !message;
 }
 
 function withBusy(work) {
@@ -2396,6 +2405,7 @@ elements["token-secret-dialog"].addEventListener("close", () => {
 
 elements["token-dialog"].addEventListener("close", () => {
   state.pendingHttpSetup = null;
+  setTokenFormError("");
 });
 
 elements["token-config-format"].addEventListener("change", () => {
@@ -3004,6 +3014,7 @@ function deriveTokenCredentialName(member) {
 elements["token-form"].addEventListener("submit", async (event) => {
   event.preventDefault();
   if (!state.projectId) return;
+  setTokenFormError("");
   const projectId = state.projectId;
   const setup = state.pendingHttpSetup;
   let projectCredentialName = "";
@@ -3018,14 +3029,14 @@ elements["token-form"].addEventListener("submit", async (event) => {
     try {
       selectedIdentity = softwareIdentityForMember(member);
     } catch (error) {
-      showToast(error.message || "所选项目成员的软件身份不完整", "error");
+      setTokenFormError(error.message || "所选项目成员的软件身份不完整");
       return;
     }
     if (selectedIdentity) {
       // 关联已有成员：沿用该成员现有软件身份，不新建身份。
       softwareIdentity = selectedIdentity;
     } else if (member) {
-      showToast("所选项目成员的软件身份不完整，请改选成员，或改为不关联并填写 Agent 显示名称", "error");
+      setTokenFormError("所选项目成员的软件身份不完整，请改选成员，或改为不关联并填写 Agent 显示名称");
       return;
     } else if (setup.mode === "add_project") {
       // 已配置软件增量加入 Project：客户端原身份由 Agent 在本地保留，
@@ -3039,7 +3050,7 @@ elements["token-form"].addEventListener("submit", async (event) => {
           elements["token-agent-name"].value,
         );
       } catch (error) {
-        showToast(error.message || "Agent 显示名称无效，请填写实际接入端名称", "error");
+        setTokenFormError(error.message || "Agent 显示名称无效，请填写实际接入端名称");
         return;
       }
       const typedName = elements["token-agent-name"].value.trim().toLocaleLowerCase();
@@ -3048,9 +3059,8 @@ elements["token-form"].addEventListener("submit", async (event) => {
         && item.metadata?.software_key !== softwareIdentity.softwareKey);
       if (nameOwner) {
         // 同名但软件身份不同：拦截并引导合并，避免再造一个同名成员（#139）。
-        showToast(
+        setTokenFormError(
           `项目中已有同名成员「${nameOwner.name}」（软件身份 ${nameOwner.metadata?.software_key || "未知"}）。请在成员下拉中选择该项以沿用现有身份合并接入，或为本次接入换一个显示名称。`,
-          "error",
         );
         return;
       }
@@ -3059,7 +3069,7 @@ elements["token-form"].addEventListener("submit", async (event) => {
   const permissions = [...elements["token-permissions"].querySelectorAll("input:checked")]
     .map((input) => input.value);
   if (!permissions.length) {
-    showToast("至少选择一项权限", "error");
+    setTokenFormError("至少选择一项权限");
     return;
   }
   try {
@@ -3090,7 +3100,7 @@ elements["token-form"].addEventListener("submit", async (event) => {
     }
     await refreshManagement();
   } catch (error) {
-    handleError(error);
+    setTokenFormError(error.message || "签发失败，请稍后重试");
   }
 });
 

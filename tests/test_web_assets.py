@@ -179,6 +179,30 @@ assert.equal(deriveTokenCredentialName(null), 'Agent 凭据');
     assert "manualImportText" not in javascript
 
 
+def test_web_token_dialog_shows_inline_validation_errors():
+    """#142：弹窗校验错误写进弹窗内联横幅（位于 top-layer 内必然可见），
+    不再依赖被 dialog::backdrop 模糊虚化的 body 级 toast。"""
+    markup = (WEB_DIR / "index.html").read_text(encoding="utf-8")
+    javascript = (WEB_DIR / "app.js").read_text(encoding="utf-8")
+
+    # 内联横幅位于 token-dialog 内部并带 alert 角色。
+    dialog_start = markup.index('<dialog id="token-dialog">')
+    dialog_end = markup.index("</dialog>", dialog_start)
+    dialog_markup = markup[dialog_start:dialog_end]
+    assert '<p class="form-error" id="token-form-error" role="alert" hidden></p>' in dialog_markup
+    assert ".form-error {" in (WEB_DIR / "app.css").read_text(encoding="utf-8")
+
+    # 提交处理器内所有校验失败与 API 失败都写内联横幅，不再调用 toast。
+    start = javascript.index('elements["token-form"].addEventListener("submit"')
+    end = javascript.index('elements["task-assign-form"].addEventListener', start)
+    handler = javascript[start:end]
+    assert handler.count("setTokenFormError(") >= 6
+    assert "showToast(" not in handler
+    assert "handleError(" not in handler
+    # 弹窗关闭与下次提交都会先清空横幅，避免残留误导。
+    assert 'setTokenFormError("")' in javascript
+
+
 def test_web_pinned_software_key_is_issued_without_random_suffix(tmp_path):
     """#139：模板固定 software_key 的接入格式按原样签发，不再拼随机后缀；
     只有 generic 这类无固定 key 的模板保留随机后缀，且签发提交流程包含
