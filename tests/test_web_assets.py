@@ -18,35 +18,29 @@ def test_http_onboarding_config_generation_and_secret_cleanup():
 
 
 def test_web_add_project_issues_without_pasting_raw_config():
-    """加入本项目：主流程零粘贴可签发；粘贴框只留在折叠的高级故障恢复区。"""
+    """加入本项目：主流程零粘贴可签发；#141 起手动粘贴故障恢复区整体移除。"""
     markup = (WEB_DIR / "index.html").read_text(encoding="utf-8")
     javascript = (WEB_DIR / "app.js").read_text(encoding="utf-8")
 
-    # 粘贴框移入默认折叠、明确标注的高级故障恢复区域，且不再必填。
-    details_start = markup.index('<details id="token-existing-config-advanced"')
-    details_end = markup.index("</details>", details_start)
-    advanced_block = markup[details_start:details_end]
-    assert "高级 · 故障恢复" in advanced_block
-    assert "（可选）" in advanced_block
-    assert "留空不影响签发" in advanced_block
-    assert "required" not in advanced_block.split("<textarea", 1)[1].split(">", 1)[0]
+    # 手动粘贴文本域与高级故障恢复区已删除，签发表单不再出现。
+    assert 'id="token-existing-config-advanced"' not in markup
+    assert 'id="token-existing-config"' not in markup
+    assert "高级 · 故障恢复" not in markup
+    assert "token-existing-config" not in javascript
 
-    # 提交路径不再阻塞空文本：旧的必填拦截提示必须移除，增量提示词生成器必须存在。
+    # 提交路径不再读取粘贴文本：增量分支仅限加入本项目。
     assert "请粘贴客户端当前使用的 agentchatroom HTTP 配置" not in javascript
     assert ".required = isAddProject" not in javascript
     assert "incrementalHttpPrompt(" in javascript
     assert "incremental: true" in javascript
-    # 增量分支仅限加入本项目；首次配置即使留空也必须生成完整配置。
-    assert 'if (manualImportText || setup.mode !== "add_project")' in javascript
+    assert 'if (setup.mode !== "add_project") {' in javascript
 
     # 增量结果弹窗与场景引导按真实用户视角描述下一步。
     assert "增量接入提示词（交给已配置的 Agent）" in javascript
     assert "签发并生成增量提示词" in javascript
     assert "无需粘贴现有配置" in javascript
-    # 三种场景保持可区分：首次配置仍生成完整配置；恢复连接不签发 Token。
+    # 两种场景保持可区分：首次配置生成完整配置；恢复连接不再出现在向导中。
     assert "签发并生成接入提示词" in javascript
-    assert "生成恢复连接提示词" in javascript
-    assert 'setup.mode === "reconnect"' in javascript
 
 
 def test_web_first_setup_requires_a_real_agent_display_name():
@@ -54,13 +48,16 @@ def test_web_first_setup_requires_a_real_agent_display_name():
     markup = (WEB_DIR / "index.html").read_text(encoding="utf-8")
     javascript = (WEB_DIR / "app.js").read_text(encoding="utf-8")
 
-    # UI 三要素语义分离：凭据名称只管理 Token，成员关联沿用旧身份，
+    # UI 三要素语义分离：凭据名称自动派生（#141），成员关联沿用旧身份，
     # 显示名称才是新成员/Session 的名称。
-    assert "凭据名称（只用于管理这个 Token，不会成为 Agent 名称）" in markup
+    assert '<input id="token-name" type="hidden"' in markup
+    assert "凭据名称（只用于管理这个 Token" not in markup
     assert "Agent 显示名称（首次接入且不关联成员时必填）" in markup
     assert 'id="token-agent-name"' in markup
     assert 'id="token-agent-name-group" hidden' in markup
-    assert "接入格式标签不是身份名称" in markup
+    assert "接入格式标签不能充当身份名称" in markup
+    assert "function deriveTokenCredentialName(" in javascript
+    assert "name: deriveTokenCredentialName(member)" in javascript
 
     # generic profile.label（“通用（标准 MCP）”）不再回退为软件身份名称。
     assert "|| concreteIdentityValue(profile?.label)" not in javascript
@@ -126,9 +123,60 @@ def test_web_integration_wizard_is_minimal_with_primary_cta():
     steps_start = markup.index('id="integration-http-action-steps"')
     steps_end = markup.index("</ol>", steps_start)
     assert markup[steps_start:steps_end].count("<li>") == 3
-    # 高级排障手动配置保持默认收起（details 无 open），且首次接入直接隐藏。
-    assert '<details id="token-existing-config-advanced" class="integration-fallback" hidden>' in markup
-    assert 'token-existing-config-advanced"].hidden = !isAddProject' in javascript
+    # 高级排障手动配置在 #141 起整体移除，签发表单保持最小输入。
+    assert '<details id="token-existing-config-advanced"' not in markup
+    assert "token-existing-config" not in javascript
+
+
+def test_web_token_form_auto_derives_credential_name_and_defaults_365d(tmp_path):
+    """#141：凭据名称按 Agent 显示名称/所选成员自动派生（重名递增序号），
+    有效天数默认 365 天，手动粘贴故障恢复区整体移除。"""
+    javascript = (WEB_DIR / "app.js").read_text(encoding="utf-8")
+    markup = (WEB_DIR / "index.html").read_text(encoding="utf-8")
+
+    start = javascript.index("function deriveTokenCredentialName(")
+    end = javascript.index('elements["token-form"].addEventListener', start)
+    snippet = javascript[start:end]
+    harness = tmp_path / "derive_token_name.js"
+    harness.write_text(
+        "const assert = require('node:assert/strict');\n"
+        "const concreteIdentityValue = (value) => {\n"
+        "  const normalized = String(value || '').trim();\n"
+        "  return normalized && !normalized.startsWith('<') ? normalized : '';\n"
+        "};\n"
+        "const state = {credentials: []};\n"
+        "const elements = {'token-agent-name': {value: ''}};\n"
+        + snippet
+        + """
+elements['token-agent-name'].value = 'Hermes';
+assert.equal(deriveTokenCredentialName(null), 'Hermes 凭据');
+state.credentials = [{name: 'Hermes 凭据'}];
+assert.equal(deriveTokenCredentialName(null), 'Hermes 凭据 2');
+state.credentials = [{name: 'Hermes 凭据'}, {name: 'Hermes 凭据 2'}];
+assert.equal(deriveTokenCredentialName(null), 'Hermes 凭据 3');
+// 显示名称优先于所选成员名
+assert.equal(deriveTokenCredentialName({name: 'Grok'}), 'Hermes 凭据 3');
+// 未填显示名称时回退到所选成员名
+elements['token-agent-name'].value = '';
+assert.equal(deriveTokenCredentialName({name: 'Grok'}), 'Grok 凭据');
+// 两者皆空时兜底
+assert.equal(deriveTokenCredentialName(null), 'Agent 凭据');
+""",
+        encoding="utf-8",
+    )
+    run = subprocess.run(["node", str(harness)], capture_output=True, text=True)
+    assert run.returncode == 0, run.stderr
+
+    # 有效天数默认 365 天；凭据名称输入框降级为隐藏字段（自动派生）。
+    assert '<label>有效天数 <input id="token-days" type="number" min="1" max="365" value="365" required></label>' in markup
+    assert '<input id="token-name" type="hidden"' in markup
+    assert "凭据名称（只用于管理这个 Token" not in markup
+    assert 'elements["token-days"].value = "365"' in javascript
+    # 手动粘贴合并相关 UI 与提交路径全部移除（配置解析契约函数保留给
+    # 生成配置的消费端回归覆盖）。
+    assert "高级 · 故障恢复" not in markup
+    assert "token-existing-config" not in javascript
+    assert "manualImportText" not in javascript
 
 
 def test_web_pinned_software_key_is_issued_without_random_suffix(tmp_path):
@@ -137,7 +185,7 @@ def test_web_pinned_software_key_is_issued_without_random_suffix(tmp_path):
     同名不同 key 的拦截与合并引导。"""
     javascript = (WEB_DIR / "app.js").read_text(encoding="utf-8")
     start = javascript.index("function createSoftwareIdentityForProfile")
-    end = javascript.index("function parseExistingSoftwareIdentity", start)
+    end = javascript.index("function mergeProjectCredentials", start)
     harness = tmp_path / "pinned_identity.js"
     harness.write_text(
         "const assert = require('node:assert/strict');\n"
@@ -429,7 +477,6 @@ def test_web_supports_human_reading_and_guided_interactions():
     assert "高级手动配置" in markup
     assert 'id="token-project-context"' in markup
     assert "所属 Project：${escapeHtml(projectName)}" in javascript
-    assert '`${projectName} · ${profile.label || "Agent"} HTTP`' in javascript
     assert 'id="token-permissions-dialog"' in markup
     assert 'id="token-extend-dialog"' in markup
     assert 'data-token-action="permissions"' in javascript
@@ -439,14 +486,9 @@ def test_web_supports_human_reading_and_guided_interactions():
     assert "/permissions`" in javascript
     assert "/extend`" in javascript
     assert "Token 未更换" in javascript
-    assert "parseExistingSoftwareIdentity" in javascript
-    assert "sameSoftwareIdentity" in javascript
-    assert "已有配置与所选项目成员不是同一个软件身份" in javascript
     assert "不关联；首次连接时按下面填写的显示名称自动创建成员" in javascript
     assert 'elements["token-agent-name"].value' in javascript
-    assert "softwareIdentity = existingIdentity" in javascript
     assert "本工作区固定 bootstrap 参数" in javascript
-    assert 'id="token-project-credential-name" autocomplete="off" readonly' in markup
     assert "[] if bundled_project_id" not in (WEB_DIR.parent / "mcp_server.py").read_text(encoding="utf-8")
     assert "function eventIdBadge(projectSeq, eventId)" in javascript
     assert "eventIdBadge(event.project_seq, event.id)" in javascript

@@ -98,7 +98,6 @@ const elements = Object.fromEntries(
     "token-dialog", "token-form", "token-name", "token-member", "token-days", "token-permissions",
     "token-agent-name", "token-agent-name-group",
     "token-dialog-context", "token-dialog-title", "token-submit-button",
-    "token-existing-config-advanced", "token-existing-config-group", "token-project-credential-name", "token-existing-config",
     "token-permissions-dialog", "token-permissions-form", "token-permissions-project",
     "token-permissions-title", "token-permissions-edit", "token-permissions-submit",
     "token-extend-dialog", "token-extend-form", "token-extend-project", "token-extend-title",
@@ -2280,16 +2279,13 @@ elements["create-token-button"].addEventListener("click", () => {
       <span>${escapeHtml(permissionLabel(permission))}</span>
     </label>`).join("");
   elements["token-form"].reset();
-  elements["token-existing-config-advanced"].hidden = true;
   elements["token-agent-name-group"].hidden = true;
   elements["token-agent-name"].value = "";
-  elements["token-project-credential-name"].value = "";
-  elements["token-existing-config"].value = "";
   elements["token-dialog-context"].textContent = "Agent 凭据";
   elements["token-dialog-title"].textContent = "签发 Token";
   elements["token-submit-button"].textContent = "签发";
   renderTokenMemberOptions();
-  elements["token-days"].value = "30";
+  elements["token-days"].value = "365";
   elements["token-dialog"].showModal();
 });
 elements["token-member"].addEventListener("change", () => syncTokenAgentNameVisibility());
@@ -2395,15 +2391,11 @@ elements["token-secret-dialog"].addEventListener("close", () => {
   elements["token-config-value"].textContent = "";
   elements["token-config-path"].textContent = "";
   elements["token-config-projects"].textContent = "";
-  elements["token-existing-config"].value = "";
   elements["token-config-section"].hidden = true;
 });
 
 elements["token-dialog"].addEventListener("close", () => {
   state.pendingHttpSetup = null;
-  elements["token-existing-config"].value = "";
-  elements["token-project-credential-name"].value = "";
-  elements["token-existing-config-advanced"].hidden = true;
 });
 
 elements["token-config-format"].addEventListener("change", () => {
@@ -2462,9 +2454,6 @@ elements["integration-open-token-button"].addEventListener("click", () => {
   elements["create-token-button"].click();
   state.pendingHttpSetup = setup;
   const isAddProject = mode === "add_project";
-  elements["token-existing-config-advanced"].hidden = !isAddProject;
-  elements["token-project-credential-name"].value = projectName;
-  elements["token-name"].value = `${projectName} · ${profile.label || "Agent"} HTTP`;
   elements["token-agent-name"].value = concreteIdentityValue(profile.software_name);
   elements["token-dialog-context"].textContent = isAddProject ? "加入当前 Project（增量）" : "首次接入";
   elements["token-dialog-title"].textContent = isAddProject ? "签发本项目 Token 并生成增量提示词" : "签发首次 HTTP 凭据";
@@ -2996,26 +2985,30 @@ elements["login-form"].addEventListener("submit", async (event) => {
   }
 });
 
+function deriveTokenCredentialName(member) {
+  // #141：凭据名称不再要求用户填写，按 Agent 显示名称（或所选成员名）
+  // 自动派生，重名时递增序号（Hermes 凭据、Hermes 凭据 2）。
+  const agentName = concreteIdentityValue(elements["token-agent-name"].value);
+  const base = `${agentName
+    || String(member?.name || "").trim()
+    || "Agent"} 凭据`;
+  const taken = new Set(
+    (state.credentials || []).map((item) => String(item.name || "").trim().toLocaleLowerCase())
+  );
+  if (!taken.has(base.toLocaleLowerCase())) return base;
+  let ordinal = 2;
+  while (taken.has(`${base} ${ordinal}`.toLocaleLowerCase())) ordinal += 1;
+  return `${base} ${ordinal}`;
+}
+
 elements["token-form"].addEventListener("submit", async (event) => {
   event.preventDefault();
   if (!state.projectId) return;
   const projectId = state.projectId;
   const setup = state.pendingHttpSetup;
-  let existingProjectCredentials = [];
   let projectCredentialName = "";
-  let manualImportText = "";
   if (setup?.projectId === projectId) {
     projectCredentialName = String(setup.projectName || "").trim();
-    // 正常主流程不粘贴任何配置；文本只出现在默认折叠的高级故障恢复区。
-    manualImportText = elements["token-existing-config"].value.trim();
-    if (manualImportText) {
-      try {
-        existingProjectCredentials = parseExistingProjectCredentials(manualImportText);
-      } catch (error) {
-        showToast(error.message || "已有 HTTP 配置无法解析", "error");
-        return;
-      }
-    }
   }
   const memberId = elements["token-member"].value;
   const member = state.members.find((item) => item.id === memberId);
@@ -3028,24 +3021,7 @@ elements["token-form"].addEventListener("submit", async (event) => {
       showToast(error.message || "所选项目成员的软件身份不完整", "error");
       return;
     }
-    if (manualImportText) {
-      let existingIdentity;
-      try {
-        existingIdentity = parseExistingSoftwareIdentity(manualImportText);
-      } catch (error) {
-        showToast(error.message || "已有 HTTP 配置的软件身份无法解析", "error");
-        return;
-      }
-      if (!existingIdentity) {
-        showToast("已有配置缺少完整的软件身份字段，请粘贴完整 agentchatroom HTTP 配置", "error");
-        return;
-      }
-      if (selectedIdentity && !sameSoftwareIdentity(existingIdentity, selectedIdentity)) {
-        showToast("已有配置与所选项目成员不是同一个软件身份，不能合并", "error");
-        return;
-      }
-      softwareIdentity = existingIdentity;
-    } else if (selectedIdentity) {
+    if (selectedIdentity) {
       // 关联已有成员：沿用该成员现有软件身份，不新建身份。
       softwareIdentity = selectedIdentity;
     } else if (member) {
@@ -3090,7 +3066,7 @@ elements["token-form"].addEventListener("submit", async (event) => {
     const result = await api(`/api/v1/projects/${projectId}/agent-tokens`, {
       method: "POST",
       body: JSON.stringify({
-        name: elements["token-name"].value.trim(),
+        name: deriveTokenCredentialName(member),
         member_id: memberId || null,
         permissions,
         expires_in_seconds: Number(elements["token-days"].value) * 24 * 60 * 60,
@@ -3100,8 +3076,8 @@ elements["token-form"].addEventListener("submit", async (event) => {
     state.pendingHttpSetup = null;
     if (setup?.projectId === projectId) {
       const newCredential = {name: projectCredentialName, token: result.token};
-      if (manualImportText || setup.mode !== "add_project") {
-        const projectCredentials = mergeProjectCredentials(existingProjectCredentials, newCredential);
+      if (setup.mode !== "add_project") {
+        const projectCredentials = mergeProjectCredentials([], newCredential);
         showIssuedHttpResult({...setup, member, softwareIdentity, projectCredentials});
       } else {
         // 增量路径：后端只保存 Token 哈希，页面无法重建旧凭据；
@@ -3282,19 +3258,6 @@ function decodeProjectCredentialBundle(bundle) {
   return projects;
 }
 
-function parseExistingProjectCredentials(input) {
-  const value = String(input || "").trim();
-  if (!value) return [];
-  const bundle = value.match(/acrb\.v1\.[A-Za-z0-9_-]+/)?.[0];
-  if (bundle) return decodeProjectCredentialBundle(bundle);
-  const entries = value.split(/\r?\n/).filter((line) => line.trim()).map((line) => {
-    const separator = line.indexOf("=");
-    if (separator < 1) throw new Error("请粘贴完整配置、凭据包，或使用“项目名称=Token”格式");
-    return {name: line.slice(0, separator), token: line.slice(separator + 1)};
-  });
-  return validateProjectCredentials(entries);
-}
-
 const SOFTWARE_IDENTITY_HEADER_NAMES = Object.freeze({
   softwareKey: "X-AgentChatRoom-Software-Key",
   softwareName: "X-AgentChatRoom-Software-Name",
@@ -3321,6 +3284,49 @@ function decodeHttpIdentityHeaderValue(value) {
   } catch (_error) {
     throw new Error("已有配置包含无效的软件身份 Header 编码");
   }
+}
+
+function parseExistingProjectCredentials(input) {
+  // 生成配置的消费端契约（Agent 在客户端本地合并时执行同样的解析）；
+  // #141 起签发表单不再提供手动粘贴入口，本函数仅由配置契约回归覆盖。
+  const value = String(input || "").trim();
+  if (!value) return [];
+  const bundle = value.match(/acrb\.v1\.[A-Za-z0-9_-]+/)?.[0];
+  if (bundle) return decodeProjectCredentialBundle(bundle);
+  const entries = value.split(/\r?\n/).filter((line) => line.trim()).map((line) => {
+    const separator = line.indexOf("=");
+    if (separator < 1) throw new Error("请粘贴完整配置、凭据包，或使用“项目名称=Token”格式");
+    return {name: line.slice(0, separator), token: line.slice(separator + 1)};
+  });
+  return validateProjectCredentials(entries);
+}
+
+function parseExistingSoftwareIdentity(input) {
+  const value = String(input || "").trim();
+  if (!value) return null;
+  const found = {};
+  for (const [key, header] of Object.entries(SOFTWARE_IDENTITY_HEADER_NAMES)) {
+    const escaped = header.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const patterns = [
+      new RegExp(`"${escaped}"\\s*:\\s*"([^"]*)"`, "g"),
+      new RegExp(`(?:^|\\n)\\s*${escaped}\\s*=\\s*"([^"]*)"`, "g"),
+    ];
+    const values = new Set();
+    for (const pattern of patterns) {
+      for (const match of value.matchAll(pattern)) {
+        if (match[1].trim()) values.add(decodeHttpIdentityHeaderValue(match[1]));
+      }
+    }
+    if (values.size > 1) throw new Error(`已有配置包含冲突的 ${header}`);
+    found[key] = values.size ? [...values][0] : "";
+  }
+  return normalizedSoftwareIdentity(found);
+}
+
+function sameSoftwareIdentity(left, right) {
+  return ["softwareKey", "softwareName", "softwareClient"].every(
+    (key) => left[key] === right[key]
+  );
 }
 
 function normalizedSoftwareIdentity(identity) {
@@ -3380,34 +3386,6 @@ function createSoftwareIdentityForProfile(profile, agentName) {
     softwareName: name,
     softwareClient: client,
   });
-}
-
-function parseExistingSoftwareIdentity(input) {
-  const value = String(input || "").trim();
-  if (!value) return null;
-  const found = {};
-  for (const [key, header] of Object.entries(SOFTWARE_IDENTITY_HEADER_NAMES)) {
-    const escaped = header.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-    const patterns = [
-      new RegExp(`"${escaped}"\\s*:\\s*"([^"]*)"`, "g"),
-      new RegExp(`(?:^|\\n)\\s*${escaped}\\s*=\\s*"([^"]*)"`, "g"),
-    ];
-    const values = new Set();
-    for (const pattern of patterns) {
-      for (const match of value.matchAll(pattern)) {
-        if (match[1].trim()) values.add(decodeHttpIdentityHeaderValue(match[1]));
-      }
-    }
-    if (values.size > 1) throw new Error(`已有配置包含冲突的 ${header}`);
-    found[key] = values.size ? [...values][0] : "";
-  }
-  return normalizedSoftwareIdentity(found);
-}
-
-function sameSoftwareIdentity(left, right) {
-  return ["softwareKey", "softwareName", "softwareClient"].every(
-    (key) => left[key] === right[key]
-  );
 }
 
 function mergeProjectCredentials(existing, added) {

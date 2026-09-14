@@ -22,7 +22,7 @@ Windows 单 EXE 的 `mcp` 入口与 GUI 错误呈现隔离：启动或运行失�
 Web「接入 Agent」入口只保留两个场景（不再展示无切换意义的「Agent 客户端」行，签发并生成是醒目的主行动按钮，快速接入指引精简为 3 步），由用户按客户端实际配置选择，不根据历史 Agent/在线记录推断本机配置：
 
 - **首次配置软件**：页面不预先展示占位提示词；签发当前 Project Token 后，一次生成可读 Project↔Token 映射、含真实凭据和稳定软件身份的 MCP 配置，以及首次 bootstrap 指令。新数据库无需预先存在成员；保持“不关联”时必须在签发弹窗填写实际的 Agent 显示名称，第一次成功连接会按该名称与配置身份自动登记成员；“通用（标准 MCP）”等接入格式标签只描述客户端配置格式，绝不会成为成员或 Session 名称。先核查已有连接器，确认没有时才配置一次。
-- **已配置软件，加入本项目**：无需粘贴任何现有配置。用户只确认客户端、Token 名称、有效期、可选的已有成员与权限后直接签发当前 Project Token；签发结果是一段增量接入提示词，交给已配置的 Agent 后由它自行检查客户端本地现有 `agentchatroom` HTTP 配置，保留原 URL、已有软件身份 Header 和全部旧 Project 凭据，仅把新凭据追加或替换进 Authorization 凭据包并写回同一条目，重载 MCP 后按目标 Project 名称 bootstrap 核对。已关联 Token 本身可提供软件身份，现有配置缺少显式 Header 时不构成失败；Header 若存在则必须匹配。后端只保存 Token 哈希，页面无法重建旧 Secret，因此旧配置读取与合并在客户端侧由 Agent 完成，不由用户解析。Agent 无法读取本地配置时按提示词报告并停止；手动粘贴合并只保留在签发弹窗默认折叠的「高级 · 故障恢复」区域，非必填。保持“不关联”时新 Project 首次连接按客户端现有软件身份自动登记成员，页面不会再生成第二套身份；选择旧成员仅用于沿用已有身份，与客户端实际身份不一致会被拒绝。各项目随后使用独立轻量 Session 并行工作。
+- **已配置软件，加入本项目**：无需粘贴任何现有配置。用户只确认客户端、可选的已有成员与权限后直接签发当前 Project Token（凭据名称按 Agent 显示名称或所选成员自动派生，重名时自动递增序号；默认有效期 365 天）；签发结果是一段增量接入提示词，交给已配置的 Agent 后由它自行检查客户端本地现有 `agentchatroom` HTTP 配置，保留原 URL、已有软件身份 Header 和全部旧 Project 凭据，仅把新凭据追加或替换进 Authorization 凭据包并写回同一条目，重载 MCP 后按目标 Project 名称 bootstrap 核对。已关联 Token 本身可提供软件身份，现有配置缺少显式 Header 时不构成失败；Header 若存在则必须匹配。后端只保存 Token 哈希，页面无法重建旧 Secret，因此旧配置读取与合并在客户端侧由 Agent 完成，不由用户解析；签发表单不再提供手动粘贴入口，Agent 无法读取本地配置时按提示词报告并停止。保持“不关联”时新 Project 首次连接按客户端现有软件身份自动登记成员，页面不会再生成第二套身份；选择旧成员仅用于沿用已有身份，与客户端实际身份不一致会被拒绝。各项目随后使用独立轻量 Session 并行工作。
 「恢复当前项目连接」不再是 Web 向导选项；恢复连接提示词仍由集成配置接口的 `onboarding_modes.reconnect` 提供（不签发新 Token、不新增或改写 MCP，单独生成恢复提示词，使用客户端已有 HTTP 配置重新 bootstrap 并核对当前 Project），供脚本化或 CLI 场景使用。
 
 接入首页只负责选择场景和客户端，不显示可误复制的占位提示词。首次配置在签发成功后显示一次性完整提示词；加入项目在签发成功后显示一次性增量提示词；恢复连接直接显示另一份不含新 Token 的恢复提示词。服务返回的 `profiles.*.onboarding_modes` 按 `first_setup`、`add_project`、`reconnect` 分组；原 `onboarding_prompts` 字段兼容保留。缺少对应场景指令时前端明确提示更新服务，不回退安装指令。提示词是引导，不代替后端项目隔离、身份验证和失败封闭校验。
@@ -270,7 +270,7 @@ Linux 或 macOS：
 
 1. 打开 Web 管理端并创建 Project。
 2. 本机部署可点击“选择文件夹”打开系统目录选择器，也可手工填写需要协作的项目文件夹；取消选择不会修改原输入。该路径只保存在运行数据库和 checkout 本地登记中，不会写入公开仓库配置。
-3. 点击“接入 Agent”，在“首次配置软件”与“已配置软件，加入本项目”两个场景中选择（Web 不再提供客户端选择行与恢复场景选项）；Web 只提供 HTTP 直连。首次配置签发后生成一份包含明文 Project↔Token 映射、真实 MCP 配置和对应指令的完整提示词；加入项目同样只需确认客户端、名称、有效期、可选成员与权限，签发后生成由已配置 Agent 在客户端本地增量合并的提示词，无需用户粘贴现有配置。
+3. 点击“接入 Agent”，在“首次配置软件”与“已配置软件，加入本项目”两个场景中选择（Web 不再提供客户端选择行与恢复场景选项）；Web 只提供 HTTP 直连。首次配置签发后生成一份包含明文 Project↔Token 映射、真实 MCP 配置和对应指令的完整提示词；加入项目同样只需确认客户端、可选成员与权限（凭据名称自动派生、默认有效期 365 天），签发后生成由已配置 Agent 在客户端本地增量合并的提示词，无需用户粘贴现有配置。
 4. 可以把页面生成的 MCP 接入信息交给 Agent：内容只包含目标客户端、HTTP 连接和当前环境动态生成的 `agentchatroom` 配置，配置位置、写入方式和异常处理由 Agent 自行判断并向用户反馈。旧 stdio 配置可先从客户端删除，再用页面生成的同名 HTTP 配置重新接入；stdio 与远程 Bridge 的后端兼容接口仍保留，但不再显示在 Web 接入流程中。
 5. 按页面提示重启客户端、重新加载 MCP 或新开会话。配置文件已写入不等于已经连接，必须等左侧显示该软件在当前 Room“已连接”。左侧已连接只表示 MCP 连接 Presence，不等于当前模型对话已经同步。
 6. Agent 开始工作前调用一次 `room_bootstrap`。不要读取或修改 `mcp.json` / `config.toml`，也不要检查源码或数据库；只有该工具返回 `identity_not_configured` 时才回到 Web“接入 Agent”重新生成 HTTP 配置。
@@ -312,7 +312,7 @@ Room。`room_join` 会从忽略的 `.agentchatroom/project.json` 读取后端登
 - 数据服务默认开启 Streamable HTTP MCP，路径为配置项 `mcp_http_path`（默认 `/mcp`），不是业务 REST 的 `/api/v1/*`。
 - 默认要求 `Authorization: Bearer <credential>`。兼容旧的单项目 Agent Token；接入向导生成 `acrb.v1.*` 多项目凭据包，包内保存多个可独立吊销、独立到期、独立授权的项目级 Token。未带凭据或所有项目 Token 都无效时返回 **401**。
 - Token 可在接入向导中签发。管理 Tab 的 Token 卡片显示所属 Project、有效期和最近使用时间，不展开权限明细；通过「修改权限」可更新同一个 Token 的授权，通过「续期」可在不更换 Token 的情况下延长有效期，因此两项操作都不要求重新配置 Agent。「吊销」会立即拒绝该 Token 的新请求。旧的 Token 更换接口只为 API 兼容保留，不在 Web 的常规流程中提供。接入首页不显示占位提示词；签发结果弹窗一次性提供明文 `project_name_N` / `project_token_N` 对应关系、可直接使用的凭据包配置和场景指令。整段交给负责配置客户端的 Agent；关闭（包括 Escape）后清除，不存入浏览器存储，也不得放进 URL、Room、日志或 Git。
-- 软件身份由生成的 HTTP 配置头注入（`X-AgentChatRoom-Software-Key/Name/Client`），或由已关联软件成员的 Token 提供。首次签发未关联成员时必须由用户填写实际的 Agent 显示名称（例如 Hermes、Grok），页面据此生成一组稳定身份写入配置，后端在第一次成功连接时按该名称自动登记成员；签发弹窗的“凭据名称”只用于管理 Token，不会成为 Agent 名称，接入格式标签（如“通用（标准 MCP）”）与随机占位名称都不能充当身份名称。模板已固定 software_key 的接入格式按模板原样签发（不追加随机后缀，避免签发身份与客户端实际上报身份割裂），仅“通用（标准 MCP）”这类没有固定 key 的模板保留随机后缀区分不同安装；同一 Project 内不允许出现第二个同名 active 软件身份，同名不同身份的接入会被 `software_identity_name_conflict` 拒绝，签发弹窗也会对同名成员给出合并引导。非 ASCII 身份字段使用 `acr-utf8.v1.*` ASCII 安全格式传输并在服务端还原；ASCII 名称（如 Hermes）在配置中保持明文；服务端也兼容旧配置把 UTF-8 Header 暴露为 Latin-1 字符串的情况，避免中文名称显示为乱码。Agent 不得自行填写或发明 `agent_key`。
+- 软件身份由生成的 HTTP 配置头注入（`X-AgentChatRoom-Software-Key/Name/Client`），或由已关联软件成员的 Token 提供。首次签发未关联成员时必须由用户填写实际的 Agent 显示名称（例如 Hermes、Grok），页面据此生成一组稳定身份写入配置，后端在第一次成功连接时按该名称自动登记成员；签发弹窗的“凭据名称”自动按 Agent 显示名称或所选成员派生（重名时递增序号，如 Hermes 凭据、Hermes 凭据 2），不需要手动填写，也不会成为 Agent 名称，接入格式标签（如“通用（标准 MCP）”）与随机占位名称都不能充当身份名称，Token 默认有效期为 365 天。模板已固定 software_key 的接入格式按模板原样签发（不追加随机后缀，避免签发身份与客户端实际上报身份割裂），仅“通用（标准 MCP）”这类没有固定 key 的模板保留随机后缀区分不同安装；同一 Project 内不允许出现第二个同名 active 软件身份，同名不同身份的接入会被 `software_identity_name_conflict` 拒绝，签发弹窗也会对同名成员给出合并引导。非 ASCII 身份字段使用 `acr-utf8.v1.*` ASCII 安全格式传输并在服务端还原；ASCII 名称（如 Hermes）在配置中保持明文；服务端也兼容旧配置把 UTF-8 Header 暴露为 Latin-1 字符串的情况，避免中文名称显示为乱码。Agent 不得自行填写或发明 `agent_key`。
 - 增量加入 Project 时若 Token 关联了已有成员，生成的提示词会列出该成员的软件身份三字段。已关联 Token 可直接提供身份，现有配置没有显式身份 Header 时仍可合并；Header 若存在则必须逐项匹配。服务端会拒绝凭据包中的不同已关联身份，也会拒绝 Token 关联身份与 HTTP 身份头不一致的请求，不能静默改绑身份。
 
 ### 客户端配置
@@ -328,7 +328,7 @@ Room。`room_join` 会从忽略的 `.agentchatroom/project.json` 读取后端登
 
 通用 JSON 形状为 `mcpServers.agentchatroom.url` + `headers.Authorization`。Web 签发结果同时给出可读 Project↔Token 映射和完整多项目凭据包，Agent 可据此转换为客户端实际要求的 JSON/TOML 语法，但必须保留服务器名 `agentchatroom`、URL、Authorization 和软件身份字段。HTTP 客户端调用 `room_bootstrap(project_name="<目标 Project 名称>")`；`status=ready` 且返回 Project 正确后才允许写操作。
 
-Web「接入 Agent」向导只提供 **HTTP 直连**。首次配置直接签发；加入新 Project 时同样零粘贴：签发后生成增量提示词，由已配置的 Agent 检查客户端本地现有 `agentchatroom` HTTP 配置，保留 URL、软件身份与全部旧 Project 凭据，仅把新 `project_name` / `project_token` 追加或替换进 `acrb.v1.*` 凭据包并写回同一条目。增量提示词明确列出本次签发的 `project_name_N` / `project_token_N`，避免只看到不可读凭据包而不知道 Project 对应关系。若旧 Authorization 仍是单个 `acr.*` Token，Agent 先保持旧连接并调用零参数 `room_bootstrap()` 取得该 Token 的精确 Project 名称，再与新凭据一起转换成 `acrb.v1.*`；无法取得名称时停止，不能猜测。高级故障恢复区接受完整配置、`acrb.v1.*` 或逐行 `Project名称=Token`，单个 Token 本身不足以恢复项目映射。客户端始终只保留一个名为 `agentchatroom` 的条目。关闭弹窗后，原配置、原 Token、新 Token 与生成结果都会从页面状态清除。
+Web「接入 Agent」向导只提供 **HTTP 直连**。首次配置直接签发；加入新 Project 时同样零粘贴：签发后生成增量提示词，由已配置的 Agent 检查客户端本地现有 `agentchatroom` HTTP 配置，保留 URL、软件身份与全部旧 Project 凭据，仅把新 `project_name` / `project_token` 追加或替换进 `acrb.v1.*` 凭据包并写回同一条目。增量提示词明确列出本次签发的 `project_name_N` / `project_token_N`，避免只看到不可读凭据包而不知道 Project 对应关系。若旧 Authorization 仍是单个 `acr.*` Token，Agent 先保持旧连接并调用零参数 `room_bootstrap()` 取得该 Token 的精确 Project 名称，再与新凭据一起转换成 `acrb.v1.*`；无法取得名称时停止，不能猜测。签发表单不提供手动粘贴入口（#141 起移除），Web 侧的配置解析函数仅作为生成配置的消费端契约保留。客户端始终只保留一个名为 `agentchatroom` 的条目。关闭弹窗后，原配置、原 Token、新 Token 与生成结果都会从页面状态清除。
 
 已经使用 stdio 的客户端可删除客户端侧旧 MCP 条目，再通过“首次配置软件”用标准名称 `agentchatroom` 建立 HTTP 配置；无需删除 Project、成员、任务或历史。保存并重载后，旧 stdio 子进程应退出；新连接按完整提示词给出的目标 Project 名称 bootstrap。
 
@@ -350,7 +350,7 @@ Web「接入 Agent」向导只提供 **HTTP 直连**。首次配置直接签发�
 
 Project 名称缺失或写错时，错误 details 返回当前凭据包中可用的 `available_project_names` 和全部已配置的 `configured_project_names`，供 Agent 按已有名称重试。某个 Project Token 已过期时返回 `project_credential_expired` 并要求续期；已吊销时返回 `project_credential_revoked` 并要求重新签发和更新凭据包。即使包内全部 Project Token 都已失效，MCP 仍允许建立一个零权限诊断连接，只能获得上述 bootstrap 恢复动作，不能创建 Room Session 或执行项目读写。
 
-“已配置软件，加入本项目”的主流程不需要粘贴任何配置；保持“不关联”时，新 Project 第一次成功连接由后端按客户端实际软件身份自动登记成员，同时兼容凭据包内“旧 Project Token 已关联身份 + 新 Project Token 未关联”的组合。手动粘贴合并仅保留在签发弹窗默认折叠的「高级 · 故障恢复」区域且非必填：粘贴含完整软件身份头的现有 HTTP 配置时，若用户选择了已有成员，则该成员的 `X-AgentChatRoom-Software-Key/Name/Client` 必须与现有配置完全一致，不完整或不同身份的配置拒绝合并。服务端拒绝包含多个不同已关联软件身份的凭据包。
+“已配置软件，加入本项目”的主流程不需要粘贴任何配置；保持“不关联”时，新 Project 第一次成功连接由后端按客户端实际软件身份自动登记成员，同时兼容凭据包内“旧 Project Token 已关联身份 + 新 Project Token 未关联”的组合。签发表单不再提供手动粘贴入口（#141 起移除）；选择旧成员仅用于沿用已有身份，该成员的软件身份必须与客户端实际身份一致，不一致会在接入时被拒绝。服务端拒绝包含多个不同已关联软件身份的凭据包。
 
 ### 项目级 `AGENTS.md` 协作规则
 

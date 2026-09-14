@@ -732,33 +732,20 @@
           </div>
           <button type="button" class="icon-button dialog-close" title="关闭" aria-label="关闭">×</button>
         </div>
-        <label>凭据名称（只用于管理这个 Token，不会成为 Agent 名称） <input id="token-name" autocomplete="off" required></label>
+        <input id="token-name" type="hidden" autocomplete="off">
         <label>关联已有成员（可选）
           <select id="token-member">
             <option value="">不关联；首次连接时按下面填写的显示名称自动创建成员</option>
           </select>
         </label>
-        <p class="form-hint">新项目无需预先创建成员。保持不关联时，Agent 首次成功连接会按生成配置中的软件身份自动登记；选择旧成员仅用于沿用已有身份。“已配置软件，加入本项目”建议保持不关联：Agent 合并时会保留客户端原身份，与所选成员不一致会被拒绝，选旧成员仅限确认身份相同时。</p>
+        <p class="form-hint">保持不关联即可：凭据名称按 Agent 显示名称自动生成，首次连接时自动登记成员；选择旧成员仅用于沿用已有身份。</p>
         <section id="token-agent-name-group" hidden>
           <label>Agent 显示名称（首次接入且不关联成员时必填）
             <input id="token-agent-name" autocomplete="off" placeholder="例如 Hermes、Grok、OpenCode">
           </label>
-          <p class="form-hint">该名称会写入生成配置的 X-AgentChatRoom-Software-Name，并在首次成功连接时登记为软件成员与 Session 的显示名称。“通用（标准 MCP）”等接入格式标签不是身份名称，不能填写或代替。</p>
+          <p class="form-hint">该名称会登记为软件成员与 Session 的显示名称；“通用（标准 MCP）”等接入格式标签不能充当身份名称。</p>
         </section>
-        <label>有效天数 <input id="token-days" type="number" min="1" max="365" value="30" required></label>
-        <details id="token-existing-config-advanced" class="integration-fallback" hidden>
-          <summary>高级 · 故障恢复：手动粘贴已有配置合并（可选）</summary>
-          <section id="token-existing-config-group">
-            <label>本项目在 MCP 中的凭据名称（固定为 Project 名）
-              <input id="token-project-credential-name" autocomplete="off" readonly>
-            </label>
-            <label>已有的 agentchatroom HTTP 配置（可选，仅供故障恢复）
-              <textarea id="token-existing-config" rows="5" autocomplete="off" spellcheck="false"
-                placeholder="粘贴完整配置/acrb.v1 凭据包；旧单 Token 请按“旧Project名称=旧Token”填写"></textarea>
-            </label>
-            <p class="form-hint">正常流程无需粘贴任何内容：签发后生成的增量提示词会让已配置的 Agent 自行读取并合并客户端本地配置。这里仅用于 Agent 无法读取本地配置时的手动恢复；可粘贴完整配置、acrb.v1 凭据包，或逐行填写“Project名称=Token”。旧配置只有单个 acr.* Token 时必须先用旧连接确认其 Project 名称，不能只粘贴无法识别项目名的 Token。页面会生成一份保留原有 Project 的完整合并配置；留空不影响签发。</p>
-          </section>
-        </details>
+        <label>有效天数 <input id="token-days" type="number" min="1" max="365" value="365" required></label>
         <fieldset class="dependency-fieldset">
           <legend>权限</legend>
           <div id="token-permissions" class="permission-grid"></div>
