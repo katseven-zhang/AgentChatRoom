@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 from dataclasses import replace
+from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
@@ -1954,3 +1955,25 @@ def test_task_update_over_rest_requires_owner_credentials_or_management(
             management_edit.json()["task"]["owner_session_id"]
             == owner["agent"]["id"]
         )
+
+
+def test_index_html_stamps_asset_versions_from_content(settings):
+    """#151: the served index.html derives asset cache-busting versions from
+    the sha256 of app.js/app.css content, so browsers can never pin a stale
+    (or transiently broken) asset copy behind the fixed ?v= string."""
+    import hashlib
+    import re
+
+    with TestClient(create_app(settings)) as client:
+        body = client.get("/").text
+
+    src_web = Path(__file__).resolve().parents[1] / "src" / "agentchatroom" / "web"
+    stamp = hashlib.sha256((src_web / "app.js").read_bytes()).hexdigest()[:10]
+    stamp_css = hashlib.sha256((src_web / "app.css").read_bytes()).hexdigest()[:10]
+
+    js_match = re.search(r'src="/assets/app\.js\?v=([0-9a-f-]+)"', body)
+    css_match = re.search(r'href="/assets/app\.css\?v=([0-9a-f-]+)"', body)
+    assert js_match and css_match, body[:500]
+    assert stamp in js_match.group(1)
+    assert stamp_css in css_match.group(1)
+    assert "central54" not in body and "central1" not in body

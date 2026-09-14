@@ -2345,9 +2345,44 @@ def create_app(
     if web_dir.is_dir():
         app.mount("/assets", StaticFiles(directory=web_dir), name="assets")
 
+        # #151：index.html 里的 ?v= 参数按资产内容 sha256 自动派生。
+        # 固定版本串会在前端更新后让浏览器长期命中旧缓存（极端情况：
+        # 编辑中途短暂损坏的 app.js 被缓存后无法自愈，页面表现为
+        # 「数据全没了」）。指纹随资产内容变化自动更新，无需人工 bump。
+        asset_fingerprint_cache: dict[str, tuple[tuple[int, int], str]] = {}
+        index_html_cache: dict[tuple[int, int, int], bytes] = {}
+
+        def _asset_fingerprint() -> str:
+            parts = []
+            for name in ("app.js", "app.css"):
+                asset = web_dir / name
+                stat = asset.stat()
+                key = (stat.st_mtime_ns, stat.st_size)
+                cached = asset_fingerprint_cache.get(name)
+                if cached is None or cached[0] != key:
+                    cached = (key, hashlib.sha256(asset.read_bytes()).hexdigest()[:10])
+                    asset_fingerprint_cache[name] = cached
+                parts.append(cached[1])
+            return "-".join(parts)
+
         @app.get("/", include_in_schema=False)
-        def web_index() -> FileResponse:
-            return FileResponse(web_dir / "index.html")
+        def web_index() -> Response:
+            index_path = web_dir / "index.html"
+            key = (
+                index_path.stat().st_mtime_ns,
+                (web_dir / "app.js").stat().st_mtime_ns,
+                (web_dir / "app.css").stat().st_mtime_ns,
+            )
+            cached = index_html_cache.get(key)
+            if cached is None:
+                stamp = _asset_fingerprint().encode()
+                cached = re.sub(rb"v=1\.0\.0[^\"?]*", b"v=" + stamp, index_path.read_bytes())
+                index_html_cache[key] = cached
+            return Response(
+                cached,
+                media_type="text/html",
+                headers={"Cache-Control": "no-cache"},
+            )
 
     if mcp_http_app is not None:
         app.mount("/", mcp_http_app, name="mcp")
