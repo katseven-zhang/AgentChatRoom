@@ -184,7 +184,7 @@
                   <p class="secondary-text">Agent 接入时自动创建，无需手工添加或编辑</p>
                 </div>
               </div>
-              <div id="member-list" class="management-list"></div>
+              <div id="member-list" class="management-list management-grid"></div>
             </section>
 
             <section class="data-section unframed management-section">
@@ -196,17 +196,15 @@
                 </div>
                 <button class="primary-button" id="create-token-button" type="button" disabled>签发 Token</button>
               </div>
-              <div id="token-list" class="management-list"></div>
+              <div id="token-list" class="management-list management-grid"></div>
             </section>
 
             <section class="data-section unframed management-section">
-              <div class="section-heading">
-                <div>
-                  <h3>Host 与 Workspace</h3>
-                  <p class="secondary-text">只读列表：Agent 通过 room_join 自动登记</p>
-                </div>
-              </div>
-              <div id="workspace-list" class="management-list"></div>
+              <details class="runtime-details">
+                <summary>高级诊断：Host 与 Workspace 登记</summary>
+                <p class="secondary-text">只读列表：Agent 通过 room_join 自动登记</p>
+                <div id="workspace-list" class="management-list"></div>
+              </details>
             </section>
 
             <section class="data-section unframed management-section">
@@ -241,7 +239,7 @@
                   <button class="secondary-button" id="refresh-audit-button" type="button" disabled>刷新</button>
                 </div>
               </div>
-              <div id="audit-list" class="management-list audit-list"></div>
+              <div id="audit-list" class="management-list audit-list management-grid"></div>
             </section>
           </div>
         </section>

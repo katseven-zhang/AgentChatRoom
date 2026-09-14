@@ -1023,6 +1023,67 @@ body.is-resizing-panels {
   gap: 8px;
 }
 
+/* #147：管理面板卡片一行 5 个的网格布局，窄屏按列数收敛。 */
+.management-grid {
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+}
+
+.management-grid > .empty-state {
+  grid-column: 1 / -1;
+}
+
+.management-grid .grid-pager {
+  grid-column: 1 / -1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  margin-top: 2px;
+}
+
+.management-grid .management-item {
+  min-width: 0;
+  /* #147：窄卡片内按钮换行到内容下方，避免文字区被挤成单字换行。 */
+  grid-template-columns: minmax(0, 1fr);
+  align-items: start;
+}
+
+.management-grid .management-item .management-actions {
+  margin-top: 6px;
+}
+
+/* 窄卡片内长 key/说明用两行截断，保持一行 5 个的可读性；标题正常换行。 */
+.management-grid .management-item p {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+.grid-placeholder {
+  min-height: 96px;
+  border: 1px dashed var(--border);
+  border-radius: var(--radius);
+}
+
+@media (max-width: 1264px) {
+  .management-grid {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+}
+
+@media (max-width: 760px) {
+  .management-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .grid-placeholder {
+    display: none;
+  }
+}
+
 .management-stack {
   display: grid;
   gap: 24px;

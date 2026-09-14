@@ -517,6 +517,26 @@ class AgentChatRoomService:
 
     def initialize(self) -> None:
         self.database.initialize()
+        self._purge_stale_credentials()
+
+    def _purge_stale_credentials(self) -> None:
+        """#147：启动维护时清理已过期与已吊销的失效凭据。
+
+        只删除未被任何 Session 引用的凭据行，维持外键完整与历史关联；
+        审计事件与成员记录不受影响。
+        """
+        with self.database.connect(write=True) as connection:
+            connection.execute(
+                """
+                DELETE FROM agent_credentials
+                WHERE (revoked_at IS NOT NULL OR expires_at <= ?)
+                  AND id NOT IN (
+                      SELECT credential_id FROM agent_sessions
+                      WHERE credential_id IS NOT NULL
+                  )
+                """,
+                (iso_now(),),
+            )
 
     def close(self) -> None:
         self._token_touch.close()

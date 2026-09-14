@@ -279,6 +279,39 @@ def test_same_name_join_is_allowed_after_old_member_is_revoked(service, project)
     assert len(members) == 2
 
 
+def test_startup_purge_removes_stale_credentials(service, project):
+    """#147：启动维护清理已过期与已吊销的失效 Token，保留有效凭据。"""
+    kept = service.issue_agent_token(
+        project["id"],
+        name="kept",
+        permissions=["room:join"],
+        expires_in_seconds=3600,
+    )
+    revoked = service.issue_agent_token(
+        project["id"],
+        name="revoked",
+        permissions=["room:join"],
+        expires_in_seconds=3600,
+    )
+    service.revoke_agent_token(project["id"], revoked["credential"]["id"])
+    expired = service.issue_agent_token(
+        project["id"],
+        name="expired",
+        permissions=["room:join"],
+        expires_in_seconds=3600,
+    )
+    with service.database.connect(write=True) as connection:
+        connection.execute(
+            "UPDATE agent_credentials SET expires_at = '2000-01-01T00:00:00Z' WHERE id = ?",
+            (expired["credential"]["id"],),
+        )
+
+    service._purge_stale_credentials()
+
+    names = {item["name"] for item in service.list_agent_tokens(project["id"])}
+    assert names == {"kept"}
+
+
 def test_agent_key_aliases_cannot_create_another_software_identity(service, project):
     first = service.join_room(
         project["id"],

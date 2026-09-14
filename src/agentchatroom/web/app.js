@@ -889,6 +889,37 @@ function auditPageSize() {
 }
 
 const AUDIT_PAGE_SIZE = 10;
+// #147：管理面板卡片网格每行 5 个；成员与 Token 每页 2 行，审计每页 1 行。
+const MANAGEMENT_GRID_COLUMNS = 5;
+const MEMBER_GRID_PAGE_SIZE = 10;
+const TOKEN_GRID_PAGE_SIZE = 10;
+let memberGridPage = 1;
+let tokenGridPage = 1;
+
+function gridPageSlice(items, pageSize, page) {
+  const totalPages = Math.max(1, Math.ceil(items.length / pageSize));
+  const current = Math.min(Math.max(1, page), totalPages);
+  return {
+    current,
+    totalPages,
+    slice: items.slice((current - 1) * pageSize, current * pageSize),
+  };
+}
+
+function gridPagerHtml(action, current, totalPages) {
+  if (totalPages <= 1) return "";
+  return `<div class="grid-pager">
+    <button type="button" class="secondary-button" data-grid-pager="${action}" data-grid-page="${current - 1}" ${current <= 1 ? "disabled" : ""}>上一页</button>
+    <span class="secondary-text">第 ${current} / ${totalPages} 页</span>
+    <button type="button" class="secondary-button" data-grid-pager="${action}" data-grid-page="${current + 1}" ${current >= totalPages ? "disabled" : ""}>下一页</button>
+  </div>`;
+}
+
+function gridPlaceholderSlots(count) {
+  // 末行不足 5 个时补空占位槽，保持网格高度与列宽稳定不跳动。
+  const slots = (MANAGEMENT_GRID_COLUMNS - (count % MANAGEMENT_GRID_COLUMNS)) % MANAGEMENT_GRID_COLUMNS;
+  return Array.from({ length: slots }, () => '<div class="grid-placeholder" aria-hidden="true"></div>').join("");
+}
 
 function auditQueryUrl(projectId, { after = 0, before = 0, eventType = "", limit = AUDIT_PAGE_SIZE } = {}) {
   const filter = eventType ? `&event_type=${encodeURIComponent(eventType)}` : "";
@@ -1926,8 +1957,10 @@ function renderRuntime() {
 }
 
 function renderMembers() {
-  elements["member-list"].innerHTML = state.members.length
-    ? state.members.map((member) => `
+  const page = gridPageSlice(state.members, MEMBER_GRID_PAGE_SIZE, memberGridPage);
+  memberGridPage = page.current;
+  elements["member-list"].innerHTML = (page.slice.length
+    ? page.slice.map((member) => `
       <article class="management-item">
         <div>
           <h4>${escapeHtml(member.name)} <span class="status-badge ${memberStatusClass(member.status)}">${escapeHtml(memberStatusLabel(member.status))}</span></h4>
@@ -1938,7 +1971,8 @@ function renderMembers() {
           ${member.status !== "revoked" ? `<button type="button" class="danger-button" data-member-action="revoke" data-member-id="${escapeHtml(member.id)}">吊销</button>` : ""}
         </div>
       </article>`).join("")
-    : '<div class="empty-state">尚未登记项目成员</div>';
+    : '<div class="empty-state">尚未登记项目成员</div>')
+    + gridPagerHtml("member", page.current, page.totalPages);
   renderTokenMemberOptions(elements["token-member"].value);
 }
 
@@ -1946,8 +1980,10 @@ function renderCredentials() {
   const memberNames = Object.fromEntries(state.members.map((member) => [member.id, member.name]));
   const projectName = state.snapshot?.project?.name || "未选择";
   elements["token-project-context"].textContent = `当前 Project：${projectName}`;
-  elements["token-list"].innerHTML = state.credentials.length
-    ? state.credentials.map((credential) => {
+  const page = gridPageSlice(state.credentials, TOKEN_GRID_PAGE_SIZE, tokenGridPage);
+  tokenGridPage = page.current;
+  elements["token-list"].innerHTML = (page.slice.length
+    ? page.slice.map((credential) => {
       const manageable = !credential.revoked_at;
       return `
       <article class="management-item">
@@ -1964,7 +2000,8 @@ function renderCredentials() {
         </div>
       </article>`;
     }).join("")
-    : '<div class="empty-state">尚未签发 Agent Token</div>';
+    : '<div class="empty-state">尚未签发 Agent Token</div>')
+    + gridPagerHtml("token", page.current, page.totalPages);
 }
 
 function renderWorkspaces() {
@@ -2090,7 +2127,9 @@ function renderAudit() {
         </div>
       </article>`).join("")
     : '<div class="empty-state">当前筛选下没有审计事件</div>';
-  elements["audit-list"].innerHTML = `${auditPager()}${items}`;
+  // #147：一行 5 个卡片网格；末行不足 5 个时补空占位槽避免翻页跳动。
+  const itemCount = state.auditEvents.length;
+  elements["audit-list"].innerHTML = `${auditPager()}${items}${gridPlaceholderSlots(itemCount)}`;
 }
 
 async function refreshManagement() {
@@ -2689,6 +2728,20 @@ elements["token-permissions-dialog"].addEventListener("close", () => {
 });
 elements["token-extend-dialog"].addEventListener("close", () => {
   state.editingCredentialId = null;
+});
+
+document.addEventListener("click", (event) => {
+  const button = event.target.closest("[data-grid-pager]");
+  if (!button || button.disabled) return;
+  const page = Number(button.dataset.gridPage);
+  if (!Number.isFinite(page)) return;
+  if (button.dataset.gridPager === "member") {
+    memberGridPage = page;
+    renderMembers();
+  } else if (button.dataset.gridPager === "token") {
+    tokenGridPage = page;
+    renderCredentials();
+  }
 });
 
 elements["member-list"].addEventListener("click", async (event) => {
