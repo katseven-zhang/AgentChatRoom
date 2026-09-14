@@ -1,6 +1,11 @@
 from __future__ import annotations
 
+import os
+import shutil
 import sys
+import tempfile
+import time
+import uuid
 from pathlib import Path
 
 import pytest
@@ -10,7 +15,60 @@ from agentchatroom.database import Database
 from agentchatroom.services import AgentChatRoomService
 
 _CHECKOUT_ROOT = Path(__file__).resolve().parents[1]
+_PYTEST_BASETEMP_ROOT = "agentchatroom-pytest"
+_STALE_RUN_MAX_AGE_SECONDS = 24 * 60 * 60
+_BASETEMP_DEFAULT_FLAG = "_agentchatroom_basetemp_default"
 _REGISTRATION_WARNED = False
+
+# pyproject 的 pythonpath = ["."] 相对 rootdir 解析，足以覆盖常规入口；
+# 这里再按 conftest 实际位置兜底一次，保证从任意工作目录启动（如 IDE
+# 测试插件）时 scripts.* 与 tests.* 仍可导入。
+if str(_CHECKOUT_ROOT) not in sys.path:
+    sys.path.insert(0, str(_CHECKOUT_ROOT))
+
+
+def _sweep_stale_run_dirs(root: Path) -> None:
+    """Best-effort removal of run dirs abandoned by earlier pytest processes."""
+    try:
+        candidates = list(root.glob("run-*"))
+    except OSError:
+        return
+    now = time.time()
+    for child in candidates:
+        try:
+            if now - child.stat().st_mtime > _STALE_RUN_MAX_AGE_SECONDS:
+                shutil.rmtree(child, ignore_errors=True)
+        except OSError:
+            continue
+
+
+def _default_basetemp() -> Path:
+    """Return a checkout-independent, per-run temp root.
+
+    每次运行使用全新名字：Windows 上残留句柄会把旧目录变成
+    delete-pending，任何复用同名目录的方案（含按 PID 命名）都会让
+    pytest 启动清理后的 mkdir 直接抛 WinError 5。专用根目录本身被
+    锁死时降级到同名的随机兄弟目录，保证测试入口永远可用。
+    """
+    root = Path(tempfile.gettempdir()) / _PYTEST_BASETEMP_ROOT
+    _sweep_stale_run_dirs(root)
+    candidate = root / f"run-{os.getpid()}-{uuid.uuid4().hex[:8]}"
+    try:
+        candidate.mkdir(parents=True)
+    except OSError:
+        candidate = Path(tempfile.gettempdir()) / (
+            f"{_PYTEST_BASETEMP_ROOT}-{uuid.uuid4().hex[:8]}"
+        )
+        candidate.mkdir(parents=True)
+    return candidate
+
+
+def _set_default_basetemp(config: pytest.Config) -> None:
+    """Keep pytest temp data in a dedicated, per-run system-temp directory."""
+    if config.getoption("--basetemp", default=None):
+        return
+    config.option.basetemp = str(_default_basetemp())
+    setattr(config.option, _BASETEMP_DEFAULT_FLAG, True)
 
 
 def _warn_if_tempdir_inside_checkout(config: pytest.Config) -> None:
@@ -45,7 +103,9 @@ def _warn_if_tempdir_inside_checkout(config: pytest.Config) -> None:
     )
 
 
+@pytest.hookimpl(tryfirst=True)
 def pytest_configure(config: pytest.Config) -> None:
+    _set_default_basetemp(config)
     _warn_if_tempdir_inside_checkout(config)
 
 

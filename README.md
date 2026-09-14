@@ -735,7 +735,7 @@ require_verified_task = true
 .venv\Scripts\python.exe -m pytest tests -p no:cacheprovider
 ```
 
-pytest 的临时目录（`--basetemp` / `tmp_path`）必须放在本 checkout 之外。测试入口 `tests/conftest.py` 默认将临时数据集中到系统临时目录下的 `agentchatroom-pytest` 专用根目录，不需要手工创建或为每次运行生成 `.pytest_tmp_*` 目录。临时目录位于 checkout 内时，`room_bootstrap` 的工作区解析会从测试临时目录向上查找 `.agentchatroom/project.json` 并命中仓库自身的登记文件，导致 `test_bootstrap` / `test_project_registration` 中依赖空 checkout 作用域的用例误报 `registration_invalid`；conftest 会在检测到这种情况时输出中文提示。需要显式 `--basetemp` 时请指向 checkout 外的固定专用目录。
+pytest 的临时目录（`--basetemp` / `tmp_path`）必须放在本 checkout 之外。测试入口 `tests/conftest.py` 默认将临时数据集中到系统临时目录下的 `agentchatroom-pytest` 专用根目录，并为每次运行分配唯一的 `run-<PID>-<随机>` 隔离子目录：Windows 上残留句柄会把旧目录变成 delete-pending，复用同名目录会让启动清理后的 mkdir 直接 `PermissionError`，全新名字则天然规避；专用根目录本身被锁死时自动降级到随机命名的兄弟目录，超过 24 小时的陈旧运行目录会被顺带清理，不需要手工创建或为每次运行生成 `.pytest_tmp_*` 目录。临时目录位于 checkout 内时，`room_bootstrap` 的工作区解析会从测试临时目录向上查找 `.agentchatroom/project.json` 并命中仓库自身的登记文件，导致 `test_bootstrap` / `test_project_registration` 中依赖空 checkout 作用域的用例误报 `registration_invalid`；conftest 会在检测到这种情况时输出中文提示。需要显式 `--basetemp` 时请指向 checkout 外的固定专用目录。
 
 其他门禁：
 

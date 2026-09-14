@@ -50,4 +50,7 @@ agentchatroom = ["web/*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# 直接运行 pytest.exe / IDE 测试插件时解释器不会隐式补齐当前目录，
+# scripts.* 与 tests.* 的模块导入依赖 rootdir 在 sys.path 上。
+pythonpath = ["."]
 addopts = "-q"
