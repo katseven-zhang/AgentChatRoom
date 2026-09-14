@@ -2912,6 +2912,17 @@ dialog::backdrop {
   padding-top: 12px;
 }
 
+/* #145：项目设置里的审计数据导出区，与系统备份明确区隔。 */
+#settings-export-section {
+  margin-top: 18px;
+  border-top: 1px solid var(--border);
+  padding-top: 12px;
+}
+
+#settings-export-section .form-hint {
+  margin-top: 6px;
+}
+
 .integration-advanced[open] {
   padding-bottom: 4px;
 }

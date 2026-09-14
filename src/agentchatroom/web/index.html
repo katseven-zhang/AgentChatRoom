@@ -77,7 +77,6 @@
           <div class="workspace-actions">
             <button class="secondary-button" id="connect-agent-button" type="button" disabled>接入 Agent</button>
             <button class="icon-button" id="project-settings-button" type="button" title="项目设置" aria-label="项目设置" disabled>⚙</button>
-            <button class="secondary-button" id="export-project-button" type="button" disabled>导出</button>
             <button class="danger-button" id="archive-project-button" type="button" disabled>归档项目</button>
             <button class="primary-button" id="create-task-button" type="button" disabled><span aria-hidden="true">+</span> 新建任务</button>
           </div>
@@ -552,6 +551,10 @@
         <label class="check-control"><input id="settings-auto-backup" type="checkbox"> 开启自动备份（全局配置，所有项目共用）</label>
         <label>备份保留份数 <input id="settings-backup-max-kept" type="number" min="1" step="1">
           <small class="form-hint" id="settings-backup-hint">生效时机：保存即写入配置文件 [backup]（与手动备份/回滚共用同一来源，重启服务后调度按新配置执行） · 对谁生效：整个数据库的自动备份调度</small></label>
+        <section id="settings-export-section">
+          <button class="secondary-button" id="export-audit-data-button" type="button" disabled>导出审计数据 (JSON)</button>
+          <p class="form-hint">导出包含本 Project 任务与审计流水的人类可读明文 JSON，用于离线分析与复盘；它不是系统级数据库备份，也不能用于回滚。</p>
+        </section>
         <div class="dialog-actions">
           <button type="button" class="secondary-button dialog-close">取消</button>
           <button type="submit" class="primary-button">保存设置</button>

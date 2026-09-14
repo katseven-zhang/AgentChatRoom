@@ -686,7 +686,7 @@ Room 中的沉淀知识以版本化 Knowledge Asset 保存，默认类型包括�
 - MCP：`knowledge_candidate_submit`、`knowledge_review`、`knowledge_supersede`、`knowledge_archive`、`knowledge_get`、`knowledge_list`。
 - CLI：`agentchatroom knowledge-submit | knowledge-review | knowledge-supersede | knowledge-archive | knowledge-list | knowledge-get`。CLI 审核通过 `--criterion "描述::passed"` 或 `--criterion "描述::failed"` 表达每项判定（省略后缀默认 passed）。
 
-项目导出（REST `/export`、CLI `project-export`）包含全部知识资产的版本与审核历史。
+项目导出（REST `/export`、CLI `project-export`）包含全部知识资产的版本与审核历史。Web 顶栏不再提供「导出」按钮（#145 起收纳）：项目设置弹窗底部提供「导出审计数据 (JSON)」，导出包含本 Project 任务与审计流水的人类可读明文 JSON，用于离线分析与复盘；它不是系统级数据库备份，也不能用于回滚。
 
 默认配置见 `config.example.toml` 的 `[knowledge]` 节：
 

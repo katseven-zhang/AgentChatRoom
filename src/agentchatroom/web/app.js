@@ -57,7 +57,7 @@ const elements = Object.fromEntries(
     "app-shell", "left-panel-resizer", "right-panel-resizer",
     "product-name", "connection-state", "connection-label", "project-count",
     "project-list", "agent-count", "agent-list", "room-name", "room-path",
-    "create-task-button", "archive-project-button", "project-settings-button", "export-project-button",
+    "create-task-button", "archive-project-button", "project-settings-button", "export-audit-data-button",
     "connect-agent-button", "logout-button",
     "metric-agents", "metric-active", "metric-leases",
     "metric-reviews", "active-task-list", "recent-event-list", "recent-activity-project",
@@ -1222,7 +1222,7 @@ function renderEmptyRoom() {
   elements["room-path"].textContent = "添加本地项目后即可开始协作";
   elements["chat-subtitle"].textContent = "等待选择项目";
   elements["onboarding"].classList.remove("is-hidden");
-  ["create-task-button", "archive-project-button", "project-settings-button", "export-project-button", "connect-agent-button",
+  ["create-task-button", "archive-project-button", "project-settings-button", "export-audit-data-button", "connect-agent-button",
     "create-token-button", "refresh-audit-button", "audit-event-filter", "create-backup-button",
     "event-filter", "message-input", "message-kind", "message-channel", "message-task", "message-priority",
     "message-requires-ack", "send-message-button"]
@@ -1250,7 +1250,7 @@ function renderAll() {
   elements["chat-subtitle"].textContent = `${connectedAgentCount(agentIdentities)} 当前连接 / ${agentIdentities.length} 个 Agent`;
   elements["chat-subtitle"].title = `${connectedAgentCount(agentIdentities)} 当前连接 / ${agentIdentities.length} 个 Agent / 累计 ${agents.length} 次接入 · 游标 ${state.snapshot.cursor}`;
   elements["onboarding"].classList.add("is-hidden");
-  ["create-task-button", "archive-project-button", "project-settings-button", "export-project-button", "connect-agent-button",
+  ["create-task-button", "archive-project-button", "project-settings-button", "export-audit-data-button", "connect-agent-button",
     "create-token-button", "refresh-audit-button", "audit-event-filter", "create-backup-button",
     "event-filter", "message-input", "message-kind", "message-channel", "message-task", "message-priority",
     "message-requires-ack", "send-message-button"]
@@ -2265,7 +2265,7 @@ document.getElementById("project-settings-button").addEventListener("click", () 
     elements["settings-backup-hint"].textContent = `${settings.effective || ""} · 配置文件：${settings.config_path || "-"}`;
   }).catch(handleError);
 });
-document.getElementById("export-project-button").addEventListener("click", () => downloadProjectExport().catch(handleError));
+elements["export-audit-data-button"].addEventListener("click", () => downloadProjectExport().catch(handleError));
 document.getElementById("refresh-button").addEventListener("click", () => {
   if (!state.projectId) return;
   withBusy(() => selectProject(state.projectId)).catch(handleError);
@@ -3882,7 +3882,7 @@ async function downloadProjectExport() {
   link.click();
   link.remove();
   setTimeout(() => URL.revokeObjectURL(url), 0);
-  showToast("项目数据已导出");
+  showToast("审计数据已导出 (JSON)");
 }
 
 function renderIntegrationTabs() {

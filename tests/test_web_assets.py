@@ -451,6 +451,27 @@ def test_web_task_list_renders_task_number_and_priority_together():
     assert '<span class="priority p${task.priority}">P${task.priority}</span>' in render_table
 
 
+def test_web_project_export_lives_in_settings_as_audit_export():
+    """#145：顶栏不再有「导出」按钮；项目设置弹窗提供「导出审计数据 (JSON)」，
+    文案明确其用于离线审计复盘、区别于系统级数据库备份与回滚。"""
+    markup = (WEB_DIR / "index.html").read_text(encoding="utf-8")
+    javascript = (WEB_DIR / "app.js").read_text(encoding="utf-8")
+
+    assert 'id="export-project-button"' not in markup
+    assert "export-project-button" not in javascript
+    dialog_start = markup.index('<dialog id="settings-dialog">')
+    dialog_end = markup.index("</dialog>", dialog_start)
+    dialog_markup = markup[dialog_start:dialog_end]
+    assert 'id="export-audit-data-button"' in dialog_markup
+    assert ">导出审计数据 (JSON)</button>" in dialog_markup
+    assert "用于离线分析与复盘" in dialog_markup
+    assert "不是系统级数据库备份" in dialog_markup
+    # 后端导出端点与前端下载逻辑保持不变。
+    assert "`/api/v1/projects/${state.projectId}/export`" in javascript
+    assert "function downloadProjectExport(" in javascript
+    assert 'elements["export-audit-data-button"].addEventListener' in javascript
+
+
 def test_web_supports_human_reading_and_guided_interactions():
     javascript = (WEB_DIR / "app.js").read_text(encoding="utf-8")
     markup = (WEB_DIR / "index.html").read_text(encoding="utf-8")
