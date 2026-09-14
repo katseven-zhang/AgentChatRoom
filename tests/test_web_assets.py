@@ -2367,107 +2367,72 @@ def test_web_local_mcp_assistant_offers_generic_only():
     assert "integration-onboarding-prompt" in markup
 
 
-def test_web_recent_activity_shows_project_and_merges_lifecycle_noise(tmp_path):
-    """#100/#138: overview card carries the project domain, resolves actor
-    names from actor_session_id, and de-noises lifecycle events; the
-    append-only feed path stays untouched."""
+SHARED_RECENT_HELPERS = (
+    "const RECENT_ACTIVITY_PAGE_SIZE = 5;\n"
+    "let recentActivityPage = 1;\n"
+    "const gridPageSlice = (items, pageSize, page) => {\n"
+    "  const totalPages = Math.max(1, Math.ceil(items.length / pageSize));\n"
+    "  const current = Math.min(Math.max(1, page), totalPages);\n"
+    "  return { current, totalPages, slice: items.slice((current - 1) * pageSize, current * pageSize) };\n"
+    "};\n"
+    "const gridPagerHtml = (action, current, totalPages, totalLabel = '') =>\n"
+    "  totalPages > 1 ? `<div class=\"grid-pager\">第 ${current} / ${totalPages} 页${totalLabel}</div>` : '';\n"
+)
+
+RECENT_EXTRACTION_START = "function renderRecentActivity("
+RECENT_EXTRACTION_END = "function renderMetrics("
+
+
+def extract_recent_activity_block(javascript):
+    start = javascript.index(RECENT_EXTRACTION_START)
+    end = javascript.index(RECENT_EXTRACTION_END, start)
+    return javascript[start:end]
+
+
+def test_web_recent_activity_is_flat_reverse_chronological_stream():
+    """#138/#150：最近活动忠实展示每一条真实事件（不折叠、无倍数统计），
+    严格时间倒序，操作主体按 actor_session_id 解析为 Agent 名字。"""
     javascript = (WEB_DIR / "app.js").read_text(encoding="utf-8")
     markup = (WEB_DIR / "index.html").read_text(encoding="utf-8")
 
     assert '"recent-activity-project"' in javascript
     assert 'id="recent-activity-project"' in markup
     assert "当前项目：" in javascript
-    assert "function mergeLifecycleActivity(events, resolveActorName)" in javascript
+    assert "function renderRecentActivity(" in javascript
+    assert "renderRecentActivity();" in javascript
     assert "function snapshotAgentName(sessionId)" in javascript
-    # The merge is a view-layer concern for the overview card only.
-    assert javascript.count("mergeLifecycleActivity(") == 2  # definition + 1 call
-    # Events only carry actor_session_id; the broken event.actor access is gone.
+    # #150：折叠聚合机制与其痕迹全部移除。
+    assert "mergeLifecycleActivity" not in javascript
+    assert "lifecycleActivitySummary" not in javascript
+    assert "LIFECYCLE_ACTIVITY_TYPES" not in javascript
+    assert "merged-activity" not in javascript
     assert "event.actor?" not in javascript
-
-    start = javascript.index("const LIFECYCLE_ACTIVITY_TYPES")
-    end = javascript.index("function renderMetrics(", start)
-    snippet = javascript[start:end]
-
-    harness = tmp_path / "recent-activity.js"
-    harness.write_text(
-        "const assert = require('node:assert/strict');\n"
-        "const eventLabel = (type) => type;\n"
-        + snippet
-        + """
-const names = {'s-zcode': 'ZCode', 's-opencode': 'OpenCode'};
-const resolveActorName = (sessionId) => names[sessionId] || '';
-const events = [
-  {id: 1, event_type: 'agent.joined', actor_session_id: 's-zcode'},
-  {id: 2, event_type: 'task.created', actor_session_id: 's-zcode'},
-  {id: 3, event_type: 'agent.session_replaced', actor_session_id: 's-zcode'},
-  {id: 4, event_type: 'agent.joined', actor_session_id: 's-opencode'},
-  {id: 5, event_type: 'agent.joined', actor_session_id: 's-zcode'},
-  {id: 6, event_type: 'message.message', actor_session_id: 's-zcode'},
-];
-const merged = mergeLifecycleActivity(events, resolveActorName);
-const joined = merged.find((item) => item.merged && item.event_type === 'agent.joined' && item.actor === 'ZCode');
-assert.equal(joined.count, 2);
-assert.equal(joined.actor, 'ZCode');
-assert.equal(joined.last.id, 5);
-const opencodeJoined = merged.find((item) => item.merged && item.event_type === 'agent.joined' && item.actor === 'OpenCode');
-assert.equal(opencodeJoined.count, 1);
-assert.equal(opencodeJoined.last.id, 4);
-const replaced = merged.find((item) => item.merged && item.event_type === 'agent.session_replaced');
-assert.equal(replaced.actor, 'ZCode');
-assert.equal(replaced.count, 1);
-assert.equal(merged.find((item) => !item.merged).event.id, 2);
-// entries keep chronological order by their latest event
-const refs = merged.map((item) => (item.merged ? item.last.id : item.event.id));
-assert.deepEqual(refs, [...refs].sort((a, b) => a - b));
-assert.equal(lifecycleActivitySummary(joined), 'ZCode 加入 Room');
-const tripleJoined = mergeLifecycleActivity(
-  [1, 2, 3].map((id) => ({id, event_type: 'agent.joined', actor_session_id: 's-zcode'})),
-  resolveActorName,
-).find((item) => item.merged);
-assert.equal(lifecycleActivitySummary(tripleJoined), 'ZCode 加入 Room ×3');
-assert.equal(lifecycleActivitySummary(replaced), 'ZCode 替换会话');
-// unknown actors degrade to 系统, never undefined
-assert.equal(lifecycleActivitySummary({...replaced, actor: ''}), '系统 替换会话');
-assert.equal(lifecycleActivitySummary({...replaced, actor: undefined}), '系统 替换会话');
-// aggregate counts only; individual events still exist in the raw feed
-assert.equal(events.filter((event) => event.event_type === 'agent.joined').length, 3);
-""",
-        encoding="utf-8",
-    )
-    run = subprocess.run(["node", str(harness)], capture_output=True, text=True)
-    assert run.returncode == 0, run.stderr
+    assert "const RECENT_ACTIVITY_PAGE_SIZE = 5;" in javascript
 
 
 def test_web_recent_activity_switch_projects_without_crosstalk(tmp_path):
-    """#100: switching A -> B re-renders the card with B's project domain and
-    B-only events (view-layer DOM assertion of the project boundary)."""
+    """#100/#150: switching A -> B re-renders the card with B's project domain
+    and B-only events (view-layer DOM assertion of the project boundary)."""
     javascript = (WEB_DIR / "app.js").read_text(encoding="utf-8")
-    start = javascript.index("const projectName = state.snapshot")
-    end_marker = "提交报告都会按时间显示在这里。</div>';"
-    end = javascript.index(end_marker, start) + len(end_marker)
-    block = javascript[start:end]
+    block = extract_recent_activity_block(javascript)
 
-    harness = tmp_path / "recent-switch.js"
+    harness = tmp_path / "recent-switch.mjs"
     harness.write_text(
-        "const assert = require('node:assert/strict');\n"
+        "import assert from 'node:assert/strict';\n"
         "const escapeHtml = (value) => String(value);\n"
         "const formatTime = () => '12:00';\n"
         "const eventIdBadge = (seq, id) => `#${seq || id}`;\n"
         "const messageModelBadge = () => '';\n"
         "const renderMessageLines = (lines) => lines.join('<br>');\n"
         "const eventLabel = (type) => type;\n"
-        + javascript[
-            javascript.index("const LIFECYCLE_ACTIVITY_TYPES"):javascript.index(
-                "function renderMetrics(",
-                javascript.index("const LIFECYCLE_ACTIVITY_TYPES"),
-            )
-        ] + "\n"
-        "const state = {snapshot: {project: {name: ''}, agents: [{id: 'A', name: 'Agent A'}, {id: 'B', name: 'Agent B'}]}, events: []};\n"
+        + SHARED_RECENT_HELPERS
+        + "\nconst snapshotAgentName = (sessionId) => ({A: 'Agent A', B: 'Agent B'})[sessionId] || '';\n"
+        "const state = {snapshot: {project: {name: ''}, agents: []}, events: []};\n"
         "const elements = {\n"
         "  'recent-activity-project': {textContent: ''},\n"
         "  'recent-event-list': {innerHTML: ''},\n"
         "};\n"
-        "const renderRecent = () => {\n" + block + "\n};\n"
+        "const renderRecent = () => {\n" + block + "renderRecentActivity();\n};\n"
         "const eventsFor = (projectId, count) => Array.from({length: count}, (_, index) => ({\n"
         "  id: index + 1, project_seq: index + 1, event_type: 'task.created', project_id: projectId,\n"
         "  actor_session_id: projectId, payload: {title: `${projectId}-event-${index + 1}`},\n"
@@ -2475,16 +2440,19 @@ def test_web_recent_activity_switch_projects_without_crosstalk(tmp_path):
         "// project A renders A events and the A badge\n"
         "state.snapshot.project.name = 'A';\n"
         "state.events = eventsFor('A', 4);\n"
+        "recentActivityPage = 1;\n"
         "renderRecent();\n"
+        "const html = elements['recent-event-list'].innerHTML;\n"
         "assert.equal(elements['recent-activity-project'].textContent, '当前项目：A · 实时更新');\n"
-        "assert.equal(elements['recent-event-list'].innerHTML.includes('A-event-4'), true);\n"
-        "assert.equal(elements['recent-event-list'].innerHTML.includes('<strong>Agent A</strong> task.created'), true);\n"
-        "assert.equal(elements['recent-event-list'].innerHTML.includes('B-event'), false);\n"
-        "assert.equal(elements['recent-event-list'].innerHTML.includes('Agent B'), false);\n"
-        "assert.equal(elements['recent-event-list'].innerHTML.includes('undefined'), false);\n"
+        "assert.equal(html.includes('A-event-4'), true);\n"
+        "assert.equal(html.includes('<strong>Agent A</strong> task.created'), true);\n"
+        "assert.equal(html.includes('B-event'), false);\n"
+        "assert.equal(html.includes('Agent B'), false);\n"
+        "assert.equal(html.includes('undefined'), false);\n"
         "// switch to B: badge and items fully switch, no A residue\n"
         "state.snapshot.project.name = 'B';\n"
         "state.events = eventsFor('B', 2);\n"
+        "recentActivityPage = 1;\n"
         "renderRecent();\n"
         "assert.equal(elements['recent-activity-project'].textContent, '当前项目：B · 实时更新');\n"
         "assert.equal(elements['recent-event-list'].innerHTML.includes('A-event'), false);\n"
@@ -2497,37 +2465,30 @@ def test_web_recent_activity_switch_projects_without_crosstalk(tmp_path):
     assert run.returncode == 0, run.stderr
 
 
-def test_web_recent_activity_headings_carry_agent_names(tmp_path):
-    """#138: every overview-card heading shows the acting agent resolved from
-    actor_session_id, degrades to 系统/用户 for unknown sessions, and keeps
-    the event-id and model badges without ever printing undefined."""
+def test_web_recent_activity_headings_carry_agent_names_and_paging(tmp_path):
+    """#138/#150: every overview-card heading shows the acting agent resolved
+    from actor_session_id, degrades to 系统/用户 for unknown sessions, keeps
+    event/model badges, and pages 5 rows at a time with placeholders."""
     javascript = (WEB_DIR / "app.js").read_text(encoding="utf-8")
-    start = javascript.index("const projectName = state.snapshot")
-    end_marker = "提交报告都会按时间显示在这里。</div>';"
-    end = javascript.index(end_marker, start) + len(end_marker)
-    block = javascript[start:end]
+    block = extract_recent_activity_block(javascript)
 
-    harness = tmp_path / "recent-actor-names.js"
+    harness = tmp_path / "recent-actor-names.mjs"
     harness.write_text(
-        "const assert = require('node:assert/strict');\n"
+        "import assert from 'node:assert/strict';\n"
         "const escapeHtml = (value) => String(value);\n"
         "const formatTime = () => '12:00';\n"
         "const eventIdBadge = (seq, id) => `#${seq || id}`;\n"
         "const messageModelBadge = () => ' [model]';\n"
         "const renderMessageLines = (lines) => lines.join('<br>');\n"
         "const eventLabel = (type) => type;\n"
-        + javascript[
-            javascript.index("const LIFECYCLE_ACTIVITY_TYPES"):javascript.index(
-                "function renderMetrics(",
-                javascript.index("const LIFECYCLE_ACTIVITY_TYPES"),
-            )
-        ] + "\n"
+        + SHARED_RECENT_HELPERS
+        + "\nconst snapshotAgentName = (sessionId) => ({'s-opencode': 'OpenCode', 's-codex': 'Codex'})[sessionId] || '';\n"
         "const state = {snapshot: {project: {name: ''}, agents: [{id: 's-opencode', name: 'OpenCode'}, {id: 's-codex', name: 'Codex'}]}, events: []};\n"
         "const elements = {\n"
         "  'recent-activity-project': {textContent: ''},\n"
         "  'recent-event-list': {innerHTML: ''},\n"
         "};\n"
-        "const renderRecent = () => {\n" + block + "\n};\n"
+        "const renderRecent = () => {\n" + block + "renderRecentActivity();\n};\n"
         "// regular, message and unknown-session events all carry an actor heading\n"
         "state.events = [\n"
         "  {id: 1, project_seq: 11, event_type: 'task.claimed', actor_session_id: 's-opencode', payload: {title: 'T1'}},\n"
@@ -2541,20 +2502,295 @@ def test_web_recent_activity_headings_carry_agent_names(tmp_path):
         "assert.equal(html.includes('<strong>Codex</strong> message.message [model]'), true);\n"
         "assert.equal(html.includes('<strong>系统</strong> lease.acquired'), true);\n"
         "assert.equal(html.includes('<strong>用户</strong> message.message [model]'), true);\n"
-        "assert.equal(html.includes('#11'), true);\n"
         "assert.equal(html.includes('undefined'), false);\n"
-        "// merged lifecycle headings carry the resolved agent name\n"
-        "state.events = [1, 2, 3].map((id) => ({id, project_seq: id, event_type: 'agent.joined', actor_session_id: 's-opencode'}));\n"
+        "// strictly reverse chronological: newest first\n"
+        "assert.ok(html.indexOf('#14') < html.indexOf('#13'));\n"
+        "assert.ok(html.indexOf('#13') < html.indexOf('#12'));\n"
+        "assert.ok(html.indexOf('#12') < html.indexOf('#11'));\n"
+        "// page 2 keeps placeholders for the missing rows\n"
+        "recentActivityPage = 2;\n"
         "renderRecent();\n"
         "html = elements['recent-event-list'].innerHTML;\n"
-        "assert.equal(html.includes('<strong>OpenCode 加入 Room ×3</strong>'), true);\n"
-        "// unknown sessions merge separately and degrade to 系统\n"
-        "state.events = [1, 2, 3].map((id) => ({id, project_seq: id, event_type: 'agent.joined', actor_session_id: ''}));\n"
-        "renderRecent();\n"
-        "html = elements['recent-event-list'].innerHTML;\n"
-        "assert.equal(html.includes('<strong>系统 加入 Room ×3</strong>'), true);\n"
+        "assert.equal((html.match(/compact-placeholder/g) || []).length, 1);\n"
         "assert.equal(html.includes('undefined'), false);\n",
         encoding="utf-8",
     )
     run = subprocess.run(["node", str(harness)], capture_output=True, text=True)
     assert run.returncode == 0, run.stderr
+
+
+def test_web_assets_contain_no_hardcoded_host_or_port_literals():
+    """Anti-regression test for Task #73: assert that web frontend assets
+    contain zero hardcoded localhost, 127.0.0.1, 8765, or absolute URLs,
+    guaranteeing that the SPA can run transparently across any host/port,
+    pywebview shell, or remote server target without frontend modification.
+    """
+    web_files = list(WEB_DIR.glob("**/*"))
+    assert len(web_files) > 0, "Web directory must contain static assets"
+
+    forbidden_host_patterns = [
+        "127.0.0.1",
+        "localhost",
+        ":8765",
+    ]
+
+    for file_path in web_files:
+        if not file_path.is_file():
+            continue
+        content = file_path.read_text(encoding="utf-8", errors="replace")
+        for pattern in forbidden_host_patterns:
+            assert pattern not in content, (
+                f"Web asset {file_path.name} contains forbidden literal '{pattern}'. "
+                "Web frontend must use relative paths only to preserve adapter decoupling."
+            )
+        # JavaScript logic must not use any absolute HTTP(S) URLs
+        if file_path.suffix == ".js":
+            assert "http://" not in content and "https://" not in content, (
+                f"Script {file_path.name} contains absolute HTTP/HTTPS URL. "
+                "All frontend API and event requests must use relative paths."
+            )
+
+
+def test_web_intake_refresh_never_overwrites_snapshot_state(tmp_path):
+    """Task #74 review fix: the intake refresh path must never commit task
+    rows directly into the snapshot. Stale or cross-project intake responses
+    are dropped, and task reconciliation flows only through the
+    cursor-protected applySnapshotIfCurrent commit."""
+    import json
+    import subprocess
+
+    javascript = (WEB_DIR / "app.js").read_text(encoding="utf-8")
+    assert "state.snapshot.tasks =" not in javascript
+
+    start_intake = javascript.index("let taskIntakeRefreshSequence = 0;")
+    end_intake = javascript.index("function sessionName(sessionId)")
+    start_snap = javascript.index("function fetchSnapshotDirect(projectId)")
+    end_snap = javascript.index("async function api(path, options = {})")
+    start_apply = javascript.index("function applySnapshotIfCurrent(projectId, snapshot)")
+    end_apply = javascript.index("function renderForEvent(event)")
+
+    harness_template = '''
+const state = {
+  projectId: 'prj-B',
+  snapshot: { project: { id: 'prj-B' }, cursor: 20, tasks: [
+    { id: 't1', title: 'one', state_view: { phase: 'todo', group: 'claimable' } },
+    { id: 't2', title: 'two', state_view: { phase: 'done', group: 'done' } },
+  ] },
+  taskIntakes: [{ raw_description: 'existing' }],
+  taskIntakeTargets: [],
+  snapshotInFlight: null,
+  __renderedTasks: null,
+  __renderedIntakes: false,
+};
+
+let pendingApi = [];
+async function api(path, options = {}) {
+  return new Promise((resolve) => { pendingApi.push({ path, resolve }); });
+}
+function matchesSuffix(entry, pathSuffix) {
+  return entry.path.split('?')[0].endsWith(pathSuffix);
+}
+function resolveApi(pathSuffix, payload) {
+  const queue = pendingApi;
+  pendingApi = [];
+  let matched = null;
+  for (const entry of queue) {
+    if (!matched && matchesSuffix(entry, pathSuffix)) { matched = entry; continue; }
+    pendingApi.push(entry);
+  }
+  if (!matched) throw new Error('no pending api call ending with ' + pathSuffix);
+  matched.resolve(payload);
+}
+async function waitForApi(pathSuffix) {
+  for (let i = 0; i < 200; i += 1) {
+    const hit = pendingApi.find((entry) => matchesSuffix(entry, pathSuffix));
+    if (hit) return;
+    await Promise.resolve();
+  }
+  throw new Error('api call never appeared: ' + pathSuffix);
+}
+function renderTasks(tasks) { state.__renderedTasks = tasks; }
+function renderMessageTaskOptions(tasks) { state.__renderedOptionsTasks = tasks; }
+function renderTaskIntakes() { state.__renderedIntakes = true; }
+
+__SNIPPETS__
+
+(async () => {
+  const out = {};
+
+  // 1) Cross-project staleness: prj-A responses arrive after the switch to
+  // prj-B; the guarded intake refresh must drop them entirely.
+  state.projectId = 'prj-A';
+  const stale = refreshTaskIntakeData();
+  state.projectId = 'prj-B';
+  resolveApi('/targets', { targets: [{ id: 'm1' }] });
+  resolveApi('/task-intakes', { intakes: [{ raw_description: 'A-project' }] });
+  await stale;
+  out.staleDropped =
+    state.taskIntakes.length === 1
+    && state.taskIntakes[0].raw_description === 'existing'
+    && state.snapshot.cursor === 20
+    && state.snapshot.tasks.length === 2;
+
+  // 2) Out-of-order snapshot: the snapshot fetched during intake refresh is
+  // older than the current one; applySnapshotIfCurrent must reject it.
+  const fresh = refreshTaskIntakeData();
+  resolveApi('/targets', { targets: [] });
+  resolveApi('/task-intakes', { intakes: [{ raw_description: 'B-intake' }] });
+  await waitForApi('/snapshot');
+  resolveApi('/snapshot', { project: { id: 'prj-B' }, cursor: 10, tasks: [{ id: 't0' }] });
+  await fresh;
+  out.monotonicHeld =
+    state.snapshot.cursor === 20 && state.snapshot.tasks.length === 2;
+
+  // 3) A newer snapshot commits through the protected path and re-renders.
+  const newer = refreshTaskIntakeData();
+  resolveApi('/targets', { targets: [] });
+  resolveApi('/task-intakes', { intakes: [{ raw_description: 'B-intake-2' }] });
+  await waitForApi('/snapshot');
+  resolveApi('/snapshot', {
+    project: { id: 'prj-B' },
+    cursor: 25,
+    tasks: [1, 2, 3].map((i) => ({ id: 't' + i, state_view: { phase: 'todo', group: 'claimable' } })),
+  });
+  await newer;
+  out.newerApplied = state.snapshot.cursor === 25 && state.snapshot.tasks.length === 3;
+  out.renderedNewTasks = Boolean(state.__renderedTasks) && state.__renderedTasks.length === 3;
+  out.intakeListRendered = state.__renderedIntakes;
+
+  if (!out.staleDropped || !out.monotonicHeld || !out.newerApplied || !out.renderedNewTasks || !out.intakeListRendered) {
+    throw new Error('intake refresh regression: ' + JSON.stringify(out));
+  }
+  console.log(JSON.stringify({ success: true, out }));
+})();
+'''
+    snippets = (
+        javascript[start_snap:end_snap]
+        + "\n"
+        + javascript[start_apply:end_apply]
+        + "\n"
+        + javascript[start_intake:end_intake]
+    )
+    harness_code = harness_template.replace("__SNIPPETS__", snippets)
+    harness_file = tmp_path / "intake_refresh_harness.js"
+    harness_file.write_text(harness_code, encoding="utf-8")
+    output = subprocess.check_output(["node", str(harness_file)], text=True)
+    result = json.loads(output)
+    assert result["success"] is True
+    assert result["out"] == {
+        "staleDropped": True,
+        "monotonicHeld": True,
+        "newerApplied": True,
+        "renderedNewTasks": True,
+        "intakeListRendered": True,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Task #86: three-column layout holds at default window width.
+# Task #87: agent list rebuild skipped when unchanged (stable hover tooltip).
+# Task #88: local MCP assistant offers the generic profile only.
+# ---------------------------------------------------------------------------
+
+def test_web_css_keeps_desktop_three_columns_at_1280():
+    """Task #86: the exe default width (1280) must stay on the desktop
+    three-column grid; the stacking breakpoint moves below it."""
+    stylesheet = (WEB_DIR / "app.css").read_text(encoding="utf-8")
+    # Task #89: narrow desktop windows keep the three columns side by side —
+    # the third column (Room feed) never stacks below the workspace.
+    assert "@media (max-width: 1264px)" in stylesheet
+    assert "@media (max-width: 1280px)" not in stylesheet
+    assert "@media (max-width: 1120px)" not in stylesheet
+    assert '"side work"' not in stylesheet
+    assert "minmax(180px, var(--left-panel-width))" in stylesheet
+    assert "minmax(260px, var(--right-panel-width))" in stylesheet
+    # Task #89: compressed workspace content scrolls horizontally instead of
+    # being clipped away.
+    workspace_block = stylesheet[
+        stylesheet.index(".workspace {"):stylesheet.index(".workspace-header {")
+    ]
+    assert "overflow-x: auto" in workspace_block
+    assert "overflow-x: clip" not in workspace_block
+
+
+def test_web_agent_list_render_skips_rebuild_when_unchanged(tmp_path):
+    """Task #87: presence polling must not rebuild the agent list DOM when
+    nothing changed, so native hover tooltips stay stable."""
+    import json
+    import subprocess
+
+    javascript = (WEB_DIR / "app.js").read_text(encoding="utf-8")
+    assert "function setInnerHtmlIfChanged(" in javascript
+
+    start = javascript.index("function setInnerHtmlIfChanged(")
+    end = javascript.index("function taskNotFinished(")
+    snippets = javascript[start:end]
+
+    harness_template = '''
+let agentListHtml = "";
+const agentList = {
+  get innerHTML() { return agentListHtml; },
+  set innerHTML(value) { agentList.writes += 1; agentListHtml = value; },
+  writes: 0,
+};
+const elements = { "agent-list": agentList, "agent-count": {} };
+const state = { snapshot: { tasks: [] } };
+function currentAgentRoster(agents) { return agents; }
+function escapeHtml(value) { return String(value ?? ""); }
+function formatRelativeTime(value) { return String(value); }
+function initials(name) { return String(name).slice(0, 2); }
+function avatarColorClass() { return "c"; }
+function taskPhaseLabel(task) { return String(task.phase); }
+function legacyStatus(status) { return String(status); }
+
+__SNIPPETS__
+
+const agent = {
+  id: "a1", name: "Alpha", client: "demo", role: "executor",
+  connection_status: "connected", session_count: 1,
+  last_heartbeat: "hb-1", last_activity_at: "act-1",
+  current_model: "M", unread_count: 0,
+};
+
+renderAgents([agent]);
+renderAgents([agent]);
+const writesAfterSameData = agentList.writes;
+
+renderAgents([{ ...agent, last_heartbeat: "hb-2" }]);
+const writesAfterChangedData = agentList.writes;
+
+if (writesAfterSameData !== 1 || writesAfterChangedData !== 2) {
+  throw new Error("unexpected rebuild counts: " + writesAfterSameData + "/" + writesAfterChangedData);
+}
+console.log(JSON.stringify({ success: true, writesAfterSameData, writesAfterChangedData }));
+'''
+    harness_file = tmp_path / "agent_render_harness.js"
+    harness_file = tmp_path / "agent_render_harness.js"
+    harness_code = harness_template.replace("__SNIPPETS__", snippets)
+    harness_file.write_text(harness_code, encoding="utf-8")
+    output = subprocess.check_output(["node", str(harness_file)], text=True)
+    result = json.loads(output)
+    assert result["success"] is True
+    assert result["writesAfterSameData"] == 1
+    assert result["writesAfterChangedData"] == 2
+
+
+def test_web_local_mcp_assistant_offers_generic_only():
+    """Task #88: the onboarding assistant exposes the generic standard-MCP
+    profile only; named-client presets stay backend/CLI-only."""
+    javascript = (WEB_DIR / "app.js").read_text(encoding="utf-8")
+    markup = (WEB_DIR / "index.html").read_text(encoding="utf-8")
+
+    assert 'integrationFormat: "generic"' in javascript
+    # #140 起单一 generic profile 不再渲染切换行，仅作为默认格式使用。
+    assert 'state.integrationFormat = "generic"' in javascript
+    assert 'filter((id) => id === "generic")' not in javascript
+    # named-client defaults are gone from the UI layer
+    assert 'integrationFormat: "workbuddy"' not in javascript
+    assert "选择客户端并完成本机 MCP 配置" not in markup
+    assert "使用 HTTP 直连（url + Project 凭据包）" in markup
+    # generic profile keeps the full onboarding flow wired
+    assert "renderIntegrationTabs()" in javascript
+    assert "integration-onboarding-prompt" in markup
+
+

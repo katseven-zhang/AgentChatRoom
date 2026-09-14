@@ -279,4 +279,5 @@ def test_recent_activity_counts_one_two_three_execute_without_type_error():
     result = subprocess.run(['node', str(root / 'evidence/review_20260908_activity.cjs')], cwd=root, capture_output=True, text=True, timeout=10)
     assert result.returncode == 0, result.stderr
     rows = [json.loads(line) for line in result.stdout.splitlines()]
-    assert [r['result'] for r in rows] == ['ok', 'ok', 'ok']
+    # #150: the flat stream renders 1/5/6/12 event pages without errors.
+    assert [r['result'] for r in rows] == ['ok', 'ok', 'ok', 'ok']

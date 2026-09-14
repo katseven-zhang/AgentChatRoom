@@ -1052,6 +1052,17 @@ body.is-resizing-panels {
   margin-top: 6px;
 }
 
+/* #150：最近活动定高行 + 末页占位，翻页不抖动。 */
+#recent-event-list .compact-item,
+#recent-event-list .compact-placeholder {
+  min-height: 56px;
+}
+
+.compact-placeholder {
+  border: 1px dashed var(--border);
+  box-shadow: none;
+}
+
 /* 窄卡片内长 key/说明用两行截断，保持一行 5 个的可读性；标题正常换行。 */
 .management-grid .management-item p {
   min-width: 0;

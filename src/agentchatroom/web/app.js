@@ -933,8 +933,10 @@ const AUDIT_PAGE_SIZE = 10;
 const MANAGEMENT_GRID_COLUMNS = 5;
 const MEMBER_GRID_PAGE_SIZE = 10;
 const TOKEN_GRID_PAGE_SIZE = 10;
+const RECENT_ACTIVITY_PAGE_SIZE = 5;
 let memberGridPage = 1;
 let tokenGridPage = 1;
+let recentActivityPage = 1;
 
 function gridPageSlice(items, pageSize, page) {
   const totalPages = Math.max(1, Math.ceil(items.length / pageSize));
@@ -946,11 +948,11 @@ function gridPageSlice(items, pageSize, page) {
   };
 }
 
-function gridPagerHtml(action, current, totalPages) {
+function gridPagerHtml(action, current, totalPages, totalLabel = "") {
   if (totalPages <= 1) return "";
   return `<div class="grid-pager">
     <button type="button" class="secondary-button" data-grid-pager="${action}" data-grid-page="${current - 1}" ${current <= 1 ? "disabled" : ""}>上一页</button>
-    <span class="secondary-text">第 ${current} / ${totalPages} 页</span>
+    <span class="secondary-text">第 ${current} / ${totalPages} 页${totalLabel}</span>
     <button type="button" class="secondary-button" data-grid-pager="${action}" data-grid-page="${current + 1}" ${current >= totalPages ? "disabled" : ""}>下一页</button>
   </div>`;
 }
@@ -1395,58 +1397,44 @@ function taskNotFinished(task) {
   return !["done", "cancelled"].includes(group);
 }
 
-const LIFECYCLE_ACTIVITY_TYPES = new Set([
-  "agent.joined", "agent.left", "agent.session_replaced", "workspace.updated",
-]);
-
-// Aggregate high-frequency session lifecycle events per (type, actor) for the
-// overview card only; the append-only event history and the Room feed stay
-// complete. Entries keep the position of their latest event.
-function mergeLifecycleActivity(events, resolveActorName) {
-  const entries = [];
-  const byKey = new Map();
-  for (const event of events) {
-    if (!LIFECYCLE_ACTIVITY_TYPES.has(event.event_type)) {
-      entries.push({ event });
-      continue;
-    }
-    const key = `${event.event_type}|${event.actor_session_id || ""}`;
-    let entry = byKey.get(key);
-    if (!entry) {
-      entry = {
-        merged: true,
-        event_type: event.event_type,
-        actor: resolveActorName(event.actor_session_id),
-        count: 0,
-        last: event,
-      };
-      byKey.set(key, entry);
-      entries.push(entry);
-    }
-    entry.count += 1;
-    entry.last = event;
-  }
-  const referenceId = (item) => (item.merged ? item.last.id : item.event.id);
-  entries.sort((a, b) => referenceId(a) - referenceId(b));
-  return entries;
-}
-
 function snapshotAgentName(sessionId) {
   if (!sessionId) return "";
   const agent = (state.snapshot?.agents || []).find((item) => item.id === sessionId);
   return agent?.name || "";
 }
 
-function lifecycleActivitySummary(item) {
-  const times = item.count >= 3 ? ` ×${item.count}` : "";
-  const who = item.actor ? `${item.actor} ` : "系统 ";
-  const verbs = {
-    "agent.joined": "加入 Room",
-    "agent.left": "离开 Room",
-    "agent.session_replaced": "替换会话",
-    "workspace.updated": "更新工作区登记",
-  };
-  return `${who}${verbs[item.event_type] || eventLabel(item.event_type)}${times}`;
+function renderRecentActivity() {
+  // #150：真实时间倒序流——每条事件独立展示（不折叠、无倍数统计），
+  // 每页固定 5 行并支持翻页；末页不足 5 行用占位行补齐避免高度跳动。
+  const projectName = state.snapshot?.project?.name || "";
+  if (elements["recent-activity-project"]) {
+    elements["recent-activity-project"].textContent = projectName
+      ? `当前项目：${projectName} · 实时更新`
+      : "实时更新";
+  }
+  const events = [...state.events].sort((a, b) => Number(b.id) - Number(a.id));
+  const page = gridPageSlice(events, RECENT_ACTIVITY_PAGE_SIZE, recentActivityPage);
+  recentActivityPage = page.current;
+  const rows = page.slice.map((event) => {
+    const isMessage = event.event_type.startsWith("message.") && event.payload?.body !== undefined;
+    const actorName = snapshotAgentName(event.actor_session_id) || (isMessage ? "用户" : "系统");
+    const modelBadge = isMessage ? messageModelBadge(event) : "";
+    const preview = isMessage
+      ? renderMessageLines(String(event.payload.body).split("\n").slice(0, 3))
+      : `<div class="msg-line">${escapeHtml(event.payload?.title || event.payload?.path_pattern || formatTime(event.created_at))}</div>`;
+    return `
+      <div class="compact-item ${isMessage ? `kind-${escapeHtml(event.event_type.split(".")[1])}` : ""}">
+        <div class="compact-heading"><span><strong>${escapeHtml(actorName)}</strong> ${escapeHtml(eventLabel(event.event_type))}${modelBadge}</span>${eventIdBadge(event.project_seq, event.id)}</div>
+        <div class="compact-body">${preview}</div>
+      </div>`;
+  });
+  const placeholders = rows.length && rows.length < RECENT_ACTIVITY_PAGE_SIZE
+    ? Array.from({ length: RECENT_ACTIVITY_PAGE_SIZE - rows.length },
+        () => '<div class="compact-item compact-placeholder" aria-hidden="true"></div>').join("")
+    : "";
+  elements["recent-event-list"].innerHTML = (rows.length ? rows.join("") + placeholders
+    : '<div class="empty-state">还没有动态。Agent 加入、认领任务、提交报告都会按时间显示在这里。</div>')
+    + gridPagerHtml("recent", page.current, page.totalPages, ` · 共 ${events.length} 条`);
 }
 
 function renderMetrics(agents, tasks, leases) {
@@ -1465,38 +1453,8 @@ function renderMetrics(agents, tasks, leases) {
       </div>`).join("")
     : '<div class="empty-state">当前没有进行中的工作。点「+ 新建任务」把第一件事交给受理 Agent。</div>';
 
-  const projectName = state.snapshot?.project?.name || "";
-  if (elements["recent-activity-project"]) {
-    elements["recent-activity-project"].textContent = projectName
-      ? `当前项目：${projectName} · 实时更新`
-      : "实时更新";
-  }
-  const recent = mergeLifecycleActivity(state.events, snapshotAgentName).slice(-6).reverse();
-  elements["recent-event-list"].innerHTML = recent.length
-    ? recent.map((item) => {
-      if (item.merged && item.count >= 3) {
-        return `
-      <div class="compact-item merged-activity">
-        <div class="compact-heading"><span><strong>${escapeHtml(lifecycleActivitySummary(item))}</strong></span>${eventIdBadge(item.last.project_seq, item.last.id)}</div>
-        <div class="compact-body"><div class="msg-line">${escapeHtml(formatTime(item.last.created_at))}</div></div>
-      </div>`;
-      }
-      const event = item.merged ? item.last : item.event;
-      const isMessage = event.event_type.startsWith("message.") && event.payload?.body !== undefined;
-      const actorName = snapshotAgentName(event.actor_session_id) || (isMessage ? "用户" : "系统");
-      const modelBadge = isMessage ? messageModelBadge(event) : "";
-      const preview = isMessage
-        ? renderMessageLines(String(event.payload.body).split("\n").slice(0, 3))
-        : `<div class="msg-line">${escapeHtml(event.payload?.title || event.payload?.path_pattern || formatTime(event.created_at))}</div>`;
-      return `
-      <div class="compact-item ${isMessage ? `kind-${escapeHtml(event.event_type.split(".")[1])}` : ""}">
-        <div class="compact-heading"><span><strong>${escapeHtml(actorName)}</strong> ${escapeHtml(eventLabel(event.event_type))}${modelBadge}</span>${eventIdBadge(event.project_seq, event.id)}</div>
-        <div class="compact-body">${preview}</div>
-      </div>`;
-    }).join("")
-    : '<div class="empty-state">还没有动态。Agent 加入、认领任务、提交报告都会按时间显示在这里。</div>';
+  renderRecentActivity();
 }
-
 function taskNavigationEntries(tasks) {
   const config = taskViewConfig();
   const counts = { attention: 0 };
@@ -2784,6 +2742,9 @@ document.addEventListener("click", (event) => {
   } else if (button.dataset.gridPager === "token") {
     tokenGridPage = page;
     renderCredentials();
+  } else if (button.dataset.gridPager === "recent") {
+    recentActivityPage = page;
+    renderRecentActivity();
   }
 });
 
