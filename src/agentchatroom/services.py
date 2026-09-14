@@ -1064,6 +1064,25 @@ class AgentChatRoomService:
                 )
             return member, False
 
+        name_conflict = connection.execute(
+            """
+            SELECT id, member_key FROM project_members
+            WHERE project_id = ? AND kind = 'software_agent' AND status = 'active'
+              AND lower(trim(name)) = lower(trim(?)) AND member_key != ?
+            LIMIT 1
+            """,
+            (project_id, name, member_key),
+        ).fetchone()
+        if name_conflict is not None:
+            # 拒绝静默创建第二个同名 active 成员（#139）：同名不同 key 的
+            # 接入必须走既有成员合并或由调用方改名，否则成员列表会出现
+            # 两个无法区分的同名身份。
+            raise DomainError(
+                "software_identity_name_conflict",
+                "Another active software identity already uses this name in the Project",
+                status_code=409,
+            )
+
         now = iso_now()
         member_id = new_id("member")
         connection.execute(

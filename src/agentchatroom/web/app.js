@@ -3082,6 +3082,18 @@ elements["token-form"].addEventListener("submit", async (event) => {
         showToast(error.message || "Agent 显示名称无效，请填写实际接入端名称", "error");
         return;
       }
+      const typedName = elements["token-agent-name"].value.trim().toLocaleLowerCase();
+      const nameOwner = state.members.find((item) => item.active !== false
+        && String(item.name || "").trim().toLocaleLowerCase() === typedName
+        && item.metadata?.software_key !== softwareIdentity.softwareKey);
+      if (nameOwner) {
+        // 同名但软件身份不同：拦截并引导合并，避免再造一个同名成员（#139）。
+        showToast(
+          `项目中已有同名成员「${nameOwner.name}」（软件身份 ${nameOwner.metadata?.software_key || "未知"}）。请在成员下拉中选择该项以沿用现有身份合并接入，或为本次接入换一个显示名称。`,
+          "error",
+        );
+        return;
+      }
     }
   }
   const permissions = [...elements["token-permissions"].querySelectorAll("input:checked")]
@@ -3372,11 +3384,15 @@ function createSoftwareIdentityForProfile(profile, agentName) {
   if (name === formatLabel) {
     throw new Error(`“${formatLabel}”是接入格式标签，请填写实际的 Agent 显示名称`);
   }
-  const prefix = concreteIdentityValue(profile?.software_key) || client;
-  const suffix = globalThis.crypto?.randomUUID?.()
-    || `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
+  const pinnedKey = concreteIdentityValue(profile?.software_key);
+  // 模板已固定 software_key 的接入格式必须原样沿用：客户端会按模板里的
+  // 固定 key 上报身份，签发时再拼随机后缀会把同一个软件安装割裂成两个
+  // 成员（#139 的 OpenCode 分裂根因）。只有 generic 这类没有固定 key 的
+  // 模板才用随机后缀区分不同安装。
+  const suffix = pinnedKey ? "" : (globalThis.crypto?.randomUUID?.()
+    || `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`);
   return normalizedSoftwareIdentity({
-    softwareKey: `${prefix}-${suffix}`,
+    softwareKey: pinnedKey || `${client}-${suffix}`,
     softwareName: name,
     softwareClient: client,
   });

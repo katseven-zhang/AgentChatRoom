@@ -207,6 +207,78 @@ def test_revoked_member_is_kept_in_history_but_removed_from_current_roster(
     ]
 
 
+def test_same_name_with_different_software_key_is_rejected(service, project):
+    """#139: a joining agent may not mint a second same-name active member."""
+    service.join_room(
+        project["id"],
+        agent_key="opencode-main",
+        name="OpenCode",
+        client="opencode",
+        model="unknown",
+    )
+    with pytest.raises(DomainError) as conflict:
+        service.join_room(
+            project["id"],
+            agent_key="stray-install",
+            software_key="opencode-1a78f00cc743",
+            name="OpenCode",
+            client="opencode",
+            model="unknown",
+        )
+    assert conflict.value.code == "software_identity_name_conflict"
+
+    # Same identity (same key) keeps supporting parallel sessions.
+    parallel = service.join_room(
+        project["id"],
+        agent_key="opencode-parallel",
+        software_key="opencode",
+        name="OpenCode",
+        client="opencode",
+        model="codex-ui-model",
+    )
+    members = service.list_project_members(project["id"])
+    opencode_members = [item for item in members if item["name"] == "OpenCode"]
+    assert len(opencode_members) == 1
+    assert parallel["agent"]["member_id"] == opencode_members[0]["id"]
+
+    # Name matching is case/whitespace insensitive on the server side too.
+    with pytest.raises(DomainError) as spaced:
+        service.join_room(
+            project["id"],
+            agent_key="spaced-alias",
+            software_key="another-key",
+            name="  opencode ",
+            client="opencode",
+            model="unknown",
+        )
+    assert spaced.value.code == "software_identity_name_conflict"
+
+
+def test_same_name_join_is_allowed_after_old_member_is_revoked(service, project):
+    """A revoked member's name no longer blocks a new software identity (#139)."""
+    first = service.join_room(
+        project["id"],
+        agent_key="legacy-install",
+        name="OpenCode",
+        client="opencode",
+        model="unknown",
+    )
+    service.revoke_project_member(project["id"], first["agent"]["member_id"])
+    replacement = service.join_room(
+        project["id"],
+        agent_key="fresh-install",
+        software_key="opencode-v2",
+        name="OpenCode",
+        client="opencode",
+        model="unknown",
+    )
+    members = service.list_project_members(project["id"])
+    statuses = {item["id"]: item["status"] for item in members}
+    assert statuses[first["agent"]["member_id"]] == "revoked"
+    assert statuses[replacement["agent"]["member_id"]] == "active"
+    assert len(members) == 2
+
+
 def test_agent_key_aliases_cannot_create_another_software_identity(service, project):
     first = service.join_room(
         project["id"],

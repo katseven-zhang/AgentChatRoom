@@ -107,6 +107,45 @@ assert.equal(nameGroup.hidden, true, 'incremental join keeps the client identity
     assert run.returncode == 0, run.stderr
 
 
+def test_web_pinned_software_key_is_issued_without_random_suffix(tmp_path):
+    """#139：模板固定 software_key 的接入格式按原样签发，不再拼随机后缀；
+    只有 generic 这类无固定 key 的模板保留随机后缀，且签发提交流程包含
+    同名不同 key 的拦截与合并引导。"""
+    javascript = (WEB_DIR / "app.js").read_text(encoding="utf-8")
+    start = javascript.index("function createSoftwareIdentityForProfile")
+    end = javascript.index("function parseExistingSoftwareIdentity", start)
+    harness = tmp_path / "pinned_identity.js"
+    harness.write_text(
+        "const assert = require('node:assert/strict');\n"
+        "const normalizedSoftwareIdentity = (identity) => identity;\n"
+        "const concreteIdentityValue = (value) => {\n"
+        "  const normalized = String(value || '').trim();\n"
+        "  return normalized && !normalized.startsWith('<') ? normalized : '';\n"
+        "};\n"
+        "const accessFormatProfileLabel = () => '';\n"
+        + javascript[start:end]
+        + """
+const pinned = createSoftwareIdentityForProfile(
+  {software_key: 'opencode', software_name: 'OpenCode', software_client: 'opencode', label: 'OpenCode'},
+  'OpenCode',
+);
+assert.equal(pinned.softwareKey, 'opencode');
+
+const generic = createSoftwareIdentityForProfile(
+  {software_key: '<stable-software-key>', software_client: '<software-client-code>', label: '通用（标准 MCP）'},
+  'MyAgent',
+);
+assert.ok(generic.softwareKey.startsWith('standard-mcp-'), 'generic keeps a random suffix');
+assert.notEqual(generic.softwareKey, 'standard-mcp-');
+""",
+        encoding="utf-8",
+    )
+    run = subprocess.run(["node", str(harness)], capture_output=True, text=True)
+    assert run.returncode == 0, run.stderr
+    assert "nameOwner" in javascript
+    assert "沿用现有身份合并接入" in javascript
+
+
 def test_frontend_exposes_only_http_while_backend_keeps_migration_support():
     markup = (WEB_DIR / "index.html").read_text(encoding="utf-8")
     javascript = (WEB_DIR / "app.js").read_text(encoding="utf-8")
