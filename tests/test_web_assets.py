@@ -610,7 +610,9 @@ def test_web_supports_human_reading_and_guided_interactions():
     assert "data-group-key" in javascript
     assert 'id="onboarding"' in markup
     assert 'id="new-message-notice"' in markup
-    assert "composer-advanced" in markup
+    # #149：composer 高级选项折叠区整体移除，发送区只保留输入框与发送按钮。
+    assert "composer-advanced" not in markup
+    assert "composer-options" not in markup
     assert ".msg-heading" in stylesheet
     assert ".project-group-header" in stylesheet
     assert ".new-message-notice" in stylesheet
@@ -1385,30 +1387,27 @@ def test_web_typography_baseline_wraps_long_content_and_narrow_selects():
     # #67 令牌化：基线块行高统一走 --lh-body 刻度令牌。
     assert "line-height: var(--lh-reading);" in baseline
     # 窄屏下 composer 下拉收缩，不再撑出横向滚动。
-    assert ".composer-options select {" in stylesheet
-    assert "flex: 1 1 auto;" in stylesheet
+    # #149：composer 下拉控件随高级选项一起移除，窄屏不再有横向溢出源。
+    assert ".composer-options select {" not in stylesheet
 
 
 def test_web_composer_advanced_options_carry_real_semantics_and_hints():
-    """Regression for task #54: every advanced composer control maps to a
-    real backend field (kinds/channels validated by the service) and
-    exposes a human hint; the message filter composes through one shared
-    function and never deletes events."""
+    """Regression for tasks #54→#149: the composer now carries ONLY the
+    input and send button; submission pins the generic protocol defaults
+    (kind/channel/task/priority/ack) instead of exposing controls."""
     markup = (WEB_DIR / "index.html").read_text(encoding="utf-8")
     javascript = (WEB_DIR / "app.js").read_text(encoding="utf-8")
-    # 每个高级控件都有面向人的提示。
+    # 高级控件全部移除。
     for fragment in (
-        'title="普通消息=日常沟通；决策=需要留痕的结论；阻塞=报告当前障碍。',
-        'title="公共=全员可见；评审=验收上下文；系统=运维广播。',
-        'title="把这条消息挂到任务时间线',
-        'title="紧急/高优先级的消息在动态里带醒目标签。',
-        'title="勾选后接收者需要显式确认',
+        'id="message-kind"', 'id="message-channel"', 'id="message-task"',
+        'id="message-priority"', 'id="message-requires-ack"',
+        'id="composer-advanced"', "高级选项",
     ):
-        assert fragment in markup
-    # 提交字段与后端 MESSAGE_KINDS/CHANNELS 语义对齐（kind/channel/task/priority/ack）。
+        assert fragment not in markup
+    # 提交固定使用通用协议参数，与后端 MESSAGE_KINDS/CHANNELS 语义一致。
     submit = javascript[javascript.index('elements["message-form"].addEventListener'):]
-    for field in ("kind:", "channel:", "task_id:", "priority:", "requires_ack:"):
-        assert field in submit
+    for pair in ('kind: "message"', 'channel: "public"', "task_id: null", "priority: 2", "requires_ack: false"):
+        assert pair in submit
     # 组合筛选走唯一入口（#45），隐藏只影响展示。
     assert "function visibleFeedEvents(events)" in javascript
 

@@ -2420,62 +2420,11 @@ button.event-id {
   line-height: var(--lh-body);
 }
 
+#149：高级选项控件移除后，发送区仅剩输入框与主行动按钮，
+# 由 flex 自适应保证任意侧栏宽度下发送按钮完整可见。
 .composer-actions {
-  justify-content: space-between;
+  justify-content: flex-end;
   gap: 8px;
-  margin-top: 8px;
-}
-
-.composer-actions > .primary-button {
-  min-width: 58px;
-  flex: 0 0 auto;
-  white-space: nowrap;
-}
-
-.composer-options {
-  min-width: 0;
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  flex-wrap: wrap;
-}
-
-.composer-advanced {
-  min-width: 0;
-  flex: 1 1 auto;
-}
-
-.composer-advanced > summary {
-  display: inline-flex;
-  align-items: center;
-  min-height: 38px;
-  padding: 0 12px;
-  border: 1px solid var(--border);
-  border-radius: var(--radius);
-  background: var(--surface);
-  color: var(--text-muted);
-  font-size: var(--fs-xs);
-  cursor: pointer;
-  list-style: none;
-  user-select: none;
-}
-
-.composer-advanced > summary::before {
-  content: "▸";
-  margin-right: 6px;
-  font-size: var(--fs-xs);
-}
-
-.composer-advanced[open] > summary::before {
-  content: "▾";
-}
-
-.composer-advanced > summary:hover {
-  color: var(--text);
-  border-color: var(--border-strong);
-}
-
-.composer-advanced .composer-options {
   margin-top: 8px;
 }
 
@@ -3289,15 +3238,6 @@ dialog::backdrop {
 
   .integration-runtime {
     display: grid;
-  }
-
-  .composer-options {
-    gap: 6px;
-  }
-
-  .composer-options select {
-    max-width: 100%;
-    flex: 1 1 auto;
   }
 
   .composer-actions {

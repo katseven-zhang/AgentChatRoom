@@ -62,8 +62,7 @@ const elements = Object.fromEntries(
     "metric-agents", "metric-active", "metric-leases",
     "metric-reviews", "active-task-list", "recent-event-list", "recent-activity-project",
     "lease-list", "review-list", "chat-subtitle", "chat-stream", "event-filter", "event-hide-system",
-    "message-form", "message-input", "message-kind", "message-channel", "message-task", "message-priority",
-    "message-requires-ack", "send-message-button", "onboarding", "new-message-notice",
+    "message-form", "message-input", "send-message-button", "onboarding", "new-message-notice",
     "project-dialog", "project-form", "project-name-input", "project-path-input",
     "project-folder-picker-button",
     "task-dialog", "task-form", "task-raw-description-input", "task-target-agent-input",
@@ -1130,7 +1129,6 @@ async function refreshPresence() {
       renderTasks(snapshot.tasks);
       renderTaskIntakes();
       renderReviews(snapshot.tasks, snapshot.agents);
-      renderMessageTaskOptions(snapshot.tasks);
     }
   } catch (error) {
     console.warn("Presence refresh failed", error);
@@ -1179,7 +1177,6 @@ function renderForEvent(event) {
     renderReviews(tasks, agents);
     renderMetrics(agentIdentities, tasks, leases);
     renderEvents(agents, tasks);
-    renderMessageTaskOptions(tasks);
     elements["chat-subtitle"].textContent = `${connectedAgentCount(agentIdentities)} 当前连接 / ${agentIdentities.length} 个 Agent`;
     elements["chat-subtitle"].title = `${connectedAgentCount(agentIdentities)} 当前连接 / ${agentIdentities.length} 个 Agent / 累计 ${state.snapshot.agents.length} 次接入 · 游标 ${state.snapshot.cursor}`;
     return;
@@ -1305,8 +1302,7 @@ function renderEmptyRoom() {
   elements["onboarding"].classList.remove("is-hidden");
   ["create-task-button", "archive-project-button", "project-settings-button", "export-audit-data-button", "connect-agent-button",
     "create-token-button", "refresh-audit-button", "audit-event-filter", "create-backup-button",
-    "event-filter", "message-input", "message-kind", "message-channel", "message-task", "message-priority",
-    "message-requires-ack", "send-message-button"]
+    "event-filter", "message-input", "send-message-button"]
     .forEach((id) => { elements[id].disabled = true; });
   elements["agent-count"].textContent = "0";
   elements["agent-list"].innerHTML = '<div class="empty-state">Agent 完成「接入 Agent」并连接当前 Room 后，会显示在这里</div>';
@@ -1333,8 +1329,7 @@ function renderAll() {
   elements["onboarding"].classList.add("is-hidden");
   ["create-task-button", "archive-project-button", "project-settings-button", "export-audit-data-button", "connect-agent-button",
     "create-token-button", "refresh-audit-button", "audit-event-filter", "create-backup-button",
-    "event-filter", "message-input", "message-kind", "message-channel", "message-task", "message-priority",
-    "message-requires-ack", "send-message-button"]
+    "event-filter", "message-input", "send-message-button"]
     .forEach((id) => { elements[id].disabled = false; });
   renderAgents(agentIdentities);
   renderMetrics(agentIdentities, tasks, leases);
@@ -1343,7 +1338,6 @@ function renderAll() {
   renderLeases(leases, agents);
   renderReviews(tasks, agents);
   renderEvents(agents, tasks);
-  renderMessageTaskOptions(tasks);
   renderManagement();
 }
 
@@ -2961,14 +2955,6 @@ elements["event-hide-system"].addEventListener("change", () => {
   if (state.snapshot) renderEvents(state.snapshot.agents, state.snapshot.tasks);
 });
 
-elements["message-task"].addEventListener("change", () => {
-  if (elements["message-task"].value && elements["message-channel"].value === "public") {
-    elements["message-channel"].value = "task";
-  } else if (!elements["message-task"].value && elements["message-channel"].value === "task") {
-    elements["message-channel"].value = "public";
-  }
-});
-
 elements["project-form"].addEventListener("submit", async (event) => {
   event.preventDefault();
   try {
@@ -3072,19 +3058,20 @@ elements["message-form"].addEventListener("submit", async (event) => {
   if (!body || !state.projectId) return;
   elements["send-message-button"].disabled = true;
   try {
+    // #149：Web 端人工发送固定使用通用协议参数（公共频道、普通消息、
+    // 普通优先级）；决策/阻塞/任务关联等由 Agent 经 MCP/CLI 发送。
     await api(`/api/v1/projects/${state.projectId}/messages`, {
       method: "POST",
       body: JSON.stringify({
         body,
-        kind: elements["message-kind"].value,
-        channel: elements["message-channel"].value,
-        task_id: elements["message-task"].value || null,
-        priority: Number(elements["message-priority"].value),
-        requires_ack: elements["message-requires-ack"].checked,
+        kind: "message",
+        channel: "public",
+        task_id: null,
+        priority: 2,
+        requires_ack: false,
       }),
     });
     elements["message-input"].value = "";
-    elements["message-requires-ack"].checked = false;
   } catch (error) {
     handleError(error);
   } finally {
@@ -3624,15 +3611,6 @@ function handleError(error) {
   showToast(error.message || "发生未知错误", "error");
 }
 
-function renderMessageTaskOptions(tasks) {
-  const selected = elements["message-task"].value;
-  const candidates = tasks.filter((task) => taskNotFinished(task));
-  elements["message-task"].innerHTML = [
-    '<option value="">不关联任务</option>',
-    ...candidates.map((task) => `<option value="${escapeHtml(task.id)}">任务 #${task.task_number} · ${escapeHtml(task.title)}</option>`),
-  ].join("");
-  if (candidates.some((task) => task.id === selected)) elements["message-task"].value = selected;
-}
 
 async function loadTaskEvents(projectId, taskId) {
   return loadEventWindow(
@@ -3681,7 +3659,6 @@ async function refreshTaskIntakeData() {
   if (requestId !== taskIntakeRefreshSequence || projectId !== state.projectId) return;
   if (snapshot && applySnapshotIfCurrent(projectId, snapshot)) {
     renderTasks(state.snapshot.tasks);
-    renderMessageTaskOptions(state.snapshot.tasks);
   }
   renderTaskIntakes();
 }
@@ -4360,14 +4337,6 @@ async function copyText(value) {
   if (!copied) throw new Error("浏览器未允许复制，请手动选择文本");
 }
 
-function populateDomainOptions() {
-  const kinds = state.config?.domain?.message_kinds || ["message", "decision", "blocker"];
-  elements["message-kind"].innerHTML = kinds.map((kind) => `<option value="${escapeHtml(kind)}">${escapeHtml(messageKind(kind))}</option>`).join("");
-  if (kinds.includes("message")) elements["message-kind"].value = "message";
-  const channels = state.config?.domain?.message_channels || ["public", "task", "review", "system"];
-  elements["message-channel"].innerHTML = channels.map((channel) => `<option value="${escapeHtml(channel)}">${escapeHtml(messageChannel(channel))}频道</option>`).join("");
-  if (channels.includes("public")) elements["message-channel"].value = "public";
-}
 
 function resolveAppearanceTheme(preference, configuredTheme, systemDark) {
   const selected = ["light", "dark"].includes(preference) ? preference : configuredTheme;
@@ -4399,7 +4368,6 @@ function initializeAppearance() {
 
 function applyPublicConfig() {
   applyAppearanceTheme();
-  populateDomainOptions();
   elements["product-name"].textContent = state.config.product_name;
   document.title = state.config.product_name;
   const folderPickerEnabled = Boolean(state.config.capabilities?.local_folder_picker);
