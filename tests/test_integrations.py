@@ -18,29 +18,29 @@ def test_onboarding_modes_separate_configuration_from_existing_connections(tmp_p
             assert set(modes[mode]) == {'local', 'http', 'remote'}
             for transport, prompt in modes[mode].items():
                 assert 'Room B' in prompt
-                assert json.dumps(str(tmp_path), ensure_ascii=False) in prompt
                 if transport == 'http':
                     assert 'room_bootstrap(project_name="Room B")' in prompt
                     assert '本机 stdio' not in prompt
                     assert '远程 Bridge' not in prompt
                 else:
                     assert '`room_bootstrap`（零参数）' in prompt
-                assert '不创建或修改软件身份' in prompt
-                assert '不新增同名连接器' in prompt
+                # #143：提示词只保留行动必需信息，说教式文案全部移除。
+                assert '生命周期说明' not in prompt
+                assert '工作区与 Room 绑定边界' not in prompt
+                assert '生效顺序' not in prompt
+                assert 'mcp_session_expired' not in prompt
+                assert '不新建第二个 agentchatroom 连接器' in prompt or mode == 'reconnect'
                 assert 'do-not-copy' not in prompt and 'private-key' not in prompt
                 assert 'mcpServers' not in prompt
                 assert 'AGENTCHATROOM_SOFTWARE_KEY' not in prompt
                 assert 'paste-issued-agent-token' not in prompt
-        assert '独立 MCP 连接上下文' in modes['add_project']['local']
-        assert '不重发结果未知的写操作' in modes['reconnect']['local']
+        assert '增量合并进现有配置' in modes['add_project']['local']
+        assert '不重新签发或改写 MCP 配置' in modes['reconnect']['local']
         migration = modes['migrate_http']['http']
         assert '从本机 stdio 切换为直接 HTTP MCP' in migration
-        assert '只保留一个名称为 `agentchatroom` 的服务器' in migration
-        assert '`command`、`args`、`cwd`、`env`' in migration
-        assert '只删除客户端侧这个旧服务器条目' in migration
-        assert '可读 Project↔Token 映射' in migration
-        assert '一次性提示词' in migration
-        assert '无需删除 Project、成员、任务或历史' in migration
+        assert '删除 `command`、`args`、`cwd`、`env` 等 stdio 字段' in migration
+        assert '重启或重新加载客户端 MCP' in migration
+        assert '`room_bootstrap`' in migration
         assert 'do-not-copy' not in migration and 'private-key' not in migration
 
 
@@ -51,19 +51,22 @@ def test_invalid_onboarding_mode_is_rejected():
 
 
 def test_add_project_http_prompt_drives_incremental_agent_side_merge(tmp_path):
-    """加入本项目的主流程零粘贴：签发后由已配置 Agent 在客户端本地增量合并。"""
+    """加入本项目：提示词直观列出目标凭据与增量合并 3 步（#143 精简后）。"""
     project = {'name': 'Room B', 'root_path': str(tmp_path), 'id': 'p', 'project_key': 'k'}
     result = build_mcp_integration(Settings(data_dir=tmp_path / 'data'), project=project)
     prompt = result['profiles']['generic']['onboarding_modes']['add_project']['http']
-    assert '无需粘贴现有配置' in prompt
-    assert '增量提示词' in prompt
+    # 必要上下文：目标 Project、合并逻辑与 bootstrap 调用。
+    assert '目标 Project：Room B' in prompt
     assert '保留原 url、软件身份三字段与全部旧 Project 凭据' in prompt
+    assert '`project_name_N` / `project_token_N`' in prompt
     assert '写回同一个 agentchatroom 条目' in prompt
-    assert '高级 · 故障恢复' in prompt
+    assert '重启或重新加载客户端 MCP' in prompt
+    assert 'room_bootstrap(project_name="Room B")' in prompt
     assert '不新建第二个 agentchatroom 连接器' in prompt
-    assert '不把 Token 发送到 Room、日志或仓库' in prompt
-    # 旧的反向守卫保持：实际未配置连接器时不得自行转为安装流程。
-    assert '不要自行转为安装流程' in prompt
+    assert '不要把 Token 发布到 Room、日志或仓库' in prompt
+    # #143：手动恢复与安装流程说教移除。
+    assert '高级 · 故障恢复' not in prompt
+    assert '不要自行转为安装流程' not in prompt
 
 
 def test_frontend_onboarding_mode_selection():
@@ -209,18 +212,15 @@ def test_project_integration_builds_stable_workbuddy_memory_without_live_state(t
     assert "switch to the correct project workspace in the Agent client" in memory
 
     prompt = result["onboarding_prompt"]
-    assert "接入名为 `agentchatroom` 的 MCP Server" in prompt
-    assert "请根据当前客户端和运行环境自行完成接入" in prompt
+    # #143：极简 3 步结构（写入配置 -> 重启/重载 MCP -> bootstrap 核对）。
+    assert "接入 AgentChatRoom MCP Server `agentchatroom`" in prompt
+    assert "将以下配置写入客户端" in prompt
+    assert "重启或重新加载客户端 MCP" in prompt
     assert "project_key：sample-project" not in prompt
     assert "room_join" not in prompt
     # The local stdio prompt requires a first zero-argument bootstrap and check.
-    assert "工作区与 Room 绑定边界" in prompt
     assert "`room_bootstrap`（零参数）" in prompt
     assert "root_path" in prompt
-    assert "首次 bootstrap 后固定绑定一个 Project" in prompt
-    assert "`agentchatroom` 是全局唯一连接器" in prompt
-    assert "立即停止消息、任务、文件占用等一切写操作" in prompt
-    assert "不要填写、猜测或复制项目 ID、会话标识或凭据" in prompt
     assert "model_display_name" not in prompt
     assert "协作规则" not in prompt
     assert ".agentchatroom/project.json" not in prompt
@@ -233,14 +233,18 @@ def test_project_integration_builds_stable_workbuddy_memory_without_live_state(t
     assert "不要提权" not in prompt
     assert "配置文件：" not in prompt
     assert "操作要求" not in prompt
-    assert "重启" not in prompt
+    # #143：生命周期原理、会话过期说教与绑定边界细则从提示词移除。
+    assert "生命周期说明" not in prompt
+    assert "mcp_session_expired" not in prompt
+    assert "工作区与 Room 绑定边界" not in prompt
+    assert "生效顺序" not in prompt
     assert "。。" not in prompt
     assert "project_runtime_only" not in memory
     assert "Session Token" in memory
 
     workbuddy_prompts = result["profiles"]["workbuddy"]["onboarding_prompts"]
     assert set(workbuddy_prompts) == {"local", "http", "remote"}
-    assert "请为 WorkBuddy 接入名为 `agentchatroom`" in workbuddy_prompts["local"]
+    assert "请为 WorkBuddy 接入 AgentChatRoom MCP Server `agentchatroom`" in workbuddy_prompts["local"]
     assert "~/.workbuddy/mcp.json" not in workbuddy_prompts["local"]
     assert "AGENTCHATROOM_SOFTWARE_KEY" in workbuddy_prompts["local"]
     assert '"AGENTCHATROOM_SOFTWARE_KEY": "workbuddy"' in workbuddy_prompts["local"]
@@ -251,7 +255,7 @@ def test_project_integration_builds_stable_workbuddy_memory_without_live_state(t
     assert "agentchatroom.mcp_bridge" in workbuddy_prompts["remote"]
 
     codex_prompts = result["profiles"]["codex"]["onboarding_prompts"]
-    assert "请为 Codex 接入名为 `agentchatroom`" in codex_prompts["local"]
+    assert "请为 Codex 接入 AgentChatRoom MCP Server `agentchatroom`" in codex_prompts["local"]
     assert "AGENTCHATROOM_SOFTWARE_KEY" in codex_prompts["local"]
     assert 'AGENTCHATROOM_SOFTWARE_KEY = "codex"' in codex_prompts["local"]
     assert (
@@ -327,7 +331,8 @@ def test_generated_mcp_configs_contain_no_terminal_launch_chain(tmp_path):
 
 
 def test_onboarding_prompt_states_lifecycle_and_pin_semantics(tmp_path):
-    """#101/#97: the handoff prompt states no auto-start and the pin caveat."""
+    """#101/#97/#143: the prompt keeps only the service_unavailable caveat,
+    the pin caveat, and the 3-step structure; lectures are gone."""
     settings = Settings(data_dir=tmp_path / "data")
     project = {
         "id": "project_prompt",
@@ -337,30 +342,26 @@ def test_onboarding_prompt_states_lifecycle_and_pin_semantics(tmp_path):
     }
     result = build_mcp_integration(settings, project=project)
     prompt = result["onboarding_prompt"]
-    assert "不会启动 AgentChatRoom 后台服务" in prompt
     assert "service_unavailable" in prompt
-    assert "用户已显式启动" in prompt
-    assert "直接 HTTP MCP" in prompt
+    assert "由用户显式启动" in prompt
+    assert "不要自动启动服务" in prompt
     assert "AGENTCHATROOM_PROJECT_PATH" in prompt
-    assert "兜底" in prompt
-    # #98: every transport's prompt carries the same binding boundary.
+    assert "将以下配置写入客户端" in prompt
+    assert "重启或重新加载客户端 MCP" in prompt
+    # #98→#143: every transport keeps the bootstrap verification, drops lectures.
     for transport, text in result["profiles"]["generic"]["onboarding_prompts"].items():
-        assert "工作区与 Room 绑定边界" in text, transport
         if transport == "http":
             assert 'room_bootstrap(project_name="AgentChatRoom")' in text
         else:
             assert "`room_bootstrap`（零参数）" in text
         assert "root_path" in text, transport
-        assert "立即停止消息、任务、文件占用等一切写操作" in text, transport
-        assert "「AgentChatRoom」" in text, transport
-        assert "生效顺序" in text, transport
-        # #116: HTTP 类传输的接入提示词给出会话过期后的唯一恢复步骤。
-        if transport in {"http", "remote"}:
-            assert "mcp_session_expired" in text, transport
-            assert "reconnect_mcp_session" in text, transport
-            assert "重新加载一次" in text, transport
-        else:
-            assert "mcp_session_expired" not in text, transport
+        assert "重启或重新加载客户端 MCP" in text, transport
+        assert "生命周期说明" not in text, transport
+        assert "工作区与 Room 绑定边界" not in text, transport
+        assert "生效顺序" not in text, transport
+        # #116→#143: 会话过期恢复说教移除，恢复契约由 required_action 承担。
+        assert "mcp_session_expired" not in text, transport
+        assert "reconnect_mcp_session" not in text, transport
     # #115: 首次配置提示词要求用户给出实际接入端显示名称，格式标签与占位符原文不可沿用。
     assert "实际接入端显示名称" in prompt
     assert "接入格式标签" in prompt

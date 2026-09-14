@@ -352,7 +352,8 @@ def test_web_bootstrap_and_phase_one_local_agent_hooks_are_complete():
     assert '<section class="integration-section onboarding-section" hidden>' in markup
     assert "project_name_${index + 1}" in javascript
     assert "project_token_${index + 1}" in javascript
-    assert "不要命名为 agentchatroom-stdio" in javascript
+    # #143：占位配置复述与冗余禁令从提示词移除。
+    assert "不要命名为 agentchatroom-stdio" not in javascript
     assert 'payload.host_key = "<stable-host-key>"' not in javascript
     assert 'payload.host_name = "<computer-name>"' not in javascript
     assert '"<path-to-project-on-this-computer>"' not in javascript
@@ -512,7 +513,11 @@ def test_web_supports_human_reading_and_guided_interactions():
     assert "Token 未更换" in javascript
     assert "不关联；首次连接时按下面填写的显示名称自动创建成员" in javascript
     assert 'elements["token-agent-name"].value' in javascript
-    assert "本工作区固定 bootstrap 参数" in javascript
+    # #143：提示词 3 步结构与放大的结果展示。
+    assert "重启或重新加载客户端 MCP" in javascript
+    assert "本工作区固定 bootstrap 参数" not in javascript
+    assert 'id="token-config-value" class="code-block secret-block"' in markup
+    assert 'class="primary-button integration-cta copy-button" type="button" data-copy-target="token-config-value"' in markup
     assert "[] if bundled_project_id" not in (WEB_DIR.parent / "mcp_server.py").read_text(encoding="utf-8")
     assert "function eventIdBadge(projectSeq, eventId)" in javascript
     assert "eventIdBadge(event.project_seq, event.id)" in javascript

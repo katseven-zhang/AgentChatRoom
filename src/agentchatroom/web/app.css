@@ -2900,6 +2900,12 @@ dialog::backdrop {
   overflow-wrap: anywhere;
 }
 
+/* #143：签发结果里的提示词卡片显著增大，复制按钮同步醒目。 */
+#token-config-value {
+  max-height: 480px;
+  font-size: var(--fs-sm);
+}
+
 .integration-fallback {
   margin-top: 18px;
   border-top: 1px solid var(--border);

@@ -328,7 +328,7 @@ Room。`room_join` 会从忽略的 `.agentchatroom/project.json` 读取后端登
 
 通用 JSON 形状为 `mcpServers.agentchatroom.url` + `headers.Authorization`。Web 签发结果同时给出可读 Project↔Token 映射和完整多项目凭据包，Agent 可据此转换为客户端实际要求的 JSON/TOML 语法，但必须保留服务器名 `agentchatroom`、URL、Authorization 和软件身份字段。HTTP 客户端调用 `room_bootstrap(project_name="<目标 Project 名称>")`；`status=ready` 且返回 Project 正确后才允许写操作。
 
-Web「接入 Agent」向导只提供 **HTTP 直连**。首次配置直接签发；加入新 Project 时同样零粘贴：签发后生成增量提示词，由已配置的 Agent 检查客户端本地现有 `agentchatroom` HTTP 配置，保留 URL、软件身份与全部旧 Project 凭据，仅把新 `project_name` / `project_token` 追加或替换进 `acrb.v1.*` 凭据包并写回同一条目。增量提示词明确列出本次签发的 `project_name_N` / `project_token_N`，避免只看到不可读凭据包而不知道 Project 对应关系。若旧 Authorization 仍是单个 `acr.*` Token，Agent 先保持旧连接并调用零参数 `room_bootstrap()` 取得该 Token 的精确 Project 名称，再与新凭据一起转换成 `acrb.v1.*`；无法取得名称时停止，不能猜测。签发表单不提供手动粘贴入口（#141 起移除），Web 侧的配置解析函数仅作为生成配置的消费端契约保留。客户端始终只保留一个名为 `agentchatroom` 的条目。关闭弹窗后，原配置、原 Token、新 Token 与生成结果都会从页面状态清除。
+Web「接入 Agent」向导只提供 **HTTP 直连**。首次配置直接签发；加入新 Project 时同样零粘贴：签发后生成增量提示词，由已配置的 Agent 检查客户端本地现有 `agentchatroom` HTTP 配置，保留 URL、软件身份与全部旧 Project 凭据，仅把新 `project_name` / `project_token` 追加或替换进 `acrb.v1.*` 凭据包并写回同一条目。增量提示词明确列出本次签发的 `project_name_N` / `project_token_N`，避免只看到不可读凭据包而不知道 Project 对应关系。接入提示词（Web 与 CLI 共用生成逻辑）自 #143 起采用极简 3 步结构：写入 MCP 配置（或增量合并凭据）→ 重启/重新加载客户端 MCP → 调用 `room_bootstrap` 核对 Project 名称与 root_path；生命周期原理、会话过期说教与绑定边界细则不再进入提示词，由项目规则与服务端 `required_action` 承担。签发表单不提供手动粘贴入口（#141 起移除），Web 侧的配置解析函数仅作为生成配置的消费端契约保留。客户端始终只保留一个名为 `agentchatroom` 的条目。关闭弹窗后，原配置、原 Token、新 Token 与生成结果都会从页面状态清除。
 
 已经使用 stdio 的客户端可删除客户端侧旧 MCP 条目，再通过“首次配置软件”用标准名称 `agentchatroom` 建立 HTTP 配置；无需删除 Project、成员、任务或历史。保存并重载后，旧 stdio 子进程应退出；新连接按完整提示词给出的目标 Project 名称 bootstrap。
 

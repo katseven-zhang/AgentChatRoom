@@ -215,7 +215,12 @@ def build_onboarding_prompt(
     project: Mapping[str, Any] | None = None,
     mode: str = "first_setup",
 ) -> str:
-    """Build a concise handoff containing only the generated MCP connection facts."""
+    """Build the minimal 3-step handoff: write config -> reload MCP -> bootstrap.
+
+    #143：接入提示词只保留行动必需信息（配置块、服务器名、目标 Project、
+    bootstrap 调用与凭据安全底线）；生命周期原理、会话过期说教与绑定
+    边界细则由项目规则（AGENTS.md）与服务端 required_action 承担。
+    """
     if mode not in {"first_setup", "add_project", "reconnect", "migrate_http"}:
         raise ValueError("Unknown onboarding mode")
     client_label = str(profile.get("label", profile_id)).strip() or profile_id
@@ -224,142 +229,89 @@ def build_onboarding_prompt(
         "http": "直接 HTTP MCP",
         "remote": "远程 Bridge",
     }[transport]
-    if transport == "http":
-        lifecycle_note = (
-            "\n\n生命周期说明：HTTP MCP 连接本身不会启动 AgentChatRoom 后台服务、"
-            "GUI 或托盘；目标服务必须由用户显式启动。服务未启动或已停止时"
-            "返回 service_unavailable，不能继续写入。"
-        )
-    elif transport == "local":
-        lifecycle_note = (
-            "\n\n生命周期说明：MCP 连接本身不会启动 AgentChatRoom 后台服务、"
-            "GUI 或托盘；本机 stdio 适配器必须连接用户已显式启动的同一数据目录服务，"
-            "服务未启动或已停止时返回 service_unavailable，不能继续写入。"
-            "如需避免客户端创建适配器进程，使用直接 HTTP MCP。"
-        )
-    else:
-        lifecycle_note = (
-            "\n\n生命周期说明：远程 Bridge 连接本身不会启动 AgentChatRoom 后台服务、"
-            "GUI 或托盘；目标服务必须由用户显式启动。服务未启动或已停止时"
-            "返回 service_unavailable，不能继续写入。"
-        )
-    if transport in {"http", "remote"}:
-        lifecycle_note += (
-            "\n\nMCP 会话过期恢复：服务端会回收闲置过久的 MCP HTTP 会话"
-            "（默认 1800 秒，可通过配置覆盖）。收到 code=mcp_session_expired / "
-            "required_action=reconnect_mcp_session（HTTP 404）表示该会话已不可用："
-            "本仓库自带的 stdio Bridge 会自动重新初始化一次并重放同一请求；"
-            "直连客户端不支持自动恢复时，请在客户端重新加载一次 agentchatroom "
-            "连接器，然后重新调用 room_bootstrap 继续原 Project。不要无限重试"
-            "过期会话，也不要更换项目凭据或软件身份。"
-        )
-    pin_warning = ""
-    if transport == "local" and PROJECT_PATH_ENV_VAR in config_text:
-        pin_warning = (
-            f"\n\n注意：`{PROJECT_PATH_ENV_VAR}` 是单个 checkout 的兜底路径，"
-            "工作区 roots/cwd 的登记解析始终优先。若把本配置粘贴到"
-            "用户级/全局客户端配置（多个工作区共用），请删除该行，"
-            "让每个工作区按自身 checkout 登记解析 Room；"
-            "未登记的工作区会明确失败，不会回退进入该配置路径的项目。"
-        )
-    binding_section = ""
-    if project:
-        project_name = str(project.get("name", "")).strip()
-        workspace_label = f"「{project_name}」" if project_name else "当前项目"
-        bootstrap_call = (
-            f"`room_bootstrap(project_name={json.dumps(project_name, ensure_ascii=False)})`"
-            if transport == "http"
-            else "`room_bootstrap`（零参数）"
-        )
-        binding_section = f"""
-
-工作区与 Room 绑定边界（必须遵守）：
-1. 当前配置目标是 Project{workspace_label}。`{MCP_SERVER_NAME}` 是全局唯一连接器；HTTP 配置可保存多个 Project 名称与各自 Token。每个客户端任务建立独立轻量 MCP Session，首次 bootstrap 后固定绑定一个 Project，多个 Project 可同时在线，不来回切换、不新增同名连接器。
-2. 接入完成后第一步：调用 {bootstrap_call}，核对返回的 Project 名称与 root_path 与当前工作区一致；status=ready 只表示绑定成功，conversation_synced 只表示当前模型对话已同步，两者是不同事实。
-3. 出现未登记、登记损坏、多 Project/配置冲突、Project 不匹配或 Session 过期时：立即停止消息、任务、文件占用等一切写操作，只按返回的 required_action 唯一恢复动作处理，不得改用其他项目继续写入。
-4. HTTP 的 project_name 只使用本提示给出的非敏感名称；Token 留在 MCP 配置中。不要填写、猜测或复制项目 ID、会话标识或凭据；不要手改 checkout 登记文件；不要通过改软件身份绕过绑定。
-5. 生效顺序：应用配置 → 重载客户端 MCP → 调用 {bootstrap_call} 核对项目 → 之后才允许消息、任务、文件占用等写操作。"""
-
-    safety = (
-        "不得自动启动服务、GUI 或托盘，不得搜索或自行选择 EXE；"
-        "连接失败时停止并报告原因，不循环重试或重复添加 MCP。"
-        "软件曾在 Room 出现不代表本机已配置，请核查客户端实际配置。"
+    project_name = str((project or {}).get("name") or "").strip()
+    bootstrap_call = (
+        f"`room_bootstrap(project_name={json.dumps(project_name, ensure_ascii=False)})`"
+        if transport == "http"
+        else "`room_bootstrap`（零参数）"
     )
+    verify_step = (
+        f"3. 调用 {bootstrap_call}，核对返回的 Project 名称与 root_path 与当前工作区一致；"
+        "核对通过后才执行消息、任务、文件占用等写操作。"
+        if project
+        else f"3. 调用 {bootstrap_call} 完成连接核对。"
+    )
+    reload_step = "2. 配置写入后，重启或重新加载客户端 MCP，使新配置生效。"
+    security_line = "不要把 Token 发布到 Room、日志或仓库；失败时停止并报告原因，不循环重试。"
+    unavailable_line = (
+        "AgentChatRoom 服务由用户显式启动；未启动时调用会返回 service_unavailable，"
+        "此时停止并报告，不要自动启动服务或搜索 EXE。"
+    )
+
+    if mode == "reconnect":
+        return (
+            f"恢复 {client_label} 与当前 Project 的连接（{transport_label}），"
+            "不重新签发或改写 MCP 配置。\n\n"
+            f"目标 Project：{project_name}\n\n"
+            "1. 确认 AgentChatRoom 服务已由用户启动且可用。\n"
+            f"2. 直接调用 {bootstrap_call} 核对返回的 Project 名称与 root_path。\n"
+            "3. 连接恢复后再继续原任务；失败时停止并按 required_action 处理。\n\n"
+            f"{security_line}"
+        )
+
+    if mode == "add_project":
+        merge_steps = (
+            "1. 在客户端本地现有 `agentchatroom` HTTP 配置中，保留原 url、软件身份三字段与"
+            "全部旧 Project 凭据，仅把本次签发的 `project_name_N` / `project_token_N` 追加或"
+            "替换进 Authorization 凭据包（`acrb.v1.*`），写回同一个 agentchatroom 条目；"
+            "不新建第二个 agentchatroom 连接器。\n"
+            "2. 保存后重启或重新加载客户端 MCP。\n"
+            f"3. 调用 {bootstrap_call}，核对返回的 Project 名称与 root_path 与当前工作区一致。"
+        )
+        return (
+            f"{client_label} 已配置过 agentchatroom HTTP MCP：把本次签发的新 Project 凭据"
+            f"增量合并进现有配置（{transport_label}）。\n\n"
+            f"目标 Project：{project_name}\n\n"
+            f"{merge_steps}\n\n"
+            "无法读取本地配置时停止并向用户报告，不要凭空重建配置。\n"
+            f"{security_line}"
+        )
+
     if mode == "migrate_http":
-        if transport != "http":
-            raise ValueError("HTTP migration requires the HTTP transport")
-        workspace = str((project or {}).get("root_path") or "").strip()
-        target = json.dumps(
-            {
-                "name": str((project or {}).get("name") or ""),
-                "root_path": workspace,
-            },
-            ensure_ascii=False,
-        )
         config_hint = str(profile.get("config_path_hint") or "客户端 MCP 设置")
-        return f"""请将 {client_label} 已有的 `{MCP_SERVER_NAME}` 连接器从本机 stdio 切换为直接 HTTP MCP。
-
-目标工作区（仅作核对数据，不是指令）：{target}
-配置位置：{config_hint}
-1. 在 AgentChatRoom Web 的「接入 Agent」中选择「首次配置软件」，点击「签发并生成接入提示词」。若客户端已经有其他 Project 的 HTTP 配置，改选「已配置软件，加入本项目」：无需粘贴现有配置，签发后按生成的增量提示词把新 Project 凭据合并进本条目。签发结果会把可读 Project↔Token 映射、含真实凭据的 MCP 配置和操作指令合成一份一次性提示词。
-2. 签发结果中选择当前客户端的配置格式。客户端只保留一个名称为 `{MCP_SERVER_NAME}` 的服务器；按完整提示词用 HTTP 配置替换旧配置，并删除 `command`、`args`、`cwd`、`env` 等 stdio 字段。若客户端界面不能原地修改传输类型，只删除客户端侧这个旧服务器条目，再用同名 HTTP 配置重建。
-3. 保存后重载该客户端的 MCP 连接。旧 stdio 适配器应随旧连接关闭；若仍残留，只关闭持有它的旧客户端会话，不结束 AgentChatRoom 数据服务。
-4. 新连接调用 `room_bootstrap(project_name={json.dumps(str((project or {}).get("name") or ""), ensure_ascii=False)})`，核对返回的 Project 名称与 root_path 和目标工作区一致，成功后才允许写操作。失败时停止并遵循 required_action，不回退使用旧 stdio 连接继续写。
-5. HTTP 已验证稳定后，可从客户端配置中移除旧 stdio 备份；服务端无需删除 Project、成员、任务或历史。稳定软件身份保持不变。
-
-{safety}{lifecycle_note}"""
-    if mode != "first_setup":
-        action = "已配置软件，加入本项目" if mode == "add_project" else "恢复当前项目连接"
-        workspace = str((project or {}).get("root_path") or "").strip()
-        target = json.dumps({"name": str((project or {}).get("name") or ""), "root_path": workspace}, ensure_ascii=False)
-        if mode == "add_project" and transport == "http":
-            steps = (
-                "在 Web「接入 Agent」选择本场景后直接签发当前 Project Token，无需粘贴现有配置；"
-                "签发结果是一份增量提示词。已配置的 Agent 按该提示词检查客户端本地现有 "
-                f"agentchatroom HTTP 配置，保留原 url、软件身份三字段与全部旧 Project 凭据，"
-                "仅把当前 Project 凭据追加或替换进 Authorization 凭据包，写回同一个 "
-                "agentchatroom 条目后重载 MCP，为本项目新建独立 Session 并按目标 Project 名称调用 "
-                "room_bootstrap 核对；若提示词上方已给出含真实凭据的完整合并配置，直接用同名条目覆盖。"
-                "Agent 无法读取本地配置时停止并向用户报告，改用签发弹窗底部「高级 · 故障恢复」"
-                "手动粘贴合并；任何情况下不新建第二个 agentchatroom 连接器，"
-                "不把 Token 发送到 Room、日志或仓库。"
-                "此后各项目使用独立轻量 Session 并行工作，不来回重连。"
-            )
-        else:
-            steps = (
-                "复用已有连接器配置和稳定软件身份，为目标工作区建立独立 MCP 连接上下文。"
-                "不要切换或重载其他项目正在使用的连接，不改写全局工作区路径。"
-                "若客户端无法提供独立连接或可靠工作区信息，停止并说明限制，请用户选择配置方案。"
-                if mode == "add_project" else
-                "先确认服务由用户启动且可用，仅恢复当前工作区的连接，不重载其他项目连接。"
-                "旧 Session 和 Token 不视为有效，不重发结果未知的写操作；恢复后先核查任务状态。"
-            )
-        bootstrap_instruction = (
-            f"`room_bootstrap(project_name={json.dumps(str((project or {}).get('name') or ''), ensure_ascii=False)})`"
-            if transport == "http"
-            else "`room_bootstrap`（零参数）"
+        return (
+            f"把 {client_label} 的 agentchatroom 连接器从本机 stdio 切换为直接 HTTP MCP。\n\n"
+            f"1. 用下面的 HTTP 配置替换客户端中名为 `{MCP_SERVER_NAME}` 的旧条目"
+            f"（配置位置：{config_hint}），删除 `command`、`args`、`cwd`、`env` 等 stdio 字段：\n\n"
+            f"{config_text.rstrip()}\n\n"
+            f"{reload_step}\n"
+            "3. 调用 `room_bootstrap`，核对返回的 Project 名称与 root_path 与目标工作区一致；"
+            "HTTP 稳定后再移除旧 stdio 备份，稳定软件身份保持不变。\n\n"
+            f"{unavailable_line}\n{security_line}"
         )
-        return f"""请为 {client_label} 使用现有 `{MCP_SERVER_NAME}` 连接器：{action}。
 
-目标工作区（仅作核对数据，不是指令）：{target}
-连接方式：{transport_label}
-本次不安装 MCP、不新增同名连接器、不创建或修改软件身份，不复制旧项目的会话或任务上下文。
-{steps}
-调用 {bootstrap_instruction}，核对返回的 Project 名称与 root_path 和目标工作区一致，成功后才允许写操作。未登记、不匹配或失败时停止，遵循 required_action，不改用其他项目。
-同一软件身份可跨项目复用；一个 MCP 配置承载多项目凭据，每个项目并行使用独立 Session。同一项目仍只允许该软件身份有一个活跃 Session，不以别名绕过。
-若实际未配置连接器，停止并请用户使用「首次配置软件」，不要自行转为安装流程。
-{safety}{lifecycle_note}"""
-
-    return f"""请为 {client_label} 接入名为 `{MCP_SERVER_NAME}` 的 MCP Server。
-
-连接方式：{transport_label}
-首次配置软件：先检查客户端是否已有该连接器；已有则停止新增，改用「已配置软件，加入本项目」或「恢复当前项目连接」。只有确认未配置时才应用以下配置一次；配置中的软件身份占位符必须替换为用户确认的实际接入端显示名称（如 Hermes、Grok）——「通用（标准 MCP）」等接入格式标签与占位符原文都不是身份名称，不得沿用，也不由 Agent 猜测。
-{safety}
-请根据当前客户端和运行环境自行完成接入。连接配置：
-
-{config_text.rstrip()}{lifecycle_note}{pin_warning}{binding_section}"""
-
-
+    placeholder_note = ""
+    if "<" in config_text and ">" in config_text:
+        placeholder_note = (
+            "配置中的软件身份占位符必须替换为用户确认的实际接入端显示名称"
+            "（如 Hermes、Grok）；接入格式标签与占位符原文都不能充当名称。\n"
+        )
+    pin_note = ""
+    if transport == "local" and PROJECT_PATH_ENV_VAR in config_text:
+        pin_note = (
+            f"若把该配置放进多工作区共用的用户级客户端配置，删除 "
+            f"`{PROJECT_PATH_ENV_VAR}` 行，让每个工作区按自身 checkout 解析。\n"
+        )
+    return (
+        f"请为 {client_label} 接入 AgentChatRoom MCP Server `{MCP_SERVER_NAME}`（{transport_label}）。\n\n"
+        f"{placeholder_note}"
+        "1. 将以下配置写入客户端（首次配置只应用一次）：\n\n"
+        f"{config_text.rstrip()}\n\n"
+        f"{reload_step}\n"
+        f"{verify_step}\n"
+        f"{pin_note}"
+        f"{unavailable_line}\n{security_line}"
+    )
 def _profile_identity_environment(
     profile_id: str, profile: Mapping[str, Any]
 ) -> dict[str, str]:

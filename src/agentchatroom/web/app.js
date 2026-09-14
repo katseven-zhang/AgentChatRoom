@@ -3415,35 +3415,21 @@ function issuedHttpPrompt(profile, setup) {
     `project_name_${index + 1}=${JSON.stringify(item.name)}`,
     `project_token_${index + 1}=${JSON.stringify(item.token)}`,
   ]).join("\n");
-  const template = profile.streamable_http_config_text || "";
-  let instructions = profile?.onboarding_modes?.[mode]?.http
-    || profile?.onboarding_prompts?.http
-    || "按目标 Project 名称完成 room_bootstrap，并核对返回的 Project。";
-  if (template && instructions.includes(template)) {
-    instructions = instructions.replace(
-      template,
-      "（含真实凭据的完整 MCP 配置已在上方给出，请勿再使用占位配置。）",
-    );
-  }
+  // #143：极简 3 步结构——写入配置 -> 重启/重载 MCP -> bootstrap 核对。
   return [
-    "请为当前客户端完成 AgentChatRoom HTTP MCP 接入。以下内容含真实测试凭据。",
-    `接入场景：${modeLabel}`,
-    `目标 Project：${bootstrapProjectName}`,
-    `本工作区固定 bootstrap 参数：project_name=${JSON.stringify(bootstrapProjectName)}`,
-    "MCP Server 标准名称：agentchatroom",
+    `请完成 AgentChatRoom HTTP MCP 接入（${modeLabel}）。目标 Project：${bootstrapProjectName}。`,
     "",
-    "Project 与 Token 对应关系（配置时必须按名称保留，不得混用）：",
+    "Project 与 Token 对应关系（按名称保留，不得混用）：",
     mapping,
     "",
-    "可直接使用的 HTTP MCP 参考配置：",
+    "1. 把下面的 MCP 配置写入客户端（服务器名固定 agentchatroom；客户端格式不同时只转换语法，保留 URL、Authorization 与软件身份字段）：",
+    "",
     config,
     "",
-    "客户端配置格式如与参考格式不同，只转换语法；必须保留 URL、Authorization、软件身份字段和标准服务器名 agentchatroom。不要命名为 agentchatroom-stdio。",
+    "2. 写入后重启或重新加载客户端 MCP，使配置生效。",
+    `3. 调用 room_bootstrap(project_name=${JSON.stringify(bootstrapProjectName)})，核对返回的 Project 名称与 root_path 与当前工作区一致，再执行写操作。`,
     "",
-    "完成配置后执行以下场景指令：",
-    instructions,
-    "",
-    "不要把上述 Token 发布到 Room、日志或仓库。",
+    "不要把 Token 发布到 Room、日志或仓库。",
   ].join("\n");
 }
 
@@ -3451,34 +3437,29 @@ function incrementalHttpPrompt(profile, setup) {
   const credential = validateProjectCredentials(setup.projectCredentials)[0];
   const projectName = String(setup.projectName || credential.name).trim();
   const configHint = profile.config_path_hint || "客户端 MCP 配置文件";
-  const bootstrapCall = `room_bootstrap(project_name=${JSON.stringify(projectName)})`;
   const linkedIdentity = setup.member
     ? normalizedSoftwareIdentity(setup.softwareIdentity)
     : null;
-  const identityInstruction = linkedIdentity
-    ? `本次 Token 已关联成员 ${JSON.stringify(setup.member.name)}，服务端会直接从已关联 Token 解析软件身份：X-AgentChatRoom-Software-Key=${JSON.stringify(linkedIdentity.softwareKey)}，X-AgentChatRoom-Software-Name=${JSON.stringify(linkedIdentity.softwareName)}，X-AgentChatRoom-Software-Client=${JSON.stringify(linkedIdentity.softwareClient)}。现有配置可以没有这三个 Header；若已经配置 Header，则三字段必须与上述身份完全一致，冲突时停止且不要覆盖。凭据包中的其他已关联 Token 也必须属于同一软件身份，否则服务端会拒绝整个连接。`
-    : "本次 Token 未关联成员。必须原样保留客户端现有的软件身份三字段；目标 Project 第一次成功连接时会按该身份自动登记成员。";
+  const identityLine = linkedIdentity
+    ? `本次 Token 已关联成员 ${JSON.stringify(setup.member.name)}：现有配置的软件身份 Header 若存在，三字段必须与 Key=${JSON.stringify(linkedIdentity.softwareKey)} 的身份一致。`
+    : "本次 Token 未关联成员：原样保留客户端现有的软件身份三字段。";
+  // #143：极简 3 步——合并凭据 -> 重启/重载 MCP -> bootstrap 核对。
   return [
-    "该客户端已经配置过 agentchatroom HTTP MCP。请把下面签发的新 Project 凭据增量合并进客户端现有配置；不要新建第二个 agentchatroom 连接器或同名变体，也不要重新执行首次安装。",
+    "该客户端已配置过 agentchatroom HTTP MCP。请把本次签发的新 Project 凭据增量合并进现有配置；不新建第二个 agentchatroom 连接器。",
     "",
-    "接入场景：已配置软件，加入本项目（增量合并）",
     `目标 Project：${projectName}`,
-    `本工作区固定 bootstrap 参数：project_name=${JSON.stringify(projectName)}`,
-    "MCP Server 标准名称：agentchatroom（全局唯一，保持不变）",
     "",
-    "本次签发的新凭据（只用于写入客户端本地 MCP 配置）：",
+    "本次签发凭据：",
     `project_name_1=${JSON.stringify(credential.name)}`,
     `project_token_1=${JSON.stringify(credential.token)}`,
     "",
-    identityInstruction,
+    identityLine,
     "",
-    "操作步骤：",
-    `1. 先检查客户端本地是否已存在名为 agentchatroom 的 HTTP MCP 配置（配置位置参考：${configHint}）。找到后保留它的 url、Authorization 中的全部旧 Project 凭据，以及当前确实存在的软件身份三字段（X-AgentChatRoom-Software-Key / X-AgentChatRoom-Software-Name / X-AgentChatRoom-Software-Client）；缺少这些 Header 时不要据此判定失败，服务端可从已关联 Token 解析身份。只追加或替换本条目。`,
-    "2. Authorization 合并方法：现值为 `Bearer acrb.v1.<base64url>` 时，把 `acrb.v1.` 之后的 base64url 解码为 JSON {\"projects\":[{\"name\":...,\"token\":...}]}，按 Project 名称把 {\"name\":" + JSON.stringify(credential.name) + ",\"token\":" + JSON.stringify(credential.token) + "} 追加或替换进去，用相同编码重新打包为 `Bearer acrb.v1.<新值>` 写回。现值为单个 `Bearer acr.*` Token 时，先保持旧配置不变，用现有连接调用零参数 `room_bootstrap()` 读取并记录旧 Project 的精确名称；然后把旧名称与旧 Token、新名称与新 Token 一并打成上述 `acrb.v1` 凭据包。无法取得旧 Project 名称时停止，不得猜测。",
-    "3. 只写回同一个 agentchatroom 条目，不改动其他 Project 的凭据；保存后重载客户端 MCP，为本项目新建独立 MCP Session，调用 " + bootstrapCall + "，核对返回的 Project 名称与 root_path 与当前工作区一致后才允许写操作。",
-    "4. 无法读取或找不到现有 agentchatroom 配置时：停止合并，向用户报告失败原因和实际检查过的配置文件位置，请用户在 Web 签发弹窗底部展开「高级 · 故障恢复」手动粘贴完整 `acrb.v1` 配置；旧配置只有单个 `acr.*` Token 时，恢复区必须填写明确的 `旧Project名称=旧Token`，不能只粘贴无法识别项目名的单 Token。不要新建同名或变体 MCP，不要凭空重建配置，不要重试超过一次。",
+    `1. 打开客户端现有 agentchatroom 条目（配置位置参考：${configHint}），保留其 url、Authorization 凭据包与软件身份字段，把上面的 {"name":...,"token":...} 合并进 acrb.v1 凭据包后写回同一条目。`,
+    "2. 保存后重启或重新加载客户端 MCP。",
+    `3. 调用 room_bootstrap(project_name=${JSON.stringify(projectName)})，核对返回的 Project 名称与 root_path 与当前工作区一致，再执行写操作；无法读取本地配置时停止并向用户报告。`,
     "",
-    "不要把上述 Token 发布到 Room、日志或仓库；合并完成后不要在回复中复述 Token 内容。",
+    "不要把 Token 发布到 Room、日志或仓库。",
   ].join("\n");
 }
 

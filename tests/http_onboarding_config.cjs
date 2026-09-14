@@ -72,7 +72,6 @@ const prompt = context.issuedHttpPrompt(profile, {
   softwareIdentity: memberIdentity,
 });
 assert.match(prompt, /目标 Project：Project B/);
-assert.match(prompt, /本工作区固定 bootstrap 参数：project_name="Project B"/);
 assert.match(prompt, /project_name_1="Project A"/);
 assert.match(prompt, /project_token_1="acr\.credential-a\.secret-a"/);
 assert.match(prompt, /project_name_2="Project B"/);
@@ -80,14 +79,18 @@ assert.match(prompt, /project_token_2="acr\.credential-b\.secret-b"/);
 assert.match(prompt, /"agentchatroom"/);
 assert.match(prompt, /Bearer acrb\.v1\./);
 assert.match(prompt, /room_bootstrap\(project_name="Project B"\)/);
-assert.match(prompt, /不要命名为 agentchatroom-stdio/);
+assert.match(prompt, /重启或重新加载客户端 MCP/);
+assert.match(prompt, /不要把 Token 发布到 Room、日志或仓库/);
+// #143：冗余说教与占位配置复述从提示词移除。
+assert.doesNotMatch(prompt, /本工作区固定 bootstrap 参数/);
+assert.doesNotMatch(prompt, /不要命名为 agentchatroom-stdio/);
 const firstPrompt = context.issuedHttpPrompt(profile, {
   mode: 'first_setup',
   projectName: 'Project A',
   projectCredentials: [entries[0]],
   softwareIdentity: memberIdentity,
 });
-assert.match(firstPrompt, /接入场景：首次配置软件/);
+assert.match(firstPrompt, /首次配置软件/);
 assert.match(firstPrompt, /目标 Project：Project A/);
 assert.match(firstPrompt, /project_name_1="Project A"/);
 assert.match(firstPrompt, /project_token_1="acr\.credential-a\.secret-a"/);
@@ -98,29 +101,26 @@ const incrementalPrompt = context.incrementalHttpPrompt(profile, {
   projectCredentials: [entries[1]],
   incremental: true,
 });
-assert.match(incrementalPrompt, /接入场景：已配置软件，加入本项目（增量合并）/);
+assert.match(incrementalPrompt, /增量合并进现有配置/);
 assert.match(incrementalPrompt, /目标 Project：Project B/);
-assert.match(incrementalPrompt, /本工作区固定 bootstrap 参数：project_name="Project B"/);
-assert.match(incrementalPrompt, /MCP Server 标准名称：agentchatroom/);
 assert.match(incrementalPrompt, /project_name_1="Project B"/);
 assert.match(incrementalPrompt, /project_token_1="acr\.credential-b\.secret-b"/);
 assert.doesNotMatch(incrementalPrompt, /project_name_2/);
 assert.doesNotMatch(incrementalPrompt, /credential-a/);
-assert.match(incrementalPrompt, /不要新建第二个 agentchatroom/);
+assert.match(incrementalPrompt, /不新建第二个 agentchatroom 连接器/);
 assert.match(incrementalPrompt, /软件身份三字段/);
-assert.match(incrementalPrompt, /全部旧 Project 凭据/);
-assert.match(incrementalPrompt, /写回同一个 agentchatroom 条目/);
+assert.match(incrementalPrompt, /写回同一条目/);
+assert.match(incrementalPrompt, /重启或重新加载客户端 MCP/);
 assert.match(incrementalPrompt, /room_bootstrap\(project_name="Project B"\)/);
 assert.match(incrementalPrompt, /acrb\.v1/);
 assert.doesNotMatch(incrementalPrompt, /Bearer acrb\.v1\.[A-Za-z0-9_-]/);
-assert.match(incrementalPrompt, /现值为单个 `Bearer acr\.\*` Token/);
-assert.match(incrementalPrompt, /零参数 `room_bootstrap\(\)`/);
-assert.match(incrementalPrompt, /旧Project名称=旧Token/);
-assert.match(incrementalPrompt, /高级 · 故障恢复/);
-assert.match(incrementalPrompt, /无法读取或找不到现有 agentchatroom 配置/);
-assert.match(incrementalPrompt, /不要把上述 Token 发布到 Room、日志或仓库/);
-assert.match(incrementalPrompt, /本次 Token 未关联成员/);
-assert.match(incrementalPrompt, /第一次成功连接时会按该身份自动登记成员/);
+// #143：手动恢复指引与多余警告移除。
+assert.doesNotMatch(incrementalPrompt, /现值为单个/);
+assert.doesNotMatch(incrementalPrompt, /零参数 `room_bootstrap\(\)`/);
+assert.doesNotMatch(incrementalPrompt, /旧Project名称=旧Token/);
+assert.doesNotMatch(incrementalPrompt, /高级 · 故障恢复/);
+assert.match(incrementalPrompt, /不要把 Token 发布到 Room、日志或仓库/);
+assert.match(incrementalPrompt, /原样保留客户端现有的软件身份三字段/);
 const linkedIncrementalPrompt = context.incrementalHttpPrompt(profile, {
   mode: 'add_project',
   projectName: 'Project B',
@@ -130,10 +130,8 @@ const linkedIncrementalPrompt = context.incrementalHttpPrompt(profile, {
   softwareIdentity: memberIdentity,
 });
 assert.match(linkedIncrementalPrompt, /本次 Token 已关联成员 "Chosen Agent"/);
-assert.match(linkedIncrementalPrompt, /X-AgentChatRoom-Software-Key="chosen"/);
-assert.match(linkedIncrementalPrompt, /现有配置可以没有这三个 Header/);
-assert.match(linkedIncrementalPrompt, /若已经配置 Header/);
-assert.match(linkedIncrementalPrompt, /其他已关联 Token 也必须属于同一软件身份/);
+assert.match(linkedIncrementalPrompt, /Key="chosen"/);
+assert.match(linkedIncrementalPrompt, /三字段必须与/);
 const replaced = context.mergeProjectCredentials(entries, {
   name: 'Project B',
   token: 'acr.credential-b2.secret-b2',
