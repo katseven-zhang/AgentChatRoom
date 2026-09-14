@@ -595,20 +595,14 @@
             <select id="integration-onboarding-mode">
               <option value="first_setup">首次配置软件</option>
               <option value="add_project">已配置软件，加入本项目</option>
-              <option value="reconnect">恢复当前项目连接</option>
             </select>
-            <p class="secondary-text">请按客户端实际配置选择；已有旧连接器时用生成的同名 HTTP 配置替换，不删除 Room 数据。</p>
+            <p class="secondary-text">已有旧连接器时用生成的同名 HTTP 配置替换，不删除 Room 数据。</p>
           </div>
           <div>
             <p class="integration-choice-label">连接方式</p>
             <div class="segmented-control integration-transport-tabs" id="integration-transport-tabs" aria-label="连接方式（仅 HTTP）">
               <button type="button" class="is-active" data-integration-transport="http">HTTP 直连</button>
             </div>
-            <p class="secondary-text">本机与远程客户端统一使用 HTTP 直连，共用服务并减少适配器进程。</p>
-          </div>
-          <div>
-            <p class="integration-choice-label">Agent 客户端</p>
-            <div class="segmented-control integration-tabs" id="integration-format-tabs" aria-label="目标 Agent"></div>
           </div>
         </section>
 
@@ -616,15 +610,15 @@
           <div class="integration-heading">
             <div>
                 <h3 id="integration-http-action-title">签发并生成首次接入提示词</h3>
-                <p id="integration-http-action-description" class="secondary-text">签发当前 Project 的 Token，生成一份包含目标 Project、真实 MCP 配置和首次接入指令的完整提示词。</p>
+                <p id="integration-http-action-description" class="secondary-text">签发当前 Project 的 Token，生成一份可直接交给 Agent 的完整提示词。</p>
                 <p class="form-hint">目标 Project：<strong id="integration-target-project"></strong></p>
             </div>
-              <button type="button" class="secondary-button" id="integration-open-token-button">签发并生成接入提示词</button>
+              <button type="button" class="primary-button integration-cta" id="integration-open-token-button">签发并生成接入提示词</button>
           </div>
           <ol class="http-token-steps" id="integration-http-action-steps">
-              <li>核对软件成员、权限与有效期后签发。</li>
-              <li>签发结果只生成一个可复制区：Project 名称、含 Token 的完整 MCP 配置和对应接入指令都在其中。</li>
-              <li>把整段内容交给 Agent；Agent 写入客户端 MCP 设置并按其中的 Project 名称调用 <code>room_bootstrap</code>。</li>
+              <li>点「签发并生成接入提示词」，核对成员、权限与有效期后签发。</li>
+              <li>复制生成的整段提示词（Project 名称、完整 MCP 配置与接入指令都在其中）。</li>
+              <li>交给 Agent：写入客户端 MCP 设置，重载后按提示词调用 <code>room_bootstrap</code>。</li>
           </ol>
         </section>
 

@@ -107,6 +107,30 @@ assert.equal(nameGroup.hidden, true, 'incremental join keeps the client identity
     assert run.returncode == 0, run.stderr
 
 
+def test_web_integration_wizard_is_minimal_with_primary_cta():
+    """#140：接入向导只保留两个场景与单一连接方式说明，签发按钮是醒目
+    主行动按钮，快速接入指引精简为 3 步，高级手动配置默认收起。"""
+    markup = (WEB_DIR / "index.html").read_text(encoding="utf-8")
+    javascript = (WEB_DIR / "app.js").read_text(encoding="utf-8")
+
+    # 场景下拉只剩首次配置与增量加入；「恢复当前项目连接」不再是选项。
+    assert '<option value="first_setup">首次配置软件</option>' in markup
+    assert '<option value="add_project">已配置软件，加入本项目</option>' in markup
+    assert '<option value="reconnect">' not in markup
+    # 无切换意义的客户端选择行整体移除。
+    assert "Agent 客户端" not in markup
+    # 主行动按钮升级 + 醒目大号样式。
+    assert 'class="primary-button integration-cta" id="integration-open-token-button"' in markup
+    assert ".integration-cta" in (WEB_DIR / "app.css").read_text(encoding="utf-8")
+    # 快速接入指引保持精简 3 步。
+    steps_start = markup.index('id="integration-http-action-steps"')
+    steps_end = markup.index("</ol>", steps_start)
+    assert markup[steps_start:steps_end].count("<li>") == 3
+    # 高级排障手动配置保持默认收起（details 无 open），且首次接入直接隐藏。
+    assert '<details id="token-existing-config-advanced" class="integration-fallback" hidden>' in markup
+    assert 'token-existing-config-advanced"].hidden = !isAddProject' in javascript
+
+
 def test_web_pinned_software_key_is_issued_without_random_suffix(tmp_path):
     """#139：模板固定 software_key 的接入格式按原样签发，不再拼随机后缀；
     只有 generic 这类无固定 key 的模板保留随机后缀，且签发提交流程包含
@@ -386,12 +410,15 @@ def test_web_supports_human_reading_and_guided_interactions():
     assert "data-copy-event" in javascript
     assert "data-open-event" in javascript
     assert "function renderIntegrationTabs()" in javascript
-    assert 'class="segmented-control integration-tabs" id="integration-format-tabs"' in markup
+    # #140：单一「通用（标准 MCP）」不再渲染成无切换意义的客户端选择行。
+    assert 'id="integration-format-tabs"' not in markup
+    assert "querySelector(\".integration-tabs\")" not in javascript
+    assert '<option value="reconnect">' not in markup
     assert "state.integration.profiles" in javascript
     assert 'id="integration-onboarding-prompt"' in markup
     assert "当前场景的接入指令" in markup
     assert '<section class="integration-section onboarding-section" hidden>' in markup
-    assert "签发结果只生成一个可复制区" in markup
+    assert "复制生成的整段提示词" in markup
     assert "Project↔Token" in javascript
     assert "受权限限制时返回可直接粘贴的配置文本" not in markup
     assert 'id="token-config-copy"' in markup
@@ -549,8 +576,10 @@ def test_web_local_mcp_assistant_separates_write_reload_and_presence_states():
     assert ".local-mcp-facts" in stylesheet
     assert '.local-mcp-fact[data-state="ready"]' in stylesheet
     assert "grid-template-columns: repeat(2, minmax(0, 1fr));" in stylesheet
-    assert ".integration-tabs button:last-child" in stylesheet
     assert ".integration-transport-tabs" in stylesheet
+    # #140：签发按钮升级为醒目主行动按钮，向导步骤保持精简 3 步。
+    assert ".integration-cta" in stylesheet
+    assert "class=\"primary-button integration-cta\" id=\"integration-open-token-button\"" in markup
     assert ".http-token-guide" in stylesheet
     assert ".http-token-steps" in stylesheet
 
@@ -2112,7 +2141,9 @@ def test_web_local_mcp_assistant_offers_generic_only():
     markup = (WEB_DIR / "index.html").read_text(encoding="utf-8")
 
     assert 'integrationFormat: "generic"' in javascript
-    assert 'filter((id) => id === "generic")' in javascript
+    # #140 起单一 generic profile 不再渲染切换行，仅作为默认格式使用。
+    assert 'state.integrationFormat = "generic"' in javascript
+    assert 'filter((id) => id === "generic")' not in javascript
     # named-client defaults are gone from the UI layer
     assert 'integrationFormat: "workbuddy"' not in javascript
     assert "选择客户端并完成本机 MCP 配置" not in markup

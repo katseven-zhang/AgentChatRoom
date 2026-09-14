@@ -2431,22 +2431,6 @@ document.getElementById("integration-onboarding-mode").addEventListener("change"
   if (state.integrationOnboardingMode === "first_setup") void refreshLocalMcpPlan();
 });
 
-document.querySelector(".integration-tabs").addEventListener("click", (event) => {
-  const button = event.target.closest("[data-integration-format]");
-  if (!button) return;
-  state.integrationFormat = button.dataset.integrationFormat;
-  document.querySelectorAll("[data-integration-format]").forEach((item) => {
-    item.classList.toggle("is-active", item === button);
-  });
-  renderIntegrationConfig();
-  renderProjectInstructions();
-  renderOnboardingPrompt();
-  state.integrationLocalPlan = null;
-  state.integrationLocalApplyResult = null;
-  renderLocalMcpPlan();
-  void refreshLocalMcpPlan();
-});
-
 elements["integration-transport-tabs"].addEventListener("click", (event) => {
   const button = event.target.closest("[data-integration-transport]");
   if (!button) return;
@@ -3933,16 +3917,12 @@ async function downloadProjectExport() {
 }
 
 function renderIntegrationTabs() {
-  const container = document.querySelector(".integration-tabs");
-  if (!container || !state.integration?.profiles) return;
-  // 配置助手只保留通用标准 MCP 接入；具名客户端预设仅保留在后端 CLI 里。
-  const profileIds = Object.keys(state.integration.profiles).filter((id) => id === "generic");
-  if (!profileIds.length) return;
-  if (!profileIds.includes(state.integrationFormat)) {
-    state.integrationFormat = profileIds[0];
+  // 配置助手只保留通用标准 MCP 接入（具名客户端预设仅在后端 CLI 里），
+  // 单一选项不再渲染切换行；profile 仍经 state.integrationFormat 使用。
+  if (!state.integration?.profiles) return;
+  if (!Object.keys(state.integration.profiles).includes(state.integrationFormat)) {
+    state.integrationFormat = "generic";
   }
-  container.innerHTML = profileIds.map((profileId) => `
-    <button type="button" ${profileId === state.integrationFormat ? 'class="is-active" ' : ""}data-integration-format="${escapeHtml(profileId)}">${escapeHtml(state.integration.profiles[profileId].label || profileId)}</button>`).join("");
 }
 
 function localMcpAssistantSupported() {
