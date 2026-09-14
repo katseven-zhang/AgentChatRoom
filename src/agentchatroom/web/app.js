@@ -818,7 +818,7 @@ async function api(path, options = {}) {
   return payload;
 }
 
-function showLoginDialog() {
+function showLoginDialog(notice) {
   closeEventSource();
   stopPresenceRefresh();
   state.authenticated = false;
@@ -827,7 +827,48 @@ function showLoginDialog() {
   renderEmptyRoom();
   elements["logout-button"].classList.add("is-hidden");
   setConnection("offline", "需要登录");
+  if (notice) elements["login-error"].textContent = notice;
   if (!elements["login-dialog"].open) elements["login-dialog"].showModal();
+}
+
+// #148：SSE 断线后不再依赖浏览器原生 EventSource 的无限重试（会带着
+// 失效 Cookie 打出 401 死循环），改为主动探测鉴权状态后决定重连方式。
+let streamRetryTimer = null;
+let streamRetryDelayMs = 1000;
+
+function scheduleStreamRetry(projectId, after) {
+  if (streamRetryTimer) clearTimeout(streamRetryTimer);
+  streamRetryTimer = setTimeout(() => {
+    streamRetryTimer = null;
+    if (state.projectId === projectId) connectEvents(after);
+  }, streamRetryDelayMs);
+  // 指数退避并封顶，避免服务重启期间控制台无限报错。
+  streamRetryDelayMs = Math.min(streamRetryDelayMs * 2, 10000);
+}
+
+async function probeAuthAndReconnect(projectId, after) {
+  try {
+    const response = await fetch("/api/v1/auth/status");
+    if (!response.ok) {
+      scheduleStreamRetry(projectId, after);
+      return;
+    }
+    const auth = await response.json();
+    if (auth.required && !auth.authenticated) {
+      // 密码模式下会话彻底失效：停止盲试，引导重新登录。
+      streamRetryDelayMs = 1000;
+      setConnection("offline", "会话已过期，请重新登录");
+      showLoginDialog("会话已过期，请重新登录");
+      return;
+    }
+    // 免密模式或会话仍有效：auth/status 会顺带静默续签浏览器会话
+    // Cookie，退避后即可恢复连接，无需手动刷新页面。
+    streamRetryDelayMs = 1000;
+    scheduleStreamRetry(projectId, after);
+  } catch (_error) {
+    // 服务不可达（重启中）：退避后继续探测。
+    scheduleStreamRetry(projectId, after);
+  }
 }
 
 function setConnection(status, label) {
@@ -1051,6 +1092,10 @@ function mergeEvents(events) {
 function closeEventSource() {
   if (state.eventSource) state.eventSource.close();
   state.eventSource = null;
+  if (streamRetryTimer) {
+    clearTimeout(streamRetryTimer);
+    streamRetryTimer = null;
+  }
 }
 
 function stopPresenceRefresh() {
@@ -1164,6 +1209,7 @@ function connectEvents(after) {
   const source = new EventSource(`/api/v1/projects/${projectId}/events/stream?after=${after}`);
   state.eventSource = source;
   source.onopen = () => {
+    streamRetryDelayMs = 1000;
     setConnection("online", "浏览器已连接");
     if (state.streamHadError) {
       state.streamHadError = false;
@@ -1176,6 +1222,9 @@ function connectEvents(after) {
   source.onerror = () => {
     state.streamHadError = true;
     setConnection("offline", "浏览器正在重连");
+    source.close();
+    if (state.eventSource === source) state.eventSource = null;
+    probeAuthAndReconnect(projectId, state.snapshot?.cursor || after).catch(() => scheduleStreamRetry(projectId, after));
   };
   source.addEventListener("room_event", async (message) => {
     const capturedProjectId = projectId;

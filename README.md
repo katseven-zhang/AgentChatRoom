@@ -624,6 +624,8 @@ Agent 自报的 `worktree` 不会被服务盲目信任。Work Report 采集 Git 
 
 「系统设置」弹窗（顶栏按钮，全局作用域）收拢中心运行状态（生效配置、进程、脱敏日志）、数据库全量备份与回滚，以及自动备份策略配置；项目设置弹窗只承载单 Project 属性（名称、租约冲突策略、默认优先级、MCP 消息条数、团队约定、审计保留策略与审计数据导出）。
 
+浏览器 SSE 长连接断开时（#148）：前端会主动探测 `/api/v1/auth/status`——免密/默认模式下该接口顺带静默续签浏览器会话 Cookie，前端按指数退避自动重建连接并恢复「浏览器已连接」，无需手动刷新；密码模式下会话彻底失效时停止盲目重试，弹出登录弹窗并明确提示会话已过期。
+
 审计历史分页在共享领域服务实现，REST `GET /api/v1/projects/{project_id}/audit`、MCP `audit_query` 和 CLI `audit` 复用同一实现：`after` / `before` 界定开区间 id 窗口（`before=0` 保持旧的前向行为），`limit` 1–1000（默认 200），支持 `event_type`、`actor_session_id`、`task_id` 过滤；响应含 `has_older` / `has_newer` 续页标志。`after >= before`（同时提供时）返回结构化错误。事件本身仍只追加、不改写。
 
 ### 数据库备份与回滚

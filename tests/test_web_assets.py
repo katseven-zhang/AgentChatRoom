@@ -538,6 +538,63 @@ def test_web_management_grid_pagination_and_workspace_drawer():
     assert ".grid-placeholder" in stylesheet
 
 
+def test_web_sse_reconnect_probes_auth_before_retrying(tmp_path):
+    """#148：SSE 断线后先探测 /api/v1/auth/status——免密模式静默续签后
+    重连；密码模式会话失效时停止盲试并弹出登录提示；服务重启期间退避
+    重试，不再出现 401 死循环。"""
+    javascript = (WEB_DIR / "app.js").read_text(encoding="utf-8")
+
+    start = javascript.index("async function probeAuthAndReconnect(")
+    end = javascript.index("function setConnection(status, label) {", start)
+    snippet = javascript[start:end]
+    harness = tmp_path / "sse_reconnect.mjs"
+    harness.write_text(
+        "import assert from 'node:assert/strict';\n"
+        "const state = {projectId: 'p1', snapshot: {cursor: 50}};\n"
+        "let streamRetryDelayMs = 1000;\n"
+        "const retries = [];\n"
+        "const scheduleStreamRetry = (projectId, after) => retries.push([projectId, after]);\n"
+        "const connections = [];\n"
+        "const setConnection = (status, label) => connections.push(label);\n"
+        "const logins = [];\n"
+        "const showLoginDialog = (notice) => logins.push(notice);\n"
+        + snippet
+        + """
+// 免密模式：auth/status 静默续签 Cookie，退避后重连。
+globalThis.fetch = async () => ({ok: true, json: async () => ({required: false, authenticated: true})});
+await probeAuthAndReconnect('p1', 50);
+assert.deepEqual(retries, [['p1', 50]]);
+assert.deepEqual(logins, []);
+
+// 密码模式且会话失效：停止重试，弹出登录提示。
+retries.length = 0;
+globalThis.fetch = async () => ({ok: true, json: async () => ({required: true, authenticated: false})});
+await probeAuthAndReconnect('p1', 50);
+assert.deepEqual(retries, []);
+assert.deepEqual(logins, ['会话已过期，请重新登录']);
+assert.ok(connections.includes('会话已过期，请重新登录'));
+
+// 服务不可达（重启中）：退避重试而不是放弃。
+retries.length = 0;
+globalThis.fetch = async () => { throw new Error('down'); };
+await probeAuthAndReconnect('p1', 50);
+assert.deepEqual(retries, [['p1', 50]]);
+""",
+        encoding="utf-8",
+    )
+    run = subprocess.run(["node", str(harness)],
+                         capture_output=True, text=True)
+    assert run.returncode == 0, run.stderr
+
+    # onerror 主动断开原生 EventSource（终结 401 无限重试）并走探测路径。
+    error_start = javascript.index("source.onerror = () => {")
+    error_end = javascript.index('source.addEventListener("room_event"', error_start)
+    handler = javascript[error_start:error_end]
+    assert "source.close()" in handler
+    assert "probeAuthAndReconnect(" in handler
+    assert 'fetch("/api/v1/auth/status")' in javascript
+
+
 def test_web_supports_human_reading_and_guided_interactions():
     javascript = (WEB_DIR / "app.js").read_text(encoding="utf-8")
     markup = (WEB_DIR / "index.html").read_text(encoding="utf-8")
