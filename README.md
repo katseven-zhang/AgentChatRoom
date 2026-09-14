@@ -613,21 +613,22 @@ Agent 自报的 `worktree` 不会被服务盲目信任。Work Report 采集 Git 
 
 ### 管理 Tab：每个入口什么时候才需要点
 
-管理 Tab 只保留有真实场景的入口，删除了与自动生命周期重复的手工按钮：
+管理 Tab 只保留纯项目级资产（项目文档、成员、Token、Workspace、审计与归档），全局运维自 #146 起收拢到顶栏「系统设置」弹窗：
 
 | 入口 | 什么时候才需要点 | 说明 |
 | --- | --- | --- |
-| 刷新（运行状态/审计） | 排障时想拉取最新运行状态或日志 | 运行状态字段卡展示服务地址、数据库类型与实际路径、配置来源、日志路径、PID/进程状态、管理认证开关、MCP HTTP 启用与路径；原始 JSON 折叠为「调试用」视图 |
 | 签发 / 修改权限 / 续期 Token | 通过 Web 为 Agent 生成或维护 HTTP 直连接入配置时 | Token 按 Project 与软件身份签发；列表标题和每张 Token 卡片都显示所属 Project，新签发 Token 的默认名称也包含 Project 名。卡片不显示权限明细，「修改权限」在弹窗中调整同一个 Token 的权限，「续期」从当前到期时间增加有效天数（已过期则从当前时间起算），两者都不更换 Token、无需重新接入。同一客户端可在一个 `agentchatroom` MCP 配置中保存多个 Project 凭据；吊销始终可用 |
 | 成员吊销 | 某个软件身份离开团队或需要禁用时 | 成员由 Agent 接入时自动创建；Web 不提供手工添加/编辑（REST `member_create`/`member_update` 仍可用于管理端脚本化场景） |
 | Workspace 列表 | 排查跨电脑项目路径登记是否正确 | 只读自动列表：Agent 通过 `room_join` 自动登记，Web 不再提供手动登记入口（REST 仍可编程登记） |
 | 审计筛选/翻页 | 需要追溯某个事件类型或更早的历史 | 审计历史按服务端分页加载，支持「加载更早」「加载更新」，刷新不丢已加载窗口；窗口大小由受验证配置 `coordination.audit_window_size`（默认 100，环境变量 `AGENTCHATROOM_AUDIT_WINDOW_SIZE`）控制 |
 
+「系统设置」弹窗（顶栏按钮，全局作用域）收拢中心运行状态（生效配置、进程、脱敏日志）、数据库全量备份与回滚，以及自动备份策略配置；项目设置弹窗只承载单 Project 属性（名称、租约冲突策略、默认优先级、MCP 消息条数、团队约定、审计保留策略与审计数据导出）。
+
 审计历史分页在共享领域服务实现，REST `GET /api/v1/projects/{project_id}/audit`、MCP `audit_query` 和 CLI `audit` 复用同一实现：`after` / `before` 界定开区间 id 窗口（`before=0` 保持旧的前向行为），`limit` 1–1000（默认 200），支持 `event_type`、`actor_session_id`、`task_id` 过滤；响应含 `has_older` / `has_newer` 续页标志。`after >= before`（同时提供时）返回结构化错误。事件本身仍只追加、不改写。
 
 ### 数据库备份与回滚
 
-数据库承载全部协作历史与审计。管理 Tab 的「数据库与备份」区块与管理端 REST 暴露产品级备份能力，底层复用 `backup_sqlite` / `backup_postgresql`：
+数据库承载全部协作历史与审计。「系统设置」弹窗的「数据库与备份」区块与管理端 REST 暴露产品级备份能力，底层复用 `backup_sqlite` / `backup_postgresql`：
 
 - **位置可见性**：运行状态字段卡展示数据库类型、SQLite 绝对路径（PostgreSQL 显示脱敏 DSN 指向）、数据目录与日志路径，值全部来自运行时配置。
 - **立即备份**：`POST /api/v1/admin/backups`（管理认证）把数据库快照写入 `<数据目录>/backups/`，返回备份文件绝对路径（界面可复制）；备份清单记录 schema 版本与事件游标，操作写入审计事件 `backup.created`。

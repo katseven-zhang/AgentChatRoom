@@ -78,6 +78,7 @@ const elements = Object.fromEntries(
     "task-assign-title", "task-assign-agent", "task-assign-agent-empty", "task-assign-note", "task-assign-submit",
     "settings-dialog", "settings-form", "settings-project-name", "settings-lease-policy", "settings-roles",
     "settings-default-priority", "settings-mcp-message-limit", "settings-audit-retention", "settings-auto-backup", "settings-backup-max-kept", "settings-backup-hint",
+    "system-settings-button", "system-settings-dialog", "system-settings-close", "save-backup-policy-button",
     "archive-dialog", "archive-form", "archive-project-name", "permanent-delete-input",
     "remove-project-hint", "remove-project-submit",
     "integration-dialog", "integration-data-dir", "integration-log-path",
@@ -1776,7 +1777,7 @@ const BACKUP_PAGE_SIZE = 5;
 function renderBackups() {
   const autoBackup = state.autoBackupInfo;
   const autoSummary = autoBackup
-    ? `自动备份：${autoBackup.enabled ? `已开启 · 每 ${Math.round(autoBackup.interval_seconds / 60)} 分钟 · 保留 ${autoBackup.max_kept} 份` : "未开启（可在项目设置或配置 [backup] 开启）"}`
+    ? `自动备份：${autoBackup.enabled ? `已开启 · 每 ${Math.round(autoBackup.interval_seconds / 60)} 分钟 · 保留 ${autoBackup.max_kept} 份` : "未开启（可在系统设置或配置 [backup] 开启）"}`
     : "";
   const total = state.managedBackups.length;
   const pages = Math.max(1, Math.ceil(total / BACKUP_PAGE_SIZE));
@@ -2259,11 +2260,30 @@ document.getElementById("project-settings-button").addEventListener("click", () 
     project.settings.audit_retention_days ?? 0,
   );
   elements["settings-dialog"].showModal();
+});
+elements["system-settings-button"].addEventListener("click", () => {
+  // #146：全局运维（自动备份策略、运行状态、全库备份）收拢在系统设置弹窗。
+  elements["system-settings-dialog"].showModal();
   api("/api/v1/admin/backup-settings").then((settings) => {
     elements["settings-auto-backup"].checked = !!settings.auto_backup_enabled;
     elements["settings-backup-max-kept"].value = settings.auto_backup_max_kept ?? 10;
     elements["settings-backup-hint"].textContent = `${settings.effective || ""} · 配置文件：${settings.config_path || "-"}`;
   }).catch(handleError);
+  if (state.projectId) refreshManagement().catch(handleError);
+});
+elements["save-backup-policy-button"].addEventListener("click", async () => {
+  try {
+    await api("/api/v1/admin/backup-settings", {
+      method: "PUT",
+      body: JSON.stringify({
+        auto_backup_enabled: elements["settings-auto-backup"].checked,
+        auto_backup_max_kept: Number(elements["settings-backup-max-kept"].value),
+      }),
+    });
+    showToast("备份策略已保存");
+  } catch (error) {
+    handleError(error);
+  }
 });
 elements["export-audit-data-button"].addEventListener("click", () => downloadProjectExport().catch(handleError));
 document.getElementById("refresh-button").addEventListener("click", () => {
@@ -2885,13 +2905,6 @@ elements["settings-form"].addEventListener("submit", async (event) => {
           mcp_message_limit: Number(elements["settings-mcp-message-limit"].value),
           audit_retention_days: Number(elements["settings-audit-retention"].value),
         },
-      }),
-    });
-    await api("/api/v1/admin/backup-settings", {
-      method: "PUT",
-      body: JSON.stringify({
-        auto_backup_enabled: elements["settings-auto-backup"].checked,
-        auto_backup_max_kept: Number(elements["settings-backup-max-kept"].value),
       }),
     });
     elements["settings-dialog"].close();

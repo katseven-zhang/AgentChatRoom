@@ -76,7 +76,8 @@
           </div>
           <div class="workspace-actions">
             <button class="secondary-button" id="connect-agent-button" type="button" disabled>接入 Agent</button>
-            <button class="icon-button" id="project-settings-button" type="button" title="项目设置" aria-label="项目设置" disabled>⚙</button>
+            <button class="secondary-button" id="project-settings-button" type="button" disabled>项目设置</button>
+            <button class="secondary-button" id="system-settings-button" type="button">系统设置</button>
             <button class="danger-button" id="archive-project-button" type="button" disabled>归档项目</button>
             <button class="primary-button" id="create-task-button" type="button" disabled><span aria-hidden="true">+</span> 新建任务</button>
           </div>
@@ -166,40 +167,6 @@
         <section class="tab-panel" id="panel-management" role="tabpanel" aria-labelledby="tab-management">
           <div class="scope-status"><span>备注</span><p>查看服务状态，管理备份、项目文档和访问权限。操作记录可在下方审计中查询。</p></div>
           <div class="management-stack">
-            <section class="data-section unframed management-section">
-              <div class="section-heading">
-                <div>
-                  <h3>中心运行状态</h3>
-                  <p class="secondary-text">生效配置、进程和脱敏日志</p>
-                </div>
-                <button class="secondary-button" id="refresh-runtime-button" type="button" disabled>刷新</button>
-              </div>
-              <div id="runtime-status" class="runtime-grid"></div>
-              <details class="runtime-details">
-                <summary>查看生效配置</summary>
-                <div id="runtime-config" class="runtime-config-cards"></div>
-                <details class="evidence-block runtime-debug">
-                  <summary>原始 JSON（调试用）</summary>
-                  <pre id="runtime-config-raw" class="code-block runtime-code"></pre>
-                </details>
-              </details>
-              <details class="runtime-details">
-                <summary>查看最近日志</summary>
-                <pre id="runtime-log" class="code-block runtime-log"></pre>
-              </details>
-            </section>
-
-            <section class="data-section unframed management-section">
-              <div class="section-heading">
-                <div>
-                  <h3>数据库与备份</h3>
-                  <p class="secondary-text">备份会另存整个协作数据库；回滚会丢弃备份之后的数据，需二次确认</p>
-                </div>
-                <button class="secondary-button" id="create-backup-button" type="button" disabled>立即备份</button>
-              </div>
-              <div id="backup-list" class="management-list"></div>
-            </section>
-
             <section class="data-section unframed management-section">
               <div class="section-heading">
                 <div>
@@ -548,9 +515,6 @@
             <option value="90">保留 90 天</option>
           </select>
           <small class="form-hint">生效时机：保存后立即清理一次，此后随审计读取每小时至多清理一次 · 对谁生效：本项目的审计历史；删除不可恢复</small></label>
-        <label class="check-control"><input id="settings-auto-backup" type="checkbox"> 开启自动备份（全局配置，所有项目共用）</label>
-        <label>备份保留份数 <input id="settings-backup-max-kept" type="number" min="1" step="1">
-          <small class="form-hint" id="settings-backup-hint">生效时机：保存即写入配置文件 [backup]（与手动备份/回滚共用同一来源，重启服务后调度按新配置执行） · 对谁生效：整个数据库的自动备份调度</small></label>
         <section id="settings-export-section">
           <button class="secondary-button" id="export-audit-data-button" type="button" disabled>导出审计数据 (JSON)</button>
           <p class="form-hint">导出包含本 Project 任务与审计流水的人类可读明文 JSON，用于离线分析与复盘；它不是系统级数据库备份，也不能用于回滚。</p>
@@ -560,6 +524,69 @@
           <button type="submit" class="primary-button">保存设置</button>
         </div>
       </form>
+    </dialog>
+
+    <dialog id="system-settings-dialog" class="wide-dialog">
+      <div class="dialog-form">
+        <div class="dialog-header">
+          <div>
+            <p class="context-label">全局配置（所有 Project 共用）</p>
+            <h2>系统设置</h2>
+          </div>
+          <button type="button" class="icon-button dialog-close" title="关闭" aria-label="关闭">×</button>
+        </div>
+
+        <section class="data-section unframed management-section">
+          <div class="section-heading">
+            <div>
+              <h3>自动备份策略</h3>
+              <p class="secondary-text">作用于整个数据库的自动备份调度，与单个 Project 无关</p>
+            </div>
+            <button class="secondary-button" id="save-backup-policy-button" type="button">保存备份策略</button>
+          </div>
+          <label class="check-control"><input id="settings-auto-backup" type="checkbox"> 开启自动备份（全局配置，所有项目共用）</label>
+          <label>备份保留份数 <input id="settings-backup-max-kept" type="number" min="1" step="1">
+            <small class="form-hint" id="settings-backup-hint">生效时机：保存即写入配置文件 [backup]（与手动备份/回滚共用同一来源，重启服务后调度按新配置执行） · 对谁生效：整个数据库的自动备份调度</small></label>
+        </section>
+
+        <section class="data-section unframed management-section">
+          <div class="section-heading">
+            <div>
+              <h3>中心运行状态</h3>
+              <p class="secondary-text">生效配置、进程和脱敏日志</p>
+            </div>
+            <button class="secondary-button" id="refresh-runtime-button" type="button">刷新</button>
+          </div>
+          <div id="runtime-status" class="runtime-grid"></div>
+          <details class="runtime-details">
+            <summary>查看生效配置</summary>
+            <div id="runtime-config" class="runtime-config-cards"></div>
+            <details class="evidence-block runtime-debug">
+              <summary>原始 JSON（调试用）</summary>
+              <pre id="runtime-config-raw" class="code-block runtime-code"></pre>
+            </details>
+          </details>
+          <details class="runtime-details">
+            <summary>查看最近日志</summary>
+            <pre id="runtime-log" class="code-block runtime-log"></pre>
+          </details>
+        </section>
+
+        <section class="data-section unframed management-section">
+          <div class="section-heading">
+            <div>
+              <h3>数据库与备份</h3>
+              <p class="secondary-text">备份会另存整个协作数据库；回滚会丢弃备份之后的数据，需二次确认</p>
+            </div>
+            <button class="secondary-button" id="create-backup-button" type="button">立即备份</button>
+          </div>
+          <div id="backup-list" class="management-list"></div>
+        </section>
+
+        <div class="dialog-actions">
+          <button type="button" class="secondary-button dialog-close" id="system-settings-close">关闭</button>
+        </div>
+      </div>
     </dialog>
 
     <dialog id="archive-dialog">

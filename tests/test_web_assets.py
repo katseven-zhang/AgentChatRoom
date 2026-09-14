@@ -472,6 +472,41 @@ def test_web_project_export_lives_in_settings_as_audit_export():
     assert 'elements["export-audit-data-button"].addEventListener' in javascript
 
 
+def test_web_system_settings_decoupled_from_project_settings():
+    """#146：全局运维（自动备份策略、运行状态、全库备份）收拢进独立的
+    系统设置弹窗；项目设置弹窗回归纯项目作用域；项目设置按钮带文字。"""
+    markup = (WEB_DIR / "index.html").read_text(encoding="utf-8")
+    javascript = (WEB_DIR / "app.js").read_text(encoding="utf-8")
+
+    # 项目设置按钮改为带文字的常规按钮，另设独立的「系统设置」入口。
+    assert '<button class="secondary-button" id="project-settings-button" type="button" disabled>项目设置</button>' in markup
+    assert '<button class="secondary-button" id="system-settings-button" type="button">系统设置</button>' in markup
+    # 管理标签页不再包含全局运行状态与数据库备份区块。
+    assert "中心运行状态" not in markup.split('<dialog id="system-settings-dialog"')[0]
+    assert "数据库与备份" not in markup.split('<dialog id="system-settings-dialog"')[0]
+    # 系统设置弹窗收拢全局运维三件套。
+    dialog_start = markup.index('<dialog id="system-settings-dialog"')
+    dialog_end = markup.index("</dialog>", dialog_start)
+    system_dialog = markup[dialog_start:dialog_end]
+    assert "自动备份策略" in system_dialog
+    assert 'id="settings-auto-backup"' in system_dialog
+    assert 'id="runtime-status"' in system_dialog
+    assert 'id="runtime-log"' in system_dialog
+    assert 'id="backup-list"' in system_dialog
+    # 项目设置弹窗不再有全局自动备份字段。
+    settings_start = markup.index('<dialog id="settings-dialog">')
+    settings_end = markup.index("</dialog>", settings_start)
+    project_dialog = markup[settings_start:settings_end]
+    assert 'id="settings-auto-backup"' not in project_dialog
+    assert 'id="settings-backup-max-kept"' not in project_dialog
+    # 保存路径拆分：项目设置只 PATCH 项目；备份策略单独保存。
+    form_start = javascript.index('elements["settings-form"].addEventListener("submit"')
+    form_end = javascript.index('elements["task-form"].addEventListener', form_start)
+    assert "backup-settings" not in javascript[form_start:form_end]
+    assert 'elements["system-settings-button"].addEventListener' in javascript
+    assert 'elements["save-backup-policy-button"].addEventListener' in javascript
+
+
 def test_web_supports_human_reading_and_guided_interactions():
     javascript = (WEB_DIR / "app.js").read_text(encoding="utf-8")
     markup = (WEB_DIR / "index.html").read_text(encoding="utf-8")
