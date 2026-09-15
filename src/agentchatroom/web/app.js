@@ -2356,8 +2356,11 @@ elements["save-backup-policy-button"].addEventListener("click", async () => {
   }
 });
 elements["export-audit-data-button"].addEventListener("click", () => downloadProjectExport().catch(handleError));
-document.getElementById("refresh-button").addEventListener("click", () => {
-  if (!state.projectId) return;
+document.getElementById("refresh-button").addEventListener("click", (event) => {
+  if (event.ctrlKey || event.shiftKey || !state.projectId) {
+    window.location.reload();
+    return;
+  }
   withBusy(() => selectProject(state.projectId)).catch(handleError);
 });
 elements["connect-agent-button"].addEventListener("click", () => openIntegrationDialog().catch(handleError));
