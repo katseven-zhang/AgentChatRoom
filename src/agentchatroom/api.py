@@ -2349,37 +2349,43 @@ def create_app(
         # 固定版本串会在前端更新后让浏览器长期命中旧缓存（极端情况：
         # 编辑中途短暂损坏的 app.js 被缓存后无法自愈，页面表现为
         # 「数据全没了」）。指纹随资产内容变化自动更新，无需人工 bump。
+        # 验收退回修正：favicon 使用自身文件内容的指纹，而非复用 js/css 指纹。
         asset_fingerprint_cache: dict[str, tuple[tuple[int, int], str]] = {}
-        index_html_cache: dict[tuple[int, int, int], bytes] = {}
+        fingerprint_assets = ("app.js", "app.css", "favicon.svg")
+        index_html_cache: dict[tuple[int, int, int, int], bytes] = {}
 
-        def _asset_fingerprint() -> str:
-            parts = []
-            for name in ("app.js", "app.css"):
-                asset = web_dir / name
-                stat = asset.stat()
-                key = (stat.st_mtime_ns, stat.st_size)
-                cached = asset_fingerprint_cache.get(name)
-                if cached is None or cached[0] != key:
-                    cached = (key, hashlib.sha256(asset.read_bytes()).hexdigest()[:10])
-                    asset_fingerprint_cache[name] = cached
-                parts.append(cached[1])
-            return "-".join(parts)
+        def _asset_fingerprint(name: str) -> str:
+            asset = web_dir / name
+            stat = asset.stat()
+            key = (stat.st_mtime_ns, stat.st_size)
+            cached = asset_fingerprint_cache.get(name)
+            if cached is None or cached[0] != key:
+                cached = (key, hashlib.sha256(asset.read_bytes()).hexdigest()[:10])
+                asset_fingerprint_cache[name] = cached
+            return cached[1]
 
         @app.get("/", include_in_schema=False)
         def web_index() -> Response:
             index_path = web_dir / "index.html"
             key = (
                 index_path.stat().st_mtime_ns,
-                (web_dir / "app.js").stat().st_mtime_ns,
-                (web_dir / "app.css").stat().st_mtime_ns,
+                *(
+                    (web_dir / name).stat().st_mtime_ns
+                    for name in fingerprint_assets
+                ),
             )
             cached = index_html_cache.get(key)
             if cached is None:
-                stamp = _asset_fingerprint().encode()
-                cached = re.sub(rb"v=1\.0\.0[^\"?]*", b"v=" + stamp, index_path.read_bytes())
-                index_html_cache[key] = cached
+                html = index_path.read_bytes()
+                for name in fingerprint_assets:
+                    html = re.sub(
+                        f"({re.escape(name)}\\?v=)[^\"?]*".encode(),
+                        b"\\g<1>" + _asset_fingerprint(name).encode(),
+                        html,
+                    )
+                index_html_cache[key] = html
             return Response(
-                cached,
+                html,
                 media_type="text/html",
                 headers={"Cache-Control": "no-cache"},
             )

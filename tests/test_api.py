@@ -1968,12 +1968,16 @@ def test_index_html_stamps_asset_versions_from_content(settings):
         body = client.get("/").text
 
     src_web = Path(__file__).resolve().parents[1] / "src" / "agentchatroom" / "web"
-    stamp = hashlib.sha256((src_web / "app.js").read_bytes()).hexdigest()[:10]
-    stamp_css = hashlib.sha256((src_web / "app.css").read_bytes()).hexdigest()[:10]
+    expected = {
+        name: hashlib.sha256((src_web / name).read_bytes()).hexdigest()[:10]
+        for name in ("app.js", "app.css", "favicon.svg")
+    }
 
-    js_match = re.search(r'src="/assets/app\.js\?v=([0-9a-f-]+)"', body)
-    css_match = re.search(r'href="/assets/app\.css\?v=([0-9a-f-]+)"', body)
-    assert js_match and css_match, body[:500]
-    assert stamp in js_match.group(1)
-    assert stamp_css in css_match.group(1)
+    js_match = re.search(r'src="/assets/app\.js\?v=([0-9a-f]+)"', body)
+    css_match = re.search(r'href="/assets/app\.css\?v=([0-9a-f]+)"', body)
+    favicon_match = re.search(r'href="/assets/favicon\.svg\?v=([0-9a-f]+)"', body)
+    assert js_match and css_match and favicon_match, body[:500]
+    assert js_match.group(1) == expected["app.js"]
+    assert css_match.group(1) == expected["app.css"]
+    assert favicon_match.group(1) == expected["favicon.svg"]
     assert "central54" not in body and "central1" not in body
