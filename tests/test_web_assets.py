@@ -508,8 +508,8 @@ def test_web_system_settings_decoupled_from_project_settings():
 
 
 def test_web_management_grid_pagination_and_workspace_drawer():
-    """#147：成员/Token/审计列表一行 5 个网格并分页；审计末行留空占位；
-    Host 与 Workspace 折叠为高级诊断抽屉。"""
+    """#147 / #153：成员/Token/审计列表单列 5 行流式分页（每页 5 行，彻底消除 5 列挤压）；
+    审计末行不足 5 行时留空占位；Host 与 Workspace 折叠为高级诊断抽屉。"""
     markup = (WEB_DIR / "index.html").read_text(encoding="utf-8")
     javascript = (WEB_DIR / "app.js").read_text(encoding="utf-8")
     stylesheet = (WEB_DIR / "app.css").read_text(encoding="utf-8")
@@ -517,14 +517,14 @@ def test_web_management_grid_pagination_and_workspace_drawer():
     assert 'id="member-list" class="management-list management-grid"' in markup
     assert 'id="token-list" class="management-list management-grid"' in markup
     assert 'id="audit-list" class="management-list audit-list management-grid"' in markup
-    # 成员与 Token 客户端分页（每页 2 行 × 5 列）。
-    assert "const MEMBER_GRID_PAGE_SIZE = 10;" in javascript
-    assert "const TOKEN_GRID_PAGE_SIZE = 10;" in javascript
+    # 成员与 Token 客户端分页（每页 5 行）。
+    assert "const MEMBER_GRID_PAGE_SIZE = 5;" in javascript
+    assert "const TOKEN_GRID_PAGE_SIZE = 5;" in javascript
     assert "function gridPageSlice(" in javascript
     assert 'gridPagerHtml("member"' in javascript
     assert 'gridPagerHtml("token"' in javascript
     assert "[data-grid-pager]" in javascript
-    # 审计末行不足 5 个时补空占位槽。
+    # 审计末行不足 5 行时补空占位槽。
     assert "function gridPlaceholderSlots(" in javascript
     assert "gridPlaceholderSlots(itemCount)" in javascript
     # Host 与 Workspace 折叠为高级诊断抽屉。
@@ -533,9 +533,12 @@ def test_web_management_grid_pagination_and_workspace_drawer():
     workspace_pos = markup.index('id="workspace-list"')
     assert markup.rindex("<details", 0, workspace_pos) > drawer_start - 1
     assert "</details>" in markup[workspace_pos:workspace_pos + 400]
-    # 网格与占位样式。
-    assert "repeat(5, minmax(0, 1fr))" in stylesheet
+    # 单列列表流与占位样式，不再强行 5 列挤压。
+    management_css = stylesheet[stylesheet.index(".management-grid {"):stylesheet.index(".management-grid > .empty-state")]
+    assert "repeat(5," not in management_css
+    assert "grid-template-columns: minmax(0, 1fr);" in management_css
     assert ".grid-placeholder" in stylesheet
+    assert ".audit-pager" in stylesheet
 
 
 def test_web_sse_reconnect_probes_auth_before_retrying(tmp_path):
@@ -700,7 +703,7 @@ def test_web_event_and_audit_panels_catch_up_to_latest_cursor():
     assert "connectEvents(eventPage.cursor)" in javascript
     assert "state.auditHasOlder" in javascript
     assert "state.auditHasNewer" in javascript
-    assert "const AUDIT_PAGE_SIZE = 10;" in javascript
+    assert "const AUDIT_PAGE_SIZE = 5;" in javascript
     assert "mergeAuditEvents" not in javascript
     assert "resetAuditBuffer" not in javascript
     assert 'data-audit-action="older"' in javascript

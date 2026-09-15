@@ -928,11 +928,11 @@ function auditPageSize() {
   return Number.isFinite(configured) && configured > 0 ? configured : 100;
 }
 
-const AUDIT_PAGE_SIZE = 10;
-// #147：管理面板卡片网格每行 5 个；成员与 Token 每页 2 行，审计每页 1 行。
-const MANAGEMENT_GRID_COLUMNS = 5;
-const MEMBER_GRID_PAGE_SIZE = 10;
-const TOKEN_GRID_PAGE_SIZE = 10;
+const AUDIT_PAGE_SIZE = 5;
+// #153：管理面板列表单列 5 行流式排版（每页 5 行，彻底解决 5 列挤压导致的竖向文字断裂与错位）。
+const MANAGEMENT_GRID_COLUMNS = 1;
+const MEMBER_GRID_PAGE_SIZE = 5;
+const TOKEN_GRID_PAGE_SIZE = 5;
 const RECENT_ACTIVITY_PAGE_SIZE = 5;
 let memberGridPage = 1;
 let tokenGridPage = 1;
@@ -958,8 +958,8 @@ function gridPagerHtml(action, current, totalPages, totalLabel = "") {
 }
 
 function gridPlaceholderSlots(count) {
-  // 末行不足 5 个时补空占位槽，保持网格高度与列宽稳定不跳动。
-  const slots = (MANAGEMENT_GRID_COLUMNS - (count % MANAGEMENT_GRID_COLUMNS)) % MANAGEMENT_GRID_COLUMNS;
+  // 末行不足 5 行时补空占位槽，保持列表高度稳定不跳动。
+  const slots = (AUDIT_PAGE_SIZE - (count % AUDIT_PAGE_SIZE)) % AUDIT_PAGE_SIZE;
   return Array.from({ length: slots }, () => '<div class="grid-placeholder" aria-hidden="true"></div>').join("");
 }
 

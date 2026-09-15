@@ -1034,33 +1034,30 @@ body.is-resizing-panels {
   gap: 8px;
 }
 
-/* #147：管理面板卡片一行 5 个的网格布局，窄屏按列数收敛。 */
+/* #153：管理面板列表单列 5 行流式排版（每页 5 行，彻底解决 5 列挤压导致的竖向文字断裂与错位）。 */
 .management-grid {
-  grid-template-columns: repeat(5, minmax(0, 1fr));
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 8px;
 }
 
 .management-grid > .empty-state {
   grid-column: 1 / -1;
 }
 
-.management-grid .grid-pager {
-  grid-column: 1 / -1;
+.management-grid .grid-pager,
+.audit-pager {
   display: flex;
   align-items: center;
   justify-content: center;
-  gap: 10px;
-  margin-top: 2px;
-}
-
-.management-grid .management-item {
-  min-width: 0;
-  /* #147：窄卡片内按钮换行到内容下方，避免文字区被挤成单字换行。 */
-  grid-template-columns: minmax(0, 1fr);
-  align-items: start;
-}
-
-.management-grid .management-item .management-actions {
+  gap: 12px;
   margin-top: 6px;
+  padding: 6px 0;
+  width: 100%;
+}
+
+.audit-pager {
+  margin-bottom: 4px;
 }
 
 /* #150：最近活动定高行 + 末页占位，翻页不抖动。 */
@@ -1074,36 +1071,11 @@ body.is-resizing-panels {
   box-shadow: none;
 }
 
-/* 窄卡片内长 key/说明用两行截断，保持一行 5 个的可读性；标题正常换行。 */
-.management-grid .management-item p {
-  min-width: 0;
-  overflow-wrap: anywhere;
-  display: -webkit-box;
-  -webkit-line-clamp: 2;
-  -webkit-box-orient: vertical;
-  overflow: hidden;
-}
-
 .grid-placeholder {
-  min-height: 96px;
+  min-height: 56px;
   border: 1px dashed var(--border);
-  border-radius: var(--radius);
-}
-
-@media (max-width: 1264px) {
-  .management-grid {
-    grid-template-columns: repeat(3, minmax(0, 1fr));
-  }
-}
-
-@media (max-width: 760px) {
-  .management-grid {
-    grid-template-columns: minmax(0, 1fr);
-  }
-
-  .grid-placeholder {
-    display: none;
-  }
+  border-radius: var(--radius-lg);
+  box-shadow: none;
 }
 
 .management-stack {
@@ -1400,13 +1372,17 @@ body.is-resizing-panels {
 }
 
 .audit-list .management-item {
-  grid-template-columns: 112px minmax(0, 1fr);
-  align-items: start;
+  grid-template-columns: 140px minmax(0, 1fr);
+  align-items: center;
+  gap: 16px;
+  min-height: 56px;
 }
 
 .audit-time {
   color: var(--text-muted);
   font-size: var(--fs-xs);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
 }
 
 .dialog-subsection {
