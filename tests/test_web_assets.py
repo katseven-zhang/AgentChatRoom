@@ -548,6 +548,27 @@ def test_web_management_grid_pagination_and_workspace_drawer():
     assert "compact-title" in javascript
 
 
+def test_web_modern_visual_enhancements_and_micro_interactions():
+    """#155：全站前端 UI 视觉与微交互深度美化重构（真·磨砂半透顶栏、双层环境光卡片、精致药丸状态胶囊与高质感调色板）。"""
+    stylesheet = (WEB_DIR / "app.css").read_text(encoding="utf-8")
+
+    # 顶栏与模态层真·半透磨砂玻璃与泛光。
+    assert "--topbar-bg" in stylesheet
+    assert "--modal-bg" in stylesheet
+    assert "--btn-glow" in stylesheet
+    assert "--card-glow" in stylesheet
+    assert "backdrop-filter: blur(16px);" in stylesheet
+    assert "backdrop-filter: blur(24px);" in stylesheet
+
+    # 主按钮环境微泛光与选项卡背景填充。
+    assert "box-shadow: var(--btn-glow);" in stylesheet
+    assert "color-mix(in srgb, var(--primary-soft) 50%, transparent);" in stylesheet
+
+    # 状态徽章药丸胶囊与 1px 细微边框。
+    assert ".status-badge," in stylesheet
+    assert "border-radius: 999px;" in stylesheet
+
+
 def test_web_sse_reconnect_probes_auth_before_retrying(tmp_path):
     """#148：SSE 断线后先探测 /api/v1/auth/status——免密模式静默续签后
     重连；密码模式会话失效时停止盲试并弹出登录提示；服务重启期间退避
