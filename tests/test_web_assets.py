@@ -332,10 +332,11 @@ def test_web_declares_a_static_favicon():
 
     assert 'rel="icon"' in markup
     assert (WEB_DIR / "favicon.svg").is_file()
-    # #158：彻底消除绿油油标签图标，采用科技藏青蓝品牌渐变。
+    # #158/#159：彻底消除绿油油标签图标，采用 Apple System Blue 经典双色微光渐变。
     assert "#0f766e" not in favicon
     assert "url(#brand-grad)" in favicon
-    assert "#4f46e5" in favicon
+    assert "#0077ed" in favicon
+    assert "#005bb5" in favicon
 
 
 
@@ -606,20 +607,24 @@ def test_web_master_grade_ui_modernization():
 
 
 def test_web_modern_tech_indigo_palette_and_smart_refresh():
-    """#157：告别绿油油，重构为现代科技感 Linear/Cursor 钛青蓝高质感调色板，并支持顶部按钮智能刷新。"""
+    """#157/#159：告别绿油油与高饱和紫色视疲劳，重构为舒适护眼、极致典雅的 macOS HIG 与 OpenAI Codex 配色体系（Apple System Blue & System Gray）。"""
     stylesheet = (WEB_DIR / "app.css").read_text(encoding="utf-8")
     javascript = (WEB_DIR / "app.js").read_text(encoding="utf-8")
     markup = (WEB_DIR / "index.html").read_text(encoding="utf-8")
 
-    # 1. 彻底告别 #176b57 森林绿，升级为 Tech Indigo
+    # 1. 彻底告别 #176b57 森林绿与高饱和刺眼紫色，升级为 Apple System Blue & System Gray
     assert "#176b57" not in stylesheet
-    assert "--primary: #4338ca;" in stylesheet
-    assert "--primary-soft: #eef2ff;" in stylesheet
-    assert "--accent-fill: #4338ca;" in stylesheet
+    assert "#4338ca" not in stylesheet
+    assert "--bg: #f5f5f7;" in stylesheet
+    assert "--primary: #0066cc;" in stylesheet
+    assert "--primary-soft: #edf5fd;" in stylesheet
+    assert "--accent-fill: #0071e3;" in stylesheet
 
-    # 2. 暗色主题采用高质感钛青蓝
-    assert "--primary: #a5b4fc;" in stylesheet
-    assert "--accent-fill: #4f46e5;" in stylesheet
+    # 2. 暗色主题采用 macOS Dark 护眼灰与 Apple System Blue
+    assert "--bg: #1c1c1e;" in stylesheet
+    assert "--surface: #2c2c2e;" in stylesheet
+    assert "--primary: #70baff;" in stylesheet
+    assert "--accent-fill: #0071e3;" in stylesheet
 
     # 3. 顶栏刷新按钮支持在无项目或按住 Ctrl/Shift 时全量重新加载页面
     assert "event.ctrlKey || event.shiftKey || !state.projectId" in javascript
