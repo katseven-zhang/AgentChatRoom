@@ -569,6 +569,37 @@ def test_web_modern_visual_enhancements_and_micro_interactions():
     assert "border-radius: 999px;" in stylesheet
 
 
+def test_web_master_grade_ui_modernization():
+    """#156：前端 UI 质的飞跃现代化重构（分段控制器药丸选项卡、独立指标悬浮微卡片阵列、终端代码胶囊路径、浮动式集成输入区与状态呼吸光环）。"""
+    stylesheet = (WEB_DIR / "app.css").read_text(encoding="utf-8")
+
+    # 1. 分段控制器药丸风格选项卡（Segmented Control）
+    assert "display: inline-flex;" in stylesheet
+    assert "border-radius: var(--radius-lg);" in stylesheet
+    assert ".tab.is-active {" in stylesheet
+    assert "box-shadow: 0 1px 4px rgba(0, 0, 0, 0.08)" in stylesheet
+
+    # 2. 独立指标悬浮微卡片阵列（Metric Stat Cards）
+    assert "grid-template-columns: repeat(4, minmax(0, 1fr));" in stylesheet
+    assert ".metric::before {" in stylesheet
+    assert "transform: translateY(-2px);" in stylesheet
+    assert "font-variant-numeric: tabular-nums;" in stylesheet
+
+    # 3. 终端代码胶囊路径（Terminal Code Pill）
+    assert ".room-path {" in stylesheet
+    assert "font-family: var(--mono);" in stylesheet
+    assert "border-radius: var(--radius-sm);" in stylesheet
+
+    # 4. 浮动式集成输入区（Floating Integrated Card Composer）
+    assert ".composer textarea:focus {" in stylesheet
+    assert "box-shadow: 0 0 0 3px var(--focus-ring)" in stylesheet
+
+    # 5. 呼吸光环与多层光晕（Breathing Pulse & Double Rings）
+    assert "animation: pulse-dot 2.4s var(--ease) infinite;" in stylesheet
+    assert ".agent-avatar {" in stylesheet
+
+
+
 def test_web_sse_reconnect_probes_auth_before_retrying(tmp_path):
     """#148：SSE 断线后先探测 /api/v1/auth/status——免密模式静默续签后
     重连；密码模式会话失效时停止盲试并弹出登录提示；服务重启期间退避
