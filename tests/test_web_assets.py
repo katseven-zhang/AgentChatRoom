@@ -328,9 +328,15 @@ def test_registered_web_elements_exist_in_markup():
 
 def test_web_declares_a_static_favicon():
     markup = (WEB_DIR / "index.html").read_text(encoding="utf-8")
+    favicon = (WEB_DIR / "favicon.svg").read_text(encoding="utf-8")
 
     assert 'rel="icon"' in markup
     assert (WEB_DIR / "favicon.svg").is_file()
+    # #158：彻底消除绿油油标签图标，采用科技藏青蓝品牌渐变。
+    assert "#0f766e" not in favicon
+    assert "url(#brand-grad)" in favicon
+    assert "#4f46e5" in favicon
+
 
 
 def test_web_bootstrap_and_phase_one_local_agent_hooks_are_complete():
