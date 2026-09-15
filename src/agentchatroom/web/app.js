@@ -1412,7 +1412,12 @@ function renderRecentActivity() {
       ? `当前项目：${projectName} · 实时更新`
       : "实时更新";
   }
-  const events = [...state.events].sort((a, b) => Number(b.id) - Number(a.id));
+  // 验收退回修正：严格按 created_at 倒序（ISO 字符串可直接比较），
+  // 时间相同时再按事件 id 兜底，保证「最新事件第 1 行」。
+  const events = [...state.events].sort((a, b) => {
+    const byTime = String(b.created_at || "").localeCompare(String(a.created_at || ""));
+    return byTime !== 0 ? byTime : Number(b.id || 0) - Number(a.id || 0);
+  });
   const page = gridPageSlice(events, RECENT_ACTIVITY_PAGE_SIZE, recentActivityPage);
   recentActivityPage = page.current;
   const rows = page.slice.map((event) => {
