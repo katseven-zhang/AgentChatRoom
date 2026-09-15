@@ -1060,22 +1060,72 @@ body.is-resizing-panels {
   margin-bottom: 4px;
 }
 
-/* #150：最近活动定高行 + 末页占位，翻页不抖动。 */
+/* #150 / #154：最近活动卡片严格定高 + 单行标题 + 末页占位，翻页器绝对固定不抖动。 */
+#recent-event-list {
+  display: grid;
+  gap: 8px;
+}
+
 #recent-event-list .compact-item,
 #recent-event-list .compact-placeholder {
-  min-height: 56px;
+  height: 60px;
+  min-height: 60px;
+  max-height: 60px;
+  box-sizing: border-box;
+  overflow: hidden;
+}
+
+#recent-event-list .compact-item {
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  padding: 8px 12px;
+}
+
+#recent-event-list .compact-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  line-height: 1.3;
+}
+
+#recent-event-list .compact-body {
+  margin-top: 4px;
+  line-height: 1.3;
+}
+
+#recent-event-list .compact-body .msg-line,
+#recent-event-list .compact-title {
+  margin: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .compact-placeholder {
   border: 1px dashed var(--border);
+  border-radius: var(--radius);
   box-shadow: none;
+  background: transparent;
+}
+
+/* #147 / #153 / #154：管理列表卡片严格定高 + 空卡片占位，翻页器绝对固定不抖动。 */
+.management-list .management-item,
+.management-grid .management-item,
+.management-grid .grid-placeholder {
+  height: 68px;
+  min-height: 68px;
+  max-height: 68px;
+  box-sizing: border-box;
+  overflow: hidden;
 }
 
 .grid-placeholder {
-  min-height: 56px;
   border: 1px dashed var(--border);
   border-radius: var(--radius-lg);
   box-shadow: none;
+  background: transparent;
 }
 
 .management-stack {
@@ -1375,7 +1425,11 @@ body.is-resizing-panels {
   grid-template-columns: 140px minmax(0, 1fr);
   align-items: center;
   gap: 16px;
-  min-height: 56px;
+  height: 68px;
+  min-height: 68px;
+  max-height: 68px;
+  box-sizing: border-box;
+  overflow: hidden;
 }
 
 .audit-time {

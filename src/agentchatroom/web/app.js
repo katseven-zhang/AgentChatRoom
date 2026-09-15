@@ -960,7 +960,7 @@ function gridPagerHtml(action, current, totalPages, totalLabel = "") {
 function gridPlaceholderSlots(count) {
   // 末行不足 5 行时补空占位槽，保持列表高度稳定不跳动。
   const slots = (AUDIT_PAGE_SIZE - (count % AUDIT_PAGE_SIZE)) % AUDIT_PAGE_SIZE;
-  return Array.from({ length: slots }, () => '<div class="grid-placeholder" aria-hidden="true"></div>').join("");
+  return Array.from({ length: slots }, () => '<div class="management-item grid-placeholder" aria-hidden="true"></div>').join("");
 }
 
 function auditQueryUrl(projectId, { after = 0, before = 0, eventType = "", limit = AUDIT_PAGE_SIZE } = {}) {
@@ -1424,9 +1424,22 @@ function renderRecentActivity() {
     const isMessage = event.event_type.startsWith("message.") && event.payload?.body !== undefined;
     const actorName = snapshotAgentName(event.actor_session_id) || (isMessage ? "用户" : "系统");
     const modelBadge = isMessage ? messageModelBadge(event) : "";
-    const preview = isMessage
-      ? renderMessageLines(String(event.payload.body).split("\n").slice(0, 3))
-      : `<div class="msg-line">${escapeHtml(event.payload?.title || event.payload?.path_pattern || formatTime(event.created_at))}</div>`;
+    let summaryTitle = "";
+    if (event.payload?.title) {
+      summaryTitle = String(event.payload.title).trim();
+    } else if (isMessage) {
+      const firstLine = String(event.payload.body || "").split("\n").map((s) => s.trim()).filter(Boolean)[0] || "";
+      summaryTitle = firstLine.replace(/^#+\s*/, "");
+    } else if (event.payload?.path_pattern) {
+      summaryTitle = `文件范围：${event.payload.path_pattern}`;
+    } else if (event.payload?.reason) {
+      summaryTitle = String(event.payload.reason).trim();
+    } else if (event.payload?.summary) {
+      summaryTitle = String(event.payload.summary).trim();
+    } else {
+      summaryTitle = formatTime(event.created_at);
+    }
+    const preview = `<div class="msg-line compact-title" title="${escapeHtml(summaryTitle)}">${escapeHtml(summaryTitle)}</div>`;
     return `
       <div class="compact-item ${isMessage ? `kind-${escapeHtml(event.event_type.split(".")[1])}` : ""}">
         <div class="compact-heading"><span><strong>${escapeHtml(actorName)}</strong> ${escapeHtml(eventLabel(event.event_type))}${modelBadge}</span>${eventIdBadge(event.project_seq, event.id)}</div>
@@ -1965,8 +1978,7 @@ function renderRuntime() {
 function renderMembers() {
   const page = gridPageSlice(state.members, MEMBER_GRID_PAGE_SIZE, memberGridPage);
   memberGridPage = page.current;
-  elements["member-list"].innerHTML = (page.slice.length
-    ? page.slice.map((member) => `
+  const items = page.slice.map((member) => `
       <article class="management-item">
         <div>
           <h4>${escapeHtml(member.name)} <span class="status-badge ${memberStatusClass(member.status)}">${escapeHtml(memberStatusLabel(member.status))}</span></h4>
@@ -1976,7 +1988,13 @@ function renderMembers() {
         <div class="management-actions">
           ${member.status !== "revoked" ? `<button type="button" class="danger-button" data-member-action="revoke" data-member-id="${escapeHtml(member.id)}">吊销</button>` : ""}
         </div>
-      </article>`).join("")
+      </article>`).join("");
+  const placeholders = page.slice.length && page.slice.length < MEMBER_GRID_PAGE_SIZE
+    ? Array.from({ length: MEMBER_GRID_PAGE_SIZE - page.slice.length },
+        () => '<div class="management-item grid-placeholder" aria-hidden="true"></div>').join("")
+    : "";
+  elements["member-list"].innerHTML = (page.slice.length
+    ? items + placeholders
     : '<div class="empty-state">尚未登记项目成员</div>')
     + gridPagerHtml("member", page.current, page.totalPages);
   renderTokenMemberOptions(elements["token-member"].value);
@@ -1988,10 +2006,9 @@ function renderCredentials() {
   elements["token-project-context"].textContent = `当前 Project：${projectName}`;
   const page = gridPageSlice(state.credentials, TOKEN_GRID_PAGE_SIZE, tokenGridPage);
   tokenGridPage = page.current;
-  elements["token-list"].innerHTML = (page.slice.length
-    ? page.slice.map((credential) => {
-      const manageable = !credential.revoked_at;
-      return `
+  const items = page.slice.map((credential) => {
+    const manageable = !credential.revoked_at;
+    return `
       <article class="management-item">
         <div>
           <h4>${escapeHtml(credential.name)} <span class="status-badge ${credential.active ? "verified" : "cancelled"}">${credential.active ? "有效" : "已失效"}</span></h4>
@@ -2005,7 +2022,13 @@ function renderCredentials() {
           <button type="button" class="danger-button" data-token-action="revoke" data-credential-id="${escapeHtml(credential.id)}">吊销</button>` : ""}
         </div>
       </article>`;
-    }).join("")
+  }).join("");
+  const placeholders = page.slice.length && page.slice.length < TOKEN_GRID_PAGE_SIZE
+    ? Array.from({ length: TOKEN_GRID_PAGE_SIZE - page.slice.length },
+        () => '<div class="management-item grid-placeholder" aria-hidden="true"></div>').join("")
+    : "";
+  elements["token-list"].innerHTML = (page.slice.length
+    ? items + placeholders
     : '<div class="empty-state">尚未签发 Agent Token</div>')
     + gridPagerHtml("token", page.current, page.totalPages);
 }
@@ -2132,10 +2155,12 @@ function renderAudit() {
           <p>${escapeHtml(event.task_id ? `任务 ${shortId(event.task_id)}` : event.actor_session_id ? `接入 ${shortId(event.actor_session_id)}` : "管理主体")}</p>
         </div>
       </article>`).join("")
-    : '<div class="empty-state">当前筛选下没有审计事件</div>';
-  // #147：一行 5 个卡片网格；末行不足 5 个时补空占位槽避免翻页跳动。
+    : "";
   const itemCount = state.auditEvents.length;
-  elements["audit-list"].innerHTML = `${auditPager()}${items}${gridPlaceholderSlots(itemCount)}`;
+  elements["audit-list"].innerHTML = (state.auditEvents.length
+    ? `${items}${gridPlaceholderSlots(itemCount)}`
+    : '<div class="empty-state">当前筛选下没有审计事件</div>')
+    + auditPager();
 }
 
 async function refreshManagement() {

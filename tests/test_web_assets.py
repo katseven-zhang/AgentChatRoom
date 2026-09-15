@@ -539,6 +539,13 @@ def test_web_management_grid_pagination_and_workspace_drawer():
     assert "grid-template-columns: minmax(0, 1fr);" in management_css
     assert ".grid-placeholder" in stylesheet
     assert ".audit-pager" in stylesheet
+    # 成员与 Token 列表不足 5 行时空卡片占位。
+    assert "MEMBER_GRID_PAGE_SIZE - page.slice.length" in javascript
+    assert "TOKEN_GRID_PAGE_SIZE - page.slice.length" in javascript
+    # #154：最近活动与管理卡片定高统一，翻页器固定位置不跳动。
+    assert "height: 60px;" in stylesheet
+    assert "height: 68px;" in stylesheet
+    assert "compact-title" in javascript
 
 
 def test_web_sse_reconnect_probes_auth_before_retrying(tmp_path):
