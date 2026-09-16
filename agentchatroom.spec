@@ -3,7 +3,7 @@ from PyInstaller.utils.hooks import collect_submodules
 
 block_cipher = None
 
-# Hidden imports required across CLI, GUI, MCP, FastAPI, Uvicorn, and Pywebview
+# Hidden imports required across CLI, GUI, MCP, FastAPI, and Uvicorn
 hidden_imports = [
     "agentchatroom",
     "agentchatroom.api",
@@ -23,7 +23,6 @@ hidden_imports = [
     "agentchatroom.models",
     "agentchatroom.project_registration",
     "agentchatroom.services",
-    "agentchatroom.shell",
     "agentchatroom.task_history",
     "uvicorn",
     "uvicorn.logging",
@@ -39,9 +38,6 @@ hidden_imports = [
     "starlette",
     "fastapi",
     "mcp",
-    "webview",
-    "clr_loader",
-    "pythonnet",
     "pystray",
     "pystray._win32",
     "PIL",
@@ -55,9 +51,10 @@ datas = [
 ]
 
 # Single windowed executable: packaging/entry_app.py dispatches on the first
-# argument — default/gui opens the pywebview shell panel, `mcp` runs the
-# stdio MCP server, and any other subcommand reaches the console CLI (the
-# detached serve subprocess reuses the very same exe via cli.py).
+# argument — default/gui opens the lightweight Tk control console (tkinter is
+# bundled on purpose), `mcp` runs the stdio MCP server, and any other
+# subcommand reaches the console CLI (the detached serve subprocess reuses
+# the very same exe via cli.py).
 a_app = Analysis(
     ['packaging/entry_app.py'],
     pathex=['src'],
@@ -67,7 +64,7 @@ a_app = Analysis(
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=['PySide6', 'PyQt5', 'PyQt6', 'tkinter'],
+    excludes=['PySide6', 'PyQt5', 'PyQt6'],
     win_no_prefer_redirects=False,
     win_private_assemblies=False,
     cipher=block_cipher,
@@ -86,7 +83,7 @@ exe_app = EXE(
     bootloader_ignore_signals=False,
     strip=False,
     upx=True,
-    # Windowed: double-click opens the GUI panel without a console window.
+    # Windowed: double-click opens the Tk control console without a console window.
     # stdio_runtime explicitly restores inherited pipe/file handles; never
     # assume that a windowed bootloader provides Python standard streams.
     console=False,

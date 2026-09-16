@@ -3,9 +3,9 @@
 The distribution carries exactly one executable; the first argument
 selects the delivery mode so every capability ships inside that exe:
 
-- no argument, ``gui``, or an option flag: open the pywebview GUI shell
-  panel (the default double-click behavior; the shell starts and stops
-  the detached service, and accepts the shell's own --port/--mode/...);
+- no argument, ``gui``, or an option flag: open the lightweight Tk
+  control console (the default double-click behavior; the console
+  starts and stops the detached service, and accepts ``--config``);
 - ``mcp``: run the MCP stdio server for Agent host integration;
 - any other subcommand: delegate to the console CLI (``serve``,
   ``stop``, ``logs``, ...).
@@ -28,9 +28,15 @@ def main() -> None:
 
     prepare_standard_streams()
     if command == "" or command == "gui" or command.startswith("-"):
-        from agentchatroom.shell import main as shell_main
+        from agentchatroom.gui import run_gui
 
-        shell_main(args[1:] if command == "gui" else args)
+        gui_args = args[1:] if command == "gui" else args
+        config_path = None
+        if "--config" in gui_args:
+            flag_index = gui_args.index("--config")
+            if flag_index + 1 < len(gui_args):
+                config_path = gui_args[flag_index + 1]
+        run_gui(config_path)
         return
     from agentchatroom.cli import main as cli_main
 

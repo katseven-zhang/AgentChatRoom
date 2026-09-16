@@ -8,11 +8,13 @@ second startup business logic lives here.
 
 from __future__ import annotations
 
+import ipaddress
 import os
 import re
 import socket
 import threading
 import tomllib
+import webbrowser
 from dataclasses import replace
 from pathlib import Path
 from queue import Empty, Queue
@@ -36,6 +38,10 @@ _SENSITIVE_ASSIGNMENT = re.compile(
 _SENSITIVE_BEARER = re.compile(r"(?i)bearer\s+[A-Za-z0-9._~+/-]+=*")
 _SENSITIVE_PROVIDER_KEY = re.compile(r"\bsk-(?:proj-|svcacct-)?[A-Za-z0-9_-]{8,}\b")
 
+# Mirrors the server config rule: only loopback targets may bind without
+# management authentication.
+LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
+
 CLOSE = "close"
 STOP_AND_CLOSE = "stop_and_close"
 KEEP_RUNNING = "keep_running"
@@ -44,6 +50,10 @@ STAY = "stay"
 
 class PortError(ValueError):
     """Raised when the port input is not a usable TCP port."""
+
+
+class HostError(ValueError):
+    """Raised when the host input is not a usable listen address."""
 
 
 def validate_port(raw: str) -> int:
@@ -55,6 +65,38 @@ def validate_port(raw: str) -> int:
     if not MIN_PORT <= port <= MAX_PORT:
         raise PortError(f"端口必须在 {MIN_PORT}-{MAX_PORT} 之间")
     return port
+
+
+def validate_host(raw: str) -> str:
+    """Validate a user-supplied listen address and return it normalized."""
+    text = str(raw).strip()
+    if not text:
+        raise HostError("监听地址不能为空（例如 127.0.0.1 或 0.0.0.0）")
+    lowered = text.lower()
+    if lowered in LOOPBACK_HOSTS:
+        return lowered
+    try:
+        ipaddress.ip_address(text)
+    except ValueError as error:
+        raise HostError(
+            f"监听地址必须是合法 IP（如 127.0.0.1、0.0.0.0、::），收到：{text}"
+        ) from error
+    return text
+
+
+def host_requires_management_auth(host: str) -> bool:
+    """Mirror the config rule: non-loopback binding requires management auth."""
+    return str(host).strip().lower() not in LOOPBACK_HOSTS
+
+
+def restart_steps(service_running: bool) -> tuple[str, ...]:
+    """Return the worker steps behind the one-click restart button."""
+    return ("stop", "start") if service_running else ("start",)
+
+
+def resolve_frontend_url(running_url: str | None, host: str, port: int) -> str:
+    """Prefer the address the server actually logged, fall back to config."""
+    return running_url if running_url else service_url(host, port)
 
 
 def port_is_free(host: str, port: int) -> bool:
@@ -133,8 +175,13 @@ def _format_toml_value(value: Any) -> str:
     raise ValueError(f"Unsupported config value: {value!r}")
 
 
-def update_config_port(config_path: Path, port: int) -> None:
-    """Persist the chosen port into the local config file for later launches."""
+def update_config_values(
+    config_path: Path,
+    *,
+    host: str | None = None,
+    port: int | None = None,
+) -> None:
+    """Persist the chosen host/port into the local config file for later launches."""
     config_path = Path(config_path)
     document: dict[str, dict[str, Any]] = {}
     if config_path.exists():
@@ -142,7 +189,10 @@ def update_config_port(config_path: Path, port: int) -> None:
             loaded = tomllib.load(handle)
         document = {name: dict(values) for name, values in loaded.items()}
     server = dict(document.get("server", {}))
-    server["port"] = port
+    if host is not None:
+        server["host"] = host
+    if port is not None:
+        server["port"] = port
     rebuilt: dict[str, dict[str, Any]] = {}
     for name, values in document.items():
         rebuilt[name] = server if name == "server" else values
@@ -156,6 +206,11 @@ def update_config_port(config_path: Path, port: int) -> None:
         lines.append("")
     config_path.parent.mkdir(parents=True, exist_ok=True)
     config_path.write_text("\n".join(lines), encoding="utf-8")
+
+
+def update_config_port(config_path: Path, port: int) -> None:
+    """Persist the chosen port into the local config file for later launches."""
+    update_config_values(config_path, port=port)
 
 
 class ServiceController:
@@ -182,15 +237,15 @@ class ServiceController:
     def is_running(self) -> bool:
         return self.running_pid() is not None
 
-    def display_url(self, port: int) -> str:
-        return service_url(self.settings.host, port)
+    def display_url(self, host: str, port: int) -> str:
+        return service_url(host, port)
 
-    def start(self, port: int) -> dict[str, Any]:
-        effective = replace(self.settings, port=port)
+    def start(self, host: str, port: int) -> dict[str, Any]:
+        effective = replace(self.settings, host=host, port=port)
         config_path = (
             str(self.settings.config_path) if self.settings.config_path else None
         )
-        return start_detached_server(effective, self.settings.host, port, config_path)
+        return start_detached_server(effective, host, port, config_path)
 
     def stop(self) -> dict[str, Any]:
         return stop_detached_server(self.settings)
@@ -244,6 +299,80 @@ def _drain(sink: Queue) -> list[Any]:
             return items
 
 
+def build_tray_menu_spec() -> list[tuple[str, str, bool]]:
+    """Return (label, action_key, is_default) rows for the tray menu."""
+    return [
+        ("打开控制台", "show", True),
+        ("打开前端", "frontend", False),
+        ("启动服务", "start", False),
+        ("重启服务", "restart", False),
+        ("停止服务", "stop", False),
+        ("退出", "quit", False),
+    ]
+
+
+def tray_icon_image():
+    """Draw the tray icon with Pillow; return None when Pillow is missing."""
+    try:
+        from PIL import Image, ImageDraw, ImageFont
+    except ImportError:
+        return None
+    image = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(image)
+    draw.rounded_rectangle((4, 4, 60, 60), radius=14, fill=(0, 113, 227, 255))
+    try:
+        font = ImageFont.load_default(size=34)
+    except TypeError:
+        font = ImageFont.load_default()
+    draw.text((32, 33), "A", font=font, fill=(255, 255, 255, 255), anchor="mm")
+    return image
+
+
+def create_tray_icon(handle_action):
+    """Build a detached pystray icon wired to ``handle_action``; None if unavailable.
+
+    ``handle_action`` receives one action key from :func:`build_tray_menu_spec`;
+    pystray invokes callbacks on its own thread, so handlers must marshal back
+    to the Tk loop themselves.
+    """
+    try:
+        import pystray
+    except ImportError:
+        return None
+    image = tray_icon_image()
+    if image is None:
+        return None
+    menu = pystray.Menu(
+        *[
+            pystray.MenuItem(
+                label,
+                lambda icon, item, action=action: handle_action(action),
+                default=default,
+            )
+            for label, action, default in build_tray_menu_spec()
+        ]
+    )
+    icon = pystray.Icon("agentchatroom", image, "AgentChatRoom 控制台", menu)
+    try:
+        icon.run_detached()
+        icon.visible = True
+    except Exception:
+        return None
+    return icon
+
+
+def main() -> None:
+    """Console-script entry: ``agentchatroom-gui [--config PATH]``."""
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        prog="agentchatroom-gui", description="打开 AgentChatRoom 轻量控制台"
+    )
+    parser.add_argument("--config", default=None, help="配置文件路径")
+    arguments = parser.parse_args()
+    run_gui(arguments.config)
+
+
 def run_gui(config_path: str | None = None) -> None:
     """Open the local GUI window (requires tkinter, imported lazily)."""
     os.environ.setdefault("AGENTCHATROOM_ACCESS_LOG", "0")
@@ -269,19 +398,33 @@ def run_gui(config_path: str | None = None) -> None:
             self.geometry("780x520")
             self.minsize(620, 420)
             self.action_active = False
-            self.pending_close_after_stop = False
+            self.pending_exit_after_stop = False
             self.running_port: int | None = None
+            self.tray = None
+            self.tray_hint_shown = False
 
             top = ttk.Frame(self, padding=(10, 10, 10, 4))
             top.pack(fill="x")
+            ttk.Label(top, text="IP:").pack(side="left")
+            self.host_entry = ttk.Entry(top, width=13, justify="center")
+            self.host_entry.insert(0, settings.host)
+            self.host_entry.pack(side="left", padx=(4, 8))
             ttk.Label(top, text="端口:").pack(side="left")
-            self.port_entry = ttk.Entry(top, width=9, justify="center")
+            self.port_entry = ttk.Entry(top, width=7, justify="center")
             self.port_entry.insert(0, str(settings.port))
             self.port_entry.pack(side="left", padx=(4, 14))
             self.start_button = ttk.Button(top, text="启动服务", command=self.on_start)
-            self.start_button.pack(side="left", padx=(0, 8))
+            self.start_button.pack(side="left", padx=(0, 6))
+            self.restart_button = ttk.Button(
+                top, text="重启服务", command=self.on_restart
+            )
+            self.restart_button.pack(side="left", padx=(0, 6))
             self.stop_button = ttk.Button(top, text="停止服务", command=self.on_stop)
-            self.stop_button.pack(side="left")
+            self.stop_button.pack(side="left", padx=(0, 6))
+            self.frontend_button = ttk.Button(
+                top, text="打开前端", command=self.on_frontend
+            )
+            self.frontend_button.pack(side="left")
             self.status_label = ttk.Label(top, text="", padding=(14, 0, 0, 0))
             self.status_label.pack(side="left")
 
@@ -291,8 +434,9 @@ def run_gui(config_path: str | None = None) -> None:
             self.log_view.pack(fill="both", expand=True, padx=10, pady=(6, 10))
 
             self.protocol("WM_DELETE_WINDOW", self.on_close)
+            self.bind("<Unmap>", self.on_unmap)
             self.append_log(f"数据目录: {settings.data_dir}")
-            self.append_log("就绪。点击「启动服务」开始。")
+            self.append_log("就绪。点击「启动服务」开始；关闭或最小化窗口会收起到系统托盘。")
             self.refresh_state()
             self.after(100, self.drain_events)
             self.after(2000, self.poll_state)
@@ -310,10 +454,16 @@ def run_gui(config_path: str | None = None) -> None:
             running = pid is not None
             start_enabled, stop_enabled = button_states(running, self.action_active)
             self.start_button.state(["!disabled"] if start_enabled else ["disabled"])
+            self.restart_button.state(
+                ["!disabled"] if (not self.action_active) else ["disabled"]
+            )
             self.stop_button.state(["!disabled"] if stop_enabled else ["disabled"])
+            self.frontend_button.state(
+                ["!disabled"] if running and not self.action_active else ["disabled"]
+            )
             if running:
                 url = (
-                    controller.display_url(self.running_port)
+                    controller.display_url(self._safe_host(), self.running_port)
                     if self.running_port
                     else running_url_from_log(controller.log_path)
                 )
@@ -323,6 +473,12 @@ def run_gui(config_path: str | None = None) -> None:
                 )
             else:
                 self.status_label.configure(text="○ 已停止", foreground="#6b7280")
+
+        def _safe_host(self) -> str:
+            try:
+                return validate_host(self.host_entry.get())
+            except HostError:
+                return settings.host
 
         def poll_state(self) -> None:
             was_running = controller.is_running()
@@ -352,6 +508,10 @@ def run_gui(config_path: str | None = None) -> None:
                 self.action_active = False
                 self.refresh_state()
                 self.append_log(f"[启动失败] {payload}")
+            elif kind == "restart_aborted":
+                self.action_active = False
+                self.refresh_state()
+                self.append_log(f"[重启中止] {payload}")
             elif kind == "stopped":
                 self.action_active = False
                 stopped = bool(payload.get("stopped"))
@@ -364,14 +524,14 @@ def run_gui(config_path: str | None = None) -> None:
                             "停止超时：请运行「关闭 AgentChatRoom.cmd」完成残留清理。"
                         )
                 self.refresh_state()
-                if self.pending_close_after_stop:
-                    self.finish_close_after_stop(stopped)
+                if self.pending_exit_after_stop:
+                    self.finish_exit_after_stop(stopped)
             elif kind == "stop_failed":
                 self.action_active = False
                 self.refresh_state()
                 self.append_log(f"[停止失败] {payload}")
-                if self.pending_close_after_stop:
-                    self.finish_close_after_stop(False)
+                if self.pending_exit_after_stop:
+                    self.finish_exit_after_stop(False)
 
         def _launched_port(self, payload: dict[str, Any]) -> int | None:
             url = str(payload.get("url", ""))
@@ -381,24 +541,41 @@ def run_gui(config_path: str | None = None) -> None:
             except ValueError:
                 return None
 
+        def _validated_host_port(self) -> tuple[str, int] | None:
+            try:
+                host = validate_host(self.host_entry.get())
+                port = validate_port(self.port_entry.get())
+            except (HostError, PortError) as error:
+                self.append_log(f"[输入错误] {error}")
+                return None
+            if host_requires_management_auth(host) and not (
+                settings.management_auth_required
+            ):
+                self.append_log(
+                    "[绑定拒绝] 非环回地址（如 0.0.0.0 或局域网 IP）必须先在配置中"
+                    "开启管理认证（[security] management_auth_required），"
+                    "否则服务会拒绝启动。"
+                )
+                return None
+            return host, port
+
         def on_start(self) -> None:
             if self.action_active:
                 return
-            try:
-                port = validate_port(self.port_entry.get())
-            except PortError as error:
-                self.append_log(f"[端口错误] {error}")
+            target = self._validated_host_port()
+            if target is None:
                 return
+            host, port = target
             self.action_active = True
             self.refresh_state()
-            self.append_log(f"正在启动服务（端口 {port}）...")
+            self.append_log(f"正在启动服务（{host}:{port}）...")
             threading.Thread(
-                target=self.start_worker, args=(port,), daemon=True
+                target=self.start_worker, args=(host, port), daemon=True
             ).start()
 
-        def start_worker(self, port: int) -> None:
+        def start_worker(self, host: str, port: int) -> None:
             try:
-                if not port_is_free(settings.host, port):
+                if not port_is_free(host, port):
                     sink.put(
                         (
                             "start_failed",
@@ -407,25 +584,87 @@ def run_gui(config_path: str | None = None) -> None:
                         )
                     )
                     return
-                result = controller.start(port)
+                result = controller.start(host, port)
                 sink.put(("started", result))
-                if port != settings.port:
+                if host != settings.host or port != settings.port:
                     try:
-                        update_config_port(config_file_path(settings), port)
-                        sink.put(("log", f"端口 {port} 已写入配置，后续启动将使用该端口。"))
-                    except (OSError, ValueError) as error:
-                        sink.put(("log", f"[配置写入失败] {error}"))
-                    if os.getenv("AGENTCHATROOM_PORT", "").strip():
+                        update_config_values(
+                            config_file_path(settings), host=host, port=port
+                        )
                         sink.put(
                             (
                                 "log",
-                                "检测到 AGENTCHATROOM_PORT 环境变量：其他启动入口仍以环境变量优先。",
+                                f"{host}:{port} 已写入配置，后续启动将使用该配置。",
+                            )
+                        )
+                    except (OSError, ValueError) as error:
+                        sink.put(("log", f"[配置写入失败] {error}"))
+                    if os.getenv("AGENTCHATROOM_PORT", "").strip() or os.getenv(
+                        "AGENTCHATROOM_HOST", ""
+                    ).strip():
+                        sink.put(
+                            (
+                                "log",
+                                "检测到 AGENTCHATROOM_HOST/PORT 环境变量：其他启动入口仍以环境变量优先。",
                             )
                         )
             except SystemExit as error:
                 sink.put(("start_failed", str(error)))
             except OSError as error:
                 sink.put(("start_failed", f"{type(error).__name__}: {error}"))
+
+        def on_restart(self) -> None:
+            if self.action_active:
+                return
+            target = self._validated_host_port()
+            if target is None:
+                return
+            host, port = target
+            self.action_active = True
+            self.refresh_state()
+            steps = restart_steps(controller.is_running())
+            self.append_log(
+                "正在重启服务（先停止后启动）..."
+                if steps == ("stop", "start")
+                else f"服务未在运行，直接启动（{host}:{port}）..."
+            )
+            threading.Thread(
+                target=self.restart_worker, args=(host, port), daemon=True
+            ).start()
+
+        def restart_worker(self, host: str, port: int) -> None:
+            try:
+                if restart_steps(controller.is_running()) == ("stop", "start"):
+                    result = controller.stop()
+                    if not result.get("stopped"):
+                        sink.put(
+                            (
+                                "restart_aborted",
+                                f"旧服务停止未完成：{result.get('reason')}",
+                            )
+                        )
+                        return
+                    sink.put(("log", "旧服务已停止，正在重新启动..."))
+                self.start_worker(host, port)
+            except OSError as error:
+                sink.put(("stop_failed", f"{type(error).__name__}: {error}"))
+
+        def on_frontend(self) -> None:
+            if controller.running_pid() is None:
+                self.append_log("服务未运行，请先启动服务再打开前端。")
+                return
+            host = self._safe_host()
+            url = resolve_frontend_url(
+                running_url_from_log(controller.log_path)
+                if not self.running_port
+                else None,
+                host,
+                self.running_port or settings.port,
+            )
+            self.append_log(f"正在用系统默认浏览器打开前端：{url}")
+            threading.Thread(
+                target=lambda: webbrowser.open(url), daemon=True
+            ).start()
 
         def on_stop(self) -> None:
             if self.action_active:
@@ -442,6 +681,9 @@ def run_gui(config_path: str | None = None) -> None:
                 sink.put(("stop_failed", f"{type(error).__name__}: {error}"))
 
         def on_close(self) -> None:
+            if self.tray is not None:
+                self.hide_to_tray()
+                return
             running = controller.is_running()
             choice: str | None = None
             if running:
@@ -457,40 +699,113 @@ def run_gui(config_path: str | None = None) -> None:
             if action == STAY:
                 return
             if action == KEEP_RUNNING:
-                self.shutdown_window()
+                self.shutdown_app()
                 return
             if action == STOP_AND_CLOSE:
                 self.action_active = True
-                self.pending_close_after_stop = True
+                self.pending_exit_after_stop = True
                 self.refresh_state()
                 self.append_log("正在结束服务并关闭...")
                 threading.Thread(target=self.stop_worker, daemon=True).start()
                 return
-            self.shutdown_window()
+            self.shutdown_app()
 
-        def finish_close_after_stop(self, stopped: bool) -> None:
-            self.pending_close_after_stop = False
+        def on_unmap(self, event) -> None:
+            if self.tray is None or event.widget is not self:
+                return
+            try:
+                iconic = self.state() == "iconic"
+            except tk.TclError:
+                return
+            if iconic:
+                self.hide_to_tray()
+
+        def hide_to_tray(self) -> None:
+            self.withdraw()
+            if not self.tray_hint_shown:
+                self.tray_hint_shown = True
+                self.append_log(
+                    "控制台已收起到系统托盘：双击托盘图标恢复窗口，"
+                    "托盘右键菜单可打开前端、启动/重启/停止服务或退出。"
+                )
+
+        def restore_from_tray(self) -> None:
+            self.deiconify()
+            self.lift()
+            self.focus_force()
+
+        def handle_tray_action(self, action: str) -> None:
+            if action == "show":
+                self.restore_from_tray()
+            elif action == "frontend":
+                self.on_frontend()
+            elif action == "start":
+                self.on_start()
+            elif action == "restart":
+                self.on_restart()
+            elif action == "stop":
+                self.on_stop()
+            elif action == "quit":
+                self.on_tray_quit()
+
+        def on_tray_quit(self) -> None:
+            running = controller.is_running()
+            choice: str | None = None
+            if running:
+                answer = messagebox.askyesnocancel(
+                    "退出 AgentChatRoom 控制台",
+                    "服务仍在运行。\n\n"
+                    "是：结束服务并退出\n"
+                    "否：保留后台服务，仅退出控制台\n"
+                    "取消：不退出",
+                )
+                choice = {True: "stop", False: "keep", None: "cancel"}[answer]
+            action = close_action(running, choice)
+            if action == STAY:
+                return
+            if action == STOP_AND_CLOSE:
+                self.action_active = True
+                self.pending_exit_after_stop = True
+                self.refresh_state()
+                self.append_log("正在结束服务并退出...")
+                threading.Thread(target=self.stop_worker, daemon=True).start()
+                return
+            self.shutdown_app()
+
+        def finish_exit_after_stop(self, stopped: bool) -> None:
+            self.pending_exit_after_stop = False
             if stopped:
-                self.shutdown_window()
+                self.shutdown_app()
                 return
             force = messagebox.askyesno(
                 "停止未完成",
                 "服务停止未完成。稍后可运行「关闭 AgentChatRoom.cmd」清理残留进程。\n\n"
-                "仍要关闭 GUI 吗？",
+                "仍要退出控制台吗？",
             )
             if force:
-                self.shutdown_window()
+                self.shutdown_app()
             else:
                 self.action_active = False
                 self.refresh_state()
 
-        def shutdown_window(self) -> None:
+        def shutdown_app(self) -> None:
             stop_log_event.set()
+            if self.tray is not None:
+                self.tray.stop()
             self.destroy()
 
     log_tail = LogTail(controller.log_path, sink, stop_log_event)
     log_tail.start()
     window = ControllerWindow()
+    window.tray = create_tray_icon(
+        lambda action: window.after(0, window.handle_tray_action, action)
+    )
+    if window.tray is None:
+        window.append_log(
+            "系统托盘不可用（需要 pystray 与 Pillow，可通过 pip install "
+            "\"agentchatroom[gui]\" 安装）：关闭窗口将按原来的方式询问，"
+            "最小化只到任务栏。"
+        )
     try:
         window.mainloop()
     finally:

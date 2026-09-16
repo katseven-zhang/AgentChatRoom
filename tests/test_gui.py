@@ -7,26 +7,35 @@ import threading
 import time
 import tomllib
 from dataclasses import replace
+from pathlib import Path
 from queue import Queue
 
 import pytest
 
-from agentchatroom.cli import build_parser, process_is_running
+from agentchatroom.cli import build_parser, process_is_running, service_url
 from agentchatroom.gui import (
     CLOSE,
     KEEP_RUNNING,
     LogTail,
+    HostError,
     PortError,
     STAY,
     STOP_AND_CLOSE,
     ServiceController,
+    build_tray_menu_spec,
     button_states,
     close_action,
     config_file_path,
+    host_requires_management_auth,
     port_is_free,
     redact_line,
+    restart_steps,
+    resolve_frontend_url,
     running_url_from_log,
+    tray_icon_image,
     update_config_port,
+    update_config_values,
+    validate_host,
     validate_port,
 )
 
@@ -72,6 +81,84 @@ def test_validate_port_accepts_usable_ports(raw: str, expected: int) -> None:
 def test_validate_port_rejects_unusable_input(raw: str) -> None:
     with pytest.raises(PortError):
         validate_port(raw)
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("127.0.0.1", "127.0.0.1"),
+        ("  localhost  ", "localhost"),
+        ("::1", "::1"),
+        ("0.0.0.0", "0.0.0.0"),
+        ("192.168.1.10", "192.168.1.10"),
+        ("::", "::"),
+    ],
+)
+def test_validate_host_accepts_usable_addresses(raw: str, expected: str) -> None:
+    assert validate_host(raw) == expected
+
+
+@pytest.mark.parametrize(
+    "raw",
+    ["", "   ", "example.com", "999.1.1.1", "127.0.0.1:8765", "0x1", "1.2.3.4.5"],
+)
+def test_validate_host_rejects_unusable_input(raw: str) -> None:
+    with pytest.raises(HostError):
+        validate_host(raw)
+
+
+@pytest.mark.parametrize(
+    ("host", "requires_auth"),
+    [
+        ("127.0.0.1", False),
+        ("localhost", False),
+        ("::1", False),
+        ("0.0.0.0", True),
+        ("192.168.1.10", True),
+        ("::", True),
+    ],
+)
+def test_host_auth_rule_mirrors_server_config(host: str, requires_auth: bool) -> None:
+    assert host_requires_management_auth(host) is requires_auth
+
+
+def test_restart_steps_stop_before_start_only_when_running() -> None:
+    assert restart_steps(service_running=True) == ("stop", "start")
+    assert restart_steps(service_running=False) == ("start",)
+
+
+def test_resolve_frontend_url_prefers_logged_address() -> None:
+    assert (
+        resolve_frontend_url("http://127.0.0.1:9000", "0.0.0.0", 8765)
+        == "http://127.0.0.1:9000"
+    )
+    assert resolve_frontend_url(None, "127.0.0.1", 8765) == service_url(
+        "127.0.0.1", 8765
+    )
+
+
+def test_tray_menu_covers_console_lifecycle_actions() -> None:
+    spec = build_tray_menu_spec()
+    actions = [action for _label, action, _default in spec]
+    assert actions == ["show", "frontend", "start", "restart", "stop", "quit"]
+    defaults = [default for _label, _action, default in spec]
+    assert defaults.count(True) == 1
+    assert spec[0][0] == "打开控制台"
+    assert defaults[0] is True
+
+
+def test_tray_icon_image_renders_with_pillow() -> None:
+    pytest.importorskip("PIL")
+    image = tray_icon_image()
+    assert image is not None
+    assert image.size == (64, 64)
+
+
+def test_create_tray_icon_degrades_without_pystray(monkeypatch) -> None:
+    import agentchatroom.gui as gui_module
+
+    monkeypatch.setitem(sys.modules, "pystray", None)
+    assert gui_module.create_tray_icon(lambda action: None) is None
 
 
 def test_button_states_follow_service_and_action_state() -> None:
@@ -166,6 +253,37 @@ def test_config_file_path_prefers_explicit_config(settings) -> None:
     assert config_file_path(settings) == settings.data_dir / "config.toml"
 
 
+def test_update_config_values_persists_host_and_port(tmp_path) -> None:
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(
+        "\n".join(
+            [
+                "[server]",
+                'host = "127.0.0.1"',
+                "port = 9000",
+                "",
+                "[knowledge]",
+                'kinds = ["decision", "api"]',
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    update_config_values(config_path, host="127.0.0.1", port=9100)
+
+    document = tomllib.loads(config_path.read_text(encoding="utf-8"))
+    assert document["server"]["host"] == "127.0.0.1"
+    assert document["server"]["port"] == 9100
+    assert document["knowledge"]["kinds"] == ["decision", "api"]
+
+    update_config_values(config_path, host="0.0.0.0")
+
+    document = tomllib.loads(config_path.read_text(encoding="utf-8"))
+    assert document["server"]["host"] == "0.0.0.0"
+    assert document["server"]["port"] == 9100
+
+
 def test_update_config_port_preserves_other_settings(tmp_path) -> None:
     config_path = tmp_path / "config.toml"
     config_path.write_text(
@@ -248,7 +366,7 @@ def test_gui_service_controller_reuses_cli_lifecycle(settings) -> None:
 
     assert controller.is_running() is False
 
-    started = controller.start(port)
+    started = controller.start(settings.host, port)
     pid = started["pid"]
     try:
         assert started["started"] is True
@@ -256,9 +374,12 @@ def test_gui_service_controller_reuses_cli_lifecycle(settings) -> None:
         assert controller.running_pid() == pid
         assert process_is_running(pid)
 
-        repeated = controller.start(port)
+        repeated = controller.start(settings.host, port)
         assert repeated["already_running"] is True
         assert repeated["pid"] == pid
+        assert controller.display_url(settings.host, port) == service_url(
+            settings.host, port
+        )
     finally:
         stopped = controller.stop()
 
@@ -301,3 +422,66 @@ def test_run_gui_reports_missing_tkinter_with_actionable_error(monkeypatch) -> N
 
     assert "tkinter" in str(exit_info.value)
     assert "python.org" in str(exit_info.value)
+
+
+def _load_entry_app():
+    import importlib.util
+
+    entry_path = (
+        Path(__file__).resolve().parents[1] / "packaging" / "entry_app.py"
+    )
+    spec = importlib.util.spec_from_file_location("entry_app_under_test", entry_path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_entry_app_routes_default_to_gui_console(monkeypatch) -> None:
+    import agentchatroom.gui as gui_module
+    import agentchatroom.stdio_runtime as stdio_runtime
+
+    entry_app = _load_entry_app()
+    calls: list[tuple[str, object]] = []
+    monkeypatch.setattr(stdio_runtime, "prepare_standard_streams", lambda: None)
+    monkeypatch.setattr(
+        gui_module, "run_gui", lambda config_path: calls.append(("gui", config_path))
+    )
+    monkeypatch.setattr(sys, "argv", ["agentchatroom.exe"])
+
+    entry_app.main()
+
+    assert calls == [("gui", None)]
+
+
+def test_entry_app_routes_gui_config_flag(monkeypatch) -> None:
+    import agentchatroom.gui as gui_module
+    import agentchatroom.stdio_runtime as stdio_runtime
+
+    entry_app = _load_entry_app()
+    calls: list[tuple[str, object]] = []
+    monkeypatch.setattr(stdio_runtime, "prepare_standard_streams", lambda: None)
+    monkeypatch.setattr(
+        gui_module, "run_gui", lambda config_path: calls.append(("gui", config_path))
+    )
+    monkeypatch.setattr(
+        sys, "argv", ["agentchatroom.exe", "gui", "--config", "custom.toml"]
+    )
+
+    entry_app.main()
+
+    assert calls == [("gui", "custom.toml")]
+
+
+def test_entry_app_routes_service_subcommands_to_cli(monkeypatch) -> None:
+    import agentchatroom.cli as cli_module
+    import agentchatroom.stdio_runtime as stdio_runtime
+
+    entry_app = _load_entry_app()
+    calls: list[str] = []
+    monkeypatch.setattr(stdio_runtime, "prepare_standard_streams", lambda: None)
+    monkeypatch.setattr(cli_module, "main", lambda: calls.append("cli"))
+    monkeypatch.setattr(sys, "argv", ["agentchatroom.exe", "serve"])
+
+    entry_app.main()
+
+    assert calls == ["cli"]

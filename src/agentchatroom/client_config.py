@@ -1,11 +1,11 @@
 """User-level client configuration and ServerTarget abstraction for AgentChatRoom.
 
-This module establishes the architectural seams for GUI shell and client targets:
+This module establishes the architectural seams for GUI consoles and client targets:
 1. ServerTarget abstraction: local vs remote mode with unified version handshake probe.
 2. User-level client configuration: stored in ~/.agentchatroom/client.toml,
    strictly separated from repository checkout config.toml.
 3. Zero authentication assumption: probe handles status codes gracefully and
-   leaves credentials/tokens entirely to the in-webview SPA login flow.
+   leaves credentials/tokens entirely to the browser SPA login flow.
 """
 
 from __future__ import annotations
@@ -45,7 +45,7 @@ class ProbeResult:
 
 @dataclass(frozen=True)
 class ServerTarget:
-    """Target server configuration for GUI shell and client adapters."""
+    """Target server configuration for GUI consoles and client adapters."""
 
     mode: Literal["local", "remote"] = "local"
     base_url: str = ""
@@ -79,7 +79,7 @@ class ServerTarget:
 
         Local and remote modes share the exact same probe path.
         Operates with zero auth assumption: if a server responds with 401/403,
-        it is still reachable and the SPA inside webview will present the login UI.
+        it is still reachable and the browser SPA will present the login UI.
         """
         version_url = f"{self.base_url.rstrip('/')}/api/v1/version"
         req = urllib.request.Request(
