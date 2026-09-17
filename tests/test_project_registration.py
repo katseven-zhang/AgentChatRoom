@@ -340,6 +340,105 @@ def test_logical_path_must_match_actual_project_directory(tmp_path):
     assert mismatch.value.code == "invalid_logical_path"
 
 
+def test_git_info_decodes_git_output_as_utf8_independent_of_locale(
+    tmp_path, monkeypatch
+):
+    """Reported regression: Git for Windows writes UTF-8 path bytes to pipes.
+
+    Decoding with the process locale (cp936 on Chinese Windows) turned the
+    repository toplevel into mojibake, so ``derive_logical_path`` rejected the
+    very directory the user selected with ``project_scope_conflict``.
+    """
+    from agentchatroom import project_registration
+
+    project_root = tmp_path / "赞助管理工具"
+    project_root.mkdir()
+    toplevel_bytes = str(project_root).replace("\\", "/").encode("utf-8")
+    remote_bytes = "git@example.invalid:team/赞助管理工具.git".encode("utf-8")
+
+    def fake_run(command, **_kwargs):
+        arguments = list(command)
+        if "rev-parse" in arguments:
+            stdout: bytes = toplevel_bytes
+        elif "config" in arguments:
+            stdout = remote_bytes
+        else:
+            stdout = b""
+        return subprocess.CompletedProcess(args=command, returncode=0, stdout=stdout, stderr=b"")
+
+    monkeypatch.setattr(project_registration.subprocess, "run", fake_run)
+
+    remote, git_root = project_registration._git_info(project_root)
+
+    assert remote == "git@example.invalid:team/赞助管理工具.git"
+    assert git_root == project_root.resolve()
+    assert checkout_scope(project_root) == {
+        "kind": "git",
+        "identity": "https://example.invalid/team/赞助管理工具",
+        "logical_path": "",
+    }
+
+
+def test_service_project_git_info_shares_utf8_decoding(tmp_path, monkeypatch):
+    """The web "添加项目" flow goes through services._project_git_info."""
+    from agentchatroom import project_registration, services
+
+    project_root = tmp_path / "赞助管理工具"
+    project_root.mkdir()
+    toplevel_bytes = str(project_root).replace("\\", "/").encode("utf-8")
+
+    def fake_run(command, **_kwargs):
+        arguments = list(command)
+        stdout = toplevel_bytes if "rev-parse" in arguments else b""
+        return subprocess.CompletedProcess(
+            args=command, returncode=0, stdout=stdout, stderr=b""
+        )
+
+    monkeypatch.setattr(project_registration.subprocess, "run", fake_run)
+
+    remote, git_root = services._project_git_info(project_root)
+
+    assert remote == ""
+    assert git_root == project_root.resolve()
+    assert derive_logical_path(project_root, git_root) == ""
+
+
+def test_checkout_scope_accepts_unicode_named_repository(tmp_path):
+    project_root = tmp_path / "赞助管理工具"
+    project_root.mkdir()
+    subprocess.run(["git", "-C", str(project_root), "init"], check=True, capture_output=True)
+
+    scope = checkout_scope(project_root)
+
+    assert scope["kind"] == "path"
+    assert scope["logical_path"] == ""
+    assert Path(scope["identity"].replace("\\", "/")).resolve() == project_root.resolve()
+
+
+def test_checkout_scope_accepts_unicode_repository_subdirectory(tmp_path):
+    repository = tmp_path / "赞助管理工具"
+    api = repository / "packages" / "接口"
+    api.mkdir(parents=True)
+    subprocess.run(["git", "-C", str(repository), "init"], check=True, capture_output=True)
+
+    assert checkout_scope(api) == {
+        "kind": "path",
+        "identity": os.path.normcase(str(repository.resolve())),
+        "logical_path": os.path.normcase("packages/接口").replace("\\", "/"),
+    }
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows case-insensitive path input")
+def test_checkout_scope_normalizes_windows_case_variant_input(tmp_path):
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    subprocess.run(["git", "-C", str(repository), "init"], check=True, capture_output=True)
+
+    variant = str(repository).swapcase()
+    assert Path(variant).resolve() == repository.resolve()
+    assert checkout_scope(variant) == checkout_scope(repository)
+
+
 def test_checkout_registration_rejects_a_file_copied_from_another_scope(
     service, tmp_path
 ):

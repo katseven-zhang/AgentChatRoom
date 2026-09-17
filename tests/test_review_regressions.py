@@ -28,7 +28,9 @@ def test_background_git_and_backup_commands_do_not_create_consoles(monkeypatch, 
         calls.append((command, kwargs))
         assert kwargs.get('creationflags') == windows_flag
         assert not kwargs.get('shell', False)
-        return SimpleNamespace(returncode=0, stdout='', stderr='')
+        # Real subprocess with capture_output=True returns bytes; git path
+        # helpers decode UTF-8 explicitly instead of trusting the locale.
+        return SimpleNamespace(returncode=0, stdout=b'', stderr=b'')
 
     monkeypatch.setattr(subprocess, 'run', fake_run)
     services._project_git_info(tmp_path)

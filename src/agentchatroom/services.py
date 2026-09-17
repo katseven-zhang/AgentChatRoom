@@ -60,7 +60,7 @@ from .contracts import (
 )
 from .database import SCHEMA_VERSION, DatabaseBackend
 from .errors import DomainError
-from .project_registration import derive_logical_path
+from .project_registration import detect_git_info, derive_logical_path
 from .task_history import (
     TASK_HISTORY_LIMIT_MAX,
     TASK_HISTORY_SCHEMA_VERSION,
@@ -457,28 +457,9 @@ def patterns_overlap(left: str, right: str) -> bool:
 
 
 def _project_git_info(root: Path) -> tuple[str, Path]:
-    try:
-        remote = subprocess.run(
-            ["git", "-C", str(root), "config", "--get", "remote.origin.url"],
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=3,
-            stdin=subprocess.DEVNULL,
-        ).stdout.strip()
-        top = subprocess.run(
-            ["git", "-C", str(root), "rev-parse", "--show-toplevel"],
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=3,
-            stdin=subprocess.DEVNULL,
-        ).stdout.strip()
-        return remote, Path(top).resolve() if top else root
-    except (OSError, subprocess.SubprocessError):
-        return "", root
+    # Single shared implementation with checkout registration: Git writes
+    # UTF-8 path bytes, which must never be decoded with the process locale.
+    return detect_git_info(root)
 
 
 def _project_scope(

@@ -85,29 +85,30 @@ def normalize_remote(value: str) -> str:
     return normalized.rstrip("/").lower()
 
 
-def _git_info(root: Path) -> tuple[str, Path]:
+def detect_git_info(root: Path) -> tuple[str, Path]:
+    def git_output(*arguments: str) -> str:
+        completed = subprocess.run(
+            ["git", *arguments],
+            check=False,
+            capture_output=True,
+            timeout=3,
+            stdin=subprocess.DEVNULL,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        # Git writes path output as UTF-8 regardless of the Windows console
+        # code page; decoding with the process locale instead turns non-ASCII
+        # repository paths into mojibake that no longer matches root_path.
+        return completed.stdout.decode("utf-8", "replace").strip()
+
     try:
-        remote = subprocess.run(
-            ["git", "-C", str(root), "config", "--get", "remote.origin.url"],
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=3,
-            stdin=subprocess.DEVNULL,
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-        ).stdout.strip()
-        top = subprocess.run(
-            ["git", "-C", str(root), "rev-parse", "--show-toplevel"],
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=3,
-            stdin=subprocess.DEVNULL,
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-        ).stdout.strip()
+        remote = git_output("-C", str(root), "config", "--get", "remote.origin.url")
+        top = git_output("-C", str(root), "rev-parse", "--show-toplevel")
         return remote, Path(top).resolve() if top else root
     except (OSError, subprocess.SubprocessError):
         return "", root
+
+
+_git_info = detect_git_info
 
 
 def project_registration_path(root_path: str | Path) -> Path:
