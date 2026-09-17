@@ -2374,8 +2374,11 @@ def create_app(
                     for name in fingerprint_assets
                 ),
             )
-            cached = index_html_cache.get(key)
-            if cached is None:
+            # Cache hits must reuse the stored document: computing ``html``
+            # only inside the miss branch left it unbound on the second
+            # request, turning every page refresh into a 500.
+            html = index_html_cache.get(key)
+            if html is None:
                 html = index_path.read_bytes()
                 for name in fingerprint_assets:
                     html = re.sub(

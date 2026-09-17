@@ -1995,3 +1995,18 @@ def test_index_html_stamps_asset_versions_from_content(settings):
     assert css_match.group(1) == expected["app.css"]
     assert favicon_match.group(1) == expected["favicon.svg"]
     assert "central54" not in body and "central1" not in body
+
+
+def test_index_html_serves_repeated_requests_without_error(settings):
+    """#164: the cached index path must return the stored document, not raise
+    UnboundLocalError on the second GET / (every page refresh hit a 500)."""
+    with TestClient(create_app(settings)) as client:
+        first = client.get("/")
+        second = client.get("/")
+        third = client.get("/")
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert third.status_code == 200
+    assert second.text == first.text
+    assert third.text == first.text
