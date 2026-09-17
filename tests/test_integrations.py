@@ -57,6 +57,8 @@ def test_add_project_http_prompt_drives_incremental_agent_side_merge(tmp_path):
     prompt = result['profiles']['generic']['onboarding_modes']['add_project']['http']
     # 必要上下文：目标 Project、合并逻辑与 bootstrap 调用。
     assert '目标 Project：Room B' in prompt
+    assert f'root_path: {tmp_path}' in prompt
+    assert f'在目标 Project 本地工作区（{tmp_path}）中调用 `room_bootstrap(project_name="Room B")`' in prompt
     assert '保留原 url、软件身份三字段与全部旧 Project 凭据' in prompt
     assert '`project_name_N` / `project_token_N`' in prompt
     assert '写回同一个 agentchatroom 条目' in prompt

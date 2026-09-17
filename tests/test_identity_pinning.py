@@ -147,3 +147,71 @@ def test_bootstrap_local_room_rejects_drifted_identity_for_linked_credential(
     assert drifted.binding is None
     details = (drifted.public.get("details") or {}).get("code")
     assert details == "software_identity_mismatch"
+
+
+def test_default_credential_name_auto_renamed_to_real_agent_name(
+    quiet_service, project_dir
+):
+    """默认兜底凭据名（Agent 凭据）在 Agent 接入后自动更名为其真实名称，且重名递增序号。"""
+    service = quiet_service
+    project = service.create_project(root_path=str(project_dir), name="AutoRename")
+
+    # 1. 首次签发：不指定真实名字，默认名为「Agent 凭据」
+    issued1 = service.issue_agent_token(project["id"], name="Agent 凭据")
+    cred1_id = issued1["credential"]["id"]
+
+    # 2. Agent 以真实名称 "Hermes" 接入，凭据应自动更名为 "Hermes 凭据"
+    joined1 = service.join_room(
+        project["id"],
+        software_key="hermes-1",
+        name="Hermes",
+        client="hermes",
+        model="unknown",
+        credential_id=cred1_id,
+    )
+    assert joined1["member_created"] is True
+
+    cred1 = next(c for c in service.list_agent_tokens(project["id"]) if c["id"] == cred1_id)
+    assert cred1["name"] == "Hermes 凭据"
+    assert cred1["member_id"] == joined1["agent"]["member_id"]
+
+    # 3. 再次签发另一个默认名为「Agent 凭据」的 Token
+    issued2 = service.issue_agent_token(project["id"], name="Agent 凭据")
+    cred2_id = issued2["credential"]["id"]
+
+    # 4. 同一 Agent (或已有成员) 再次接入，凭据自动更名为递增序号 "Hermes 凭据 2"
+    joined2 = service.join_room(
+        project["id"],
+        software_key="hermes-1",
+        name="Hermes",
+        client="hermes",
+        model="unknown",
+        credential_id=cred2_id,
+    )
+    assert joined2["member_created"] is False  # 成员已存在
+
+    cred2 = next(c for c in service.list_agent_tokens(project["id"]) if c["id"] == cred2_id)
+    assert cred2["name"] == "Hermes 凭据 2"
+    assert cred2["member_id"] == joined1["agent"]["member_id"]
+
+    # 5. 显式自定义名称的凭据不应被更名
+    issued3 = service.issue_agent_token(project["id"], name="Custom Managed Token")
+    cred3_id = issued3["credential"]["id"]
+    service.join_room(
+        project["id"],
+        software_key="hermes-1",
+        name="Hermes",
+        client="hermes",
+        model="unknown",
+        credential_id=cred3_id,
+    )
+    cred3 = next(c for c in service.list_agent_tokens(project["id"]) if c["id"] == cred3_id)
+    assert cred3["name"] == "Custom Managed Token"
+    assert cred3["member_id"] == joined1["agent"]["member_id"]
+
+    # 6. 直接调用 link_credential_member 关联默认凭据名时，也应自动更名
+    issued4 = service.issue_agent_token(project["id"], name="Agent 凭据")
+    cred4_id = issued4["credential"]["id"]
+    linked_res = service.link_credential_member(project["id"], cred4_id, joined1["agent"]["member_id"])
+    assert linked_res["linked"] is True
+    assert linked_res["credential"]["name"] == "Hermes 凭据 3"

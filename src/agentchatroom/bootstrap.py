@@ -11,6 +11,8 @@ from .errors import DomainError
 from .project_registration import (
     PROJECT_REGISTRATION_RELATIVE_PATH,
     checkout_scope,
+    load_checkout_registration,
+    register_checkout_project,
     resolve_checkout_project_key,
     stored_project_scope,
     write_project_coordination_instructions,
@@ -691,6 +693,13 @@ def bootstrap_local_room(
                 }
         except DomainError:
             pass
+        try:
+            reg = load_checkout_registration(checkout)
+            expected_scope = checkout_scope(checkout)
+            if reg is None or reg.get("scope") != expected_scope:
+                register_checkout_project(checkout, project, replace_existing=True)
+        except DomainError:
+            pass
 
     workspace_path = str(checkout) if checkout is not None else ""
     try:
@@ -710,6 +719,22 @@ def bootstrap_local_room(
                 client=client,
             )
             if restored_outcome is not None:
+                if credential_id:
+                    session_info = restored_outcome.payload.get("session") or {}
+                    session_id = session_info.get("id")
+                    if session_id:
+                        with service.database.connect(write=False) as conn:
+                            srow = conn.execute(
+                                "SELECT member_id FROM agent_sessions WHERE id = ?",
+                                (session_id,),
+                            ).fetchone()
+                            if srow and srow["member_id"]:
+                                try:
+                                    service.link_credential_member(
+                                        project["id"], credential_id, str(srow["member_id"])
+                                    )
+                                except DomainError:
+                                    pass
                 return restored_outcome
         registered = (
             service.register_workspace(
@@ -771,8 +796,9 @@ def bootstrap_local_room(
             member_id=pinned_member_id,
             host_id=registered["host"]["id"] if registered else None,
             workspace_id=registered["workspace"]["id"] if registered else None,
+            credential_id=credential_id,
         )
-        if credential_id and joined.get("member_created"):
+        if credential_id:
             member_id = str(
                 joined.get("agent", {}).get("member_id")
                 or joined.get("identity", {}).get("id")

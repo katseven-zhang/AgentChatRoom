@@ -92,6 +92,10 @@ AGENT_PERMISSIONS = {
     "document:write",
 }
 DEFAULT_AGENT_PERMISSIONS = AGENT_PERMISSIONS - {"audit:read"}
+DEFAULT_CREDENTIAL_NAME_PATTERN = re.compile(
+    r"^(?:Agent\s*(?:凭据|Token)(?:\s+\d+)?|.+?\s*·\s*.*HTTP|.*(?:通用（标准\s*MCP）|Standard\s*MCP).*)$",
+    re.IGNORECASE,
+)
 PROJECT_SETTINGS_DEFAULTS: dict[str, Any] = {
     "lease_conflict_policy": "advisory",
     "roles": [],
@@ -1016,6 +1020,36 @@ class AgentChatRoomService:
         )
         return data
 
+    @staticmethod
+    def _is_default_credential_name(name: str) -> bool:
+        return bool(DEFAULT_CREDENTIAL_NAME_PATTERN.match(name.strip()))
+
+    def _derive_unique_credential_name(
+        self,
+        connection: Any,
+        project_id: str,
+        member_name: str,
+        *,
+        exclude_credential_id: str | None = None,
+    ) -> str:
+        clean_name = member_name.strip() or "Agent"
+        base = f"{clean_name} 凭据"
+        existing_rows = connection.execute(
+            "SELECT id, name FROM agent_credentials WHERE project_id = ?",
+            (project_id,),
+        ).fetchall()
+        taken = {
+            row["name"].strip().casefold()
+            for row in existing_rows
+            if exclude_credential_id is None or row["id"] != exclude_credential_id
+        }
+        if base.casefold() not in taken:
+            return base
+        ordinal = 2
+        while f"{base.casefold()} {ordinal}" in taken:
+            ordinal += 1
+        return f"{base} {ordinal}"
+
     def _member_dict(self, row: Mapping[str, Any]) -> dict[str, Any]:
         data = dict(row)
         data["metadata"] = json_load(data.pop("metadata_json"), {})
@@ -1532,12 +1566,67 @@ class AgentChatRoomService:
         remote, git_root = _project_git_info(root)
         logical = derive_logical_path(root, git_root, logical_path)
         candidate_scope = _project_scope(remote, git_root, logical)
-        with self.database.connect() as connection:
+        with self.database.connect(write=True) as connection:
+            all_projects = connection.execute("SELECT * FROM projects").fetchall()
             scope_projects = [
                 project
-                for project in connection.execute("SELECT * FROM projects").fetchall()
+                for project in all_projects
                 if _stored_project_scope(project) == candidate_scope
             ]
+            if not scope_projects and remote:
+                heal_target = None
+                norm_root = os.path.normcase(str(root.resolve()))
+                reg_key = str(registered_project_key or "").strip()
+                if reg_key:
+                    for p in all_projects:
+                        if str(p["project_key"]).strip() == reg_key:
+                            try:
+                                p_root = os.path.normcase(
+                                    str(Path(p["root_path"]).expanduser().resolve())
+                                )
+                                if p_root == norm_root:
+                                    heal_target = p
+                                    break
+                            except OSError:
+                                pass
+                if heal_target is None and not reg_key:
+                    matching_path_projects = [
+                        p
+                        for p in all_projects
+                        if p["archived_at"] is None
+                        and not str(p["git_remote"] or "").strip()
+                        and os.path.normcase(
+                            str(Path(p["root_path"]).expanduser().resolve())
+                        )
+                        == norm_root
+                    ]
+                    if len(matching_path_projects) == 1:
+                        heal_target = matching_path_projects[0]
+
+                if heal_target is not None:
+                    now = iso_now()
+                    connection.execute(
+                        """
+                        UPDATE projects
+                        SET git_remote = ?, logical_path = ?, updated_at = ?
+                        WHERE id = ?
+                        """,
+                        (remote, logical, now, heal_target["id"]),
+                    )
+                    self._emit(
+                        connection,
+                        heal_target["id"],
+                        "project.updated",
+                        payload={
+                            "git_remote": remote,
+                            "logical_path": logical,
+                            "scope_healed": True,
+                        },
+                    )
+                    updated_row = connection.execute(
+                        "SELECT * FROM projects WHERE id = ?", (heal_target["id"],)
+                    ).fetchone()
+                    scope_projects = [updated_row]
             active_scope = [
                 project for project in scope_projects if project["archived_at"] is None
             ]
@@ -1636,8 +1725,46 @@ class AgentChatRoomService:
             }
 
     def get_project(self, project_id: str) -> dict[str, Any]:
-        with self.database.connect() as connection:
-            return self._project_dict(self._require_project(connection, project_id))
+        with self.database.connect(write=True) as connection:
+            project = self._require_project(connection, project_id)
+            if (
+                project["archived_at"] is None
+                and not str(project["git_remote"] or "").strip()
+                and str(project["root_path"] or "").strip()
+            ):
+                try:
+                    root = Path(str(project["root_path"])).expanduser().resolve()
+                    if root.is_dir():
+                        remote, git_root = _project_git_info(root)
+                        if remote:
+                            logical = derive_logical_path(
+                                root, git_root, str(project["logical_path"] or "")
+                            )
+                            now = iso_now()
+                            connection.execute(
+                                """
+                                UPDATE projects
+                                SET git_remote = ?, logical_path = ?, updated_at = ?
+                                WHERE id = ?
+                                """,
+                                (remote, logical, now, project_id),
+                            )
+                            self._emit(
+                                connection,
+                                project_id,
+                                "project.updated",
+                                payload={
+                                    "git_remote": remote,
+                                    "logical_path": logical,
+                                    "scope_healed": True,
+                                },
+                            )
+                            project = connection.execute(
+                                "SELECT * FROM projects WHERE id = ?", (project_id,)
+                            ).fetchone()
+                except (OSError, DomainError):
+                    pass
+            return self._project_dict(project)
 
     def update_project(
         self,
@@ -2641,7 +2768,7 @@ class AgentChatRoomService:
             if credential_id:
                 credential = connection.execute(
                     """
-                    SELECT id, member_id FROM agent_credentials
+                    SELECT id, member_id, name FROM agent_credentials
                     WHERE id = ? AND project_id = ?
                     """,
                     (credential_id, project_id),
@@ -2744,6 +2871,33 @@ class AgentChatRoomService:
                         "client": client.strip(),
                     },
                 )
+            if credential_id and credential is not None:
+                needs_link = credential["member_id"] != member_id
+                needs_rename = self._is_default_credential_name(credential["name"])
+                if needs_link or needs_rename:
+                    cred_name = credential["name"]
+                    if needs_rename:
+                        cred_name = self._derive_unique_credential_name(
+                            connection,
+                            project_id,
+                            str(member["name"]),
+                            exclude_credential_id=credential_id,
+                        )
+                    connection.execute(
+                        "UPDATE agent_credentials SET member_id = ?, name = ?, updated_at = ? WHERE id = ?",
+                        (member_id, cred_name, now, credential_id),
+                    )
+                    self._emit(
+                        connection,
+                        project_id,
+                        "agent.credential_linked",
+                        actor_session_id=session_id,
+                        payload={
+                            "credential_id": credential_id,
+                            "member_id": member_id,
+                            "name": cred_name,
+                        },
+                    )
             if replacement["previous_session_ids"]:
                 self._emit(
                     connection,
@@ -2810,14 +2964,6 @@ class AgentChatRoomService:
                     "Agent credential does not belong to this Project",
                     status_code=404,
                 )
-            if credential["member_id"] == member_id:
-                return {"credential": self._credential_dict(credential), "linked": False}
-            if credential["member_id"] is not None:
-                raise DomainError(
-                    "credential_already_linked",
-                    "Agent credential is already linked to a project member",
-                    status_code=409,
-                )
             member = connection.execute(
                 "SELECT * FROM project_members WHERE id = ? AND project_id = ?",
                 (member_id, project_id),
@@ -2828,16 +2974,64 @@ class AgentChatRoomService:
                     "Credential can only be linked to an active project member",
                     status_code=409,
                 )
+            new_name = None
+            if self._is_default_credential_name(credential["name"]):
+                new_name = self._derive_unique_credential_name(
+                    connection,
+                    project_id,
+                    str(member["name"]),
+                    exclude_credential_id=credential_id,
+                )
+            if credential["member_id"] == member_id:
+                if new_name and new_name != credential["name"]:
+                    now = iso_now()
+                    connection.execute(
+                        "UPDATE agent_credentials SET name = ?, updated_at = ? WHERE id = ?",
+                        (new_name, now, credential_id),
+                    )
+                    event_id = self._emit(
+                        connection,
+                        project_id,
+                        "agent.credential_linked",
+                        actor_session_id=actor_session_id,
+                        payload={
+                            "credential_id": credential_id,
+                            "member_id": member_id,
+                            "name": new_name,
+                        },
+                    )
+                    updated = connection.execute(
+                        "SELECT * FROM agent_credentials WHERE id = ?", (credential_id,)
+                    ).fetchone()
+                    return {
+                        "credential": self._credential_dict(updated),
+                        "linked": True,
+                        "event_id": event_id,
+                        "cursor": event_id,
+                    }
+                return {"credential": self._credential_dict(credential), "linked": False}
+            if credential["member_id"] is not None:
+                raise DomainError(
+                    "credential_already_linked",
+                    "Agent credential is already linked to a project member",
+                    status_code=409,
+                )
+            now = iso_now()
+            updated_name = new_name or credential["name"]
             connection.execute(
-                "UPDATE agent_credentials SET member_id = ?, updated_at = ? WHERE id = ?",
-                (member_id, iso_now(), credential_id),
+                "UPDATE agent_credentials SET member_id = ?, name = ?, updated_at = ? WHERE id = ?",
+                (member_id, updated_name, now, credential_id),
             )
             event_id = self._emit(
                 connection,
                 project_id,
                 "agent.credential_linked",
                 actor_session_id=actor_session_id,
-                payload={"credential_id": credential_id, "member_id": member_id},
+                payload={
+                    "credential_id": credential_id,
+                    "member_id": member_id,
+                    "name": updated_name,
+                },
             )
             updated = connection.execute(
                 "SELECT * FROM agent_credentials WHERE id = ?", (credential_id,)

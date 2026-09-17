@@ -1141,9 +1141,14 @@ def room_bootstrap(model: str = "", project_name: str = "") -> dict[str, Any]:
     selected_credential_id = None
     if access is not None:
         selected_claims = access.claims or {}
-        selected_credential_id = (
-            str(selected_claims.get("credential_id") or "").strip() or None
-        )
+        if selected_claims.get("credential_bundle") and selected_project_id:
+            proj_cred = (selected_claims.get("project_credentials") or {}).get(selected_project_id)
+            if isinstance(proj_cred, dict) and proj_cred.get("credential_id"):
+                selected_credential_id = str(proj_cred["credential_id"]).strip() or None
+        if not selected_credential_id:
+            selected_credential_id = (
+                str(selected_claims.get("credential_id") or "").strip() or None
+            )
     outcome = bootstrap_local_room(
         get_service(),
         software_key=software_key,

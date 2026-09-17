@@ -230,6 +230,7 @@ def build_onboarding_prompt(
         "remote": "远程 Bridge",
     }[transport]
     project_name = str((project or {}).get("name") or "").strip()
+    root_path = str((project or {}).get("root_path") or "").strip()
     bootstrap_call = (
         f"`room_bootstrap(project_name={json.dumps(project_name, ensure_ascii=False)})`"
         if transport == "http"
@@ -260,18 +261,28 @@ def build_onboarding_prompt(
         )
 
     if mode == "add_project":
+        target_project_line = (
+            f"目标 Project：{project_name}（本地工作区根目录 root_path: {root_path}）"
+            if root_path
+            else f"目标 Project：{project_name}"
+        )
+        step3_call = (
+            f"3. 在目标 Project 本地工作区（{root_path}）中调用 {bootstrap_call}，核对返回的 Project 名称与 root_path 与当前工作区一致。"
+            if root_path
+            else f"3. 调用 {bootstrap_call}，核对返回的 Project 名称与 root_path 与当前工作区一致。"
+        )
         merge_steps = (
             "1. 在客户端本地现有 `agentchatroom` HTTP 配置中，保留原 url、软件身份三字段与"
             "全部旧 Project 凭据，仅把本次签发的 `project_name_N` / `project_token_N` 追加或"
             "替换进 Authorization 凭据包（`acrb.v1.*`），写回同一个 agentchatroom 条目；"
             "不新建第二个 agentchatroom 连接器。\n"
             "2. 保存后重启或重新加载客户端 MCP。\n"
-            f"3. 调用 {bootstrap_call}，核对返回的 Project 名称与 root_path 与当前工作区一致。"
+            f"{step3_call}"
         )
         return (
             f"{client_label} 已配置过 agentchatroom HTTP MCP：把本次签发的新 Project 凭据"
             f"增量合并进现有配置（{transport_label}）。\n\n"
-            f"目标 Project：{project_name}\n\n"
+            f"{target_project_line}\n\n"
             f"{merge_steps}\n\n"
             "无法读取本地配置时停止并向用户报告，不要凭空重建配置。\n"
             f"{security_line}"

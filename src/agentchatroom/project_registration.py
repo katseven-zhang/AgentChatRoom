@@ -406,6 +406,30 @@ def load_checkout_registration(
     return dict(matches[0]) if matches else None
 
 
+def _is_path_to_git_upgrade(
+    root_path: str | Path,
+    registered_scope: Mapping[str, Any],
+    requested_scope: Mapping[str, Any],
+) -> bool:
+    if (
+        isinstance(registered_scope, Mapping)
+        and isinstance(requested_scope, Mapping)
+        and registered_scope.get("kind") == "path"
+        and requested_scope.get("kind") == "git"
+    ):
+        try:
+            registered_identity = os.path.normcase(
+                str(Path(str(registered_scope.get("identity", ""))).expanduser().resolve())
+            )
+            current_identity = os.path.normcase(
+                str(Path(root_path).expanduser().resolve())
+            )
+            return registered_identity == current_identity
+        except (OSError, ValueError):
+            return False
+    return False
+
+
 def resolve_checkout_project_key(
     root_path: str | Path,
     *,
@@ -417,20 +441,23 @@ def resolve_checkout_project_key(
         root_path,
         logical_path=expected_logical_path,
     )
+    if registration is None and expected_logical_path:
+        registration = load_checkout_registration(root_path, logical_path="")
     if registration is None:
         return None, False
 
     if registration["scope"] != expected_scope:
-        raise DomainError(
-            "project_registration_scope_conflict",
-            "Checkout Project registration belongs to another repository scope",
-            status_code=409,
-            details={
-                "path": str(project_registration_path(root_path)),
-                "registered_scope": registration["scope"],
-                "requested_scope": expected_scope,
-            },
-        )
+        if not _is_path_to_git_upgrade(root_path, registration["scope"], expected_scope):
+            raise DomainError(
+                "project_registration_scope_conflict",
+                "Checkout Project registration belongs to another repository scope",
+                status_code=409,
+                details={
+                    "path": str(project_registration_path(root_path)),
+                    "registered_scope": registration["scope"],
+                    "requested_scope": expected_scope,
+                },
+            )
     registered_key = str(registration["project_key"]).strip()
     return registered_key, True
 
@@ -444,16 +471,17 @@ def validate_project_scope(
     requested_scope = checkout_scope(root_path, logical_path=logical_path)
     actual_scope = stored_project_scope(project)
     if requested_scope != actual_scope:
-        raise DomainError(
-            "project_scope_conflict",
-            "Resolved Project belongs to another repository scope",
-            status_code=409,
-            details={
-                "project_key": str(project.get("project_key", "")),
-                "project_scope": actual_scope,
-                "requested_scope": requested_scope,
-            },
-        )
+        if not _is_path_to_git_upgrade(root_path, actual_scope, requested_scope):
+            raise DomainError(
+                "project_scope_conflict",
+                "Resolved Project belongs to another repository scope",
+                status_code=409,
+                details={
+                    "project_key": str(project.get("project_key", "")),
+                    "project_scope": actual_scope,
+                    "requested_scope": requested_scope,
+                },
+            )
 
 
 def _write_document(path: Path, document: dict[str, Any]) -> None:
@@ -499,6 +527,9 @@ def register_checkout_project(
         ),
         None,
     )
+    if existing is None and registrations:
+        if len(registrations) == 1 and str(registrations[0].get("project_key", "")).strip() == project_key:
+            existing = registrations[0]
     if (
         existing is not None
         and str(existing["project_key"]).strip() != project_key

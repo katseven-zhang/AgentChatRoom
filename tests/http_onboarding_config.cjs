@@ -132,6 +132,16 @@ const linkedIncrementalPrompt = context.incrementalHttpPrompt(profile, {
 assert.match(linkedIncrementalPrompt, /本次 Token 已关联成员 "Chosen Agent"/);
 assert.match(linkedIncrementalPrompt, /Key="chosen"/);
 assert.match(linkedIncrementalPrompt, /三字段必须与/);
+const pathIncrementalPrompt = context.incrementalHttpPrompt(profile, {
+  mode: 'add_project',
+  projectName: 'Project B',
+  projectPath: '/path/to/project-b',
+  projectCredentials: [entries[1]],
+  incremental: true,
+});
+assert.match(pathIncrementalPrompt, /目标 Project：Project B（本地工作区根目录 root_path: \/path\/to\/project-b）/);
+assert.match(pathIncrementalPrompt, /合并条目：\{"name": "Project B", "token": "acr\.credential-b\.secret-b"\}/);
+assert.match(pathIncrementalPrompt, /在目标 Project 本地工作区（\/path\/to\/project-b）中调用 room_bootstrap\(project_name="Project B"\)/);
 const replaced = context.mergeProjectCredentials(entries, {
   name: 'Project B',
   token: 'acr.credential-b2.secret-b2',
