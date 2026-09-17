@@ -64,7 +64,7 @@ const elements = Object.fromEntries(
     "lease-list", "review-list", "chat-subtitle", "chat-stream", "event-filter", "event-hide-system",
     "message-form", "message-input", "send-message-button", "onboarding", "new-message-notice",
     "project-dialog", "project-form", "project-name-input", "project-path-input",
-    "project-folder-picker-button",
+    "project-folder-picker-button", "project-form-error",
     "task-dialog", "task-form", "task-raw-description-input", "task-target-agent-input",
     "task-target-agent-empty", "task-intake-submit", "task-intake-list", "task-table",
     "task-sort-controls",
@@ -684,13 +684,20 @@ function showToast(message, type = "success") {
   setTimeout(() => item.remove(), 3600);
 }
 
-function setTokenFormError(message) {
-  // #142：弹窗处于顶层（top-layer），body 底部的 toast 会被
-  // dialog::backdrop 的模糊滤镜虚化；签发表单的校验错误必须写在
-  // 弹窗内部的内联横幅里才能被看清。
-  const banner = elements["token-form-error"];
+function setDialogFormError(banner, message) {
+  // #142/#163：弹窗处于顶层（top-layer），body 底部的 toast 会被
+  // dialog::backdrop 的模糊滤镜虚化；弹窗内表单的错误必须写在
+  // 弹窗内部的内联横幅里才能被看清。所有 dialog 表单共用这一机制。
   banner.textContent = message || "";
   banner.hidden = !message;
+}
+
+function setTokenFormError(message) {
+  setDialogFormError(elements["token-form-error"], message);
+}
+
+function setProjectFormError(message) {
+  setDialogFormError(elements["project-form-error"], message);
 }
 
 function withBusy(work) {
@@ -2949,8 +2956,8 @@ elements["event-hide-system"].addEventListener("change", () => {
   if (state.snapshot) renderEvents(state.snapshot.agents, state.snapshot.tasks);
 });
 
-elements["project-form"].addEventListener("submit", async (event) => {
-  event.preventDefault();
+async function submitProjectForm() {
+  setProjectFormError("");
   try {
     const project = await withBusy(() => api("/api/v1/projects", {
       method: "POST",
@@ -2966,9 +2973,20 @@ elements["project-form"].addEventListener("submit", async (event) => {
     await loadProjects(alreadyKnown && previousId ? previousId : project.id);
     showToast("项目已添加");
   } catch (error) {
-    handleError(error);
+    // #163：失败时保持弹窗打开、输入原样保留，错误写进弹窗内横幅；
+    // 底层页面 toast 会被 dialog::backdrop 模糊遮住（与 #142 同机制）。
+    setProjectFormError(error.message || "项目添加失败");
   }
+}
+
+
+elements["project-form"].addEventListener("submit", async (event) => {
+  event.preventDefault();
+  await submitProjectForm();
 });
+
+// 关闭弹窗（成功、取消或右上角 ×）时清掉错误横幅，下次打开是干净状态。
+elements["project-dialog"].addEventListener("close", () => setProjectFormError(""));
 
 
 elements["settings-form"].addEventListener("submit", async (event) => {

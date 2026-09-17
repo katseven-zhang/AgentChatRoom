@@ -142,6 +142,20 @@ def test_project_api_rejects_broken_managed_agents_markers_before_database_write
         )
 
 
+def test_api_create_project_errors_are_reported_for_dialog_banner(settings, tmp_path):
+    # #163：新建项目弹窗把后端失败写进弹窗内横幅；这里钉住错误形状与列表不变。
+    with TestClient(create_app(settings)) as client:
+        missing = client.post(
+            "/api/v1/projects",
+            json={"name": "外部项目", "root_path": str(tmp_path / "不存在" / "赞助管理工具")},
+        )
+        assert missing.status_code == 400
+        error = missing.json()["error"]
+        assert error["code"] == "project_path_not_found"
+        assert error["message"]
+        assert client.get("/api/v1/projects").json()["projects"] == []
+
+
 def test_health_and_project_room_flow(settings, project_dir):
     with TestClient(create_app(settings)) as client:
         health = client.get("/health")
