@@ -17,6 +17,28 @@ def test_http_onboarding_config_generation_and_secret_cleanup():
     assert result.returncode == 0, result.stderr
 
 
+def test_dialog_toast_top_layer_routing_and_close_adoption():
+    """#167: 模态弹窗打开状态下 Toast 自动穿透路由至顶层弹窗内部，
+    弹窗关闭时自动由 body 级 toast-region 继承，CSS 确保在 Top Layer 中
+    浮层居中且不被 dialog::backdrop 虚化。"""
+    result = subprocess.run(
+        ["node", str(Path(__file__).with_name("dialog_toast_top_layer.cjs"))],
+        capture_output=True, text=True, timeout=20,
+    )
+    assert result.returncode == 0, result.stderr
+
+    css = (WEB_DIR / "app.css").read_text(encoding="utf-8")
+    javascript = (WEB_DIR / "app.js").read_text(encoding="utf-8")
+
+    assert "dialog > .toast-region" in css
+    assert ".dialog-toast-region" in css
+    assert "@keyframes dialog-toast-in" in css
+    assert "getActiveModalDialog()" in javascript
+    assert "getToastRegion()" in javascript
+    assert "adoptDialogToasts(dialog)" in javascript
+
+
+
 def test_web_add_project_issues_without_pasting_raw_config():
     """加入本项目：主流程零粘贴可签发；#141 起手动粘贴故障恢复区整体移除。"""
     markup = (WEB_DIR / "index.html").read_text(encoding="utf-8")

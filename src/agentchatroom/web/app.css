@@ -3217,6 +3217,54 @@ dialog::backdrop {
   border-left-color: var(--red);
 }
 
+/* 对话框顶层 Toast（#167）：当二级模态弹窗处于打开状态时，Toast 提示直接呈现在活跃弹窗
+   内部顶层，处于浏览器的 Top Layer 渲染上下文中，彻底避免被 dialog::backdrop 遮罩模糊虚化。
+   采用顶部居中、高对比度阴影的浮层展示，避免遮挡弹窗底部的确认/取消操作栏。 */
+dialog > .toast-region,
+.dialog-toast-region {
+  position: fixed;
+  top: 16px;
+  left: 50%;
+  transform: translateX(-50%);
+  right: auto;
+  bottom: auto;
+  z-index: 1000;
+  pointer-events: none;
+  width: max-content;
+  max-width: calc(100% - 32px);
+  display: grid;
+  gap: 8px;
+  justify-items: center;
+}
+
+dialog > .toast-region .toast {
+  pointer-events: auto;
+  width: max-content;
+  max-width: min(420px, calc(100vw - 48px));
+  border: 1px solid var(--border-strong, var(--border));
+  border-left: 4px solid var(--primary);
+  border-radius: var(--radius);
+  background: var(--surface);
+  color: var(--text);
+  box-shadow: 0 10px 28px -4px rgba(15, 23, 42, 0.22), 0 4px 10px -2px rgba(15, 23, 42, 0.12);
+  animation: dialog-toast-in 0.22s var(--ease);
+}
+
+dialog > .toast-region .toast.error {
+  border-left-color: var(--red);
+}
+
+@keyframes dialog-toast-in {
+  from {
+    opacity: 0;
+    transform: translateY(-8px) scale(0.96);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
 .sr-only {
   position: absolute;
   width: 1px;

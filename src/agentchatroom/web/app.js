@@ -678,10 +678,49 @@ function showToast(message, type = "success") {
   const item = document.createElement("div");
   item.className = `toast ${type}`;
   item.textContent = message;
-  const region = elements["toast-region"];
-  region.setAttribute("aria-live", type === "error" ? "assertive" : "polite");
-  region.append(item);
-  setTimeout(() => item.remove(), 3600);
+  const region = getToastRegion();
+  if (region) {
+    region.setAttribute("aria-live", type === "error" ? "assertive" : "polite");
+    region.append(item);
+  }
+  setTimeout(() => {
+    if (item.isConnected) item.remove();
+  }, 3600);
+}
+
+function getActiveModalDialog() {
+  const openDialogs = document.querySelectorAll("dialog[open]");
+  if (!openDialogs.length) return null;
+  return openDialogs[openDialogs.length - 1];
+}
+
+function getToastRegion() {
+  // #167: 当任意二级模态弹窗打开时，Toast 必须直接渲染在活跃弹窗顶层容器内部，
+  // 处于浏览器 Top Layer 上下文中，彻底避免被 dialog::backdrop 的模糊滤镜遮挡。
+  const activeDialog = getActiveModalDialog();
+  if (activeDialog) {
+    let dialogRegion = activeDialog.querySelector(":scope > .toast-region");
+    if (!dialogRegion) {
+      dialogRegion = document.createElement("div");
+      dialogRegion.className = "toast-region dialog-toast-region";
+      dialogRegion.setAttribute("aria-live", "polite");
+      activeDialog.appendChild(dialogRegion);
+    }
+    return dialogRegion;
+  }
+  return elements["toast-region"] || document.getElementById("toast-region");
+}
+
+function adoptDialogToasts(dialog) {
+  // 当模态弹窗关闭时，将弹窗内尚未过期的 Toast 平滑移动到底层页面的 toast-region，
+  // 确保用户仍能读完提示，不会因弹窗关闭而突兀消失。
+  const dialogRegion = dialog.querySelector(":scope > .toast-region");
+  const baseRegion = elements["toast-region"] || document.getElementById("toast-region");
+  if (dialogRegion && baseRegion) {
+    while (dialogRegion.firstChild) {
+      baseRegion.appendChild(dialogRegion.firstChild);
+    }
+  }
 }
 
 function setDialogFormError(banner, message) {
@@ -2593,6 +2632,15 @@ document.querySelectorAll("[data-copy-target]").forEach((button) => {
     if (!target) return;
     try {
       await copyText(target.textContent);
+      const originalText = button.textContent;
+      if (!button.dataset.copying) {
+        button.dataset.copying = "true";
+        button.textContent = "已复制 ✓";
+        setTimeout(() => {
+          button.textContent = originalText;
+          delete button.dataset.copying;
+        }, 1600);
+      }
       showToast("已复制到剪贴板");
     } catch (error) {
       handleError(error);
@@ -2658,6 +2706,7 @@ document.querySelectorAll("dialog").forEach((dialog) => {
   });
   dialog.addEventListener("close", () => {
     clearDialogDrafts(dialog);
+    adoptDialogToasts(dialog);
   });
 });
 
