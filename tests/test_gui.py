@@ -424,6 +424,39 @@ def test_run_gui_reports_missing_tkinter_with_actionable_error(monkeypatch) -> N
     assert "python.org" in str(exit_info.value)
 
 
+def test_run_gui_reports_broken_tcl_runtime_with_visible_diagnostic(monkeypatch) -> None:
+    """#161 退回回归：tkinter 可导入但 Tcl/Tk 运行库损坏（如打包缺 init.tcl）
+    属于 TclError，必须给出明确修复提示并退出，而不是窗口未出现就静默崩溃。"""
+    import types
+
+    import agentchatroom.gui as gui_module
+
+    broken = types.ModuleType("tkinter")
+    broken.TclError = type("TclError", (Exception,), {})
+
+    def _broken_tk():
+        raise broken.TclError("Can't find a usable init.tcl in the following directories")
+
+    broken.Tk = _broken_tk
+    broken.TclVersion = 8.6
+    broken.TkVersion = 8.6
+    broken.messagebox = types.SimpleNamespace()
+    broken.scrolledtext = types.SimpleNamespace()
+    broken.ttk = types.SimpleNamespace()
+    monkeypatch.setitem(sys.modules, "tkinter", broken)
+
+    dialogs: list[str] = []
+    monkeypatch.setattr(gui_module, "_show_fatal_gui_dialog", dialogs.append)
+
+    with pytest.raises(SystemExit) as exit_info:
+        gui_module.run_gui(config_path="unused")
+
+    message = str(exit_info.value)
+    assert "init.tcl" in message or "Tcl/Tk" in message
+    assert "重新打包" in message
+    assert dialogs == [message]
+
+
 def _load_entry_app():
     import importlib.util
 

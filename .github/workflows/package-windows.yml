@@ -75,6 +75,26 @@ jobs:
           $env:AGENTCHATROOM_TEST_EXE = (Resolve-Path "dist\agentchatroom\agentchatroom.exe").Path
           python -m pytest tests/test_gui.py tests/test_stdio_runtime.py tests/test_mcp.py::test_local_mcp_stdio_waits_for_bootstrap_and_disconnects_on_exit tests/test_mcp.py::test_mcp_stdio_round_trip -p no:cacheprovider --basetemp="$env:RUNNER_TEMP\acr-package-tests"
 
+      - name: Smoke test default GUI window
+        shell: pwsh
+        run: |
+          # #161: the default double-click path is the Tk console; the
+          # package is unusable if it exits immediately (e.g. missing
+          # init.tcl after tkinter was excluded at build time).
+          $bundle = "dist\agentchatroom"
+          $initTcl = Get-ChildItem -Path $bundle -Recurse -Filter "init.tcl" | Select-Object -First 1
+          if (-not $initTcl) {
+            throw "Tcl/Tk init.tcl is missing from the package; tkinter was not bundled"
+          }
+          $exe = Join-Path (Resolve-Path $bundle).Path "agentchatroom.exe"
+          $proc = Start-Process -FilePath $exe -WorkingDirectory (Resolve-Path $bundle).Path -PassThru
+          Start-Sleep -Seconds 15
+          if ($proc.HasExited) {
+            throw "Default GUI exited immediately with code $($proc.ExitCode); Tcl/Tk console did not start"
+          }
+          Stop-Process -Id $proc.Id -Force
+          Write-Host "Default GUI smoke passed: process stayed alive and init.tcl is bundled."
+
       - name: Create downloadable archive
         shell: pwsh
         run: Compress-Archive -Path "dist\agentchatroom" -DestinationPath "dist\agentchatroom-windows-x64.zip" -Force

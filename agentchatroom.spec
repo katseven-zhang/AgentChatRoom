@@ -1,5 +1,35 @@
 # -*- mode: python ; coding: utf-8 -*-
+import tkinter
+
 from PyInstaller.utils.hooks import collect_submodules
+
+
+def _require_working_tcl_tk() -> None:
+    """Fail the build immediately when the build environment cannot run
+    Tcl/Tk (#161). PyInstaller otherwise prints "tkinter installation is
+    broken; excluded" and keeps exit code 0, silently shipping an exe whose
+    default GUI path dies on the missing init.tcl. The default double-click
+    behavior is the Tk console, so a GUI-less package is a failed build.
+    """
+    try:
+        probe = tkinter.Tk()
+    except Exception as error:
+        raise SystemExit(
+            "agentchatroom.spec: 构建环境的 Tcl/Tk 不可用，拒绝打包无 GUI 的 exe。\n"
+            f"探测错误：{error!r}\n"
+            "请改用自带完整 Tcl/Tk 的官方 Python 发行版（python.org 安装器"
+            "勾选 tcl/tk）后重新构建。"
+        ) from error
+    probe.withdraw()
+    tcl_library = str(probe.tk.eval("info library"))
+    probe.destroy()
+    print(
+        f"agentchatroom.spec: Tcl/Tk probe OK (Tcl {tkinter.TclVersion}, "
+        f"Tk {tkinter.TkVersion}, library {tcl_library})"
+    )
+
+
+_require_working_tcl_tk()
 
 block_cipher = None
 
@@ -24,6 +54,8 @@ hidden_imports = [
     "agentchatroom.project_registration",
     "agentchatroom.services",
     "agentchatroom.task_history",
+    "tkinter",
+    "_tkinter",
     "uvicorn",
     "uvicorn.logging",
     "uvicorn.loops",

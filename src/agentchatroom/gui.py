@@ -12,6 +12,7 @@ import ipaddress
 import os
 import re
 import socket
+import sys
 import threading
 import tomllib
 import webbrowser
@@ -373,6 +374,24 @@ def main() -> None:
     run_gui(arguments.config)
 
 
+def _show_fatal_gui_dialog(message: str) -> None:
+    """Surface a fatal startup diagnostic without tkinter (#161).
+
+    A windowed PyInstaller exe has no console, so when Tcl/Tk itself is
+    broken the native message box is the only channel the user actually
+    sees. Only the packaged (frozen) form pops the dialog — console runs
+    and tests read the SystemExit text directly.
+    """
+    if sys.platform != "win32" or not getattr(sys, "frozen", False):
+        return
+    try:
+        import ctypes
+
+        ctypes.windll.user32.MessageBoxW(None, message, "AgentChatRoom", 0x10)
+    except Exception:
+        pass
+
+
 def run_gui(config_path: str | None = None) -> None:
     """Open the local GUI window (requires tkinter, imported lazily)."""
     os.environ.setdefault("AGENTCHATROOM_ACCESS_LOG", "0")
@@ -380,11 +399,31 @@ def run_gui(config_path: str | None = None) -> None:
         import tkinter as tk
         from tkinter import messagebox, scrolledtext, ttk
     except ImportError as error:
-        raise SystemExit(
+        message = (
             "无法加载 tkinter 图形界面模块。请安装包含 tkinter 的 Python"
             "（python.org 官方安装器默认包含，安装时勾选 tcl/tk），"
             "删除本仓库的 .venv 目录后重新双击启动入口。"
-        ) from error
+        )
+        _show_fatal_gui_dialog(message)
+        raise SystemExit(message) from error
+
+    try:
+        probe = tk.Tk()
+        probe.withdraw()
+        probe.destroy()
+    except tk.TclError as error:
+        # import 成功但 Tcl/Tk 运行库初始化失败——典型场景是打包环境缺少
+        # init.tcl（PyInstaller 探测到损坏的 tkinter 后静默排除）。
+        message = (
+            "tkinter 模块已找到，但 Tcl/Tk 运行库初始化失败：\n"
+            f"{error}\n\n"
+            "常见原因：打包时构建环境的 Tcl/Tk 不完整，exe 内缺少 "
+            "init.tcl。请改用自带完整 Tcl/Tk 的官方 Python 重新打包，"
+            "并在构建日志中确认 tkinter 未被排除；开发环境请安装完整 "
+            "Python 运行时后再启动。"
+        )
+        _show_fatal_gui_dialog(message)
+        raise SystemExit(message) from error
 
     settings = load_settings(config_path)
     controller = ServiceController(settings)
