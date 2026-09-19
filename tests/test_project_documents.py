@@ -48,7 +48,7 @@ def test_task_claim_injects_binding_documents_and_stamps_receipt(service, projec
         project["id"], doc_key="design", kind="reference",
         title="设计说明", content="参考用", actor="management",
     )
-    task = service.create_task(project["id"], title="T", acceptance_criteria=["c1"])["task"]
+    task = service.create_task(project["id"], title="T", acceptance_criteria=["c1"], actor_session_id=executor["agent"]["id"], token=executor["token"], )["task"]
     claimed = service.claim_task(
         project["id"], task["id"],
         session_id=executor["agent"]["id"], token=executor["token"],

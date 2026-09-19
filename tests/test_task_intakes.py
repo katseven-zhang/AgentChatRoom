@@ -197,11 +197,16 @@ def test_define_task_from_intake_creates_formal_task_and_links_back(service, pro
 
 
 def test_task_number_starts_at_one_and_advances_within_project(service, project):
+    author = service.join_room(
+        project["id"], name="Author", client="codex", model="unknown"
+    )
     numbers = [
         service.create_task(
             project["id"],
             title=f"Task {index}",
             acceptance_criteria=["Pass"],
+            actor_session_id=author["agent"]["id"],
+            token=author["token"],
         )["task"]["task_number"]
         for index in range(3)
     ]
@@ -209,10 +214,15 @@ def test_task_number_starts_at_one_and_advances_within_project(service, project)
 
 
 def test_task_number_unique_constraint_rejects_duplicate(service, project):
+    author = service.join_room(
+        project["id"], name="Author", client="codex", model="unknown"
+    )
     service.create_task(
         project["id"],
         title="Anchor",
         acceptance_criteria=["Pass"],
+        actor_session_id=author["agent"]["id"],
+        token=author["token"],
     )
     with service.database.connect(write=False) as connection:
         with pytest.raises(Exception):
@@ -234,6 +244,8 @@ def test_task_number_is_immutable_across_lifecycle_changes(service, project, joi
         project["id"],
         title="Lifecycle",
         acceptance_criteria=["Pass"],
+        actor_session_id=executor["agent"]["id"],
+        token=executor["token"],
     )["task"]
     assert task["task_number"] == 1
     service.claim_task(

@@ -287,6 +287,8 @@ def test_health_and_project_room_flow(settings, project_dir):
             f"/api/v1/projects/{project['id']}/tasks",
             json={
                 "title": "API task",
+            "actor_session_id": agent["agent"]["id"],
+            "token": agent["token"],
                 "acceptance_criteria": ["Endpoint works"],
                 "priority": 1,
             },
@@ -786,6 +788,8 @@ def test_api_can_assign_and_acknowledge_task(settings, project_dir):
             f"/api/v1/projects/{project['id']}/tasks",
             json={
                 "title": "Implement adapter",
+            "actor_session_id": worker["agent"]["id"],
+            "token": worker["token"],
                 "acceptance_criteria": ["Adapter passes"],
             },
         ).json()["task"]
@@ -840,6 +844,8 @@ def test_api_release_endpoint_returns_task_to_claimable_pool(settings, project_d
             f"/api/v1/projects/{project['id']}/tasks",
             json={
                 "title": "Released through REST",
+            "actor_session_id": owner["agent"]["id"],
+            "token": owner["token"],
                 "acceptance_criteria": ["Back to todo"],
             },
         ).json()["task"]
@@ -889,6 +895,16 @@ def test_api_can_assign_an_offline_member_identity(settings, project_dir):
                 "role": "executor",
             },
         ).json()
+        coordinator = client.post(
+            f"/api/v1/projects/{project['id']}/agents/join",
+            json={
+                "agent_key": "offline-coordinator-main",
+                "name": "Offline Coordinator",
+                "client": "codex",
+                "model": "test-model",
+                "role": "coordinator",
+            },
+        ).json()
         # The target goes offline before the assignment is created.
         client.post(
             f"/api/v1/projects/{project['id']}/agents/{worker['agent']['id']}/leave",
@@ -905,6 +921,8 @@ def test_api_can_assign_an_offline_member_identity(settings, project_dir):
             json={
                 "title": "Queue work for offline Agent",
                 "acceptance_criteria": ["Picked up after reconnect"],
+                "actor_session_id": coordinator["agent"]["id"],
+                "token": coordinator["token"],
             },
         ).json()["task"]
         assigned = client.post(
@@ -969,6 +987,8 @@ def test_api_handoff_review_and_integration_are_explicit(settings, project_dir):
             f"/api/v1/projects/{project['id']}/tasks",
             json={
                 "title": "Complete lifecycle",
+            "actor_session_id": first["agent"]["id"],
+            "token": first["token"],
                 "acceptance_criteria": ["Lifecycle passes"],
             },
         ).json()["task"]
@@ -1095,6 +1115,8 @@ def test_api_allows_approved_task_handoff_before_integration(settings, project_d
             f"/api/v1/projects/{project['id']}/tasks",
             json={
                 "title": "Approved handoff",
+            "actor_session_id": executor["agent"]["id"],
+            "token": executor["token"],
                 "acceptance_criteria": ["Behavior is verified"],
             },
         ).json()["task"]
@@ -1182,6 +1204,8 @@ def test_api_accepts_no_code_work_report(settings, project_dir):
             f"/api/v1/projects/{project['id']}/tasks",
             json={
                 "title": "Read-only investigation",
+            "actor_session_id": agent["agent"]["id"],
+            "token": agent["token"],
                 "acceptance_criteria": ["Findings are documented"],
             },
         ).json()["task"]
@@ -1913,6 +1937,8 @@ def test_task_update_over_rest_requires_owner_credentials_or_management(
             f"/api/v1/projects/{project['id']}/tasks",
             json={
                 "title": "Authority target",
+            "actor_session_id": owner["agent"]["id"],
+            "token": owner["token"],
                 "acceptance_criteria": ["Only authorized callers may edit this task"],
             },
         ).json()["task"]
@@ -2010,3 +2036,46 @@ def test_index_html_serves_repeated_requests_without_error(settings):
     assert third.status_code == 200
     assert second.text == first.text
     assert third.text == first.text
+
+
+def test_api_rejects_task_creation_without_operator(settings, project_dir):
+    """#168：REST 与 MCP 语义一致——无操作者创建返回 missing_actor_session；
+    提供已认证会话时 tasks.created_by_session_id 记录创建者。"""
+    with TestClient(create_app(settings)) as client:
+        project = client.post(
+            "/api/v1/projects",
+            json={"root_path": str(project_dir), "name": "Operator Gate"},
+        ).json()
+        missing = client.post(
+            f"/api/v1/projects/{project['id']}/tasks",
+            json={
+                "title": "No operator",
+                "acceptance_criteria": ["Rejected clearly"],
+            },
+        )
+        assert missing.status_code == 400
+        assert missing.json()["error"]["code"] == "missing_actor_session"
+
+        author = _join_agent(
+            client,
+            project,
+            agent_key="author-main",
+            name="Author",
+            client="codex",
+            model="test-model",
+            role="executor",
+        )
+        created = client.post(
+            f"/api/v1/projects/{project['id']}/tasks",
+            json={
+                "title": "With operator",
+                "acceptance_criteria": ["Operator is recorded"],
+                "actor_session_id": author["agent"]["id"],
+                "token": author["token"],
+            },
+        )
+        assert created.status_code == 201
+        assert (
+            created.json()["task"]["created_by_session_id"]
+            == author["agent"]["id"]
+        )

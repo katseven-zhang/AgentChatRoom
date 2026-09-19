@@ -76,6 +76,8 @@ def _claimed_task(service, project_id: str, owner):
         project_id,
         title="Recovery target",
         acceptance_criteria=["Owner keeps the task until it legitimately leaves"],
+        actor_session_id=owner["agent"]["id"],
+        token=owner["token"],
     )["task"]
     service.claim_task(project_id, task["id"], owner["agent"]["id"], owner["token"])
     return task
@@ -367,6 +369,8 @@ def test_missing_credentials_cannot_rewrite_task_dependencies(quiet_service, pro
         project["id"],
         title="Dependency target",
         acceptance_criteria=["Exists only to be referenced"],
+        actor_session_id=owner["agent"]["id"],
+        token=owner["token"],
     )["task"]
 
     with pytest.raises(DomainError) as denied:

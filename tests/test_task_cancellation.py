@@ -32,11 +32,13 @@ def _active_lease_count(service, project_id: str, task_id: str) -> int:
     )
 
 
-def _make_task(service, project_id: str, title: str):
+def _make_task(service, project_id: str, title: str, actor):
     return service.create_task(
         project_id,
         title=title,
         acceptance_criteria=["Cancellation keeps history"],
+        actor_session_id=actor["agent"]["id"],
+        token=actor["token"],
     )["task"]
 
 
@@ -45,7 +47,7 @@ def test_cancel_cleans_up_leases_assignments_and_handoffs(service, project_dir):
     project_id = project["id"]
     owner = _join_agent(service, project_id, "worker-a")
     other = _join_agent(service, project_id, "worker-b")
-    task = _make_task(service, project_id, "Cancellable task")
+    task = _make_task(service, project_id, "Cancellable task", owner)
 
     service.claim_task(
         project_id, task["id"], owner["agent"]["id"], owner["token"]
@@ -99,7 +101,7 @@ def test_cancelled_task_cannot_be_claimed_or_recancelled_with_new_event(
     project = service.create_project(root_path=str(project_dir))
     project_id = project["id"]
     agent = _join_agent(service, project_id, "worker-a")
-    task = _make_task(service, project_id, "Terminal cancel")
+    task = _make_task(service, project_id, "Terminal cancel", agent)
 
     service.update_task(project_id, task["id"], status="cancelled",
         management_authorized=True,

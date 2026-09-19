@@ -53,11 +53,17 @@ def test_authenticate_agent_token_verify_stays_on_read_path(service, project):
 
 
 def test_concurrent_create_task_allocates_unique_task_numbers(service, project):
+    author = service.join_room(
+        project["id"], name="Author", client="codex", model="unknown"
+    )
+
     def create_one(index: int):
         return service.create_task(
             project["id"],
             title=f"Concurrent task {index}",
             acceptance_criteria=["Unique number"],
+            actor_session_id=author["agent"]["id"],
+            token=author["token"],
         )["task"]
 
     with ThreadPoolExecutor(max_workers=8) as pool:
@@ -75,12 +81,16 @@ def test_list_tasks_does_not_use_per_task_relation_queries(
         project["id"],
         title="First",
         acceptance_criteria=["One"],
+        actor_session_id=executor["agent"]["id"],
+        token=executor["token"],
     )["task"]
     service.create_task(
         project["id"],
         title="Second",
         acceptance_criteria=["Two"],
         depends_on=[first["id"]],
+        actor_session_id=executor["agent"]["id"],
+        token=executor["token"],
     )
     calls = {"count": 0}
     original = AgentChatRoomService._task_with_dependencies
@@ -114,6 +124,8 @@ def test_work_report_rejects_unregistered_and_untrusted_worktrees(
         project["id"],
         title="Workspace gate",
         acceptance_criteria=["Registered workspace required"],
+        actor_session_id=unregistered["agent"]["id"],
+        token=unregistered["token"],
     )["task"]
     service.claim_task(
         project["id"], task["id"], unregistered["agent"]["id"], unregistered["token"]
@@ -151,6 +163,8 @@ def test_work_report_rejects_unregistered_and_untrusted_worktrees(
         project["id"],
         title="Untrusted worktree",
         acceptance_criteria=["Path must stay inside workspace"],
+        actor_session_id=trusted["agent"]["id"],
+        token=trusted["token"],
     )["task"]
     service.claim_task(
         project["id"], other["id"], trusted["agent"]["id"], trusted["token"]
@@ -185,6 +199,8 @@ def test_work_report_rejects_unregistered_and_untrusted_worktrees(
         project["id"],
         title="Commit gate",
         acceptance_criteria=["Commit must parse"],
+        actor_session_id=restored["agent"]["id"],
+        token=restored["token"],
     )["task"]
     service.claim_task(
         project["id"], hashed["id"], restored["agent"]["id"], restored["token"]
@@ -291,6 +307,9 @@ def test_sse_client_ip_ignores_spoofed_forwarded_for_from_untrusted_peers():
 
 
 def test_list_members_and_tasks_scale_for_100_members_200_tasks(service, project):
+    author = service.join_room(
+        project["id"], name="Author", client="codex", model="unknown"
+    )
     for index in range(100):
         service.create_project_member(
             project["id"],
@@ -303,6 +322,8 @@ def test_list_members_and_tasks_scale_for_100_members_200_tasks(service, project
             project["id"],
             title=f"Scale task {index}",
             acceptance_criteria=["Unique number"],
+            actor_session_id=author["agent"]["id"],
+            token=author["token"],
         )["task"]
         assert created["phase"] == "todo"
     started = time.perf_counter()
@@ -431,6 +452,9 @@ def test_batched_lists_issue_half_the_round_trips_of_legacy_n_plus_one(
     round trip costs a network hop). The absolute wall-clock ceiling is kept
     by test_list_members_and_tasks_scale_for_100_members_200_tasks.
     """
+    baseline_author = service.join_room(
+        project["id"], name="Baseline Author", client="codex", model="unknown"
+    )
     for index in range(100):
         service.create_project_member(
             project["id"],
@@ -443,6 +467,8 @@ def test_batched_lists_issue_half_the_round_trips_of_legacy_n_plus_one(
             project["id"],
             title=f"Baseline task {index}",
             acceptance_criteria=["c"],
+            actor_session_id=baseline_author["agent"]["id"],
+            token=baseline_author["token"],
         )
 
     def legacy_per_row_counts() -> None:
@@ -491,9 +517,10 @@ def test_batched_lists_issue_half_the_round_trips_of_legacy_n_plus_one(
         return len(statements)
 
     legacy_round_trips = counted(lambda connection: legacy_per_row_counts())
-    # The legacy shape is reproduced faithfully: 100x2 member COUNTs + 200x4
-    # task COUNTs + 2 id-listing statements.
-    assert legacy_round_trips == 100 * 2 + 200 * 4 + 2
+    # The legacy shape is reproduced faithfully: the author session adds one
+    # project_member row, then (100+1)x2 member COUNTs + 200x4 task COUNTs +
+    # 2 id-listing statements.
+    assert legacy_round_trips == 101 * 2 + 200 * 4 + 2
 
     new_round_trips = counted(
         lambda connection: (

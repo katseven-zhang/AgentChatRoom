@@ -415,6 +415,8 @@ def test_task_linked_approval_requires_verified_task(
         project["id"],
         title="Ship feature",
         acceptance_criteria=["Feature works"],
+        actor_session_id=executor["agent"]["id"],
+        token=executor["token"],
     )["task"]
     service.claim_task(
         project["id"], task["id"], executor["agent"]["id"], executor["token"]
@@ -715,6 +717,8 @@ def _task_with_pending_report(service, project, executor):
         project["id"],
         title="Harden knowledge provenance",
         acceptance_criteria=["Gate enforced"],
+        actor_session_id=executor["agent"]["id"],
+        token=executor["token"],
     )["task"]
     service.claim_task(
         project["id"], task["id"], executor["agent"]["id"], executor["token"]

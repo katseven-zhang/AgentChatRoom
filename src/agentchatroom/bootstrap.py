@@ -889,6 +889,12 @@ def bind_runtime_arguments(
         "integrator_session_id",
         "created_by_session_id",
     } & names
+    # actor_session_id doubles as a read-only audit filter on tools that
+    # authenticate nothing (audit_query carries no token parameter); treat it
+    # as a write actor only on tools that validate a session token, so the
+    # Room session that owns this transport is always the recorded operator.
+    if "token" in names and "actor_session_id" in names:
+        session_aliases.add("actor_session_id")
 
     def empty(key: str) -> bool:
         value = forwarded.get(key, "")

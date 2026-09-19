@@ -445,7 +445,7 @@ room_bootstrap
 
 | 迁移 | 命令 | 发起者 | 前置条件 | 主要失败码 | 副作用 |
 | --- | --- | --- | --- | --- | --- |
-| 创建 → 待认领 | `task_create` | 用户/Agent | 任务合同完整 | `invalid_task` | 无 owner、无指派，绝不隐式派发 |
+| 创建 → 待认领 | `task_create` | 用户/Agent | 任务合同完整；操作者必须是已认证 Agent 会话（MCP 从运行时绑定自动派生 `actor_session_id`，REST 显式提供） | `invalid_task`、`missing_actor_session` | 无 owner、无指派，绝不隐式派发；无法确定操作者的创建被显式拒绝，不产生无主任务 |
 | 待认领 → 已认领 | `task_claim` | 任意 Agent | 无 owner、execution=todo、依赖满足 | `task_already_claimed`、`task_dependencies_incomplete` | owner 更新；并发只有一个胜出 |
 | 已认领 → 执行中/阻塞 | `task_update` | 当前 owner | 合法 legacy 迁移 | `invalid_transition`、`structured_transition_required` | 状态与 blocker_reason 更新 |
 | 执行中 → 待验收 | `work_report` | 当前 owner | execution∈{claimed,in_progress,blocked}；证据齐全、worktree 受信 | `insufficient_work_evidence`、`not_task_owner`、`invalid_transition` | 释放任务租约、进度 100 |
@@ -591,7 +591,7 @@ REST `GET /api/v1/projects/{project_id}/tasks?phase=`、MCP `task_list(phase=…
 
 ### 任务证据链与分页历史
 
-任务详情时间线不再依赖 Room 动态最近 120 条事件。REST `GET /api/v1/projects/{project_id}/tasks/{task_id}/history`、MCP `task_history` 和 CLI `task-history` 复用同一领域投影，按 `event_id` 稳定排序，支持 `after` / `before` / `cursor` / `limit` / `event_type`：默认返回最新一页；`cursor` 是 `after` 的前向分页别名（与 `after` 冲突时返回结构化错误）；`has_more_after` / `has_more_before` 与 `next_after` / `next_before` / `cursor` 字段按本任务事件边界计算，不受 Room 内其他任务活动影响。投影联结 append-only 事件与不可变 Work Report、Review、Integration、Message、Acknowledgement 记录，显示原文、逐条验收证据、测试命令、状态 before→after、确认人和当时软件身份。Agent 消息只使用该条消息自己的 `model_display_name`，缺失则为 `unknown`。验证通过不等于最终完成；集成结果单独显示。历史结果走共享脱敏，不会返回 Token、Authorization、Cookie 或私钥。事件编号可复制为 `任务 #N / 事件 #序号`（序号为项目内编号），并用 `#event-ID`（内部全局 ID）定位。
+任务详情时间线不再依赖 Room 动态最近 120 条事件。REST `GET /api/v1/projects/{project_id}/tasks/{task_id}/history`、MCP `task_history` 和 CLI `task-history` 复用同一领域投影，按 `event_id` 稳定排序，支持 `after` / `before` / `cursor` / `limit` / `event_type`：默认返回最新一页；`cursor` 是 `after` 的前向分页别名（与 `after` 冲突时返回结构化错误）；`has_more_after` / `has_more_before` 与 `next_after` / `next_before` / `cursor` 字段按本任务事件边界计算，不受 Room 内其他任务活动影响。投影联结 append-only 事件与不可变 Work Report、Review、Integration、Message、Acknowledgement 记录，显示原文、逐条验收证据、测试命令、状态 before→after、确认人和当时软件身份。交互写事件在写入时把操作者快照（名称/客户端/角色/软件标识）固化进事件载荷：读取时优先实时反查会话身份，反查不出真实操作者（如会话行被清理后的历史悬空事件）时退回该快照，时间线显示创建者不依赖会话行存活；两者都无法确定的历史事件在 Web 时间线显示「操作者未记录」降级文案，不再渲染「unknown · unknown · unknown」。Agent 消息只使用该条消息自己的 `model_display_name`，缺失则为 `unknown`。验证通过不等于最终完成；集成结果单独显示。历史结果走共享脱敏，不会返回 Token、Authorization、Cookie 或私钥。事件编号可复制为 `任务 #N / 事件 #序号`（序号为项目内编号），并用 `#event-ID`（内部全局 ID）定位。
 
 Agent Session Token 校验与 `last_used_at` 更新是分开的：校验走只读连接，使用时间在后台批量写入（默认至少间隔 60 秒或累计 32 次调用），进程退出时 flush。`session_heartbeat` 只刷新连接存活，不承担 Token 校验写锁。
 

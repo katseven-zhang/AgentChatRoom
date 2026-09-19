@@ -186,7 +186,9 @@ def test_update_task_enforces_text_limits(service, project):
         project["id"], name="Owner", client="codex", model="unknown"
     )
     task = service.create_task(
-        project["id"], title="Base", acceptance_criteria=["c"]
+        project["id"], title="Base", acceptance_criteria=["c"],
+        actor_session_id=joined["agent"]["id"],
+        token=joined["token"],
     )["task"]
     service.claim_task(
         project["id"], task["id"], joined["agent"]["id"], joined["token"]
@@ -372,7 +374,9 @@ def test_knowledge_review_supersede_archive_optimistic_locks(service, project):
         project["id"], name="Reviewer", client="qoder", model="unknown"
     )
     task = service.create_task(
-        project["id"], title="K asset", acceptance_criteria=["c"]
+        project["id"], title="K asset", acceptance_criteria=["c"],
+        actor_session_id=reviewer["agent"]["id"],
+        token=reviewer["token"],
     )["task"]
     service.claim_task(
         project["id"], task["id"], creator["agent"]["id"], creator["token"]

@@ -60,7 +60,9 @@ def test_silence_is_display_only_and_keeps_leases_tasks_submission(
         workspace_id=registered["workspace"]["id"],
     )
     task = service.create_task(
-        project["id"], title="Long quiet work", acceptance_criteria=["no noise"]
+        project["id"], title="Long quiet work", acceptance_criteria=["no noise"],
+        actor_session_id=worker["agent"]["id"],
+        token=worker["token"],
     )["task"]
     service.claim_task(project["id"], task["id"], worker["agent"]["id"], worker["token"])
     lease = service.acquire_lease(
@@ -134,7 +136,9 @@ def test_reclaim_uses_transport_state_not_the_presence_window(quiet_service):
         member_id=member["id"],
     )
     task = service.create_task(
-        project["id"], title="Crash recovery", acceptance_criteria=["reclaim fast"]
+        project["id"], title="Crash recovery", acceptance_criteria=["reclaim fast"],
+        actor_session_id=first["agent"]["id"],
+        token=first["token"],
     )["task"]
     service.claim_task(project["id"], task["id"], first["agent"]["id"], first["token"])
 
@@ -179,7 +183,9 @@ def test_reclaim_uses_transport_state_not_the_presence_window(quiet_service):
 
     # A different identity is always denied, transport state aside.
     other_task = service.create_task(
-        project["id"], title="Other identity probe", acceptance_criteria=["deny"]
+        project["id"], title="Other identity probe", acceptance_criteria=["deny"],
+        actor_session_id=first["agent"]["id"],
+        token=first["token"],
     )["task"]
     service.claim_task(
         project["id"], other_task["id"], successor["agent"]["id"], successor["token"]

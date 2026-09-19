@@ -3791,8 +3791,16 @@ function renderTaskAssignments(task) {
 }
 
 function historyActorLabel(actor) {
-  if (!actor) return "unknown";
-  const parts = [actor.name || "unknown", actor.client || "", actor.role || ""].filter(Boolean);
+  const name = String(actor?.name || "").trim();
+  if (!name || name === "unknown") {
+    // 历史事件无操作者且无法回填：给出明确降级文案，不猜测身份。
+    return "操作者未记录";
+  }
+  const client = String(actor?.client || "").trim();
+  const role = String(actor?.role || "").trim();
+  const parts = [`操作者 ${name}`];
+  if (client && client !== "unknown") parts.push(`客户端 ${client}`);
+  if (role && role !== "unknown") parts.push(`角色 ${role}`);
   return parts.join(" · ");
 }
 

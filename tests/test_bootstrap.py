@@ -183,6 +183,8 @@ def test_ready_bootstrap_creates_independent_session_and_hides_token(
         project["id"],
         title="Stay claimed across bootstrap",
         acceptance_criteria=["Ownership remains with the first conversation"],
+        actor_session_id=first.binding.session_id,
+        token=first.binding.token,
     )["task"]
     service.claim_task(
         project["id"], created["id"], first.binding.session_id, first.binding.token
@@ -266,6 +268,8 @@ def test_bootstrap_keeps_pending_assignment_and_handoff_with_original_session(
         project["id"],
         title="Pending assignment survives bootstrap",
         acceptance_criteria=["Target session remains stable"],
+        actor_session_id=other["agent"]["id"],
+        token=other["token"],
     )["task"]
     assigned = service.assign_task(
         project["id"],
@@ -279,6 +283,8 @@ def test_bootstrap_keeps_pending_assignment_and_handoff_with_original_session(
         project["id"],
         title="Pending handoff survives bootstrap",
         acceptance_criteria=["From session remains stable"],
+        actor_session_id=other["agent"]["id"],
+        token=other["token"],
     )["task"]
     service.claim_task(
         project["id"], owned["id"], first.binding.session_id, first.binding.token
@@ -434,6 +440,24 @@ def test_mcp_room_bootstrap_injects_runtime_and_rejects_mismatch(
     )
     assert created["ok"] is True
     assert created["result"]["task"]["project_id"] == project["id"]
+    # #168：未传 actor_session_id 时任务自动归属当前绑定的 Room 会话，
+    # 协作时间线能显示真实操作者而不是 unknown。
+    assert (
+        created["result"]["task"]["created_by_session_id"]
+        == binding.session_id
+    )
+    created_history = _call_tool(
+        "task_history", {"task_id": created["result"]["task"]["id"]}
+    )
+    assert created_history["ok"] is True
+    created_event = next(
+        item
+        for item in created_history["result"]["items"]
+        if item["event_type"] == "task.created"
+    )
+    assert created_event["actor"]["name"] == "Boot Agent"
+    assert created_event["actor"]["client"] == "codex"
+    assert created_event["actor"]["session_id"] == binding.session_id
 
     mismatch = _call_tool("room_sync", {"project_id": "project_other"})
     assert mismatch["ok"] is False
@@ -480,6 +504,8 @@ def test_mcp_task_update_cannot_change_another_sessions_task(
         project["id"],
         title="MCP authority target",
         acceptance_criteria=["Only the owner may edit this task"],
+        actor_session_id=owner["agent"]["id"],
+        token=owner["token"],
     )["task"]
     service.claim_task(project["id"], task["id"], owner["agent"]["id"], owner["token"])
 
@@ -1009,6 +1035,8 @@ def test_restored_session_keeps_task_ownership_after_a_cleared_context(
         project["id"],
         title="Survives a new conversation",
         acceptance_criteria=["Ownership is unchanged"],
+        actor_session_id=first.binding.session_id,
+        token=first.binding.token,
     )["task"]
     service.claim_task(
         project["id"], task["id"], first.binding.session_id, first.binding.token
@@ -1043,6 +1071,8 @@ def test_bootstrap_creates_a_new_session_when_the_previous_one_is_closed(
         project["id"],
         title="Left behind",
         acceptance_criteria=["Owner stays the closed session until reclaim"],
+        actor_session_id=first.binding.session_id,
+        token=first.binding.token,
     )["task"]
     service.claim_task(project["id"], task["id"], binding.session_id, binding.token)
     service.leave_session(project["id"], binding.session_id, binding.token)
@@ -1119,3 +1149,82 @@ def test_runtime_binding_restore_requires_the_same_project_and_identity():
         )
         is None
     )
+
+
+def test_bind_runtime_arguments_derives_actor_session_id_with_token():
+    """#168：认证型工具的 actor_session_id 由运行时绑定派生，调用方无需手工提供。"""
+    from agentchatroom.bootstrap import RuntimeBinding
+
+    binding = RuntimeBinding(
+        project_id="project_bound",
+        session_id="agent_bound",
+        token="bound-token",
+        cursor=1,
+        software_key="boot-agent",
+        agent_key="member_bound",
+        conversation_synced=True,
+    )
+    forwarded = bind_runtime_arguments(
+        [
+            "project_id",
+            "title",
+            "acceptance_criteria",
+            "actor_session_id",
+            "token",
+        ],
+        {},
+        binding,
+    )
+    assert forwarded["actor_session_id"] == "agent_bound"
+    assert forwarded["token"] == "bound-token"
+
+
+def test_bind_runtime_arguments_keeps_audit_actor_filter_readonly():
+    """#168：audit_query 的 actor_session_id 是只读过滤器（无 token 参数），不得注入。"""
+    from agentchatroom.bootstrap import RuntimeBinding
+
+    binding = RuntimeBinding(
+        project_id="project_bound",
+        session_id="agent_bound",
+        token="bound-token",
+        cursor=1,
+        software_key="boot-agent",
+        agent_key="member_bound",
+        conversation_synced=True,
+    )
+    forwarded = bind_runtime_arguments(
+        [
+            "project_id",
+            "after",
+            "before",
+            "limit",
+            "event_type",
+            "actor_session_id",
+            "task_id",
+        ],
+        {},
+        binding,
+    )
+    assert "actor_session_id" not in forwarded
+
+
+def test_bind_runtime_arguments_rejects_foreign_actor_session_id():
+    """#168：显式提供他人 actor_session_id 必须被拒绝，无法冒名创建任务。"""
+    from agentchatroom.bootstrap import RuntimeBinding
+
+    binding = RuntimeBinding(
+        project_id="project_bound",
+        session_id="agent_bound",
+        token="bound-token",
+        cursor=1,
+        software_key="boot-agent",
+        agent_key="member_bound",
+        conversation_synced=True,
+    )
+    with pytest.raises(DomainError) as error:
+        bind_runtime_arguments(
+            ["project_id", "actor_session_id", "token"],
+            {"actor_session_id": "agent_foreign", "token": "bound-token"},
+            binding,
+        )
+    assert error.value.code == "runtime_context_mismatch"

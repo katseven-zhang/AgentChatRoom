@@ -237,7 +237,7 @@ async def test_roots_timeout_fails_closed_without_cwd_fallback(rooms, monkeypatc
 
 def test_cancelled_task_cannot_reacquire_resources(service, project):
     joined = service.join_room(project['id'], software_key='regression', name='Regression', client='test', model='unknown')
-    task = service.create_task(project['id'], title='cancel', acceptance_criteria=['ok'])['task']
+    task = service.create_task(project['id'], title='cancel', acceptance_criteria=['ok'], actor_session_id=joined["agent"]["id"], token=joined["token"], )['task']
     service.update_task(project['id'], task['id'], status='cancelled',
         management_authorized=True,
     )

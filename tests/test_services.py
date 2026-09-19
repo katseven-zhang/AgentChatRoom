@@ -349,6 +349,8 @@ def test_parallel_same_identity_session_does_not_transfer_task_or_lease(service,
         project["id"],
         title="Continue after reconnect",
         acceptance_criteria=["Ownership and lease survive reconnect"],
+        actor_session_id=first["agent"]["id"],
+        token=first["token"],
     )["task"]
     service.claim_task(
         project["id"], task["id"], first["agent"]["id"], first["token"]
@@ -401,6 +403,8 @@ def test_explicit_reclaim_recovers_unfinished_task_from_closed_identity_session(
         project["id"],
         title="Resume after explicit disconnect",
         acceptance_criteria=["The software identity keeps unfinished work"],
+        actor_session_id=first["agent"]["id"],
+        token=first["token"],
     )["task"]
     service.claim_task(
         project["id"], task["id"], first["agent"]["id"], first["token"]
@@ -833,6 +837,8 @@ def test_task_claim_is_atomic(service, project, joined_agents):
         project["id"],
         title="Implement authentication",
         acceptance_criteria=["Login works"],
+        actor_session_id=first["agent"]["id"],
+        token=first["token"],
     )["task"]
     barrier = threading.Barrier(2)
     outcomes: list[str] = []
@@ -857,10 +863,15 @@ def test_task_claim_is_atomic(service, project, joined_agents):
 
 
 def test_task_contract_exposes_versioned_state(service, project):
+    author = service.join_room(
+        project["id"], name="Author", client="codex", model="unknown"
+    )
     task = service.create_task(
         project["id"],
         title="Versioned task state",
         acceptance_criteria=["State contract is exposed"],
+        actor_session_id=author["agent"]["id"],
+        token=author["token"],
     )["task"]
 
     assert task["schema_version"] == 7
@@ -896,11 +907,16 @@ def test_task_contract_exposes_versioned_state(service, project):
 
 
 def test_get_task_returns_one_complete_task(service, project):
+    author = service.join_room(
+        project["id"], name="Author", client="codex", model="unknown"
+    )
     created = service.create_task(
         project["id"],
         title="Read one task",
         description="Avoid expanding a large project board",
         acceptance_criteria=["The exact task is returned"],
+        actor_session_id=author["agent"]["id"],
+        token=author["token"],
     )["task"]
 
     fetched = service.get_task(project["id"], created["id"])
@@ -931,6 +947,8 @@ def test_task_assignment_acceptance_is_targeted_and_idempotent(
         project["id"],
         title="Implement Python adapter",
         acceptance_criteria=["Adapter tests pass"],
+        actor_session_id=assigner["agent"]["id"],
+        token=assigner["token"],
     )["task"]
     assigned = service.assign_task(
         project["id"],
@@ -999,6 +1017,8 @@ def test_task_assignment_can_be_declined_or_blocked(
         project["id"],
         title=f"Assignment response {response}",
         acceptance_criteria=["Response is recorded"],
+        actor_session_id=assigner["agent"]["id"],
+        token=assigner["token"],
     )["task"]
     assigned = service.assign_task(
         project["id"],
@@ -1033,6 +1053,8 @@ def test_offline_member_assignment_targets_persistent_identity_and_survives_rejo
         project["id"],
         title="Delayed offline assignment",
         acceptance_criteria=["Done after reconnect"],
+        actor_session_id=assigner["agent"]["id"],
+        token=assigner["token"],
     )["task"]
     member_id = worker["agent"]["member_id"]
 
@@ -1085,6 +1107,8 @@ def test_member_assignment_rejects_revoked_unknown_or_never_joined_targets(
         project["id"],
         title="Guarded offline assignment",
         acceptance_criteria=["Reject invalid targets"],
+        actor_session_id=worker["agent"]["id"],
+        token=worker["token"],
     )["task"]
 
     with pytest.raises(DomainError) as unknown:
@@ -1128,6 +1152,8 @@ def test_assign_task_rejects_session_and_member_targets_together(
         project["id"],
         title="Conflicting targets",
         acceptance_criteria=["Reject ambiguous targets"],
+        actor_session_id=worker["agent"]["id"],
+        token=worker["token"],
     )["task"]
     with pytest.raises(DomainError) as conflict:
         service.assign_task(
@@ -1148,6 +1174,8 @@ def test_manager_can_assign_without_impersonating_an_agent(
         project["id"],
         title="Manager assignment",
         acceptance_criteria=["Worker acknowledges"],
+        actor_session_id=worker["agent"]["id"],
+        token=worker["token"],
     )["task"]
 
     assigned = service.assign_task(
@@ -1176,6 +1204,8 @@ def test_task_handoff_transfers_owner_and_releases_task_leases(
         project["id"],
         title="Continue an implementation",
         acceptance_criteria=["New owner can continue"],
+        actor_session_id=executor["agent"]["id"],
+        token=executor["token"],
     )["task"]
     service.claim_task(
         project["id"], task["id"], executor["agent"]["id"], executor["token"]
@@ -1264,6 +1294,8 @@ def test_manager_can_request_handoff_without_impersonating_owner(
         project["id"],
         title="Manager-requested handoff",
         acceptance_criteria=["Handoff is acknowledged"],
+        actor_session_id=owner["agent"]["id"],
+        token=owner["token"],
     )["task"]
     service.claim_task(
         project["id"], task["id"], owner["agent"]["id"], owner["token"]
@@ -1331,6 +1363,8 @@ def test_work_report_releases_task_leases(service, project, joined_agents):
         project["id"],
         title="Release task leases",
         acceptance_criteria=["Lease is released with the work report"],
+        actor_session_id=executor["agent"]["id"],
+        token=executor["token"],
     )["task"]
     service.claim_task(
         project["id"], task["id"], executor["agent"]["id"], executor["token"]
@@ -1374,6 +1408,8 @@ def test_work_must_be_independently_reviewed(service, project, joined_agents):
         project["id"],
         title="Implement authentication",
         acceptance_criteria=["Login works", "Tests pass"],
+        actor_session_id=executor["agent"]["id"],
+        token=executor["token"],
     )["task"]
     service.claim_task(
         project["id"], task["id"], executor["agent"]["id"], executor["token"]
@@ -1511,6 +1547,8 @@ def test_same_software_cannot_become_an_independent_reviewer_by_reconnecting(
         project["id"],
         title="Identity-aware review",
         acceptance_criteria=["Review comes from another software identity"],
+        actor_session_id=executor["agent"]["id"],
+        token=executor["token"],
     )["task"]
     service.claim_task(
         project["id"], task["id"], executor["agent"]["id"], executor["token"]
@@ -1566,6 +1604,8 @@ def test_approved_completed_task_can_handoff_to_integrator(
         project["id"],
         title="Handoff after independent approval",
         acceptance_criteria=["Implementation is verified"],
+        actor_session_id=executor["agent"]["id"],
+        token=executor["token"],
     )["task"]
     service.claim_task(
         project["id"], task["id"], executor["agent"]["id"], executor["token"]
@@ -1647,6 +1687,8 @@ def test_changes_requested_preserves_completion_history_and_allows_resubmission(
         project["id"],
         title="Correctable implementation",
         acceptance_criteria=["Behavior is correct"],
+        actor_session_id=executor["agent"]["id"],
+        token=executor["token"],
     )["task"]
     service.claim_task(
         project["id"], task["id"], executor["agent"]["id"], executor["token"]
@@ -1737,6 +1779,8 @@ def test_changes_requested_task_can_be_reassigned_after_owner_leaves(
         project["id"],
         title="Reassign a rejected task",
         acceptance_criteria=["The revised report is accepted"],
+        actor_session_id=executor["agent"]["id"],
+        token=executor["token"],
     )["task"]
 
     service.claim_task(
@@ -1809,7 +1853,9 @@ def test_changes_requested_task_can_be_reassigned_after_owner_leaves(
 def test_work_report_requires_evidence(service, project, joined_agents):
     executor, _ = joined_agents
     task = service.create_task(
-        project["id"], title="Small change", acceptance_criteria=["Change is complete"]
+        project["id"], title="Small change", acceptance_criteria=["Change is complete"],
+        actor_session_id=executor["agent"]["id"],
+        token=executor["token"],
     )["task"]
     service.claim_task(
         project["id"], task["id"], executor["agent"]["id"], executor["token"]
@@ -1835,6 +1881,8 @@ def test_work_report_accepts_and_exports_structured_no_code_reason(
         project["id"],
         title="Investigate current architecture",
         acceptance_criteria=["Findings cite the current implementation"],
+        actor_session_id=executor["agent"]["id"],
+        token=executor["token"],
     )["task"]
     service.claim_task(
         project["id"], task["id"], executor["agent"]["id"], executor["token"]
@@ -1879,7 +1927,9 @@ def test_work_report_accepts_and_exports_structured_no_code_reason(
 def test_work_report_rejects_unstructured_test_evidence(service, project, joined_agents):
     executor, _ = joined_agents
     task = service.create_task(
-        project["id"], title="Evidence change", acceptance_criteria=["Evidence is valid"]
+        project["id"], title="Evidence change", acceptance_criteria=["Evidence is valid"],
+        actor_session_id=executor["agent"]["id"],
+        token=executor["token"],
     )["task"]
     service.claim_task(
         project["id"], task["id"], executor["agent"]["id"], executor["token"]
@@ -1903,12 +1953,16 @@ def test_task_dependencies_block_claim_until_verified(service, project, joined_a
         project["id"],
         title="Foundation",
         acceptance_criteria=["Foundation works"],
+        actor_session_id=executor["agent"]["id"],
+        token=executor["token"],
     )["task"]
     dependent = service.create_task(
         project["id"],
         title="Dependent",
         acceptance_criteria=["Dependent works"],
         depends_on=[prerequisite["id"]],
+        actor_session_id=executor["agent"]["id"],
+        token=executor["token"],
     )["task"]
 
     with pytest.raises(DomainError) as blocked:
@@ -2208,13 +2262,17 @@ def test_task_can_be_edited_released_and_cannot_form_dependency_cycle(
 ):
     executor, _ = joined_agents
     first = service.create_task(
-        project["id"], title="First", acceptance_criteria=["First passes"]
+        project["id"], title="First", acceptance_criteria=["First passes"],
+        actor_session_id=executor["agent"]["id"],
+        token=executor["token"],
     )["task"]
     second = service.create_task(
         project["id"],
         title="Second",
         acceptance_criteria=["Second passes"],
         depends_on=[first["id"]],
+        actor_session_id=executor["agent"]["id"],
+        token=executor["token"],
     )["task"]
     edited = service.update_task(
         project["id"],
@@ -2273,6 +2331,8 @@ def test_release_task_owner_self_release_keeps_progress_and_allows_reclaim(
         project["id"],
         title="Release me",
         acceptance_criteria=["Released, not cancelled"],
+        actor_session_id=first["agent"]["id"],
+        token=first["token"],
     )["task"]
     service.claim_task(
         project["id"], task["id"], first["agent"]["id"], first["token"]
@@ -2319,6 +2379,8 @@ def test_release_task_management_releases_for_offline_owner_with_full_event(
         project["id"],
         title="Management release",
         acceptance_criteria=["Event carries the whole trail"],
+        actor_session_id=assigner["agent"]["id"],
+        token=assigner["token"],
     )["task"]
     service.claim_task(
         project["id"], task["id"], owner["agent"]["id"], owner["token"]
@@ -2375,6 +2437,8 @@ def test_release_task_rejects_non_owner_and_keeps_ownership(
         project["id"],
         title="Not yours",
         acceptance_criteria=["Ownership protected"],
+        actor_session_id=owner["agent"]["id"],
+        token=owner["token"],
     )["task"]
     service.claim_task(
         project["id"], task["id"], owner["agent"]["id"], owner["token"]
@@ -2401,6 +2465,8 @@ def test_release_task_after_changes_requested_preserves_verification_state(
         project["id"],
         title="Returned work",
         acceptance_criteria=["Fix and resubmit"],
+        actor_session_id=owner["agent"]["id"],
+        token=owner["token"],
     )["task"]
     service.claim_task(
         project["id"], task["id"], owner["agent"]["id"], owner["token"]
@@ -2453,6 +2519,8 @@ def test_release_task_is_idempotent_for_todo_and_rejects_terminal_phases(
         project["id"],
         title="Idempotent release",
         acceptance_criteria=["No duplicate events"],
+        actor_session_id=owner["agent"]["id"],
+        token=owner["token"],
     )["task"]
 
     first_release = service.release_task(
@@ -2496,6 +2564,8 @@ def test_release_task_is_idempotent_for_todo_and_rejects_terminal_phases(
                 project["id"],
                 title="Another task",
                 acceptance_criteria=["c"],
+                actor_session_id=owner["agent"]["id"],
+                token=owner["token"],
             )["task"]["id"],
             reason_code="because",
             management_authorized=True,
@@ -2908,6 +2978,8 @@ def test_task_release_payload_reports_released_lease_ids(
         project["id"],
         title="Release with lease",
         acceptance_criteria=["Lease cleanup visible"],
+        actor_session_id=owner["agent"]["id"],
+        token=owner["token"],
     )["task"]
     service.claim_task(
         project["id"], task["id"], owner["agent"]["id"], owner["token"]
@@ -2945,6 +3017,8 @@ def test_duplicate_review_and_integration_are_rejected_structurally(
         project["id"],
         title="Single review only",
         acceptance_criteria=["Works"],
+        actor_session_id=executor["agent"]["id"],
+        token=executor["token"],
     )["task"]
     service.claim_task(
         project["id"], task["id"], executor["agent"]["id"], executor["token"]
@@ -3020,6 +3094,8 @@ def test_concurrent_reviews_have_single_winner(service, project, joined_agents):
         project["id"],
         title="Race review",
         acceptance_criteria=["Works"],
+        actor_session_id=executor["agent"]["id"],
+        token=executor["token"],
     )["task"]
     service.claim_task(
         project["id"], task["id"], executor["agent"]["id"], executor["token"]
@@ -3075,6 +3151,8 @@ def test_concurrent_release_has_single_winner_and_idempotent_loser(
         project["id"],
         title="Concurrent release",
         acceptance_criteria=["One release wins"],
+        actor_session_id=owner["agent"]["id"],
+        token=owner["token"],
     )["task"]
     service.claim_task(
         project["id"], task["id"], owner["agent"]["id"], owner["token"]
@@ -3161,6 +3239,8 @@ def test_release_task_supports_blocked_tasks_and_clears_blocker_reason(
         project["id"],
         title="Blocked then released",
         acceptance_criteria=["Blocker cleared on release"],
+        actor_session_id=owner["agent"]["id"],
+        token=owner["token"],
     )["task"]
     service.claim_task(
         project["id"], task["id"], owner["agent"]["id"], owner["token"]
@@ -3202,6 +3282,8 @@ def test_release_request_id_replay_does_not_duplicate_release_event(
         project["id"],
         title="Release replay",
         acceptance_criteria=["Replay is idempotent"],
+        actor_session_id=owner["agent"]["id"],
+        token=owner["token"],
     )["task"]
     service.claim_task(
         project["id"], task["id"], owner["agent"]["id"], owner["token"]
@@ -3236,6 +3318,8 @@ def test_release_invalidates_pending_handoff_and_keeps_history(
         project["id"],
         title="Handoff then release",
         acceptance_criteria=["Handoff invalidated by release"],
+        actor_session_id=owner["agent"]["id"],
+        token=owner["token"],
     )["task"]
     service.claim_task(
         project["id"], task["id"], owner["agent"]["id"], owner["token"]
@@ -3275,11 +3359,15 @@ def test_release_keeps_other_task_leases_of_the_same_session(
         project["id"],
         title="Release one",
         acceptance_criteria=["Only tied leases released"],
+        actor_session_id=owner["agent"]["id"],
+        token=owner["token"],
     )["task"]
     untouched_task = service.create_task(
         project["id"],
         title="Keep one",
         acceptance_criteria=["Untouched lease survives"],
+        actor_session_id=owner["agent"]["id"],
+        token=owner["token"],
     )["task"]
     service.claim_task(
         project["id"], released_task["id"], owner["agent"]["id"], owner["token"]
@@ -3321,6 +3409,8 @@ def test_cancelled_tasks_reject_release(service, project, joined_agents):
         project["id"],
         title="Cancelled stays cancelled",
         acceptance_criteria=["Terminal stays terminal"],
+        actor_session_id=owner["agent"]["id"],
+        token=owner["token"],
     )["task"]
     service.claim_task(
         project["id"], task["id"], owner["agent"]["id"], owner["token"]
@@ -3357,6 +3447,8 @@ def test_release_and_claim_race_admits_exactly_one_successor(
         project["id"],
         title="Release/claim race",
         acceptance_criteria=["Exactly one successor"],
+        actor_session_id=owner["agent"]["id"],
+        token=owner["token"],
     )["task"]
     service.claim_task(
         project["id"], task["id"], owner["agent"]["id"], owner["token"]
@@ -3437,6 +3529,8 @@ def test_reassignment_supersedes_stale_pending_assignment_atomically(
         project["id"],
         title="Atomic reassignment",
         acceptance_criteria=["One pending assignment at a time"],
+        actor_session_id=first_target["agent"]["id"],
+        token=first_target["token"],
     )["task"]
 
     first = service.assign_task(
@@ -3648,6 +3742,8 @@ def test_update_task_optimistic_lock_rejects_concurrent_changes(service, project
         project["id"],
         title="Concurrent task",
         acceptance_criteria=["Criterion 1"],
+        actor_session_id=agent["agent"]["id"],
+        token=agent["token"],
     )["task"]
     service.claim_task(project["id"], task["id"], agent["agent"]["id"], agent["token"])
 
@@ -3702,6 +3798,8 @@ def test_acknowledge_assignment_optimistic_lock_rejects_concurrent_ack(
         project["id"],
         title="Assignment race",
         acceptance_criteria=["Criterion 1"],
+        actor_session_id=assigner["agent"]["id"],
+        token=assigner["token"],
     )["task"]
     assigned = service.assign_task(
         project["id"],
@@ -3752,3 +3850,20 @@ def test_acknowledge_assignment_optimistic_lock_rejects_concurrent_ack(
         assert err.value.status_code == 409
     finally:
         service.database.connect = real_connect
+
+
+def test_create_task_without_operator_is_rejected(service, project):
+    """#168：无法确定操作者的正式任务创建必须显式拒绝，不再静默写 NULL actor。"""
+    with pytest.raises(DomainError) as error:
+        service.create_task(
+            project["id"],
+            title="Unattributed task",
+            acceptance_criteria=["Creation without operator is rejected"],
+        )
+    assert error.value.code == "missing_actor_session"
+    assert service.list_tasks(project["id"]) == []
+    with service.database.connect() as connection:
+        created_events = connection.execute(
+            "SELECT COUNT(*) AS n FROM events WHERE event_type = 'task.created'"
+        ).fetchone()["n"]
+    assert created_events == 0

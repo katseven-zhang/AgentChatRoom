@@ -9,8 +9,15 @@ def test_default_task_priority_comes_from_project_settings(service, project):
     service.update_project(
         project["id"], settings={"default_task_priority": 0}
     )
+    author = service.join_room(
+        project["id"], name="Author", client="codex", model="unknown"
+    )
     created = service.create_task(
-        project["id"], title="uses project default", acceptance_criteria=["c1"]
+        project["id"],
+        title="uses project default",
+        acceptance_criteria=["c1"],
+        actor_session_id=author["agent"]["id"],
+        token=author["token"],
     )
     assert created["task"]["priority"] == 0
 
@@ -19,6 +26,8 @@ def test_default_task_priority_comes_from_project_settings(service, project):
         title="explicit wins",
         acceptance_criteria=["c1"],
         priority=3,
+        actor_session_id=author["agent"]["id"],
+        token=author["token"],
     )
     assert explicit["task"]["priority"] == 3
 

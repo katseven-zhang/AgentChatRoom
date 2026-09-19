@@ -66,6 +66,7 @@ from .task_history import (
     TASK_HISTORY_SCHEMA_VERSION,
     actor_snapshot,
     project_history_item,
+    redact_runtime_value,
 )
 
 
@@ -798,6 +799,32 @@ class AgentChatRoomService:
             )
         return row
 
+    def _actor_event_snapshot(
+        self, connection: Any, project_id: str, session_id: str
+    ) -> dict[str, Any] | None:
+        """Resolve the operator identity once, at event write time.
+
+        The snapshot is embedded into the event payload so the collaboration
+        timeline keeps showing the operator even when the agent_sessions row
+        later disappears (append-only history may never be rewritten).
+        """
+        session = connection.execute(
+            "SELECT * FROM agent_sessions WHERE id = ? AND project_id = ?",
+            (session_id, project_id),
+        ).fetchone()
+        if session is None:
+            return None
+        member = None
+        member_id = session["member_id"] if "member_id" in session.keys() else None
+        if member_id:
+            member = connection.execute(
+                "SELECT * FROM project_members WHERE id = ?", (member_id,)
+            ).fetchone()
+            if member is not None:
+                member = dict(member)
+                member["metadata"] = json_load(member.get("metadata_json"), {})
+        return actor_snapshot(dict(session), member)
+
     def _emit(
         self,
         connection: Any,
@@ -809,6 +836,12 @@ class AgentChatRoomService:
         payload: dict[str, Any] | None = None,
     ) -> int:
         event_payload = dict(payload or {})
+        if actor_session_id and "actor" not in event_payload:
+            snapshot = self._actor_event_snapshot(
+                connection, project_id, actor_session_id
+            )
+            if snapshot is not None:
+                event_payload["actor"] = snapshot
         if task_id and "task_number" not in event_payload:
             task = connection.execute(
                 "SELECT task_number FROM tasks WHERE id = ? AND project_id = ?",
@@ -3636,8 +3669,19 @@ class AgentChatRoomService:
         items = []
         for event in events:
             payload = event.get("payload") or {}
+            payload_actor = payload.get("actor")
             session = sessions.get(str(event.get("actor_session_id") or ""))
             member = members.get(str((session or {}).get("member_id") or ""))
+            actor = actor_snapshot(session, member)
+            if (
+                isinstance(payload_actor, Mapping)
+                and str(payload_actor.get("name") or "").strip()
+                and str(payload_actor.get("name")) != "unknown"
+                and str(actor.get("name") or "unknown") == "unknown"
+            ):
+                # 会话行缺失（不可再反查）时退回写入时固化的操作者快照，
+                # 时间线因此不依赖 agent_sessions 行存活。
+                actor = redact_runtime_value(dict(payload_actor))
             related = {
                 "report": reports.get(str(payload.get("report_id") or "")),
                 "review": reviews.get(str(payload.get("review_id") or "")),
@@ -3648,7 +3692,7 @@ class AgentChatRoomService:
             items.append(
                 project_history_item(
                     event,
-                    actor=actor_snapshot(session, member),
+                    actor=actor,
                     related=related,
                     acknowledgements=acknowledgements_by_event.get(int(event["id"]), []),
                 )
@@ -4361,8 +4405,14 @@ class AgentChatRoomService:
                 )
                 if not 0 <= priority <= 4:
                     priority = PROJECT_SETTINGS_DEFAULTS["default_task_priority"]
-            if actor_session_id:
-                self._authenticate(connection, project_id, actor_session_id, token or "")
+            if not actor_session_id:
+                # 正式任务必须能追溯到创建者；无操作者的创建一律显式拒绝，
+                # 不再静默写入 actor 为 NULL 的任务与事件。
+                raise DomainError(
+                    "missing_actor_session",
+                    "Task creation requires the authenticated Agent session of the operator",
+                )
+            self._authenticate(connection, project_id, actor_session_id, token or "")
             for dependency_id in dependencies:
                 self._require_task(connection, project_id, dependency_id)
             task_number = self._next_task_number(connection, project_id)

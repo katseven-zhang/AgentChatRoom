@@ -56,6 +56,8 @@ def test_task_text_over_default_limit_is_rejected(service, project):
             project["id"],
             title="y" * (limit + 1),
             acceptance_criteria=["criterion"],
+            actor_session_id="actor-length-probe",
+            token="not-a-real-token",
         )
     assert title_error.value.code == "task_text_too_long"
     with pytest.raises(DomainError) as description_error:
@@ -64,6 +66,8 @@ def test_task_text_over_default_limit_is_rejected(service, project):
             title="ok",
             description="z" * (limit + 1),
             acceptance_criteria=["criterion"],
+            actor_session_id="actor-length-probe",
+            token="not-a-real-token",
         )
     assert description_error.value.code == "task_text_too_long"
     with pytest.raises(DomainError) as criterion_error:
@@ -71,6 +75,8 @@ def test_task_text_over_default_limit_is_rejected(service, project):
             project["id"],
             title="ok",
             acceptance_criteria=["c" * (limit + 1)],
+            actor_session_id="actor-length-probe",
+            token="not-a-real-token",
         )
     assert criterion_error.value.code == "task_text_too_long"
 
@@ -93,6 +99,8 @@ def test_message_and_task_within_limits_are_accepted(service, project):
         title="Normal task",
         description="d" * 1000,
         acceptance_criteria=["criterion " + "c" * 100],
+        actor_session_id=sender["agent"]["id"],
+        token=sender["token"],
     )["task"]
     assert task["title"] == "Normal task"
 

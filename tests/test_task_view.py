@@ -257,10 +257,15 @@ def test_task_contract_state_phase_delegates_to_the_projection():
 
 
 def test_unclassified_projection_warns_once_per_task(service, project, caplog):
+    author = service.join_room(
+        project["id"], name="Author", client="codex", model="unknown"
+    )
     created = service.create_task(
         project["id"],
         title="Legacy residue task",
         acceptance_criteria=["Projection surfaces unknown combinations"],
+        actor_session_id=author["agent"]["id"],
+        token=author["token"],
     )["task"]
     # Force an unclassified triple as legacy residue would look after a
     # cancelled -> todo reopening that kept an approved verification value.
@@ -288,10 +293,14 @@ def test_list_tasks_filters_by_view_phase_and_attention(
 ):
     executor, _reviewer = joined_agents
     todo_task = service.create_task(
-        project["id"], title="Todo sample", acceptance_criteria=["c"]
+        project["id"], title="Todo sample", acceptance_criteria=["c"],
+        actor_session_id=executor["agent"]["id"],
+        token=executor["token"],
     )["task"]
     blocked_task = service.create_task(
-        project["id"], title="Blocked sample", acceptance_criteria=["c"]
+        project["id"], title="Blocked sample", acceptance_criteria=["c"],
+        actor_session_id=executor["agent"]["id"],
+        token=executor["token"],
     )["task"]
     # claim -> in_progress -> blocked through the shared state machine
     executor_session = executor["agent"]["id"]
@@ -314,7 +323,9 @@ def test_list_tasks_filters_by_view_phase_and_attention(
         token=executor["token"],
     )
     done_task = service.create_task(
-        project["id"], title="Done sample", acceptance_criteria=["c"]
+        project["id"], title="Done sample", acceptance_criteria=["c"],
+        actor_session_id=executor["agent"]["id"],
+        token=executor["token"],
     )["task"]
 
     assert {task["id"] for task in service.list_tasks(project["id"], phase="todo")} == {

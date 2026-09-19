@@ -86,6 +86,8 @@ def test_mcp_context_filtering_and_boundaries(service, project, joined_agents):
         project["id"],
         title="Test Task",
         acceptance_criteria=["Criteria 1"],
+        actor_session_id=executor["agent"]["id"],
+        token=executor["token"],
     )["task"]
     service.claim_task(
         project["id"],
@@ -325,6 +327,8 @@ def test_audit_integrity_and_task_history_remain_untrimmed(service, project, joi
         project["id"],
         title="Audit Task",
         acceptance_criteria=["Criterion"],
+        actor_session_id=executor["agent"]["id"],
+        token=executor["token"],
     )["task"]
     service.claim_task(
         project["id"],

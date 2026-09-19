@@ -87,10 +87,15 @@ async def test_submit_posts_message_and_report_with_only_a_credential(
         )
     )
     project, member, credential = _prepared_project(app, project_dir)
+    author = app.state.service.join_room(
+        project["id"], name="Author", client="codex", model="unknown"
+    )
     task = app.state.service.create_task(
         project["id"],
         title="Submit fallback task",
         acceptance_criteria=["evidence lands without MCP"],
+        actor_session_id=author["agent"]["id"],
+        token=author["token"],
     )["task"]
 
     server, server_task, url = await _serve(app)
@@ -113,9 +118,11 @@ async def test_submit_posts_message_and_report_with_only_a_credential(
         assert result["left"] is True
         assert result["workspace_id"], "workspace must be auto-registered"
         # AC3: the one-shot run joins exactly once — no duplicate sessions.
+        # (The setup task author session is excluded from the count.)
         agents = app.state.service.snapshot(project["id"])["agents"]
-        assert len(agents) == 1
-        assert agents[0]["name"] == "OpenCode"
+        submit_agents = [a for a in agents if a["name"] != "Author"]
+        assert len(submit_agents) == 1
+        assert submit_agents[0]["name"] == "OpenCode"
         # The message landed in the room.
         events = app.state.service.list_events(project["id"], after=0)["events"]
         messages = [e for e in events if e["event_type"] == "message.message"]

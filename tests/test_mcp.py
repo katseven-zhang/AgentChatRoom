@@ -1724,6 +1724,8 @@ def test_mcp_task_release_enforces_owner_and_idempotent_repeat(monkeypatch, serv
         project["id"],
         title="MCP release parity",
         acceptance_criteria=["Same semantics over MCP"],
+        actor_session_id=owner["agent"]["id"],
+        token=owner["token"],
     )["task"]
     service.claim_task(
         project["id"], task["id"], owner["agent"]["id"], owner["token"]

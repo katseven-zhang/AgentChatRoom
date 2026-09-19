@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import sqlite3
+
 from fastapi.testclient import TestClient
 
 from agentchatroom.api import create_app
@@ -37,6 +39,8 @@ def test_task_history_projects_review_message_and_report_evidence(
         project["id"],
         title="Traceable history",
         acceptance_criteria=["Evidence is visible", "Decision body is visible"],
+        actor_session_id=executor["agent"]["id"],
+        token=executor["token"],
     )["task"]
     service.claim_task(
         project["id"], task["id"], executor["agent"]["id"], executor["token"]
@@ -164,6 +168,8 @@ def test_task_history_keeps_revoked_member_name_and_missing_relations(service, p
         project["id"],
         title="Keep identity",
         acceptance_criteria=["Name survives revoke"],
+        actor_session_id=joined["agent"]["id"],
+        token=joined["token"],
     )["task"]
     service.claim_task(
         project["id"], task["id"], joined["agent"]["id"], joined["token"]
@@ -202,6 +208,8 @@ def test_task_history_rest_mcp_and_detail_kind_alignment(
         project["id"],
         title="Adapter history",
         acceptance_criteria=["Shared contract"],
+        actor_session_id=executor["agent"]["id"],
+        token=executor["token"],
     )["task"]
     service.claim_task(
         project["id"], task["id"], executor["agent"]["id"], executor["token"]
@@ -230,6 +238,8 @@ def test_task_history_shows_integration_commit_hash(service, project, joined_age
         project["id"],
         title="Integration evidence",
         acceptance_criteria=["Integration shows its commit hash"],
+        actor_session_id=executor["agent"]["id"],
+        token=executor["token"],
     )["task"]
     service.claim_task(
         project["id"], task["id"], executor["agent"]["id"], executor["token"]
@@ -328,6 +338,8 @@ def test_task_history_cursor_pagination_walks_the_whole_chain_without_overlap(
         project["id"],
         title="Cursor pagination",
         acceptance_criteria=["Every event reachable via cursor"],
+        actor_session_id=executor["agent"]["id"],
+        token=executor["token"],
     )["task"]
     service.claim_task(
         project["id"], task["id"], executor["agent"]["id"], executor["token"]
@@ -419,6 +431,8 @@ def test_task_history_has_more_after_ignores_unrelated_room_events(
         project["id"],
         title="Bounded forward pagination",
         acceptance_criteria=["has_more_after reflects this task only"],
+        actor_session_id=executor["agent"]["id"],
+        token=executor["token"],
     )["task"]
     service.claim_task(
         project["id"], task["id"], executor["agent"]["id"], executor["token"]
@@ -437,6 +451,8 @@ def test_task_history_has_more_after_ignores_unrelated_room_events(
         project["id"],
         title="Unrelated noise",
         acceptance_criteria=["noise"],
+        actor_session_id=executor["agent"]["id"],
+        token=executor["token"],
     )["task"]
     service.claim_task(
         project["id"], noise["id"], other["agent"]["id"], other["token"]
@@ -458,6 +474,8 @@ def test_task_history_shows_claim_state_transition_from_payload(
         project["id"],
         title="Claim trail",
         acceptance_criteria=["Claim shows before and after"],
+        actor_session_id=executor["agent"]["id"],
+        token=executor["token"],
     )["task"]
     service.claim_task(
         project["id"], task["id"], executor["agent"]["id"], executor["token"]
@@ -475,3 +493,56 @@ def test_task_history_shows_claim_state_transition_from_payload(
     assert fields["execution_status"]["after"] == "claimed"
     assert claimed["payload"]["owner_session_id"] == executor["agent"]["id"]
     assert claimed["task_number"] == task["task_number"]
+
+
+def test_task_created_event_keeps_operator_after_session_row_is_gone(
+    service, project
+):
+    """#168：操作者快照在事件写入时固化，会话行消失后时间线仍显示创建者。"""
+    executor = join_room_with_workspace(
+        service,
+        project,
+        agent_key="snapshot-main",
+        name="Snapshot Author",
+        client="codex",
+        model="test-model",
+        role="executor",
+    )
+    task = service.create_task(
+        project["id"],
+        title="Snapshot survives session purge",
+        acceptance_criteria=["Timeline keeps the operator"],
+        actor_session_id=executor["agent"]["id"],
+        token=executor["token"],
+    )["task"]
+
+    def created_actor():
+        history = service.list_task_history(project["id"], task["id"])
+        item = next(
+            entry
+            for entry in history["items"]
+            if entry["event_type"] == "task.created"
+        )
+        return item["actor"]
+
+    actor = created_actor()
+    assert actor["name"] == "Snapshot Author"
+    assert actor["client"] == "codex"
+    assert actor["role"] == "executor"
+
+    # 模拟历史脏数据/清理后的悬空会话：事件仍指向已不存在的会话行。
+    # 绕过服务层连接（其写事务固定开启 foreign_keys），以外部清理路径删除。
+    raw = sqlite3.connect(service.database.path)
+    try:
+        raw.execute("PRAGMA foreign_keys = OFF")
+        raw.execute(
+            "DELETE FROM agent_sessions WHERE id = ?", (executor["agent"]["id"],)
+        )
+        raw.commit()
+    finally:
+        raw.close()
+
+    actor_after = created_actor()
+    assert actor_after["name"] == "Snapshot Author"
+    assert actor_after["client"] == "codex"
+    assert actor_after["session_id"] == executor["agent"]["id"]
