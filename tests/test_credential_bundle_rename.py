@@ -131,3 +131,54 @@ def test_already_linked_placeholder_credential_heals_name(test_service, tmp_path
     res = service.link_credential_member(project["id"], cid, member["id"])
     assert res["linked"] is True
     assert res["credential"]["name"] == "Heal Bot 凭据"
+
+
+@pytest.mark.parametrize(
+    "custom_name",
+    [
+        "Alice · Custom HTTP",
+        "QA · 私有生产 HTTP",
+        "my_proj · Custom HTTP",
+        "自定义 · 直接 HTTP MCP",
+    ],
+)
+def test_custom_credential_names_are_never_renamed(test_service, tmp_path, custom_name):
+    """#165 退回回归：非占位的自定义凭据名必须原样保留，join/link 不得静默改名。
+
+    旧模式 `.+? · .*HTTP` 把任意「X · Y HTTP」都判成占位名；收紧后只有含
+    向导明确标记（通用（标准 MCP）/Standard MCP）或 Agent 凭据/Token 系列
+    的名称才会被重命名。
+    """
+    service = test_service
+    project = service.create_project(root_path=str(tmp_path), name="KeepNameProj")
+    issued = service.issue_agent_token(project["id"], name=custom_name)
+    cid = issued["credential"]["id"]
+
+    joined = service.join_room(
+        project["id"],
+        software_key="keep-name-agent",
+        name="Keep Name Agent",
+        client="test",
+        model="unknown",
+        credential_id=cid,
+    )
+    tokens = service.list_agent_tokens(project["id"])
+    tok = next(t for t in tokens if t["id"] == cid)
+    assert tok["name"] == custom_name
+    assert joined["agent"]["name"] == "Keep Name Agent"
+
+
+def test_custom_credential_name_survives_member_link(test_service, tmp_path):
+    """#165 退回回归：link_credential_member 对自定义名同样不重命名。"""
+    service = test_service
+    project = service.create_project(root_path=str(tmp_path), name="LinkKeepProj")
+    member = service.create_project_member(
+        project["id"], member_key="link-keep-bot", name="Link Keep Bot"
+    )["member"]
+    issued = service.issue_agent_token(project["id"], name="QA · 私有生产 HTTP")
+    cid = issued["credential"]["id"]
+
+    res = service.link_credential_member(project["id"], cid, member["id"])
+    assert res["linked"] is True
+    assert res["credential"]["name"] == "QA · 私有生产 HTTP"
+    assert res["credential"]["member_id"] == member["id"]

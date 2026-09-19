@@ -94,7 +94,9 @@ AGENT_PERMISSIONS = {
 }
 DEFAULT_AGENT_PERMISSIONS = AGENT_PERMISSIONS - {"audit:read"}
 DEFAULT_CREDENTIAL_NAME_PATTERN = re.compile(
-    r"^(?:Agent\s*(?:凭据|Token)(?:\s+\d+)?|.+?\s*·\s*.*HTTP|.*(?:通用（标准\s*MCP）|Standard\s*MCP).*)$",
+    # 仅识别向导真实派生的占位名（Agent 凭据/Token 系列与通用标准 MCP 标记），
+    # 不再匹配任意「X · Y HTTP」——那会把用户自定义凭据静默改名（#165）。
+    r"^(?:Agent\s*(?:凭据|Token)(?:\s+\d+)?|.*(?:通用（标准\s*MCP）|\bStandard\s+MCP\b).*)$",
     re.IGNORECASE,
 )
 PROJECT_SETTINGS_DEFAULTS: dict[str, Any] = {

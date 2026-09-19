@@ -12,7 +12,7 @@ AgentChatRoom 是一个面向异构 AI 编程 Agent 的项目级实时协作中�
 - 托盘恢复窗口采用单个后台操作与可配置超时，防止重复点击堆积操作。
 - POSIX 平台端口检查兼容服务退出后的 TCP 等待状态，避免误判为端口占用；仍拒绝正在监听的端口。
 - 接入指令区分首次配置、已配置软件加入新项目与恢复连接；取消任务不能重新获取文件租约，修复少量动态事件的聚合显示。
-- 自动重命名与占位凭据自愈：多项目凭据包（`credential_bundle`）接入时正确解析对应项目的凭据 ID；各类占位凭据名称（如“通用（标准 MCP） HTTP”、“Standard MCP”、“Agent 凭据”等）在 Agent 接入时自动重命名为“{member_name} 凭据”（重名自动递增序号）；已关联成员的历史占位凭据在重新接入时自动自愈更名。
+- 自动重命名与占位凭据自愈：多项目凭据包（`credential_bundle`）接入时正确解析对应项目的凭据 ID；仅向导真实派生的占位凭据名称（含“通用（标准 MCP）/Standard MCP”标记的名称，及“Agent 凭据/Token”系列）在 Agent 接入时自动重命名为“{member_name} 凭据”（重名自动递增序号）；用户自定义名称（如「Alice · Custom HTTP」）永远不会被自动改名；已关联成员的历史占位凭据在重新接入时自动自愈更名。
 - 本地路径项目 Git 升级自愈：无 Git 的本地路径项目后续初始化 Git 仓库并配置远程地址时，`resolve_project_for_join` 与 `room_bootstrap` 自动识别物理路径并平滑将项目 scope 与 `git_remote` 从本地路径升级为 Git 仓库，更新 `.agentchatroom/project.json` 登记并推送 `project.updated` 实时事件，消除 `project_registration_orphaned` 错误，前端项目标签即时从「本地路径」同步切换为「Git」。
 
 升级时请替换完整 Windows ZIP 解压目录（包含 `_internal`），并检查各客户端 MCP 配置是否仍引用旧 EXE 路径。关闭旧 MCP 连接和服务后再替换；新进程才会加载修复。仅删除 EXE 会导致连接失败，不代表成功接入。每个并行项目需要独立连接上下文。
