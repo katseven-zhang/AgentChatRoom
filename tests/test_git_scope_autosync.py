@@ -164,3 +164,68 @@ def test_is_path_to_git_upgrade_safety():
         {"kind": "path", "identity": r"c:\my\project"},
         {"kind": "git", "identity": "https://github.com/foo/bar"},
     ) is False
+
+
+def test_resolve_rejects_when_registered_key_differs_from_git_scope_owner(
+    test_service, tmp_path
+):
+    """#166 退回回归：登记指向 PathRoom A，而同 remote 的 git scope 已被
+    活动中的 GitRoom B 占用时，resolve 必须显式 409，不得静默串房到 B。"""
+    service = test_service
+    dir_a = tmp_path / "repo_a"
+    dir_a.mkdir()
+    dir_b = tmp_path / "repo_b"
+    dir_b.mkdir()
+    remote_url = "https://github.com/test-org/shared.git"
+
+    # GitRoom B 先登记并占用该 remote scope。
+    _init_git_with_remote(dir_b, remote_url)
+    project_b = service.create_project(root_path=str(dir_b), name="GitRoom B")
+    assert project_b["git_remote"] == remote_url
+
+    # PathRoom A 以 path scope 登记且尚无 git。
+    project_a = service.create_project(root_path=str(dir_a), name="PathRoom A")
+    register_checkout_project(dir_a, project_a)
+    assert service.get_project(project_a["id"])["git_remote"] is None
+
+    # 用户之后才在 A 初始化 git 并指向同一 remote。
+    _init_git_with_remote(dir_a, remote_url)
+
+    with pytest.raises(DomainError) as conflict:
+        service.resolve_project_for_join(
+            root_path=str(dir_a),
+            registered_project_key=project_a["project_key"],
+        )
+    assert conflict.value.status_code == 409
+    assert conflict.value.code == "project_registration_conflict"
+    assert conflict.value.details["registered_project_id"] == project_a["id"]
+    assert conflict.value.details["scope_project_ids"] == [project_b["id"]]
+
+    # 失败封闭：A 未被 heal 成 git scope，事件历史也没有 project.updated。
+    # （用裸只读连接检查——get_project 自身带磁盘自愈会污染断言。）
+    with service.database.connect() as connection:
+        row = connection.execute(
+            "SELECT git_remote FROM projects WHERE id = ?", (project_a["id"],)
+        ).fetchone()
+    assert row["git_remote"] is None
+    events = service.list_events(project_a["id"], after=0)["events"]
+    assert not [e for e in events if e["event_type"] == "project.updated"]
+
+
+def test_resolve_still_accepts_owner_of_claimed_git_scope(test_service, tmp_path):
+    """#166 回归：同 remote 下，登记 key 与 scope 归属一致时正常解析，不误伤。"""
+    service = test_service
+    dir_b = tmp_path / "repo_owner"
+    dir_b.mkdir()
+    remote_url = "https://github.com/test-org/owner.git"
+
+    _init_git_with_remote(dir_b, remote_url)
+    project_b = service.create_project(root_path=str(dir_b), name="GitRoom B")
+    register_checkout_project(dir_b, project_b)
+
+    resolved = service.resolve_project_for_join(
+        root_path=str(dir_b),
+        registered_project_key=project_b["project_key"],
+    )
+    assert resolved["id"] == project_b["id"]
+    assert resolved["git_remote"] == remote_url

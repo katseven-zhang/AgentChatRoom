@@ -1601,6 +1601,7 @@ class AgentChatRoomService:
         remote, git_root = _project_git_info(root)
         logical = derive_logical_path(root, git_root, logical_path)
         candidate_scope = _project_scope(remote, git_root, logical)
+        reg_key = str(registered_project_key or "").strip()
         with self.database.connect(write=True) as connection:
             all_projects = connection.execute("SELECT * FROM projects").fetchall()
             scope_projects = [
@@ -1608,10 +1609,38 @@ class AgentChatRoomService:
                 for project in all_projects
                 if _stored_project_scope(project) == candidate_scope
             ]
+            if scope_projects and reg_key and not any(
+                str(p["project_key"]).strip() == reg_key for p in scope_projects
+            ):
+                # #166 fail-closed：checkout 登记把本工作区钉在唯一 Room 上；
+                # 登记的 Room 真实存在却不拥有当前仓库 scope 时，意味着两个
+                # Room 争用同一仓库，必须显式拒绝而不是静默串房。key 已不在
+                # 库中（遗留登记迁移）且 scope 归属无歧义时保留原自愈语义。
+                registered = next(
+                    (
+                        p
+                        for p in all_projects
+                        if str(p["project_key"]).strip() == reg_key
+                    ),
+                    None,
+                )
+                if registered is not None:
+                    raise DomainError(
+                        "project_registration_conflict",
+                        "Checkout registration points to a different Room than this repository's git scope; resolve the duplicate explicitly",
+                        status_code=409,
+                        details={
+                            "registered_project_id": registered["id"],
+                            "registered_project_key": registered["project_key"],
+                            "scope_project_ids": [p["id"] for p in scope_projects],
+                            "scope_project_keys": [
+                                p["project_key"] for p in scope_projects
+                            ],
+                        },
+                    )
             if not scope_projects and remote:
                 heal_target = None
                 norm_root = os.path.normcase(str(root.resolve()))
-                reg_key = str(registered_project_key or "").strip()
                 if reg_key:
                     for p in all_projects:
                         if str(p["project_key"]).strip() == reg_key:
