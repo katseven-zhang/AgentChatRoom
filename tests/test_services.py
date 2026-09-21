@@ -440,6 +440,114 @@ def test_explicit_reclaim_recovers_unfinished_task_from_closed_identity_session(
     assert stored_task["owner_session_id"] == second["agent"]["id"]
 
 
+def test_blocked_task_same_identity_reclaim_after_disconnect(service, project):
+    """#173: blocked tasks are reclaimable like claimed/in_progress when owner is gone."""
+    first = service.join_room(
+        project["id"],
+        agent_key="codex-main",
+        name="Codex",
+        client="codex",
+        model="unknown",
+    )
+    task = service.create_task(
+        project["id"],
+        title="Blocked then reclaimed",
+        acceptance_criteria=["Blocked is unfinished execution work"],
+        actor_session_id=first["agent"]["id"],
+        token=first["token"],
+    )["task"]
+    service.claim_task(
+        project["id"], task["id"], first["agent"]["id"], first["token"]
+    )
+    service.update_task(
+        project["id"],
+        task["id"],
+        status="blocked",
+        blocker_reason="Waiting on upstream",
+        session_id=first["agent"]["id"],
+        token=first["token"],
+    )
+    lease = service.acquire_lease(
+        project["id"],
+        session_id=first["agent"]["id"],
+        token=first["token"],
+        task_id=task["id"],
+        path_pattern="src/blocked.py",
+    )["lease"]
+
+    second = service.join_room(
+        project["id"],
+        agent_key="codex-main",
+        name="Codex recovery",
+        client="codex",
+        model="unknown",
+    )
+    foreign = service.join_room(
+        project["id"],
+        agent_key="other-main",
+        name="Other",
+        client="qoder",
+        model="unknown",
+    )
+
+    # Owner still connected: reject with the bounded reconnect contract.
+    with pytest.raises(DomainError) as connected:
+        service.claim_task(
+            project["id"],
+            task["id"],
+            second["agent"]["id"],
+            second["token"],
+            reclaim=True,
+        )
+    assert connected.value.code == "task_owner_session_connected"
+    assert connected.value.details["retry_after_seconds"] >= 1
+    assert (
+        connected.value.details["required_action"]
+        == "wait_for_owner_release_or_reclaim"
+    )
+
+    # Different software identity: always forbidden.
+    with pytest.raises(DomainError) as foreign_denied:
+        service.claim_task(
+            project["id"],
+            task["id"],
+            foreign["agent"]["id"],
+            foreign["token"],
+            reclaim=True,
+        )
+    assert foreign_denied.value.code == "task_reclaim_forbidden"
+
+    # Owner transport gone: same identity reclaims blocked task + lease + event.
+    service.transport_liveness_check = lambda project_id, session_id: (
+        "gone" if session_id == first["agent"]["id"] else "unknown"
+    )
+    reclaimed = service.claim_task(
+        project["id"],
+        task["id"],
+        second["agent"]["id"],
+        second["token"],
+        reclaim=True,
+    )
+    assert reclaimed["task"]["owner_session_id"] == second["agent"]["id"]
+    assert reclaimed["task"]["execution_status"] == "blocked"
+    assert reclaimed["event_id"] is not None
+
+    events = service.list_events(project["id"], after=0)["events"]
+    reclaim_events = [
+        e for e in events if e["event_type"] == "task.reclaimed"
+    ]
+    assert len(reclaim_events) == 1
+    assert reclaim_events[0]["payload"]["execution_status"] == "blocked"
+    assert lease["id"] in reclaim_events[0]["payload"]["transferred_lease_ids"]
+
+    stored_lease = next(
+        item
+        for item in service.snapshot(project["id"])["leases"]
+        if item["id"] == lease["id"]
+    )
+    assert stored_lease["session_id"] == second["agent"]["id"]
+
+
 def test_different_software_clients_have_distinct_identities(service, project):
     codex = service.join_room(
         project["id"],

@@ -4617,7 +4617,9 @@ class AgentChatRoomService:
                 can_reclaim = bool(
                     owner is not None
                     and self._same_agent_identity(claimant, owner)
-                    and task["execution_status"] in {"claimed", "in_progress"}
+                    # Unfinished execution states are reclaimable once the owner
+                    # is disconnected: claimed, in_progress, and blocked.
+                    and task["execution_status"] in {"claimed", "in_progress", "blocked"}
                 )
                 if not reclaim:
                     raise DomainError(
