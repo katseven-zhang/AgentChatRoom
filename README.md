@@ -308,7 +308,7 @@ Room。`room_join` 会从忽略的 `.agentchatroom/project.json` 读取后端登
 - 数据服务默认开启 Streamable HTTP MCP，路径为配置项 `mcp_http_path`（默认 `/mcp`），不是业务 REST 的 `/api/v1/*`。
 - 默认要求 `Authorization: Bearer <credential>`。兼容旧的单项目 Agent Token；接入向导生成 `acrb.v1.*` 多项目凭据包，包内保存多个可独立吊销、独立到期、独立授权的项目级 Token。未带凭据或所有项目 Token 都无效时返回 **401**。
 - Token 可在接入向导中签发。管理 Tab 的 Token 卡片显示所属 Project、有效期和最近使用时间，不展开权限明细；通过「修改权限」可更新同一个 Token 的授权，通过「续期」可在不更换 Token 的情况下延长有效期，因此两项操作都不要求重新配置 Agent。「吊销」会立即拒绝该 Token 的新请求。旧的 Token 更换接口只为 API 兼容保留，不在 Web 的常规流程中提供。接入首页不显示占位提示词；签发结果弹窗一次性提供明文 `project_name_N` / `project_token_N` 对应关系、可直接使用的凭据包配置和场景指令。整段交给负责配置客户端的 Agent；关闭（包括 Escape）后清除，不存入浏览器存储，也不得放进 URL、Room、日志或 Git。
-- 软件身份由生成的 HTTP 配置头注入（`X-AgentChatRoom-Software-Key/Name/Client`），或由已关联软件成员的 Token 提供。首次签发未关联成员时必须由用户填写实际的 Agent 显示名称（例如 Hermes、Grok），页面据此生成一组稳定身份写入配置，后端在第一次成功连接时按该名称自动登记成员；签发弹窗的“凭据名称”自动按 Agent 显示名称或所选成员派生（重名时递增序号，如 Hermes 凭据、Hermes 凭据 2），不需要手动填写，也不会成为 Agent 名称，接入格式标签（如“通用（标准 MCP）”）与随机占位名称都不能充当身份名称，Token 默认有效期为 365 天。模板已固定 software_key 的接入格式按模板原样签发（不追加随机后缀，避免签发身份与客户端实际上报身份割裂），仅“通用（标准 MCP）”这类没有固定 key 的模板保留随机后缀区分不同安装；同一 Project 内不允许出现第二个同名 active 软件身份，同名不同身份的接入会被 `software_identity_name_conflict` 拒绝，签发弹窗也会对同名成员给出合并引导。非 ASCII 身份字段使用 `acr-utf8.v1.*` ASCII 安全格式传输并在服务端还原；ASCII 名称（如 Hermes）在配置中保持明文；服务端也兼容旧配置把 UTF-8 Header 暴露为 Latin-1 字符串的情况，避免中文名称显示为乱码。Agent 不得自行填写或发明 `agent_key`。
+- 软件身份由生成的 HTTP 配置头注入（`X-AgentChatRoom-Software-Key/Name/Client`），或由已关联软件成员的 Token 提供。首次签发未关联成员时必须由用户填写实际的 Agent 显示名称（例如 Hermes、Grok），页面据此生成一组稳定身份写入配置，后端在第一次成功连接时按该名称自动登记成员；签发弹窗的“凭据名称”自动按 Agent 显示名称或所选成员派生（重名时递增序号，如 Hermes 凭据、Hermes 凭据 2），不需要手动填写，也不会成为 Agent 名称，接入格式标签（如“通用（标准 MCP）”）与随机占位名称都不能充当身份名称，Token 默认有效期为 365 天；`issue_agent_token` / `rotate_agent_token` 省略 `expires_in_seconds` 时才回落配置默认，显式 0/负值与超出上限拒绝 `invalid_agent_token_ttl`。模板已固定 software_key 的接入格式按模板原样签发（不追加随机后缀，避免签发身份与客户端实际上报身份割裂），仅“通用（标准 MCP）”这类没有固定 key 的模板保留随机后缀区分不同安装；同一 Project 内不允许出现第二个同名 active 软件身份，同名不同身份的接入会被 `software_identity_name_conflict` 拒绝，签发弹窗也会对同名成员给出合并引导。非 ASCII 身份字段使用 `acr-utf8.v1.*` ASCII 安全格式传输并在服务端还原；ASCII 名称（如 Hermes）在配置中保持明文；服务端也兼容旧配置把 UTF-8 Header 暴露为 Latin-1 字符串的情况，避免中文名称显示为乱码。Agent 不得自行填写或发明 `agent_key`。
 - 增量加入 Project 时若 Token 关联了已有成员，生成的提示词会列出该成员的软件身份三字段。已关联 Token 可直接提供身份，现有配置没有显式身份 Header 时仍可合并；Header 若存在则必须逐项匹配。服务端会拒绝凭据包中的不同已关联身份，也会拒绝 Token 关联身份与 HTTP 身份头不一致的请求，不能静默改绑身份。
 
 ### 客户端配置
@@ -446,9 +446,9 @@ room_bootstrap
 | 迁移 | 命令 | 发起者 | 前置条件 | 主要失败码 | 副作用 |
 | --- | --- | --- | --- | --- | --- |
 | 创建 → 待认领 | `task_create` | 用户/Agent | 任务合同完整；操作者必须是已认证 Agent 会话（MCP 从运行时绑定自动派生 `actor_session_id`，REST 显式提供） | `invalid_task`、`missing_actor_session` | 无 owner、无指派，绝不隐式派发；无法确定操作者的创建被显式拒绝，不产生无主任务 |
-| 待认领 → 已认领 | `task_claim` | 任意 Agent | 无 owner、execution=todo、依赖满足 | `task_already_claimed`、`task_dependencies_incomplete` | owner 更新；并发只有一个胜出 |
+| 待认领 → 已认领 | `task_claim` | 任意 Agent | 无 owner、execution=todo、依赖满足 | `task_already_claimed`、`task_dependencies_incomplete` | owner 更新；并发只有一个胜出；同身份可用 `task_claim(reclaim=true)` / CLI `task-claim --reclaim` 显式接管断连 owner 的未完成任务，仅同身份且 owner 已断连才允许 |
 | 已认领 → 执行中/阻塞 | `task_update` | 当前 owner | 合法 legacy 迁移 | `invalid_transition`、`structured_transition_required` | 状态与 blocker_reason 更新 |
-| 执行中 → 待验收 | `work_report` | 当前 owner | execution∈{claimed,in_progress,blocked}；证据齐全、worktree 受信 | `insufficient_work_evidence`、`not_task_owner`、`invalid_transition` | 释放任务租约、进度 100 |
+| 执行中 → 待验收 | `work_report` | 当前 owner | execution∈{claimed,in_progress,blocked}；先认证并校验 owner/状态，再核验 git 证据与 commit；证据齐全、worktree 受信 | `insufficient_work_evidence`、`not_task_owner`、`invalid_transition`、`invalid_commit_hash` | 非 owner 在 commit 核验前即 403，不写 `commit_unverified` 事件；owner 且 commit 校验失败才写该事件并 400；成功后释放任务租约、进度 100 |
 | 待验收 → 已退回 | `review_submit verdict=changes_requested` | 独立身份（≠owner） | awaiting_review | `invalid_transition`、`reviewer_not_independent` | execution 回 in_progress、保留 changes_requested |
 | 待验收 → 待集成 | `review_submit verdict=approved` | 独立身份 | awaiting_review；逐条验收标准 passed | `acceptance_criteria_not_satisfied` | verification=approved |
 | 待集成 → 已完成/集成失败 | `integration_submit` | Agent 或管理端 | verification=approved | `task_not_ready_for_integration`、`task_already_integrated`、`integration_tests_failed` | integration=done/failed；done 要求测试全过 |
@@ -464,13 +464,13 @@ room_bootstrap
 
 | 环节 | 语义 |
 | --- | --- |
-| 申请 | `lease_acquire` 声明 `path_pattern` + 模式（readonly/shared/exclusive）+ TTL（默认 1800s，上限可配）；同一 Session 对同一归一化范围的重复申请幂等续用已有租约，不产生重复占用 |
+| 申请 | `lease_acquire` 声明 `path_pattern` + 模式（readonly/shared/exclusive）+ TTL（省略用默认 1800s，上限可配；显式 0/负值与超上限拒绝 `invalid_lease_ttl`，仅 `None`/缺省回落默认）；同一 Session 对同一归一化范围的重复申请幂等续用已有租约，不产生重复占用 |
 | 持有 | 活跃租约在快照/列表中展示模式、路径、持有者、TTL、到期时间、续租时间与原因 |
 | 冲突 | 申请时在同一写事务内做 glob 重叠 + 模式互斥检测；跨 Agent 冲突拒绝申请并写入 `lease.conflict` 事件，并发申请恰好一个成功 |
 | 续租 | Session 心跳自动为未释放、未过期的租约续期；过期租约不会被心跳复活 |
 | 主动释放 | `lease_release` 仅持有者可释放；重复释放幂等（`already_released`），不再追加事件 |
 | 过期回收 | 到期租约惰性失效：不再参与冲突检测、不再出现在活跃快照，他人可立即申请同一范围 |
-| 失联回收 | Session 主动离开或心跳超时即视为失联：离开时原子释放全部租约；新 Session 不会静默接管。相同软件身份可用 `task_claim(reclaim=true)` 显式恢复失联 Session 的未完成执行任务（`claimed` / `in_progress` / `blocked`）并转移该任务的活跃租约；心跳超时的持有者租约也标记为可回收 |
+| 失联回收 | Session 主动离开或心跳超时即视为失联：离开时原子释放全部租约；新 Session 不会静默接管。相同软件身份可用 `task_claim(reclaim=true)` 或 CLI `task-claim --reclaim` 显式恢复失联 Session 的未完成执行任务（`claimed` / `in_progress` / `blocked`）并转移该任务的活跃租约（仅同身份且 owner 已断连才允许）；心跳超时的持有者租约也标记为可回收 |
 | 任务结束清理 | 任务释放、Work Report 提交、交接确认会原子释放关联租约，`released_lease_ids` 写入对应事件 |
 
 `lease_conflict_policy` 只作用于提交前检查 `check_leases`：`advisory` 返回冲突清单并放行（由调用方决定），`pre_commit_block` 拒绝并写入 `lease.pre_commit_blocked` 事件；申请阶段的冲突始终拒绝，与该设置无关。非法策略值由统一配置校验拒绝。项目设置中的「协作角色约定」（roles）只是团队协作约定的可读记录（自动去重去空），不参与任何权限判定；Agent 的实际职责由会话角色、成员权限与任务分工决定。
@@ -625,7 +625,7 @@ Web 端采用现代科技感设计系统与零构建原生 CSS 资产交付：
 | 签发 / 修改权限 / 续期 Token | 通过 Web 为 Agent 生成或维护 HTTP 直连接入配置时 | Token 按 Project 与软件身份签发；列表标题和每张 Token 卡片都显示所属 Project，新签发 Token 的默认名称也包含 Project 名。卡片不显示权限明细，「修改权限」在弹窗中调整同一个 Token 的权限，「续期」从当前到期时间增加有效天数（已过期则从当前时间起算），两者都不更换 Token、无需重新接入。同一客户端可在一个 `agentchatroom` MCP 配置中保存多个 Project 凭据；吊销始终可用 |
 | 成员吊销 | 某个软件身份离开团队或需要禁用时 | 成员由 Agent 接入时自动创建；Web 不提供手工添加/编辑（REST `member_create`/`member_update` 仍可用于管理端脚本化场景） |
 | Workspace 列表 | 排查跨电脑项目路径登记是否正确 | 只读自动列表：Agent 通过 `room_join` 自动登记，Web 不再提供手动登记入口（REST 仍可编程登记） |
-| 审计筛选/翻页 | 需要追溯某个事件类型或更早的历史 | 审计历史按服务端分页加载，支持「加载更早」「加载更新」，刷新不丢已加载窗口；窗口大小由受验证配置 `coordination.audit_window_size`（默认 100，环境变量 `AGENTCHATROOM_AUDIT_WINDOW_SIZE`）控制 |
+| 审计筛选/翻页 | 需要追溯某个事件类型或更早的历史 | 审计历史按服务端分页加载，支持「加载更早」「加载更新」，刷新不丢已加载窗口；窗口大小由受验证配置 `coordination.audit_window_size`（默认 100，环境变量 `AGENTCHATROOM_AUDIT_WINDOW_SIZE`）控制。真实消费点是 Web 审计列表分页（`app.js` 的 `auditPageSize()` 从运行时 `settings.audit_window_size` 取页大小，非法或缺省回退 100），该键保留在 `CONFIG_FILE_SCHEMA` 与 `Settings` 中，不迁移删除 |
 
 「系统设置」弹窗（顶栏按钮，全局作用域）收拢中心运行状态（生效配置、进程、脱敏日志）、数据库全量备份与回滚，以及自动备份策略配置；项目设置弹窗只承载单 Project 属性（名称、租约冲突策略、默认优先级、MCP 消息条数、团队约定、审计保留策略与审计数据导出）。
 
@@ -647,7 +647,7 @@ Web 端采用现代科技感设计系统与零构建原生 CSS 资产交付：
 
 每个 Project 可以维护版本化的「项目文档」，kind 分为两类：
 
-- **规范（binding）**：必须遵循的工程规范。Agent 每次通过 `task_claim` 认领任务时，响应自动附带当前 binding 文档内容（受 `documents.inject_max_chars` 配置限制，默认 12000 字符，超出部分降级为摘要与按需获取指引）；服务端在 `task.claimed` 事件中记录本次认领适用的规范版本快照。
+- **规范（binding）**：必须遵循的工程规范。Agent 每次通过 `task_claim` 认领任务时，响应自动附带当前 binding 文档内容（受 `documents.inject_max_chars` 配置限制，默认 12000 字符，超出部分降级为摘要与按需获取指引）；生效优先级为环境变量 `AGENTCHATROOM_PROJECT_DOC_INJECT_MAX_CHARS` > 配置文件 `[documents].inject_max_chars` > 默认值 12000（运行时字段名为 `project_doc_inject_max_chars`，文件键名保持 `inject_max_chars`）。服务端在 `task.claimed` 事件中记录本次认领适用的规范版本快照。
 - **参考（reference）**：设计/架构文档，进入文档清单（manifest），按需获取，不强制注入。
 
 回执闭环：`work_report` 时服务端从认领事件自动读取该快照并写入 `work.reported` 事件的 `spec_receipt` 字段（不依赖 Agent 自觉填写）；任务详情与验收界面按该版本对照判定合规。后端只负责注入、留痕与展示，不做合规性自动判定——独立验收才是执法环节。
