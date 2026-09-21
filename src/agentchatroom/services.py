@@ -2183,7 +2183,11 @@ class AgentChatRoomService:
                 "Agent token contains unsupported permissions",
                 details={"unknown": unknown},
             )
-        ttl = expires_in_seconds or self.settings.agent_token_ttl_seconds
+        ttl = (
+            self.settings.agent_token_ttl_seconds
+            if expires_in_seconds is None
+            else expires_in_seconds
+        )
         if not 300 <= ttl <= self.settings.max_agent_token_ttl_seconds:
             raise DomainError(
                 "invalid_agent_token_ttl",
@@ -2517,7 +2521,11 @@ class AgentChatRoomService:
         *,
         expires_in_seconds: int | None = None,
     ) -> dict[str, Any]:
-        ttl = expires_in_seconds or self.settings.agent_token_ttl_seconds
+        ttl = (
+            self.settings.agent_token_ttl_seconds
+            if expires_in_seconds is None
+            else expires_in_seconds
+        )
         if not 300 <= ttl <= self.settings.max_agent_token_ttl_seconds:
             raise DomainError(
                 "invalid_agent_token_ttl",
@@ -6334,7 +6342,11 @@ class AgentChatRoomService:
                 "invalid_lease_mode",
                 "Lease mode must be readonly, shared, or exclusive",
             )
-        ttl = ttl_seconds or self.settings.default_lease_ttl_seconds
+        ttl = (
+            self.settings.default_lease_ttl_seconds
+            if ttl_seconds is None
+            else ttl_seconds
+        )
         if not 1 <= ttl <= self.settings.max_lease_ttl_seconds:
             raise DomainError(
                 "invalid_lease_ttl",
@@ -6658,6 +6670,19 @@ class AgentChatRoomService:
         with self.database.connect() as connection:
             agent = self._authenticate(connection, project_id, session_id, token)
             project = self._require_project(connection, project_id)
+            task = self._require_task(connection, project_id, task_id)
+            if task["owner_session_id"] != session_id:
+                raise DomainError(
+                    "not_task_owner",
+                    "Only the task owner can report work",
+                    status_code=403,
+                )
+            if task["execution_status"] not in {"claimed", "in_progress", "blocked"}:
+                raise DomainError(
+                    "invalid_transition",
+                    "Task is not in a state that accepts a work report",
+                    status_code=409,
+                )
             worktree = self._trusted_worktree(connection, project, agent)
         system_evidence = self._collect_git_evidence(
             project, agent, commit_hash, worktree=worktree

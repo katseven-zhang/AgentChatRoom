@@ -312,6 +312,88 @@ def test_startup_purge_removes_stale_credentials(service, project):
     assert names == {"kept"}
 
 
+def test_issue_agent_token_ttl_validates_zero_negative_and_bounds(service, project):
+    for invalid in (0, -1):
+        with pytest.raises(DomainError) as failure:
+            service.issue_agent_token(
+                project["id"],
+                name=f"invalid-{invalid}",
+                permissions=["room:read"],
+                expires_in_seconds=invalid,
+            )
+        assert failure.value.code == "invalid_agent_token_ttl"
+        assert failure.value.status_code == 400
+
+    issued_min = service.issue_agent_token(
+        project["id"],
+        name="ttl-min",
+        permissions=["room:read"],
+        expires_in_seconds=300,
+    )
+    assert issued_min["credential"]["id"]
+
+    maximum = service.settings.max_agent_token_ttl_seconds
+    issued_max = service.issue_agent_token(
+        project["id"],
+        name="ttl-max",
+        permissions=["room:read"],
+        expires_in_seconds=maximum,
+    )
+    assert issued_max["credential"]["id"]
+
+    with pytest.raises(DomainError) as over_max:
+        service.issue_agent_token(
+            project["id"],
+            name="ttl-over-max",
+            permissions=["room:read"],
+            expires_in_seconds=maximum + 1,
+        )
+    assert over_max.value.code == "invalid_agent_token_ttl"
+
+
+def test_rotate_agent_token_ttl_validates_zero_negative_and_bounds(service, project):
+    issued = service.issue_agent_token(
+        project["id"],
+        name="rotate-ttl-base",
+        permissions=["room:read"],
+        expires_in_seconds=3600,
+    )
+    credential_id = issued["credential"]["id"]
+
+    for invalid in (0, -1):
+        with pytest.raises(DomainError) as failure:
+            service.rotate_agent_token(
+                project["id"],
+                credential_id,
+                expires_in_seconds=invalid,
+            )
+        assert failure.value.code == "invalid_agent_token_ttl"
+        assert failure.value.status_code == 400
+
+    rotated_min = service.rotate_agent_token(
+        project["id"],
+        credential_id,
+        expires_in_seconds=300,
+    )
+    credential_id = rotated_min["credential"]["id"]
+
+    maximum = service.settings.max_agent_token_ttl_seconds
+    rotated_max = service.rotate_agent_token(
+        project["id"],
+        credential_id,
+        expires_in_seconds=maximum,
+    )
+    credential_id = rotated_max["credential"]["id"]
+
+    with pytest.raises(DomainError) as over_max:
+        service.rotate_agent_token(
+            project["id"],
+            credential_id,
+            expires_in_seconds=maximum + 1,
+        )
+    assert over_max.value.code == "invalid_agent_token_ttl"
+
+
 def test_agent_key_aliases_cannot_create_another_software_identity(service, project):
     first = service.join_room(
         project["id"],
@@ -1465,6 +1547,52 @@ def test_conflicting_exclusive_lease_is_rejected(service, project, joined_agents
     assert any(event["event_type"] == "lease.conflict" for event in events)
 
 
+def test_acquire_lease_ttl_validates_zero_negative_and_bounds(
+    service, project, joined_agents
+):
+    executor, _ = joined_agents
+    for invalid in (0, -1):
+        with pytest.raises(DomainError) as failure:
+            service.acquire_lease(
+                project["id"],
+                session_id=executor["agent"]["id"],
+                token=executor["token"],
+                path_pattern=f"src/ttl-invalid-{invalid}/**",
+                ttl_seconds=invalid,
+            )
+        assert failure.value.code == "invalid_lease_ttl"
+        assert failure.value.status_code == 400
+
+    leased_min = service.acquire_lease(
+        project["id"],
+        session_id=executor["agent"]["id"],
+        token=executor["token"],
+        path_pattern="src/ttl-min/**",
+        ttl_seconds=1,
+    )["lease"]
+    assert leased_min["id"]
+
+    maximum = service.settings.max_lease_ttl_seconds
+    leased_max = service.acquire_lease(
+        project["id"],
+        session_id=executor["agent"]["id"],
+        token=executor["token"],
+        path_pattern="src/ttl-max/**",
+        ttl_seconds=maximum,
+    )["lease"]
+    assert leased_max["id"]
+
+    with pytest.raises(DomainError) as over_max:
+        service.acquire_lease(
+            project["id"],
+            session_id=executor["agent"]["id"],
+            token=executor["token"],
+            path_pattern="src/ttl-over-max/**",
+            ttl_seconds=maximum + 1,
+        )
+    assert over_max.value.code == "invalid_lease_ttl"
+
+
 def test_work_report_releases_task_leases(service, project, joined_agents):
     executor, _reviewer = joined_agents
     task = service.create_task(
@@ -1979,6 +2107,42 @@ def test_work_report_requires_evidence(service, project, joined_agents):
             tests=[],
         )
     assert failure.value.code == "insufficient_work_evidence"
+
+
+def test_work_report_non_owner_forged_commit_is_403_with_zero_events(
+    service, project, joined_agents
+):
+    owner, stranger = joined_agents
+    task = service.create_task(
+        project["id"],
+        title="Ownership protected report",
+        acceptance_criteria=["Only the owner reports work"],
+        actor_session_id=owner["agent"]["id"],
+        token=owner["token"],
+    )["task"]
+    service.claim_task(
+        project["id"], task["id"], owner["agent"]["id"], owner["token"]
+    )
+    events_before = service.list_events(project["id"], after=0)["events"]
+    with pytest.raises(DomainError) as denied:
+        service.submit_work_report(
+            project["id"],
+            task["id"],
+            session_id=stranger["agent"]["id"],
+            token=stranger["token"],
+            summary="Forged report with a bad commit",
+            files=["src/forge.py"],
+            tests=[{"command": "pytest", "exit_code": 0}],
+            commit_hash="0000000000000000000000000000000000000000",
+        )
+    assert denied.value.code == "not_task_owner"
+    assert denied.value.status_code == 403
+    events_after = service.list_events(project["id"], after=0)["events"]
+    assert events_after == events_before
+    assert not any(
+        event["event_type"] == "work_report.commit_unverified"
+        for event in events_after
+    )
 
 
 def test_work_report_accepts_and_exports_structured_no_code_reason(
