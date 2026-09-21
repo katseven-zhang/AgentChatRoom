@@ -2128,6 +2128,63 @@ def test_required_message_can_be_acknowledged(service, project, joined_agents):
     assert service.snapshot(project["id"])["acknowledgements"][0]["event_id"] == message["event_id"]
 
 
+def test_repeated_acknowledge_does_not_duplicate_message_acknowledged_event(
+    service, project, joined_agents
+):
+    """#174: duplicate acknowledge is idempotent and does not spam the event stream."""
+    sender, receiver = joined_agents
+    message = service.post_message(
+        project["id"],
+        session_id=sender["agent"]["id"],
+        token=sender["token"],
+        body="Confirm once, not forever",
+        model_display_name="Model A",
+        requires_ack=True,
+    )
+    first = service.acknowledge_event(
+        project["id"],
+        message["event_id"],
+        receiver["agent"]["id"],
+        receiver["token"],
+        request_id="ack-request-1",
+    )
+    assert first["acknowledged"] is True
+    assert first.get("already_acknowledged") is not True
+    assert first["event_id"] is not None
+
+    replay = service.acknowledge_event(
+        project["id"],
+        message["event_id"],
+        receiver["agent"]["id"],
+        receiver["token"],
+        request_id="ack-request-1",
+    )
+    assert replay["idempotent_replay"] is True
+    assert replay["event_id"] == first["event_id"]
+
+    # Different request_id: must not append a second message.acknowledged.
+    repeated = service.acknowledge_event(
+        project["id"],
+        message["event_id"],
+        receiver["agent"]["id"],
+        receiver["token"],
+        request_id="ack-request-2",
+    )
+    assert repeated["acknowledged"] is True
+    assert repeated["already_acknowledged"] is True
+    assert repeated["acknowledged_event_id"] == message["event_id"]
+    assert repeated["event_id"] is None
+    assert repeated["cursor"] == first["cursor"]
+
+    events = [
+        event
+        for event in service.list_events(project["id"])["events"]
+        if event["event_type"] == "message.acknowledged"
+        and event["payload"].get("event_id") == message["event_id"]
+    ]
+    assert len(events) == 1
+
+
 def test_archived_project_is_hidden_and_can_be_restored(service, project_dir):
     project = service.create_project(root_path=str(project_dir), name="Archivable")
     archived = service.archive_project(project["id"])

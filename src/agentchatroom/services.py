@@ -3945,14 +3945,25 @@ class AgentChatRoomService:
                     "This event does not require acknowledgement",
                     status_code=409,
                 )
-            connection.execute(
+            inserted = connection.execute(
                 """
                 INSERT INTO event_acknowledgements(event_id, session_id, created_at)
                 VALUES (?, ?, ?)
                 ON CONFLICT(event_id, session_id) DO NOTHING
                 """,
                 (event_id, session_id, iso_now()),
-            )
+            ).rowcount
+            if inserted != 1:
+                # Duplicate acknowledge: keep append-only history stable and
+                # do not emit another message.acknowledged (style matches
+                # release_lease's already_released).
+                return {
+                    "acknowledged": True,
+                    "already_acknowledged": True,
+                    "acknowledged_event_id": event_id,
+                    "event_id": None,
+                    "cursor": self.latest_cursor(connection, project_id),
+                }
             cursor = self._emit(
                 connection,
                 project_id,
