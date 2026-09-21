@@ -806,10 +806,16 @@ def upsert_toml_section(text: str, section: str, values: dict[str, Any]) -> str:
     lines = text.splitlines()
     header = f"[{section}]"
     start = next((index for index, line in enumerate(lines) if line.strip() == header), None)
-    rendered = [
-        f"{key} = {str(value).lower() if isinstance(value, bool) else value}"
-        for key, value in values.items()
-    ]
+
+    def _render_value(value: Any) -> str:
+        if isinstance(value, bool):
+            return str(value).lower()
+        if isinstance(value, str):
+            # Quote str so spaces/中文/quotes/newlines stay valid TOML.
+            return json.dumps(value, ensure_ascii=False)
+        return str(value)
+
+    rendered = [f"{key} = {_render_value(value)}" for key, value in values.items()]
     if start is None:
         block = [header, *rendered]
         prefix = "\n".join(lines) + "\n" if lines else ""

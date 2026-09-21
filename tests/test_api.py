@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import tomllib
 from dataclasses import replace
 from pathlib import Path
 
@@ -13,6 +14,7 @@ from agentchatroom.api import (
     _is_expected_windows_proactor_disconnect,
     _redact_log_line,
     create_app,
+    upsert_toml_section,
 )
 from agentchatroom.desktop import DirectoryPickerUnavailable
 from agentchatroom.local_mcp import LocalMcpConfigurator, LocalMcpEnvironment
@@ -2186,3 +2188,45 @@ def test_api_acknowledge_event_rest_contract(settings, project_dir):
         )
         assert unauthorized.status_code == 401
         assert unauthorized.json()["error"]["code"] == "invalid_session_token"
+
+
+def test_upsert_toml_section_quotes_str_and_keeps_bool_int_scalars():
+    note = 'path with spaces 中文注释 "quoted" \'single\'\nline2\ttab'
+    values: dict[str, object] = {
+        "note": note,
+        "enabled": True,
+        "count": 42,
+        "disabled_flag": False,
+    }
+    base = '[backup]\nenabled = false\ncount = 1\nother_kept = 7\n'
+    result = upsert_toml_section(base, "backup", values)
+    parsed = tomllib.loads(result)
+    backup = parsed["backup"]
+    assert backup["note"] == note
+    assert backup["enabled"] is True
+    assert backup["count"] == 42
+    assert backup["disabled_flag"] is False
+    assert backup["other_kept"] == 7
+    # str values must be quoted TOML strings, not bare words
+    assert 'note = "' in result
+
+
+def test_upsert_toml_section_creates_section_with_toml_safe_strings():
+    text = 'title = "root"\n'
+    note = "保存即写入配置文件 [backup]；path = C:\\dir\\x\nnext"
+    result = upsert_toml_section(text, "meta", {"label": note, "n": 3})
+    parsed = tomllib.loads(result)
+    assert parsed["title"] == "root"
+    assert parsed["meta"]["label"] == note
+    assert parsed["meta"]["n"] == 3
+
+
+def test_upsert_toml_section_bool_int_written_without_quotes():
+    result = upsert_toml_section("", "backup", {"auto_backup_enabled": True})
+    parsed = tomllib.loads(result)
+    assert parsed["backup"]["auto_backup_enabled"] is True
+    assert "true" in result
+    assert '"true"' not in result
+    int_result = upsert_toml_section("", "backup", {"auto_backup_max_kept": 5})
+    int_parsed = tomllib.loads(int_result)
+    assert int_parsed["backup"]["auto_backup_max_kept"] == 5
