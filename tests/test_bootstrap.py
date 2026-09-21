@@ -978,6 +978,95 @@ def test_bootstrap_updates_stale_agents_coordination_block(
     assert restored == current
 
 
+def _notice_codes(outcome):
+    return [notice["code"] for notice in outcome.public.get("notices", [])]
+
+
+def test_bootstrap_notice_root_fallback_without_instructions_change(
+    monkeypatch, service, project_dir
+):
+    """#179：仅 server root 兜底时，只报一次 server_project_root_registered。"""
+    _configure_software(monkeypatch)
+    project = _register_project(service, project_dir)
+    primed = bootstrap_local_room(
+        service,
+        software_key="boot-agent",
+        software_name="Boot Agent",
+        client="codex",
+        model="unknown",
+        cwd=project_dir,
+    )
+    assert primed.public["status"] == "ready"
+
+    outcome = bootstrap_local_room(
+        service,
+        software_key="boot-agent",
+        software_name="Boot Agent",
+        client="codex",
+        model="unknown",
+        workspace_roots=[],
+        selected_project_id=project["id"],
+    )
+    assert outcome.public["status"] == "ready"
+    codes = _notice_codes(outcome)
+    assert codes.count("server_project_root_registered") == 1
+    assert not any(code.startswith("project_instructions_") for code in codes)
+
+
+def test_bootstrap_notice_instructions_update_without_root_fallback(
+    monkeypatch, service, project_dir
+):
+    """#179：仅 instructions 更新时，不得误报 server_project_root_registered。"""
+    _configure_software(monkeypatch)
+    project = _register_project(service, project_dir)
+    instructions_path = project_dir / "AGENTS.md"
+    current = instructions_path.read_text(encoding="utf-8")
+    instructions_path.write_text(
+        current.replace("room_sync", "legacy-sync-marker"), encoding="utf-8"
+    )
+
+    outcome = bootstrap_local_room(
+        service,
+        software_key="boot-agent",
+        software_name="Boot Agent",
+        client="codex",
+        model="unknown",
+        workspace_roots=[project_dir],
+        selected_project_id=project["id"],
+    )
+    assert outcome.public["status"] == "ready"
+    codes = _notice_codes(outcome)
+    assert codes.count("project_instructions_updated") == 1
+    assert "server_project_root_registered" not in codes
+
+
+def test_bootstrap_notice_root_fallback_and_instructions_update(
+    monkeypatch, service, project_dir
+):
+    """#179：root 兜底与 instructions 更新同时发生时，各只报一次。"""
+    _configure_software(monkeypatch)
+    project = _register_project(service, project_dir)
+    instructions_path = project_dir / "AGENTS.md"
+    current = instructions_path.read_text(encoding="utf-8")
+    instructions_path.write_text(
+        current.replace("room_sync", "legacy-sync-marker"), encoding="utf-8"
+    )
+
+    outcome = bootstrap_local_room(
+        service,
+        software_key="boot-agent",
+        software_name="Boot Agent",
+        client="codex",
+        model="unknown",
+        workspace_roots=[],
+        selected_project_id=project["id"],
+    )
+    assert outcome.public["status"] == "ready"
+    codes = _notice_codes(outcome)
+    assert codes.count("server_project_root_registered") == 1
+    assert codes.count("project_instructions_updated") == 1
+
+
 def _bootstrap(service, project_dir, **overrides):
     arguments = {
         "software_key": "boot-agent",

@@ -848,15 +848,6 @@ def bootstrap_local_room(
         )
     if instructions_notice is not None:
         notices.append(instructions_notice)
-        notices.append(
-            {
-                "code": "server_project_root_registered",
-                "message": (
-                    "The client did not advertise workspace roots; the selected "
-                    "Project's existing server-local root was registered as this Session's Workspace"
-                ),
-            }
-        )
     return _ready_outcome(
         project=project,
         session_id=str(joined["agent"]["id"]),
