@@ -1120,6 +1120,15 @@ def build_parser() -> argparse.ArgumentParser:
     claim.add_argument("task_id")
     claim.add_argument("--session-id", required=True)
     claim.add_argument("--token", required=True)
+    claim.add_argument(
+        "--reclaim",
+        action="store_true",
+        help=(
+            "Reclaim an unfinished task from a disconnected Session of the "
+            "same software identity; rejected while the owner is connected "
+            "or belongs to another identity"
+        ),
+    )
 
     task_release = commands.add_parser(
         "task-release", help="Release an owned task back to the claimable pool"
@@ -1757,7 +1766,11 @@ def main(argv: list[str] | None = None) -> None:
         result = call_api(
             "POST",
             f"/api/v1/projects/{args.project_id}/tasks/{args.task_id}/claim",
-            {"session_id": args.session_id, "token": args.token},
+            {
+                "session_id": args.session_id,
+                "token": args.token,
+                "reclaim": args.reclaim,
+            },
         )
     elif args.command == "task-release":
         result = call_api(

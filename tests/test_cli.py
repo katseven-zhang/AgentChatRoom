@@ -844,3 +844,45 @@ def test_task_release_cli_posts_structured_reason(monkeypatch, capsys):
         "session_id": None,
         "token": None,
     }
+
+
+def test_task_claim_cli_passes_reclaim_flag(monkeypatch, capsys):
+    captured = []
+
+    def fake_request_json(base, method, path, body=None, *, request_id=None):
+        captured.append({"method": method, "path": path, "body": body})
+        return {"ok": True}
+
+    monkeypatch.setattr(cli, "request_json", fake_request_json)
+
+    main(
+        [
+            "task-claim",
+            "project_example",
+            "task_example",
+            "--session-id",
+            "agent_example",
+            "--token",
+            "session-token",
+            "--reclaim",
+        ]
+    )
+    main(
+        [
+            "task-claim",
+            "project_example",
+            "task_example",
+            "--session-id",
+            "agent_example",
+            "--token",
+            "session-token",
+        ]
+    )
+
+    assert captured[0]["method"] == "POST"
+    assert captured[0]["path"].endswith("/tasks/task_example/claim")
+    assert captured[0]["body"]["reclaim"] is True
+    assert captured[0]["body"]["session_id"] == "agent_example"
+    assert captured[0]["body"]["token"] == "session-token"
+    assert captured[1]["body"]["reclaim"] is False
+    assert capsys.readouterr().out.count('"ok": true') == 2
