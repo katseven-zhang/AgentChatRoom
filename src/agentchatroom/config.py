@@ -629,7 +629,7 @@ def load_settings(
         "project_doc_inject_max_chars": int(
             os.getenv(
                 "AGENTCHATROOM_PROJECT_DOC_INJECT_MAX_CHARS",
-                file_values.get("inject_max_chars", 12000),
+                file_values.get("project_doc_inject_max_chars", 12000),
             )
         ),
         "knowledge_kinds": normalize_knowledge_kinds(

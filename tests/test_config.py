@@ -1,10 +1,15 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pytest
 
-from agentchatroom.config import default_data_dir, load_settings
+from agentchatroom.config import (
+    CONFIG_FILE_SCHEMA,
+    default_data_dir,
+    load_settings,
+)
 
 
 def test_environment_overrides_config_file(monkeypatch, tmp_path):
@@ -307,3 +312,192 @@ def test_invalid_database_configuration_is_rejected(monkeypatch, tmp_path):
 
     with pytest.raises(ValueError, match="maximum size must not be less than minimum"):
         load_settings()
+
+
+def test_documents_inject_max_chars_file_value_takes_effect(monkeypatch, tmp_path):
+    """#178: [documents].inject_max_chars must map through _merge_toml into Settings."""
+    monkeypatch.setenv("AGENTCHATROOM_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.delenv("AGENTCHATROOM_PROJECT_DOC_INJECT_MAX_CHARS", raising=False)
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(
+        "[documents]\ninject_max_chars = 4096\n",
+        encoding="utf-8",
+    )
+
+    settings = load_settings(config_path)
+
+    assert settings.project_doc_inject_max_chars == 4096
+
+
+def test_documents_inject_max_chars_priority_env_over_file_over_default(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("AGENTCHATROOM_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.delenv("AGENTCHATROOM_PROJECT_DOC_INJECT_MAX_CHARS", raising=False)
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(
+        "[documents]\ninject_max_chars = 4096\n",
+        encoding="utf-8",
+    )
+
+    assert load_settings(config_path).project_doc_inject_max_chars == 4096
+
+    monkeypatch.setenv("AGENTCHATROOM_PROJECT_DOC_INJECT_MAX_CHARS", "8192")
+    assert load_settings(config_path).project_doc_inject_max_chars == 8192
+
+    monkeypatch.delenv("AGENTCHATROOM_PROJECT_DOC_INJECT_MAX_CHARS", raising=False)
+    config_path.write_text(
+        "[application]\nschema_version = 1\n",
+        encoding="utf-8",
+    )
+    assert load_settings(config_path).project_doc_inject_max_chars == 12000
+
+
+def _settings_attr_for(section: str, key: str) -> str:
+    """Map CONFIG_FILE_SCHEMA keys onto Settings field names."""
+    if (section, key) == ("application", "schema_version"):
+        return "config_schema_version"
+    if (section, key) == ("documents", "inject_max_chars"):
+        return "project_doc_inject_max_chars"
+    if section == "database":
+        return f"database_{key}"
+    if section == "knowledge":
+        return f"knowledge_{key}"
+    if (section, key) == ("coordination", "mcp_message_context_limit"):
+        return "mcp_message_limit"
+    return key
+
+
+def test_every_config_file_schema_key_maps_into_settings(monkeypatch, tmp_path):
+    """Walk CONFIG_FILE_SCHEMA: each file key must land on a Settings field."""
+    samples: dict[str, dict[str, object]] = {
+        "application": {
+            "schema_version": 1,
+            "deployment_profile": "local",
+        },
+        "server": {
+            "host": "127.0.0.1",
+            "port": 9101,
+            "mcp_http_enabled": False,
+            "mcp_http_path": "/mcp-custom",
+            "mcp_http_stateless": True,
+            "mcp_http_json_response": False,
+            "mcp_http_session_idle_timeout_seconds": 600.0,
+            "mcp_http_session_adoption": False,
+            "mcp_http_tombstone_limit": 32,
+            "mcp_http_tombstone_ttl_seconds": 3600.0,
+            "mcp_bridge_command": "python3",
+            "external_base_url": "",
+            "trusted_proxy_headers": False,
+            "trusted_proxy_ips": "10.0.0.9",
+        },
+        "database": {
+            "backend": "sqlite",
+            "url_env": "ROOM_TEST_DATABASE_URL",
+            "pool_min_size": 2,
+            "pool_max_size": 5,
+            "connect_timeout_seconds": 2.5,
+        },
+        "knowledge": {
+            "kinds": ["decision", "pitfall"],
+            "require_verified_task": False,
+        },
+        "coordination": {
+            "mcp_roots_timeout_seconds": 4.0,
+            "heartbeat_timeout_seconds": 60,
+            "presence_keepalive_enabled": True,
+            "presence_keepalive_interval_seconds": 15.0,
+            "session_token_ttl_seconds": 3600,
+            "default_lease_ttl_seconds": 600,
+            "max_lease_ttl_seconds": 7200,
+            "sse_poll_interval_seconds": 1.5,
+            "presence_refresh_interval_seconds": 2.5,
+            "max_sse_clients_per_project": 16,
+            "sse_per_ip_limit": 4,
+            "audit_window_size": 50,
+            "token_touch_interval_seconds": 30.0,
+            "token_touch_min_calls": 8,
+            "mcp_message_limit": 7,
+            "message_max_body_length": 4096,
+            "task_text_max_length": 2048,
+            # mcp_message_context_limit is an alias; covered in a dedicated load below.
+        },
+        "security": {
+            "agent_token_ttl_seconds": 3600,
+            "max_agent_token_ttl_seconds": 7200,
+            "mcp_http_auth_required": False,
+            "management_auth_required": False,
+            "management_token_env": "ROOM_TEST_ADMIN_TOKEN",
+            "management_session_ttl_seconds": 3600,
+            "management_cookie_name": "room_test_admin",
+        },
+        "backup": {
+            "auto_backup_enabled": True,
+            "auto_backup_interval_seconds": 120,
+            "auto_backup_max_kept": 5,
+        },
+        "documents": {
+            "inject_max_chars": 4096,
+        },
+        "interface": {
+            "product_name": "Mapped Room",
+            "default_theme": "dark",
+        },
+    }
+
+    for name in list(os.environ):
+        if name.startswith("AGENTCHATROOM_"):
+            monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("AGENTCHATROOM_DATA_DIR", str(tmp_path / "data"))
+
+    schema_keys = {
+        (section, key)
+        for section, keys in CONFIG_FILE_SCHEMA.items()
+        for key in keys
+    }
+    covered = {
+        (section, key)
+        for section, keys in samples.items()
+        for key in keys
+    }
+    # Every schema key must be exercised; the context-limit alias is asserted separately.
+    alias_key = ("coordination", "mcp_message_context_limit")
+    assert covered | {alias_key} == schema_keys
+
+    lines: list[str] = []
+    for section, values in samples.items():
+        lines.append(f"[{section}]")
+        for key, value in values.items():
+            if isinstance(value, bool):
+                rendered = "true" if value else "false"
+            elif isinstance(value, str):
+                rendered = f'"{value}"'
+            elif isinstance(value, list):
+                rendered = "[" + ", ".join(f'"{item}"' for item in value) + "]"
+            else:
+                rendered = repr(value)
+            lines.append(f"{key} = {rendered}")
+        lines.append("")
+
+    config_path = tmp_path / "mapped.toml"
+    config_path.write_text("\n".join(lines), encoding="utf-8")
+    settings = load_settings(config_path)
+
+    for section, values in samples.items():
+        for key, file_value in values.items():
+            attr = _settings_attr_for(section, key)
+            expected = file_value
+            if attr == "knowledge_kinds":
+                expected = tuple(file_value)  # type: ignore[arg-type]
+            assert getattr(settings, attr) == expected, (
+                f"[{section}].{key} did not map to Settings.{attr}"
+            )
+
+    # Alias: [coordination].mcp_message_context_limit -> Settings.mcp_message_limit
+    # when mcp_message_limit is absent from the file.
+    alias_path = tmp_path / "alias.toml"
+    alias_path.write_text(
+        "[coordination]\nmcp_message_context_limit = 9\n",
+        encoding="utf-8",
+    )
+    assert load_settings(alias_path).mcp_message_limit == 9
