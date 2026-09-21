@@ -2079,3 +2079,110 @@ def test_api_rejects_task_creation_without_operator(settings, project_dir):
             created.json()["task"]["created_by_session_id"]
             == author["agent"]["id"]
         )
+
+
+def test_api_acknowledge_event_rest_contract(settings, project_dir):
+    """#171: REST acknowledge uses EventAcknowledge (session_id/token) only."""
+    with TestClient(create_app(settings)) as client:
+        project = client.post(
+            "/api/v1/projects",
+            json={"root_path": str(project_dir), "name": "Ack Contract"},
+        ).json()
+        sender = _join_agent(
+            client,
+            project,
+            agent_key="ack-sender-main",
+            name="Ack Sender",
+            client="codex",
+            model="test-model",
+        )
+        receiver = _join_agent(
+            client,
+            project,
+            agent_key="ack-receiver-main",
+            name="Ack Receiver",
+            client="codex",
+            model="test-model",
+        )
+        ack_base = f"/api/v1/projects/{project['id']}/events"
+
+        requires_ack = client.post(
+            f"/api/v1/projects/{project['id']}/messages",
+            json={
+                "body": "Please confirm",
+                "requires_ack": True,
+                "session_id": sender["agent"]["id"],
+                "token": sender["token"],
+                "model_display_name": "Sender Model",
+            },
+        )
+        assert requires_ack.status_code == 201
+        ack_event_id = requires_ack.json()["event_id"]
+
+        plain = client.post(
+            f"/api/v1/projects/{project['id']}/messages",
+            json={
+                "body": "No confirmation needed",
+                "requires_ack": False,
+                "session_id": sender["agent"]["id"],
+                "token": sender["token"],
+                "model_display_name": "Sender Model",
+            },
+        )
+        assert plain.status_code == 201
+        plain_event_id = plain.json()["event_id"]
+
+        acknowledged = client.post(
+            f"{ack_base}/{ack_event_id}/acknowledge",
+            json={
+                "session_id": receiver["agent"]["id"],
+                "token": receiver["token"],
+            },
+        )
+        assert acknowledged.status_code == 200, acknowledged.text
+        body = acknowledged.json()
+        assert body["acknowledged"] is True
+        assert body["acknowledged_event_id"] == ack_event_id
+
+        snapshot = client.get(f"/api/v1/projects/{project['id']}/snapshot")
+        assert snapshot.status_code == 200
+        acknowledgements = snapshot.json()["acknowledgements"]
+        assert any(
+            item["event_id"] == ack_event_id for item in acknowledgements
+        )
+        events = client.get(f"/api/v1/projects/{project['id']}/events").json()
+        assert any(
+            item.get("event_type") == "message.acknowledged"
+            and (item.get("payload") or {}).get("event_id") == ack_event_id
+            for item in events.get("events", events if isinstance(events, list) else [])
+        )
+
+        not_required = client.post(
+            f"{ack_base}/{plain_event_id}/acknowledge",
+            json={
+                "session_id": receiver["agent"]["id"],
+                "token": receiver["token"],
+            },
+        )
+        assert not_required.status_code == 409
+        assert not_required.json()["error"]["code"] == "acknowledgement_not_required"
+
+        missing = client.post(
+            f"{ack_base}/999999/acknowledge",
+            json={
+                "session_id": receiver["agent"]["id"],
+                "token": receiver["token"],
+            },
+        )
+        assert missing.status_code == 404
+        assert missing.json()["error"]["code"] == "event_not_found"
+
+        unauthorized = client.post(
+            f"{ack_base}/{ack_event_id}/acknowledge",
+            json={
+                "session_id": receiver["agent"]["id"],
+                "token": "wrong-token",
+            },
+        )
+        assert unauthorized.status_code == 401
+        assert unauthorized.json()["error"]["code"] == "invalid_session_token"

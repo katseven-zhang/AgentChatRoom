@@ -1922,7 +1922,6 @@ def create_app(
             event_id,
             body.session_id,
             body.token,
-            reclaim=body.reclaim,
             request_id=request.state.request_id,
         )
 
