@@ -481,10 +481,16 @@ function eventLabel(type) {
   const labels = {
     "project.created": "项目已创建", "project.updated": "更新了项目设置",
     "project.archived": "归档了项目", "project.restored": "恢复了项目",
-    "agent.joined": "加入了 Room",
+    "agent.joined": "加入了 Room", "agent.left": "离开了 Room",
+    "agent.identity_registered": "登记了 Agent 身份",
+    "agent.credential_linked": "关联了 Agent 凭据",
+    "agent.session_replaced": "替换了 Agent Session",
     "task.created": "创建了任务", "task.claimed": "认领了任务",
+    "task.reclaimed": "重变认领了任务",
     "task.assigned": "派发了任务", "task.assignment_acknowledged": "回应了任务派发",
+    "task.assignment_cancelled": "取消了任务派发",
     "task.handoff_requested": "请求了任务交接", "task.handoff_acknowledged": "回应了任务交接",
+    "task.handoff_cancelled": "取消了任务交接",
     "task.completed": "声明执行完成",
     "task.updated": "更新了任务", "task.blocked": "阻塞了任务",
     "task.intake_submitted": "提交了任务意图", "task.intake_acknowledged": "受理了任务意图",
@@ -493,7 +499,9 @@ function eventLabel(type) {
     "task.cancelled": "取消了任务", "lease.acquired": "占用了文件范围",
     "lease.released": "释放了文件范围", "lease.conflict": "检测到文件冲突",
     "lease.pre_commit_blocked": "提交前检查被文件占用阻断",
-    "work.reported": "提交了工作证据", "review.submitted": "提交了验证结论",
+    "work.reported": "提交了工作证据",
+    "work_report.commit_unverified": "工作证据提交时未核验 Commit",
+    "review.submitted": "提交了验证结论",
     "task.integration_completed": "完成了最终集成", "task.integration_failed": "记录了集成失败",
     "message.acknowledged": "确认了消息",
     "message.message": "发布了消息", "message.decision": "发布了决策",
@@ -504,6 +512,15 @@ function eventLabel(type) {
     "workspace.updated": "更新了 Workspace",
     "member.created": "创建了项目成员", "member.updated": "更新了项目成员",
     "member.revoked": "吊销了项目成员",
+    "document.created": "创建了规范文档", "document.updated": "更新了规范文档",
+    "document.archived": "归档了规范文档",
+    "knowledge.candidate_submitted": "提交了知识资产候选",
+    "knowledge.reviewed": "评审了知识资产", "knowledge.approved": "批准了知识资产",
+    "knowledge.superseded": "替换了知识资产", "knowledge.archived": "归档了知识资产",
+    "backup.created": "创建了备份", "backup.deleted": "删除了备份",
+    "backup.restore_started": "开始恢复备份", "backup.restore_completed": "完成恢复备份",
+    "backup.restore_rejected": "拒绝恢复备份",
+    "audit.purged": "清理了审计事件",
   };
   return labels[type] || type;
 }
@@ -1762,16 +1779,11 @@ function renderTaskIntakes() {
 
 function renderLeases(leases, agents) {
   const names = Object.fromEntries(agents.map((agent) => [agent.id, agent.name]));
-  const onlineCutoff = Date.now() - 90 * 1000;
-  const parseTime = (value) => (value ? Date.parse(value) : 0);
+  // #119: lease validity is TTL-only; backend strips presence fields from the
+  // lease projection. Do not read last_heartbeat/last_activity_at here.
   elements["lease-list"].innerHTML = leases.length
     ? leases.map((lease) => {
-      // snapshot 只包含活跃租约；持有者最近无心跳即标记为可回收。
-      const holderSeen = parseTime(lease.last_heartbeat || lease.last_activity_at);
-      const holderOffline = holderSeen > 0 && holderSeen < onlineCutoff;
-      const holder = holderOffline
-        ? `${escapeHtml(names[lease.session_id] || shortId(lease.session_id))} · 持有者离线，租约可回收`
-        : escapeHtml(names[lease.session_id] || shortId(lease.session_id));
+      const holder = escapeHtml(names[lease.session_id] || shortId(lease.session_id));
       return `<article class="lease-item">
         <div class="lease-meta">
           <span class="type-badge">${escapeHtml(leaseMode(lease.mode))}</span>
@@ -2212,10 +2224,17 @@ function renderAudit() {
 async function refreshManagement() {
   if (!state.projectId) return;
   const eventType = elements["audit-event-filter"].value;
-  const auditRefresh = eventType === state.auditFilter && state.auditEvents.length
+  // #196: keep the window open to the right — do not clamp after/before to the
+  // already-rendered set. Same filter + data: probe for events newer than the
+  // current right edge. Filter change or empty list: reset to the live tail.
+  const hasLoadedWindow = eventType === state.auditFilter && state.auditEvents.length > 0;
+  const latestId = hasLoadedWindow
+    ? state.auditEvents[state.auditEvents.length - 1].id
+    : 0;
+  const viewingLiveTail = !state.auditHasNewer;
+  const auditRefresh = hasLoadedWindow
     ? api(auditQueryUrl(state.projectId, {
-        after: state.auditEvents[0].id - 1,
-        before: state.auditEvents[state.auditEvents.length - 1].id + 1,
+        after: latestId,
         eventType,
       }))
     : fetchAuditTail(state.projectId, eventType);
@@ -2233,10 +2252,29 @@ async function refreshManagement() {
   if (eventType !== state.auditFilter) {
     state.auditFilter = eventType;
     state.auditPage = 1;
+    state.auditEvents = audit.events;
+    state.auditHasOlder = audit.has_older;
+    state.auditHasNewer = audit.has_newer;
+  } else if (!hasLoadedWindow) {
+    state.auditEvents = audit.events;
+    state.auditHasOlder = audit.has_older;
+    state.auditHasNewer = audit.has_newer;
+    state.auditPage = 1;
+  } else {
+    // after-query relative to previous right edge
+    const fresh = audit.events || [];
+    if (fresh.length && viewingLiveTail) {
+      const merged = [...state.auditEvents, ...fresh];
+      const overflow = Math.max(0, merged.length - AUDIT_PAGE_SIZE);
+      state.auditEvents = overflow ? merged.slice(overflow) : merged;
+      if (overflow) state.auditHasOlder = true;
+      state.auditHasNewer = false;
+      state.auditPage = 1;
+    } else {
+      // mid-history view: new events exist beyond the preserved window; do not jump pages
+      state.auditHasNewer = fresh.length > 0 || state.auditHasNewer;
+    }
   }
-  state.auditEvents = audit.events;
-  state.auditHasOlder = audit.has_older;
-  state.auditHasNewer = audit.has_newer;
   state.runtime = runtime;
   state.managedBackups = backups.backups || [];
   state.autoBackupInfo = backups.auto_backup || null;

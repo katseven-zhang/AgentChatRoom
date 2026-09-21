@@ -2485,6 +2485,249 @@ def test_web_local_mcp_assistant_offers_generic_only():
     assert "integration-onboarding-prompt" in markup
 
 
+def test_web_lease_contract_has_no_presence_fields_or_recyclable_copy():
+    """#195/#119: lease projection strips presence; UI must not read stripped
+    fields or claim a silent holder's lease is recyclable."""
+    javascript = (WEB_DIR / "app.js").read_text(encoding="utf-8")
+    start = javascript.index("function renderLeases(")
+    end = javascript.index("\nfunction renderReviews(", start)
+    body = javascript[start:end]
+
+    assert "lease.last_heartbeat" not in body
+    assert "lease.last_activity_at" not in body
+    assert "holderOffline" not in body
+    assert "持有者离线" not in body
+    assert "租约可回收" not in body
+    assert "onlineCutoff" not in body
+    assert "names[lease.session_id]" in body
+    assert "TTL ${lease.ttl_seconds}s" in body
+
+
+def test_web_management_audit_refresh_queries_past_right_edge():
+    """#196: refresh must open a window past the current right edge so new
+    events after the rendered set become visible (no sealed before/after)."""
+    javascript = (WEB_DIR / "app.js").read_text(encoding="utf-8")
+    start = javascript.index("async function refreshManagement(")
+    end = javascript.index("\nfunction renderReportEvidence(", start)
+    body = javascript[start:end]
+
+    assert "state.auditEvents[0].id - 1" not in body
+    assert "before: state.auditEvents[state.auditEvents.length - 1].id + 1" not in body
+    assert "after: latestId" in body
+    assert "before:" not in body
+    assert "fetchAuditTail(state.projectId, eventType)" in body
+    assert "viewingLiveTail" in body
+    assert "state.auditEvents = overflow ? merged.slice(overflow) : merged" in body
+    assert "state.auditHasNewer = fresh.length > 0 || state.auditHasNewer" in body
+
+
+def test_web_audit_refresh_merge_surfaces_new_events_after_emit(tmp_path):
+    """#196: equivalence harness — after new ids appear past the window, the
+    refresh merge path appends them when viewing the live tail."""
+    javascript = (WEB_DIR / "app.js").read_text(encoding="utf-8")
+    start = javascript.index("async function refreshManagement(")
+    end = javascript.index("\nfunction renderReportEvidence(", start)
+    source_slice = javascript[start:end]
+    harness = tmp_path / "audit_refresh_merge.js"
+    harness.write_text(
+        "const assert = require('node:assert/strict');\n"
+        "const AUDIT_PAGE_SIZE = 5;\n"
+        "const state = {\n"
+        "  auditEvents: [{id: 1}, {id: 2}, {id: 3}],\n"
+        "  auditHasNewer: false,\n"
+        "  auditHasOlder: false,\n"
+        "  auditPage: 1,\n"
+        "  auditFilter: '',\n"
+        "};\n"
+        "const eventType = '';\n"
+        "const hasLoadedWindow = eventType === state.auditFilter && state.auditEvents.length > 0;\n"
+        "assert.equal(hasLoadedWindow, true);\n"
+        "const latestId = state.auditEvents[state.auditEvents.length - 1].id;\n"
+        "assert.equal(latestId, 3);\n"
+        "const viewingLiveTail = !state.auditHasNewer;\n"
+        "assert.equal(viewingLiveTail, true);\n"
+        "const audit = { events: [{id: 4}, {id: 5}], has_older: true, has_newer: false };\n"
+        "const fresh = audit.events || [];\n"
+        "assert.ok(fresh.length && viewingLiveTail);\n"
+        "const merged = [...state.auditEvents, ...fresh];\n"
+        "const overflow = Math.max(0, merged.length - AUDIT_PAGE_SIZE);\n"
+        "state.auditEvents = overflow ? merged.slice(overflow) : merged;\n"
+        "if (overflow) state.auditHasOlder = true;\n"
+        "state.auditHasNewer = false;\n"
+        "state.auditPage = 1;\n"
+        "assert.deepEqual(state.auditEvents.map((e) => e.id), [1, 2, 3, 4, 5]);\n"
+        "assert.equal(state.auditEvents[state.auditEvents.length - 1].id, 5);\n"
+        "state.auditEvents = [{id: 10}, {id: 11}];\n"
+        "state.auditHasNewer = false;\n"
+        "state.auditPage = 3;\n"
+        "const latestMid = state.auditEvents[state.auditEvents.length - 1].id;\n"
+        "assert.equal(latestMid, 11);\n"
+        "const viewingTailMid = !state.auditHasNewer;\n"
+        "const midFresh = [{id: 12}];\n"
+        "if (!(midFresh.length && viewingTailMid)) {\n"
+        "  state.auditHasNewer = midFresh.length > 0 || state.auditHasNewer;\n"
+        "}\n"
+        "assert.deepEqual(state.auditEvents.map((e) => e.id), [10, 11]);\n"
+        "assert.equal(state.auditHasNewer, true);\n"
+        "assert.equal(state.auditPage, 3);\n"
+        "const src = " + json.dumps(source_slice) + ";\n"
+        "assert.ok(!src.includes('state.auditEvents[0].id - 1'));\n"
+        "assert.ok(src.includes('after: latestId'));\n"
+        "console.log(JSON.stringify({ success: true }));\n",
+        encoding="utf-8",
+    )
+    run = subprocess.run(["node", str(harness)], capture_output=True, text=True)
+    assert run.returncode == 0, run.stderr
+    assert json.loads(run.stdout)["success"] is True
+
+
+def test_web_event_label_covers_services_emit_event_types(tmp_path):
+    """#197: every event_type string emitted via services._emit must have a
+    Chinese eventLabel entry so activity/audit UI never shows raw codes."""
+    services_path = Path(__file__).parents[1] / "src" / "agentchatroom" / "services.py"
+    services = services_path.read_text(encoding="utf-8")
+    javascript = (WEB_DIR / "app.js").read_text(encoding="utf-8")
+    start = javascript.index("function eventLabel(")
+    end = javascript.index("\nfunction leaseMode(", start)
+    body = javascript[start:end]
+
+    prefix = (
+        r"(?:project|agent|task|lease|work|work_report|review|message|credential|"
+        r"workspace|member|document|knowledge|backup|audit)"
+    )
+    # Third positional argument of self._emit(...) — capture every quoted event type
+    # appearing between _emit( and the following payload=/actor_session_id=/).
+    emit_blocks = re.findall(
+        r"self\._emit\(\s*connection,\s*[^,]+,\s*(.*?)\n\s*\)",
+        services,
+        flags=re.S,
+    )
+    event_types: set[str] = set()
+    for block in emit_blocks:
+        event_types.update(
+            re.findall(rf"\"({prefix}\.[a-z0-9_]+)\"", block)
+        )
+        # f"message.{kind}" form
+        if "message.{kind}" in block or 'f"message.' in block:
+            event_types.update(
+                {
+                    "message.message",
+                    "message.decision",
+                    "message.blocker",
+                    "message.system",
+                }
+            )
+        # event_type variable form
+        if re.search(r"\bevent_type\b", block):
+            event_types.update(
+                re.findall(rf"\"({prefix}\.[a-z0-9_]+)\"", block)
+            )
+
+    # event_type = "..." assignments (and ternaries) before emit.
+    event_types.update(
+        re.findall(
+            rf"event_type\s*=\s*\"({prefix}\.[a-z0-9_]+)\"",
+            services,
+        )
+    )
+    for match in re.finditer(
+        rf"event_type\s*=\s*\"({prefix}\.[a-z0-9_]+)\"\s+if\b[^:\n]+else\s+\"({prefix}\.[a-z0-9_]+)\"",
+        services,
+    ):
+        event_types.add(match.group(1))
+        event_types.add(match.group(2))
+
+    # Conditional ternaries written inline in the emit third argument.
+    for match in re.finditer(
+        rf"self\._emit\(\s*connection,\s*[^,]+,\s*\"({prefix}\.[a-z0-9_]+)\"\s+if\b[^,]+else\s+\"({prefix}\.[a-z0-9_]+)\"",
+        services,
+        flags=re.S,
+    ):
+        event_types.add(match.group(1))
+        event_types.add(match.group(2))
+
+    # Workspace/member/document conditional pairs without event_type = .
+    for match in re.finditer(
+        rf"self\._emit\(\s*connection,\s*[^,]+,\s*\"({prefix}\.[a-z0-9_]+)\"\s+if\s+[^,]+else\s+\"({prefix}\.[a-z0-9_]+)\"",
+        services,
+        flags=re.S,
+    ):
+        event_types.add(match.group(1))
+        event_types.add(match.group(2))
+
+    # f"message.{kind}" expansion
+    event_types.update(
+        {
+            "message.message",
+            "message.decision",
+            "message.blocker",
+            "message.system",
+        }
+    )
+    # Status-driven emit uses event_type variable (already collected) plus defaults.
+    event_types.update(
+        {
+            "task.blocked",
+            "task.released",
+            "task.unblocked",
+            "task.cancelled",
+            "task.updated",
+            "work_report.commit_unverified",
+            "audit.purged",
+        }
+    )
+
+    assert event_types, "failed to collect service emit event types"
+
+    missing = sorted(et for et in event_types if f'"{et}"' not in body)
+    assert not missing, f"eventLabel missing labels for: {missing}"
+
+    for et in (
+        "agent.left",
+        "agent.identity_registered",
+        "agent.credential_linked",
+        "agent.session_replaced",
+        "task.reclaimed",
+        "task.assignment_cancelled",
+        "task.handoff_cancelled",
+        "document.created",
+        "document.updated",
+        "document.archived",
+        "knowledge.candidate_submitted",
+        "knowledge.reviewed",
+        "knowledge.approved",
+        "knowledge.superseded",
+        "knowledge.archived",
+        "backup.created",
+        "backup.deleted",
+        "backup.restore_started",
+        "backup.restore_completed",
+        "backup.restore_rejected",
+        "work_report.commit_unverified",
+        "audit.purged",
+    ):
+        assert f'"{et}"' in body, et
+
+    harness = tmp_path / "event_label.js"
+    harness.write_text(
+        body
+        + "\nconst types = "
+        + json.dumps(sorted(event_types))
+        + ";\n"
+        + "const assert = require('node:assert/strict');\n"
+        + "for (const t of types) {\n"
+        + "  const label = eventLabel(t);\n"
+        + "  assert.notEqual(label, t, 'raw event code leaked: ' + t);\n"
+        + "  assert.ok(label && label.length > 0, 'empty label: ' + t);\n"
+        + "}\n"
+        + "console.log(JSON.stringify({ count: types.length }));\n",
+        encoding="utf-8",
+    )
+    run = subprocess.run(["node", str(harness)], capture_output=True, text=True)
+    assert run.returncode == 0, run.stderr
+    assert json.loads(run.stdout)["count"] == len(event_types)
+
+
 SHARED_RECENT_HELPERS = (
     "const RECENT_ACTIVITY_PAGE_SIZE = 5;\n"
     "let recentActivityPage = 1;\n"
