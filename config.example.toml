@@ -42,6 +42,8 @@ pool_max_size = 10
 connect_timeout_seconds = 10.0
 
 [coordination]
+# MCP roots bind timeout (seconds); 0 is invalid, max 60.
+mcp_roots_timeout_seconds = 5.0
 heartbeat_timeout_seconds = 45
 # Long-running local MCP and remote Bridge processes keep joined sessions alive.
 presence_keepalive_enabled = true
@@ -51,11 +53,30 @@ default_lease_ttl_seconds = 1800
 max_lease_ttl_seconds = 86400
 sse_poll_interval_seconds = 0.5
 presence_refresh_interval_seconds = 1.0
+# SSE occupancy caps; over-limit streams return 429 sse_limit_exceeded.
+max_sse_clients_per_project = 64
+sse_per_ip_limit = 16
+# Web audit list page size (events per page).
+audit_window_size = 100
+# Batched write-through for session token last_used_at updates.
+token_touch_interval_seconds = 60.0
+token_touch_min_calls = 32
+# MCP room_bootstrap/room_sync injected recent Agent messages (1-10).
+mcp_message_limit = 5
 # Size bounds for room submissions: oversized message bodies / task texts are
 # rejected with message_body_too_long / task_text_too_long instead of being
 # stored and re-downloaded by every client.
 message_max_body_length = 65536
 task_text_max_length = 32768
+# List-shaped inputs and project document content are bounded (#175).
+list_input_max_count = 100
+test_entry_notes_max_length = 4000
+project_document_max_bytes = 262144
+# room_sync/Web snapshot reports/reviews/acks recent window (#183).
+snapshot_recent_limit = 200
+# Idempotency record retention in days; 0 = keep forever (#200).
+idempotency_retention_days = 30
+
 [knowledge]
 # Knowledge Asset kinds enabled for this deployment. Each kind must match
 # ^[a-z][a-z0-9_-]{0,63}$ and at least one kind is required.
@@ -84,6 +105,9 @@ management_auth_required = false
 management_token_env = "AGENTCHATROOM_ADMIN_TOKEN"
 management_session_ttl_seconds = 43200
 management_cookie_name = "agentchatroom_admin"
+management_login_max_failures = 5
+management_login_window_seconds = 60
+management_login_lockout_seconds = 60
 
 [interface]
 product_name = "AgentChatRoom"

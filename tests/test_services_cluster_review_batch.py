@@ -345,10 +345,28 @@ def test_snapshot_reports_reviews_acks_are_bounded_with_totals(service, project,
     # compatibility: existing keys retained
     for key in ("reports", "reviews", "acknowledgements", "tasks", "cursor"):
         assert key in snapshot
+    # #183: each page_info slice carries next/before cursors for continuation.
+    for kind in ("reports", "reviews", "acknowledgements"):
+        info = snapshot["page_info"][kind]
+        assert "next" in info
+        assert "before" in info
+        assert "has_more" in info
+        assert "total" in info
 
 
-def test_snapshot_cost_bounded_with_many_events(service, project, joined, monkeypatch):
-    # Insert a large event history directly for performance shape.
+def test_snapshot_cost_bounded_with_many_events_and_reports(
+    service, project, joined, monkeypatch
+):
+    # ≥5000 events and ≥200 work_reports: projection must stay bounded.
+    report_task = service.create_task(
+        project["id"],
+        title="Snapshot perf",
+        description="bulk reports for bounded projection",
+        acceptance_criteria=["bounded"],
+        actor_session_id=joined["agent"]["id"],
+        token=joined["token"],
+    )
+    task_id = report_task["task"]["id"]
     connection = sqlite3.connect(service.database.path)
     try:
         connection.execute("BEGIN")
@@ -361,6 +379,23 @@ def test_snapshot_cost_bounded_with_many_events(service, project, joined, monkey
                 """,
                 (project["id"], payload, iso_now()),
             )
+        for i in range(200):
+            connection.execute(
+                """
+                INSERT INTO work_reports(
+                    project_id, task_id, session_id, summary, files_json,
+                    tests_json, system_evidence_json, commit_hash, created_at
+                )
+                VALUES (?, ?, ?, ?, '[]', '[]', '{}', '', ?)
+                """,
+                (
+                    project["id"],
+                    task_id,
+                    joined["agent"]["id"],
+                    f"report {i}",
+                    iso_now(),
+                ),
+            )
         connection.commit()
     finally:
         connection.close()
@@ -370,9 +405,17 @@ def test_snapshot_cost_bounded_with_many_events(service, project, joined, monkey
     started = time.perf_counter()
     snapshot = service.snapshot(project["id"])
     elapsed = time.perf_counter() - started
+    encoded = __import__("json").dumps(snapshot, ensure_ascii=False)
     assert len(snapshot["reports"]) <= 50
     assert snapshot["page_info"]["limit"] == 50
-    # Bounded projection: must finish quickly even with 5k events.
+    assert snapshot["totals"]["reports"] >= 200
+    assert snapshot["page_info"]["reports"]["total"] >= 200
+    assert snapshot["page_info"]["reports"]["has_more"] is True
+    assert snapshot["page_info"]["reports"]["next"]
+    assert snapshot["page_info"]["reports"]["before"]
+    # Bounded payload: recent window only, not the full 200-report history.
+    assert len(encoded) < 2_000_000
+    # Bounded projection: must finish quickly even with 5k events + 200 reports.
     assert elapsed < 5.0
 
 

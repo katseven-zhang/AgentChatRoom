@@ -68,6 +68,10 @@ def test_snapshot_audit_and_task_history_carry_project_seq(
     )
     assert int(listed_message["project_seq"]) > 0
     assert all("project_seq" in event for event in listed["events"])
+    # #169: public event objects must not present two conflicting numbers —
+    # top-level id is the project_seq, never the physical global AUTOINCREMENT.
+    for event in listed["events"]:
+        assert int(event["id"]) == int(event["project_seq"])
 
 
 def test_task_history_items_expose_project_seq(service, project, joined_agents):
@@ -88,6 +92,9 @@ def test_task_history_items_expose_project_seq(service, project, joined_agents):
     assert created["event_id"] == created["project_seq"]
     assert created["event_id"] > 0
     assert created["internal_id"] > 0
+    # Dual-track guard: citable number is always project_seq.
+    for item in history["items"]:
+        assert int(item["event_id"]) == int(item["project_seq"])
 
 
 def test_write_event_id_matches_list_and_history_project_seq(
@@ -340,6 +347,83 @@ def test_schema22_backfill_preserves_history_and_seeds_counter(tmp_path):
         "project-a": 4,
         "project-b": 3,
     }
+
+
+def test_migration_25_rewrites_knowledge_source_event_ids_to_project_seq(tmp_path):
+    """#169: schema 25 converts knowledge source_event_ids from global id → project_seq."""
+    import json as _json
+
+    from agentchatroom.database import SCHEMA_VERSION
+
+    assert SCHEMA_VERSION >= 25
+    path = tmp_path / "legacy_knowledge.sqlite"
+    connection = sqlite3.connect(path)
+    connection.executescript(
+        """
+        CREATE TABLE schema_meta (version INTEGER NOT NULL);
+        INSERT INTO schema_meta(version) VALUES (24);
+        CREATE TABLE projects (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            settings_json TEXT NOT NULL DEFAULT '{}',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            archived_at TEXT
+        );
+        CREATE TABLE events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            project_id TEXT NOT NULL,
+            event_type TEXT NOT NULL,
+            actor_session_id TEXT,
+            task_id TEXT,
+            payload_json TEXT NOT NULL DEFAULT '{}',
+            created_at TEXT NOT NULL,
+            project_seq INTEGER
+        );
+        CREATE TABLE knowledge_assets (
+            id TEXT PRIMARY KEY,
+            project_id TEXT NOT NULL
+        );
+        CREATE TABLE knowledge_asset_versions (
+            id TEXT PRIMARY KEY,
+            asset_id TEXT NOT NULL,
+            source_event_ids_json TEXT NOT NULL DEFAULT '[]',
+            body TEXT NOT NULL DEFAULT '',
+            summary TEXT NOT NULL DEFAULT '',
+            title TEXT NOT NULL DEFAULT '',
+            kind TEXT NOT NULL DEFAULT 'decision',
+            status TEXT NOT NULL DEFAULT 'candidate',
+            tags_json TEXT NOT NULL DEFAULT '[]',
+            created_at TEXT NOT NULL,
+            created_by_session_id TEXT
+        );
+        INSERT INTO projects(id, name, created_at, updated_at)
+        VALUES ('project-a', 'A', '2026-09-01T00:00:00Z', '2026-09-01T00:00:00Z');
+        INSERT INTO events(id, project_id, event_type, payload_json, created_at, project_seq) VALUES
+            (10, 'project-a', 'message.message', '{}', '2026-09-01T00:00:01Z', 1),
+            (11, 'project-a', 'message.message', '{}', '2026-09-01T00:00:02Z', 2),
+            (99, 'project-b', 'message.message', '{}', '2026-09-01T00:00:03Z', 1);
+        INSERT INTO knowledge_assets(id, project_id) VALUES ('ka-1', 'project-a');
+        INSERT INTO knowledge_asset_versions(
+            id, asset_id, source_event_ids_json, body, summary, title, kind,
+            status, tags_json, created_at, created_by_session_id
+        ) VALUES (
+            'kav-1', 'ka-1', '[10,11]', 'body', 'sum', 't', 'decision',
+            'candidate', '[]', '2026-09-01T00:00:00Z', NULL
+        );
+        """
+    )
+    connection.commit()
+    connection.close()
+
+    migrated = sqlite3.connect(path)
+    migrated.row_factory = sqlite3.Row
+    migrated.executescript(MIGRATIONS[25])
+    row = migrated.execute(
+        "SELECT source_event_ids_json FROM knowledge_asset_versions WHERE id = 'kav-1'"
+    ).fetchone()
+    migrated.close()
+    assert _json.loads(row["source_event_ids_json"]) == [1, 2]
 
 
 def test_migrated_database_continues_numbering_after_backfill(tmp_path):

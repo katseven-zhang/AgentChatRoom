@@ -374,3 +374,35 @@ def test_list_projects_ttl_avoids_repeat_git_probe(
     assert first[0]["project_source"] == "path"
     assert second[0]["project_source"] == "path"
     assert probe_calls["n"] == 1
+
+
+def test_get_project_detail_ttl_avoids_repeat_git_probe(
+    test_service, tmp_path, monkeypatch
+):
+    """#172：详情 GET 对纯路径候选同样走 TTL，不反复跑 git 子进程。"""
+    service = test_service
+    project_dir = tmp_path / "detail_ttl"
+    project_dir.mkdir()
+    project = service.create_project(root_path=str(project_dir), name="DetailTtl")
+
+    probe_calls = {"n": 0}
+    original_git_info = __import__(
+        "agentchatroom.services", fromlist=["_project_git_info"]
+    )._project_git_info
+
+    def counting_git_info(root):
+        probe_calls["n"] += 1
+        return original_git_info(root)
+
+    monkeypatch.setattr(
+        "agentchatroom.services._project_git_info", counting_git_info
+    )
+    first = service.get_project(project["id"])
+    second = service.get_project(project["id"])
+    third = service.get_project(project["id"])
+    assert first["project_source"] == "path"
+    assert second["project_source"] == "path"
+    assert third["project_source"] == "path"
+    assert probe_calls["n"] == 1, (
+        "detail GET must reuse the TTL cache and not re-run git each read"
+    )

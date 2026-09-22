@@ -75,6 +75,9 @@ CONFIG_FILE_SCHEMA: dict[str, dict[str, tuple[type, ...]]] = {
         "management_token_env": (str,),
         "management_session_ttl_seconds": (int,),
         "management_cookie_name": (str,),
+        "management_login_max_failures": (int,),
+        "management_login_window_seconds": (int, float),
+        "management_login_lockout_seconds": (int, float),
     },
     "backup": {
         "auto_backup_enabled": (bool,),
@@ -410,6 +413,15 @@ def _merge_toml(path: Path) -> dict[str, Any]:
         ),
         "management_cookie_name": raw.get("security", {}).get(
             "management_cookie_name"
+        ),
+        "management_login_max_failures": raw.get("security", {}).get(
+            "management_login_max_failures"
+        ),
+        "management_login_window_seconds": raw.get("security", {}).get(
+            "management_login_window_seconds"
+        ),
+        "management_login_lockout_seconds": raw.get("security", {}).get(
+            "management_login_lockout_seconds"
         ),
         "product_name": raw.get("interface", {}).get("product_name"),
         "default_theme": raw.get("interface", {}).get("default_theme"),

@@ -198,6 +198,62 @@ def test_example_configs_include_documents_inject_max_chars() -> None:
         assert "inject_max_chars = 12000" in text, relative
 
 
+def test_example_configs_parse_as_valid_toml() -> None:
+    """#175/#201: both example files must be loadable TOML (no duplicate tables)."""
+    for relative in ("config.example.toml", "deploy/config.server.example.toml"):
+        tomllib.loads((ROOT / relative).read_text(encoding="utf-8"))
+
+
+def test_readme_config_keys_appear_in_example_configs() -> None:
+    """#201: every CONFIG_FILE_SCHEMA key documented in README appears in an example.
+
+    Key-level (not section-level): build a single parseable inventory of
+    section.key pairs from both example TOMLs and require each README-mentioned
+    schema key to be present.
+    """
+    import re
+
+    from agentchatroom.config import CONFIG_FILE_SCHEMA
+
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    example_docs = [
+        tomllib.loads((ROOT / path).read_text(encoding="utf-8"))
+        for path in ("config.example.toml", "deploy/config.server.example.toml")
+    ]
+
+    present: set[tuple[str, str]] = set()
+    for doc in example_docs:
+        for section, values in doc.items():
+            if isinstance(values, dict):
+                for key in values:
+                    present.add((section, key))
+
+    mentioned_section_keys = set(
+        re.findall(r"`([a-z][a-z0-9_]*)\.([a-z][a-z0-9_]*)`", readme)
+    )
+    schema_key_names = {
+        key for keys in CONFIG_FILE_SCHEMA.values() for key in keys
+    }
+    mentioned_bare = {
+        key
+        for key in re.findall(r"`([a-z][a-z0-9_]{3,})`", readme)
+        if key in schema_key_names
+    }
+
+    missing: list[str] = []
+    for section, keys in CONFIG_FILE_SCHEMA.items():
+        for key in keys:
+            documented = (section, key) in mentioned_section_keys or key in mentioned_bare
+            if not documented:
+                continue
+            if (section, key) not in present:
+                missing.append(f"{section}.{key}")
+    assert missing == [], (
+        "README documents config keys missing from example TOMLs: "
+        + ", ".join(missing)
+    )
+
+
 def test_readme_config_sections_appear_in_example_configs() -> None:
     """#201: every CONFIG_FILE_SCHEMA section README mentions is in some example."""
     from agentchatroom.config import CONFIG_FILE_SCHEMA

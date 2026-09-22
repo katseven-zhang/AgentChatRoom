@@ -395,7 +395,7 @@ def _load_document(path: Path) -> dict[str, Any]:
         logical = normalize_logical_path(str(registration.get("logical_path", "") or ""))
         project_key = registration.get("project_key")
         scope = registration.get("scope")
-        if logical in seen:
+        if logical.casefold() in seen:
             raise _invalid_registration(path, "Checkout Project registration contains duplicate logical paths")
         if not isinstance(project_key, str) or not project_key.strip():
             raise _invalid_registration(path, "Checkout Project registration has no project_key")

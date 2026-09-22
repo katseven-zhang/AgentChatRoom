@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import tomllib
 from pathlib import Path
 
 import pytest
@@ -314,6 +315,44 @@ def test_invalid_database_configuration_is_rejected(monkeypatch, tmp_path):
         load_settings()
 
 
+def test_management_login_keys_load_from_example_toml(tmp_path, monkeypatch):
+    """#188: management_login_* keys must load from a real example-style TOML."""
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(
+        "\n".join(
+            [
+                "[application]",
+                "schema_version = 1",
+                'deployment_profile = "local"',
+                "[security]",
+                "management_login_max_failures = 3",
+                "management_login_window_seconds = 45",
+                "management_login_lockout_seconds = 90",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.delenv("AGENTCHATROOM_MANAGEMENT_LOGIN_MAX_FAILURES", raising=False)
+    monkeypatch.delenv("AGENTCHATROOM_MANAGEMENT_LOGIN_WINDOW_SECONDS", raising=False)
+    monkeypatch.delenv("AGENTCHATROOM_MANAGEMENT_LOGIN_LOCKOUT_SECONDS", raising=False)
+    settings = load_settings(config_path)
+    assert settings.management_login_max_failures == 3
+    assert settings.management_login_window_seconds == 45.0
+    assert settings.management_login_lockout_seconds == 90.0
+
+
+def test_management_login_keys_load_from_shipped_example_configs():
+    """#188: both shipped example configs must parse and carry the three keys."""
+    root = __import__("pathlib").Path(__file__).parents[1]
+    for relative in ("config.example.toml", "deploy/config.server.example.toml"):
+        data = tomllib.loads((root / relative).read_text(encoding="utf-8"))
+        security = data.get("security", {})
+        assert "management_login_max_failures" in security, relative
+        assert "management_login_window_seconds" in security, relative
+        assert "management_login_lockout_seconds" in security, relative
+
+
 def test_documents_inject_max_chars_file_value_takes_effect(monkeypatch, tmp_path):
     """#178: [documents].inject_max_chars must map through _merge_toml into Settings."""
     monkeypatch.setenv("AGENTCHATROOM_DATA_DIR", str(tmp_path / "data"))
@@ -435,6 +474,9 @@ def test_every_config_file_schema_key_maps_into_settings(monkeypatch, tmp_path):
             "management_token_env": "ROOM_TEST_ADMIN_TOKEN",
             "management_session_ttl_seconds": 3600,
             "management_cookie_name": "room_test_admin",
+            "management_login_max_failures": 4,
+            "management_login_window_seconds": 30.0,
+            "management_login_lockout_seconds": 45.0,
         },
         "backup": {
             "auto_backup_enabled": True,

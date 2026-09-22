@@ -782,55 +782,44 @@ class SSELimiter:
         self._ip_counts: dict[str, int] = {}
 
     def ensure_available(self, project_id: str, client_ip: str) -> None:
-        """Raise 429 when a new stream would exceed limits, without taking a slot.
-
-        Capacity is reserved inside the generator (first iteration) so a client
-        that disconnects before the body starts never holds a slot.
-        """
+        """Raise 429 when a new stream would exceed limits, without taking a slot."""
         with self._guard:
-            project_count = self._project_counts.get(project_id, 0)
-            ip_count = self._ip_counts.get(client_ip, 0)
-            if project_count >= self.max_per_project:
-                raise DomainError(
-                    "sse_limit_exceeded",
-                    "Too many event stream clients for this Project",
-                    status_code=429,
-                    details={
-                        "limit": self.max_per_project,
-                        "scope": "project",
-                    },
-                )
-            if ip_count >= self.max_per_ip:
-                raise DomainError(
-                    "sse_limit_exceeded",
-                    "Too many event stream clients from this address",
-                    status_code=429,
-                    details={"limit": self.max_per_ip, "scope": "ip"},
-                )
+            self._check_limits(project_id, client_ip)
+
+    def _check_limits(self, project_id: str, client_ip: str) -> None:
+        project_count = self._project_counts.get(project_id, 0)
+        ip_count = self._ip_counts.get(client_ip, 0)
+        if project_count >= self.max_per_project:
+            raise DomainError(
+                "sse_limit_exceeded",
+                "Too many event stream clients for this Project",
+                status_code=429,
+                details={
+                    "limit": self.max_per_project,
+                    "scope": "project",
+                },
+            )
+        if ip_count >= self.max_per_ip:
+            raise DomainError(
+                "sse_limit_exceeded",
+                "Too many event stream clients from this address",
+                status_code=429,
+                details={"limit": self.max_per_ip, "scope": "ip"},
+            )
 
     def acquire(self, project_id: str, client_ip: str) -> None:
+        """Atomically reserve a slot before response headers (#181).
+
+        Concurrent callers that both pass a dry-run check must not both receive
+        HTTP 200; the loser gets 429 here. Release is guaranteed by the response
+        wrapper even if the body generator never starts.
+        """
         with self._guard:
-            project_count = self._project_counts.get(project_id, 0)
-            ip_count = self._ip_counts.get(client_ip, 0)
-            if project_count >= self.max_per_project:
-                raise DomainError(
-                    "sse_limit_exceeded",
-                    "Too many event stream clients for this Project",
-                    status_code=429,
-                    details={
-                        "limit": self.max_per_project,
-                        "scope": "project",
-                    },
-                )
-            if ip_count >= self.max_per_ip:
-                raise DomainError(
-                    "sse_limit_exceeded",
-                    "Too many event stream clients from this address",
-                    status_code=429,
-                    details={"limit": self.max_per_ip, "scope": "ip"},
-                )
-            self._project_counts[project_id] = project_count + 1
-            self._ip_counts[client_ip] = ip_count + 1
+            self._check_limits(project_id, client_ip)
+            self._project_counts[project_id] = (
+                self._project_counts.get(project_id, 0) + 1
+            )
+            self._ip_counts[client_ip] = self._ip_counts.get(client_ip, 0) + 1
 
     def release(self, project_id: str, client_ip: str) -> None:
         with self._guard:
@@ -1797,26 +1786,26 @@ def create_app(
         service.get_project(project_id)
         authorize_event_stream(request, project_id)
         client_ip = event_stream_client_ip(request)
-        # Dry-run capacity check only: taking the slot here would leak it when
-        # the client disconnects before StreamingResponse starts the generator.
-        sse_limiter.ensure_available(project_id, client_ip)
+        # Atomic reserve before headers so a concurrent loser gets 429, not an
+        # empty 200. Release runs from the response wrapper even when the body
+        # generator never starts (client disconnect before first byte).
+        sse_limiter.acquire(project_id, client_ip)
         header_cursor = request.headers.get("last-event-id", "")
         if header_cursor.isdigit():
             after = max(after, int(header_cursor))
 
+        released = False
+
+        def release_slot() -> None:
+            nonlocal released
+            if not released:
+                released = True
+                sse_limiter.release(project_id, client_ip)
+
         async def event_stream():
             cursor = after
             idle_ticks = 0
-            acquired = False
             try:
-                # Acquire on first iteration so a cancel before body start never
-                # holds a slot; once iteration begins Starlette runs finally.
-                try:
-                    sse_limiter.acquire(project_id, client_ip)
-                    acquired = True
-                except DomainError:
-                    # Lost a race after ensure_available; headers already 200.
-                    return
                 yield ": connected\n\n"
                 while not await request.is_disconnected():
                     # Sync SQLite must not run on the event loop (#184).
@@ -1839,11 +1828,11 @@ def create_app(
                             idle_ticks = 0
                     await asyncio.sleep(resolved.sse_poll_interval_seconds)
             finally:
-                if acquired:
-                    sse_limiter.release(project_id, client_ip)
+                release_slot()
 
         class _EnsureCloseStreamingResponse(StreamingResponse):
-            """Always aclose the body iterator so generator finally (SSE release) runs."""
+            """Always aclose the body iterator so generator finally runs, then
+            release the pre-header reservation if the generator never started."""
 
             async def stream_response(self, send) -> None:  # type: ignore[override]
                 try:
@@ -1852,6 +1841,7 @@ def create_app(
                     aclose = getattr(self.body_iterator, "aclose", None)
                     if aclose is not None:
                         await aclose()
+                    release_slot()
 
         return _EnsureCloseStreamingResponse(
             event_stream(),

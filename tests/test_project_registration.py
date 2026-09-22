@@ -468,6 +468,53 @@ def test_checkout_registration_rejects_a_file_copied_from_another_scope(
     assert conflict.value.code == "project_registration_scope_conflict"
 
 
+def test_load_document_rejects_case_duplicate_logical_paths_both_orders(tmp_path):
+    """#198: foo/Foo must collide regardless of registration order."""
+    from agentchatroom.project_registration import _load_document
+
+    def write_doc(path, first, second):
+        path.write_text(
+            __import__("json").dumps(
+                {
+                    "schema_version": 1,
+                    "registrations": [
+                        {
+                            "logical_path": first,
+                            "project_key": "key-a",
+                            "scope": {
+                                "kind": "path",
+                                "identity": "id-a",
+                                "logical_path": first,
+                            },
+                        },
+                        {
+                            "logical_path": second,
+                            "project_key": "key-b",
+                            "scope": {
+                                "kind": "path",
+                                "identity": "id-b",
+                                "logical_path": second,
+                            },
+                        },
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+
+    foo_first = tmp_path / "foo_first.json"
+    write_doc(foo_first, "foo", "Foo")
+    with pytest.raises(DomainError) as a:
+        _load_document(foo_first)
+    assert a.value.code == "project_registration_invalid"
+
+    Foo_first = tmp_path / "Foo_first.json"
+    write_doc(Foo_first, "Foo", "foo")
+    with pytest.raises(DomainError) as b:
+        _load_document(Foo_first)
+    assert b.value.code == "project_registration_invalid"
+
+
 def test_checkout_registration_supports_derived_logical_subprojects_and_removal(
     service, tmp_path
 ):

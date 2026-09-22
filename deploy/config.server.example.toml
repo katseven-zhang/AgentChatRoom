@@ -22,6 +22,7 @@ pool_max_size = 20
 connect_timeout_seconds = 10.0
 
 [coordination]
+mcp_roots_timeout_seconds = 5.0
 heartbeat_timeout_seconds = 45
 presence_keepalive_enabled = true
 presence_keepalive_interval_seconds = 15.0
@@ -30,6 +31,17 @@ default_lease_ttl_seconds = 1800
 max_lease_ttl_seconds = 86400
 sse_poll_interval_seconds = 0.5
 presence_refresh_interval_seconds = 1.0
+max_sse_clients_per_project = 64
+sse_per_ip_limit = 16
+audit_window_size = 100
+token_touch_interval_seconds = 60.0
+token_touch_min_calls = 32
+mcp_message_limit = 5
+list_input_max_count = 100
+test_entry_notes_max_length = 4000
+project_document_max_bytes = 262144
+snapshot_recent_limit = 200
+idempotency_retention_days = 30
 
 [documents]
 # Character cap for binding-document injection on task claim/get responses.
@@ -44,6 +56,9 @@ management_auth_required = true
 management_token_env = "AGENTCHATROOM_ADMIN_TOKEN"
 management_session_ttl_seconds = 43200
 management_cookie_name = "agentchatroom_admin"
+management_login_max_failures = 5
+management_login_window_seconds = 60
+management_login_lockout_seconds = 60
 
 [interface]
 product_name = "AgentChatRoom"

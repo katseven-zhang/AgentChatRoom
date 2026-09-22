@@ -11,7 +11,7 @@ if TYPE_CHECKING:
     from .config import Settings
 
 
-SCHEMA_VERSION = 24
+SCHEMA_VERSION = 25
 
 
 class DatabaseBackend(Protocol):
@@ -799,6 +799,27 @@ MIGRATIONS = {
             0
         )
         WHERE last_read_cursor > 0;
+    """,
+    25: """
+        UPDATE knowledge_asset_versions
+        SET source_event_ids_json = (
+            SELECT COALESCE(json_group_array(seq), '[]')
+            FROM (
+                SELECT COALESCE(
+                    (
+                        SELECT e.project_seq
+                        FROM events e
+                        JOIN knowledge_assets ka ON ka.project_id = e.project_id
+                        WHERE ka.id = knowledge_asset_versions.asset_id
+                          AND e.id = CAST(j.value AS INTEGER)
+                    ),
+                    CAST(j.value AS INTEGER)
+                ) AS seq
+                FROM json_each(knowledge_asset_versions.source_event_ids_json) AS j
+            )
+        )
+        WHERE source_event_ids_json NOT LIKE '[]'
+          AND source_event_ids_json LIKE '%[%';
     """,
 }
 

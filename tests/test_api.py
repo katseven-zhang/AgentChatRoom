@@ -2281,8 +2281,8 @@ def test_upsert_toml_section_bool_int_written_without_quotes():
 
 
 # ---------------------------------------------------------------------------
-# #181 SSE slot leak: acquire must live inside the generator; cancel-before-
-# iterate must never hold occupancy.
+# #181 SSE slot: atomic reserve before headers + release even when the body
+# generator never starts; concurrent losers must get 429, not empty 200.
 # ---------------------------------------------------------------------------
 
 
@@ -2319,7 +2319,7 @@ def _sse_asgi_scope(path: str, headers: dict[str, str]) -> dict:
 def test_sse_slot_not_leaked_when_generator_never_iterates(
     settings, project_dir
 ):
-    """#181: cancel after response.start / before body iteration must free capacity."""
+    """#181: reserve before headers; cancel after response.start still frees capacity."""
     max_clients = 3
     limited = replace(
         settings,
@@ -2385,7 +2385,8 @@ def test_sse_slot_not_leaked_when_generator_never_iterates(
             assert startup["type"] == "lifespan.startup.complete", startup
 
             try:
-                # N > max: response.start succeeds, body never iterates.
+                # N > max: each request reserves before headers; cancel on
+                # response.start must still release via the response wrapper.
                 for _ in range(max_clients + 5):
                     scope = _sse_asgi_scope(path, auth)
                     request_sent = False
@@ -2416,8 +2417,11 @@ def test_sse_slot_not_leaked_when_generator_never_iterates(
                         pass
                     await asyncio.wait_for(started.wait(), timeout=5)
 
-                assert acquires == 0, "generator never iterated => no acquire"
-                assert releases == 0
+                deadline = time.time() + 5
+                while releases < acquires and time.time() < deadline:
+                    await asyncio.sleep(0.01)
+                assert acquires == max_clients + 5
+                assert releases == acquires, "every reserve must be released"
 
                 # One full iteration must still succeed after aborted attempts.
                 scope = _sse_asgi_scope(path, auth)
@@ -2453,12 +2457,11 @@ def test_sse_slot_not_leaked_when_generator_never_iterates(
 
                 assert status_holder.get("status") == 200
                 assert b"connected" in bytes(body)
-                assert acquires == 1
-                # Closing/cancelling after first iteration must release.
+                assert acquires == max_clients + 6
                 deadline = time.time() + 5
-                while releases < 1 and time.time() < deadline:
+                while releases < acquires and time.time() < deadline:
                     await asyncio.sleep(0.01)
-                assert releases == 1
+                assert releases == acquires
             finally:
                 await lifespan_rx.put({"type": "lifespan.shutdown"})
                 try:
@@ -2479,6 +2482,20 @@ def test_sse_slot_not_leaked_when_generator_never_iterates(
     finally:
         SSELimiter.acquire = original_acquire  # type: ignore[method-assign]
         SSELimiter.release = original_release  # type: ignore[method-assign]
+
+
+def test_sse_concurrent_reserve_loser_gets_429_not_empty_200():
+    """#181: two callers that both pass a dry-run must not both get 200."""
+    limiter = SSELimiter(max_per_project=1, max_per_ip=2)
+    limiter.ensure_available("p", "10.0.0.1")
+    limiter.ensure_available("p", "10.0.0.2")
+    limiter.acquire("p", "10.0.0.1")
+    with pytest.raises(DomainError) as loser:
+        limiter.acquire("p", "10.0.0.2")
+    assert loser.value.status_code == 429
+    assert loser.value.code == "sse_limit_exceeded"
+    limiter.release("p", "10.0.0.1")
+    assert limiter._project_counts.get("p", 0) == 0
 
 
 def test_sse_acquire_inside_generator_pattern_releases_on_close():

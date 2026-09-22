@@ -1016,6 +1016,16 @@ class AgentChatRoomService:
         else:
             default_channel = "system"
         data["channel"] = data["payload"].get("channel", default_channel)
+        # Public event number is project_seq only (#169): never expose the
+        # physical global AUTOINCREMENT id as a second citable number.
+        physical_id = data.pop("id", None)
+        seq = data.get("project_seq")
+        if seq is not None:
+            data["id"] = int(seq)
+            data["project_seq"] = int(seq)
+            data["internal_id"] = physical_id
+        else:
+            data["id"] = physical_id
         return data
 
     def _project_dict(
@@ -2003,6 +2013,11 @@ class AgentChatRoomService:
 
         root_path = str(project["root_path"])
         now = time.monotonic()
+        # Detail GET uses the same TTL cache as list for path candidates (#172):
+        # avoid a git subprocess on every read when nothing has changed.
+        cached = self._git_scope_probe_cache.get(project_id)
+        if cached and cached[1] == "path" and (now - cached[0]) < GIT_SCOPE_RECHECK_TTL_SECONDS:
+            return self._project_dict(project, project_source="path")
         try:
             root = Path(root_path).expanduser().resolve()
         except (OSError, ValueError):
@@ -2018,6 +2033,7 @@ class AgentChatRoomService:
         source = _project_source_from_disk(remote, is_work_tree)
         if not remote:
             # Local work-tree or plain path: display-only, never write.
+            self._git_scope_probe_cache[project_id] = (now, source, "")
             return self._project_dict(project, project_source=source)
 
         try:
@@ -8591,6 +8607,37 @@ class AgentChatRoomService:
                 }
                 for agent in agents
             ]
+            def _page_cursors(rows: list[dict[str, Any]]) -> dict[str, Any]:
+                info: dict[str, Any] = {
+                    "returned": len(rows),
+                    "has_more": False,
+                    "next": None,
+                    "before": None,
+                }
+                if rows:
+                    info["before"] = rows[0].get("created_at")
+                return info
+
+            reports_info = _page_cursors(reports)
+            reports_info["total"] = totals["reports"]
+            reports_info["has_more"] = totals["reports"] > len(reports)
+            if reports_info["has_more"] and reports:
+                reports_info["next"] = reports[-1].get("created_at")
+
+            reviews_info = _page_cursors(reviews)
+            reviews_info["total"] = totals["reviews"]
+            reviews_info["has_more"] = totals["reviews"] > len(reviews)
+            if reviews_info["has_more"] and reviews:
+                reviews_info["next"] = reviews[-1].get("created_at")
+
+            acks_info = _page_cursors(acknowledgements)
+            acks_info["total"] = totals["acknowledgements"]
+            acks_info["has_more"] = totals["acknowledgements"] > len(
+                acknowledgements
+            )
+            if acks_info["has_more"] and acknowledgements:
+                acks_info["next"] = acknowledgements[-1].get("created_at")
+
             return {
                 "project": project,
                 "members": members,
@@ -8606,22 +8653,9 @@ class AgentChatRoomService:
                 "totals": totals,
                 "page_info": {
                     "limit": recent_limit,
-                    "reports": {
-                        "returned": len(reports),
-                        "total": totals["reports"],
-                        "has_more": totals["reports"] > len(reports),
-                    },
-                    "reviews": {
-                        "returned": len(reviews),
-                        "total": totals["reviews"],
-                        "has_more": totals["reviews"] > len(reviews),
-                    },
-                    "acknowledgements": {
-                        "returned": len(acknowledgements),
-                        "total": totals["acknowledgements"],
-                        "has_more": totals["acknowledgements"]
-                        > len(acknowledgements),
-                    },
+                    "reports": reports_info,
+                    "reviews": reviews_info,
+                    "acknowledgements": acks_info,
                 },
             }
 
