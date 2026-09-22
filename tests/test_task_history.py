@@ -29,7 +29,9 @@ def test_history_unknown_event_type_degrades_without_secrets():
     assert item["detail_kind"] == "unknown"
     assert item["event_id"] == 42
     assert item["project_seq"] == 42
-    assert item["internal_id"] == 9
+    # #169: the physical global id (9) must not surface under any name.
+    assert "internal_id" not in item
+    assert 9 not in (item["event_id"], item["project_seq"])
     assert "secret-token-value" not in str(item)
     assert "token" not in item["payload"]
 

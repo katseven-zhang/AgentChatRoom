@@ -1016,16 +1016,14 @@ class AgentChatRoomService:
         else:
             default_channel = "system"
         data["channel"] = data["payload"].get("channel", default_channel)
-        # Public event number is project_seq only (#169): never expose the
-        # physical global AUTOINCREMENT id as a second citable number.
-        physical_id = data.pop("id", None)
+        # Public event number is project_seq only (#169): the physical global
+        # AUTOINCREMENT id is storage-internal and is not exposed under any
+        # name — one event, one citable number, on every adapter.
+        data.pop("id", None)
         seq = data.get("project_seq")
         if seq is not None:
             data["id"] = int(seq)
             data["project_seq"] = int(seq)
-            data["internal_id"] = physical_id
-        else:
-            data["id"] = physical_id
         return data
 
     def _project_dict(
@@ -4036,7 +4034,6 @@ class AgentChatRoomService:
             str((event.get("payload") or {}).get("integration_id") or "")
             for event in events
         }
-        event_ids = [int(event["id"]) for event in events]
         sessions = self._rows_by_id(
             connection, "agent_sessions", session_ids, redact_token=True
         )
@@ -4064,19 +4061,25 @@ class AgentChatRoomService:
         for integration in integrations.values():
             integration["files"] = json_load(integration.get("files_json"), [])
             integration["tests"] = json_load(integration.get("tests_json"), [])
+        # Acknowledgements are stored against the physical events.id; public
+        # event dicts carry project_seq only (#169), so join through the
+        # (project_id, project_seq) index instead of comparing number spaces.
+        project_id = str(events[0]["project_id"])
+        event_seqs = [int(event["project_seq"]) for event in events]
         acknowledgements_by_event: dict[int, list[dict[str, Any]]] = {
-            event_id: [] for event_id in event_ids
+            seq: [] for seq in event_seqs
         }
-        if event_ids:
-            placeholders = _sql_placeholders(len(event_ids))
+        if event_seqs:
+            placeholders = _sql_placeholders(len(event_seqs))
             for row in connection.execute(
                 f"""
-                SELECT event_id, session_id, created_at
-                FROM event_acknowledgements
-                WHERE event_id IN ({placeholders})
-                ORDER BY created_at
+                SELECT e.project_seq AS project_seq, a.session_id, a.created_at
+                FROM event_acknowledgements a
+                JOIN events e ON e.id = a.event_id
+                WHERE e.project_id = ? AND e.project_seq IN ({placeholders})
+                ORDER BY a.created_at
                 """,
-                event_ids,
+                [project_id, *event_seqs],
             ).fetchall():
                 ack_session = sessions.get(str(row["session_id"]))
                 if ack_session is None:
@@ -4099,7 +4102,7 @@ class AgentChatRoomService:
                             members[member_id]["metadata"] = json_load(
                                 members[member_id].get("metadata_json"), {}
                             )
-                acknowledgements_by_event[int(row["event_id"])].append(
+                acknowledgements_by_event[int(row["project_seq"])].append(
                     {
                         "session_id": str(row["session_id"]),
                         "created_at": row["created_at"],
@@ -4137,7 +4140,9 @@ class AgentChatRoomService:
                     event,
                     actor=actor,
                     related=related,
-                    acknowledgements=acknowledgements_by_event.get(int(event["id"]), []),
+                    acknowledgements=acknowledgements_by_event.get(
+                        int(event["project_seq"]), []
+                    ),
                 )
             )
         return items
@@ -8599,7 +8604,9 @@ class AgentChatRoomService:
 
                 has_more_* come from real boundary probes against the page window
                 (not total>len, not bool(rows)) so the last page never advertises
-                a fake continuation (#183).
+                a fake continuation (#183). Rows are normalized newest-first
+                before probing, so the boundary rows mean the same thing on
+                ``*_before`` and ``*_after`` pages alike.
                 """
                 if before and after:
                     raise DomainError(
@@ -8627,7 +8634,7 @@ class AgentChatRoomService:
                         order_time = "ASC"
                         order_id = "ASC"
                 params.append(recent_limit)
-                raw_rows = [
+                rows = [
                     dict(row)
                     for row in connection.execute(
                         f"SELECT * FROM {table} WHERE {' AND '.join(where)} "
@@ -8635,7 +8642,6 @@ class AgentChatRoomService:
                         params,
                     ).fetchall()
                 ]
-                rows = raw_rows[:recent_limit]
                 if after:
                     rows.reverse()
 

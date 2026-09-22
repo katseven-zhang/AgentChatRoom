@@ -556,12 +556,9 @@ function messageModelBadge(event) {
 
 function eventIdBadge(projectSeq, eventId) {
   const internalId = Number(eventId);
-  const seq = Number(projectSeq);
-  // 用户可见编号与深链/引用一律使用 project_seq；全局 id 仅作 payload 内部字段。
-  if (!Number.isFinite(seq) || seq <= 0) {
-    if (!Number.isFinite(internalId)) return "";
-    return `<button type="button" class="event-id" data-open-event="${internalId}" title="打开并定位事件（内部 ID ${internalId}）" aria-label="事件 内部 ID ${internalId}">#${internalId}</button>`;
-  }
+  const seq = Number(projectSeq) || (Number.isFinite(internalId) ? internalId : NaN);
+  // 用户可见编号与深链/引用一律使用 project_seq；全局 id 不在界面暴露（#169）。
+  if (!Number.isFinite(seq) || seq <= 0) return "";
   return `<button type="button" class="event-id" data-open-event="${seq}" title="事件编号 #${seq}（项目内序号）" aria-label="事件编号 ${seq}">#${seq}</button>`;
 }
 
@@ -3915,7 +3912,7 @@ function renderTaskTimeline(task) {
           ${item.result ? `<p>集成结果：${escapeHtml(item.result)}。验证通过不等于最终完成。</p>` : ""}
           ${renderHistoryEvidence(item)}
           ${renderHistoryAcknowledgements(item)}
-          <small class="secondary-text">${eventIdBadge(item.project_seq, item.internal_id || item.event_id)}${item.task_number ? ` · 任务 #${escapeHtml(item.task_number)}` : ""} <button type="button" class="link-button" data-copy-event="${item.event_id}" data-copy-seq="${item.project_seq || item.event_id || ""}" data-task-number="${item.task_number || ""}">复制引用</button></small>
+          <small class="secondary-text">${eventIdBadge(item.project_seq, item.event_id)}${item.task_number ? ` · 任务 #${escapeHtml(item.task_number)}` : ""} <button type="button" class="link-button" data-copy-event="${item.event_id}" data-copy-seq="${item.project_seq || item.event_id || ""}" data-task-number="${item.task_number || ""}">复制引用</button></small>
         </div>
       </li>`).join("")}</ol>`
     : '<div class="empty-state">尚无协作事件</div>';
@@ -4053,7 +4050,7 @@ async function loadTaskHistoryUntil(taskId, eventSeq) {
 async function copyEventReference(eventId, taskNumber, projectSeq) {
   // 用户可读编号与深链都使用 project_seq；全局 id 不再对外暴露。
   const seq = Number(projectSeq) || Number(eventId);
-  const label = Number.isFinite(seq) && seq > 0 ? `事件 #${seq}` : `事件 #${eventId}`;
+  const label = Number.isFinite(seq) && seq > 0 ? `事件 #${seq}` : "事件";
   const text = taskNumber ? `任务 #${taskNumber} / ${label}` : label;
   location.hash = `event-${seq}`;
   try {

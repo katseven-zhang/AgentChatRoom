@@ -685,6 +685,141 @@ def test_snapshot_tied_created_at_pages_by_id_without_gap_or_overlap(
     assert page3["page_info"]["reports"]["next"] is None
 
 
+def test_snapshot_after_pages_are_truthful_newest_first_and_non_overlapping(
+    service, project, joined
+):
+    """#183: *_after pages obey the same contract as before pages.
+
+    Window rows come back newest-first; has_more_* probe the page boundaries
+    (the page's own rows never count as continuation); next continues
+    older-ward without re-serving the page; before stays the poll high-water.
+    """
+    report_task = service.create_task(
+        project["id"],
+        title="After pages",
+        description="direction contract for *_after cursors",
+        acceptance_criteria=["truthful after pages"],
+        actor_session_id=joined["agent"]["id"],
+        token=joined["token"],
+    )
+    stamps = {
+        "wr-a": "2026-01-01T00:00:01Z",
+        "wr-b": "2026-01-01T00:00:02Z",
+        "wr-c": "2026-01-01T00:00:03Z",
+        "wr-d": "2026-01-01T00:00:04Z",
+        "wr-e": "2026-01-01T00:00:05Z",
+    }
+    connection = sqlite3.connect(service.database.path)
+    try:
+        for report_id, created_at in stamps.items():
+            connection.execute(
+                """
+                INSERT INTO work_reports(
+                    id, project_id, task_id, session_id, summary, files_json,
+                    tests_json, system_evidence_json, commit_hash, created_at
+                )
+                VALUES (?, ?, ?, ?, ?, '[]', '[]', '{}', '', ?)
+                """,
+                (
+                    report_id,
+                    project["id"],
+                    report_task["task"]["id"],
+                    joined["agent"]["id"],
+                    report_id,
+                    created_at,
+                ),
+            )
+        connection.commit()
+    finally:
+        connection.close()
+
+    service.settings = replace(service.settings, snapshot_recent_limit=2)
+
+    # Initial (no cursor) page: newest-first, no fake newer.
+    page1 = service.snapshot(project["id"])
+    assert [row["id"] for row in page1["reports"]] == ["wr-e", "wr-d"]
+    info1 = page1["page_info"]["reports"]
+    assert info1["has_more"] is True
+    assert info1["has_more_newer"] is False
+
+    # Mid-history after-page: window (wr-b, ∞) = {c, d, e}; the ASC fetch takes
+    # the oldest two and normalizes them newest-first.
+    page_after = service.snapshot(project["id"], reports_after=stamps["wr-b"] + "|wr-b")
+    assert [row["id"] for row in page_after["reports"]] == ["wr-d", "wr-c"]
+    info = page_after["page_info"]["reports"]
+    assert info["has_more"] is True, "a and b remain older than the page"
+    assert info["has_more_newer"] is True, "wr-e lies beyond the page top"
+    # Page's own rows must never be offered as its continuation.
+    assert info["next"] == stamps["wr-c"] + "|wr-c"
+    older = service.snapshot(project["id"], reports_before=info["next"])
+    assert [row["id"] for row in older["reports"]] == ["wr-b", "wr-a"]
+    assert not {row["id"] for row in older["reports"]} & {"wr-d", "wr-c"}
+    assert older["page_info"]["reports"]["has_more"] is False
+    assert older["page_info"]["reports"]["has_more_newer"] is True
+
+    # Truthfulness at the window top: after-cursor on wr-c → page [e, d] is the
+    # newest content; has_more_newer must be False even though the page has rows.
+    top = service.snapshot(project["id"], reports_after=stamps["wr-c"] + "|wr-c")
+    assert [row["id"] for row in top["reports"]] == ["wr-e", "wr-d"]
+    assert top["page_info"]["reports"]["has_more_newer"] is False
+    assert top["page_info"]["reports"]["has_more"] is True
+
+    # before stays the poll high-water on after pages: (b, ∞) again.
+    poll = service.snapshot(
+        project["id"], reports_after=older["page_info"]["reports"]["before"]
+    )
+    assert [row["id"] for row in poll["reports"]] == ["wr-d", "wr-c"]
+
+    # Same contract for acknowledgements (three-part cursor space).
+    service.settings = replace(service.settings, snapshot_recent_limit=200)
+    acked = []
+    for index in range(3):
+        message = service.post_message(
+            project["id"],
+            body=f"ack me {index}",
+            session_id=joined["agent"]["id"],
+            token=joined["token"],
+            model_display_name="test",
+            requires_ack=True,
+        )
+        service.acknowledge_event(
+            project["id"],
+            message["event_id"],
+            joined["agent"]["id"],
+            joined["token"],
+        )
+        acked.append(message["event_id"])
+    full = service.snapshot(project["id"])
+    ack_rows = full["acknowledgements"]
+    assert len(ack_rows) == 3
+    oldest_ack = ack_rows[-1]
+
+    service.settings = replace(service.settings, snapshot_recent_limit=1)
+    ack_cursor = (
+        f"{oldest_ack['created_at']}|{oldest_ack['event_id']}|{oldest_ack['session_id']}"
+    )
+    ack_after = service.snapshot(project["id"], acknowledgements_after=ack_cursor)
+    assert len(ack_after["acknowledgements"]) == 1
+    assert ack_after["acknowledgements"][0]["event_id"] != oldest_ack["event_id"]
+    ack_info = ack_after["page_info"]["acknowledgements"]
+    assert ack_info["has_more_newer"] is True
+    assert ack_info["has_more"] is True
+    ack_older = service.snapshot(
+        project["id"], acknowledgements_before=ack_info["next"]
+    )
+    assert [
+        (row["event_id"], row["session_id"]) for row in ack_older["acknowledgements"]
+    ] == [(oldest_ack["event_id"], oldest_ack["session_id"])]
+    assert ack_older["page_info"]["acknowledgements"]["has_more"] is False
+    # Window top: after-cursor on the second-newest ack leaves one newer page.
+    middle = ack_rows[1]
+    mid_cursor = f"{middle['created_at']}|{middle['event_id']}|{middle['session_id']}"
+    ack_top = service.snapshot(project["id"], acknowledgements_after=mid_cursor)
+    assert len(ack_top["acknowledgements"]) == 1
+    assert ack_top["acknowledgements"][0]["event_id"] == ack_rows[0]["event_id"]
+    assert ack_top["page_info"]["acknowledgements"]["has_more_newer"] is False
+
+
 def test_events_project_type_task_index_exists():
     assert SCHEMA_VERSION >= 23
     assert "idx_events_project_type_task" in SCHEMA

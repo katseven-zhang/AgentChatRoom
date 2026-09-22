@@ -91,7 +91,8 @@ def test_task_history_items_expose_project_seq(service, project, joined_agents):
     assert created["project_seq"] > 0
     assert created["event_id"] == created["project_seq"]
     assert created["event_id"] > 0
-    assert created["internal_id"] > 0
+    # #169: no second numbering — the physical global id is not exposed.
+    assert "internal_id" not in created
     # Dual-track guard: citable number is always project_seq.
     for item in history["items"]:
         assert int(item["event_id"]) == int(item["project_seq"])
@@ -626,3 +627,96 @@ def test_migrated_database_continues_numbering_after_backfill(tmp_path):
 
     seqs = _event_project_seqs(service, "project-a")
     assert seqs == [1, 2, 3, 4]
+
+
+def test_public_event_objects_expose_no_internal_id(service, project, joined_agents):
+    """#169: one event, one number — no adapter may surface the physical id."""
+    executor, _reviewer = joined_agents
+    service.post_message(
+        project["id"],
+        body="No second numbering",
+        session_id=executor["agent"]["id"],
+        token=executor["token"],
+        model_display_name="Model A",
+    )
+    created_task = service.create_task(
+        project["id"],
+        title="Single numbering",
+        description="Physical id stays storage-internal",
+        acceptance_criteria=["No internal_id anywhere"],
+        actor_session_id=executor["agent"]["id"],
+        token=executor["token"],
+    )
+    listed = service.list_events(project["id"], after=0)
+    audit = service.query_audit(project["id"], after=0, limit=1000)
+    synced = service.room_sync(project["id"], mcp_context=True)
+    history = service.list_task_history(project["id"], created_task["task"]["id"])
+    for event in [*listed["events"], *audit["events"], *synced["events"]]:
+        assert "internal_id" not in event
+        assert int(event["id"]) == int(event["project_seq"])
+    for item in history["items"]:
+        assert "internal_id" not in item
+        assert int(item["event_id"]) == int(item["project_seq"])
+
+
+def test_task_history_acknowledgements_survive_diverged_physical_ids(
+    service, project, joined_agents
+):
+    """Ack rows store the physical events.id; history items cite project_seq.
+
+    Once a database's physical ids drift from project_seq (any real long-lived
+    Room), the projection must still join acknowledgements onto the public
+    event number — not compare the two number spaces.
+    """
+    from agentchatroom.services import iso_now
+
+    executor, _reviewer = joined_agents
+    created_task = service.create_task(
+        project["id"],
+        title="Acked on another id space",
+        description="ack by project_seq, stored on physical id",
+        acceptance_criteria=["Acknowledgement renders in history"],
+        actor_session_id=executor["agent"]["id"],
+        token=executor["token"],
+    )
+    task_id = created_task["task"]["id"]
+    with service.database.connect() as connection:
+        next_seq = int(
+            connection.execute(
+                "SELECT COALESCE(MAX(project_seq), 0) AS s FROM events WHERE project_id = ?",
+                (project["id"],),
+            ).fetchone()["s"]
+        )
+    ack_seq = next_seq + 1
+    with service.database.connect(write=True) as connection:
+        connection.execute(
+            """
+            INSERT INTO events(
+                id, project_id, event_type, actor_session_id, task_id,
+                payload_json, project_seq, created_at
+            )
+            VALUES (900001, ?, 'message.message', ?, ?,
+                    '{"schema_version":7,"requires_ack":true,"body":"ack me"}',
+                    ?, ?)
+            """,
+            (project["id"], executor["agent"]["id"], task_id, ack_seq, iso_now()),
+        )
+        # A manual insert bypasses the per-project counter; advance it so the
+        # next service-side emit does not collide with the manual row.
+        connection.execute(
+            "UPDATE event_number_sequences SET next_value = ? WHERE project_id = ?",
+            (ack_seq + 1, project["id"]),
+        )
+    acked = service.acknowledge_event(
+        project["id"], ack_seq, executor["agent"]["id"], executor["token"]
+    )
+    assert acked["acknowledged"] is True
+    assert acked["acknowledged_event_id"] == ack_seq
+
+    history = service.list_task_history(project["id"], task_id)
+    item = next(item for item in history["items"] if item["project_seq"] == ack_seq)
+    assert item["event_id"] == ack_seq
+    assert item["acknowledgements"], (
+        "ack stored on physical id 900001 must render on the project_seq item"
+    )
+    assert item["acknowledgements"][0]["session_id"] == executor["agent"]["id"]
