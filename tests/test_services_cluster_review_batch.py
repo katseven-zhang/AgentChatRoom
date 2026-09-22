@@ -412,6 +412,7 @@ def test_snapshot_cost_bounded_with_many_events_and_reports(
     assert snapshot["totals"]["reports"] >= 200
     assert snapshot["page_info"]["reports"]["total"] >= 200
     assert snapshot["page_info"]["reports"]["has_more"] is True
+    assert snapshot["page_info"]["reports"]["has_more_newer"] is False
     assert snapshot["page_info"]["reports"]["next"]
     assert snapshot["page_info"]["reports"]["before"]
     # Cursor must carry created_at|id tiebreaker (#183).
@@ -580,6 +581,108 @@ def test_snapshot_page_cursor_rejects_malformed_and_both_directions(
             reports_after="2026-01-01T00:00:00Z|x",
         )
     assert both.value.code == "invalid_page_cursor"
+
+
+def test_snapshot_single_row_latest_page_has_no_fake_newer_continuation(
+    service, project, joined
+):
+    """#183: 1 report + limit=1 on the newest page must not claim has_more_newer."""
+    report_task = service.create_task(
+        project["id"],
+        title="Solo",
+        description="one report only",
+        acceptance_criteria=["ok"],
+        actor_session_id=joined["agent"]["id"],
+        token=joined["token"],
+    )
+    connection = sqlite3.connect(service.database.path)
+    try:
+        connection.execute(
+            """
+            INSERT INTO work_reports(
+                id, project_id, task_id, session_id, summary, files_json,
+                tests_json, system_evidence_json, commit_hash, created_at
+            )
+            VALUES ('wr-solo', ?, ?, ?, 'solo', '[]', '[]', '{}', '', ?)
+            """,
+            (
+                project["id"],
+                report_task["task"]["id"],
+                joined["agent"]["id"],
+                iso_now(),
+            ),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    service.settings = replace(service.settings, snapshot_recent_limit=1)
+    snap = service.snapshot(project["id"])
+    info = snap["page_info"]["reports"]
+    assert info["returned"] == 1
+    assert info["has_more"] is False
+    assert info["has_more_newer"] is False
+    assert info["next"] is None
+    # before is the window high-water mark (poll cursor), not a continuation page.
+    assert info["before"]
+    assert "|" in info["before"]
+
+
+def test_snapshot_tied_created_at_pages_by_id_without_gap_or_overlap(
+    service, project, joined
+):
+    """#183: identical created_at must still page cleanly via id tiebreaker."""
+    report_task = service.create_task(
+        project["id"],
+        title="Tied",
+        description="same timestamps",
+        acceptance_criteria=["ok"],
+        actor_session_id=joined["agent"]["id"],
+        token=joined["token"],
+    )
+    tied_at = "2026-01-01T00:00:00Z"
+    connection = sqlite3.connect(service.database.path)
+    try:
+        for i in range(5):
+            connection.execute(
+                """
+                INSERT INTO work_reports(
+                    id, project_id, task_id, session_id, summary, files_json,
+                    tests_json, system_evidence_json, commit_hash, created_at
+                )
+                VALUES (?, ?, ?, ?, ?, '[]', '[]', '{}', '', ?)
+                """,
+                (
+                    f"wr-tied-{i}",
+                    project["id"],
+                    report_task["task"]["id"],
+                    joined["agent"]["id"],
+                    f"t{i}",
+                    tied_at,
+                ),
+            )
+        connection.commit()
+    finally:
+        connection.close()
+
+    service.settings = replace(service.settings, snapshot_recent_limit=2)
+    page1 = service.snapshot(project["id"])
+    ids1 = [r["id"] for r in page1["reports"]]
+    assert len(ids1) == 2
+    assert page1["page_info"]["reports"]["has_more"] is True
+    page2 = service.snapshot(
+        project["id"], reports_before=page1["page_info"]["reports"]["next"]
+    )
+    ids2 = [r["id"] for r in page2["reports"]]
+    page3 = service.snapshot(
+        project["id"], reports_before=page2["page_info"]["reports"]["next"]
+    )
+    ids3 = [r["id"] for r in page3["reports"]]
+    all_ids = ids1 + ids2 + ids3
+    assert sorted(all_ids) == sorted({*all_ids}), "no overlap"
+    assert len(all_ids) == 5, "no gap across tied-timestamp pages"
+    assert page3["page_info"]["reports"]["has_more"] is False
+    assert page3["page_info"]["reports"]["next"] is None
 
 
 def test_events_project_type_task_index_exists():

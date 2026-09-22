@@ -1461,9 +1461,26 @@ class AgentChatRoomService:
     def _knowledge_version_dict(self, row: Mapping[str, Any]) -> dict[str, Any]:
         data = dict(row)
         data["tags"] = json_load(data.pop("tags_json"), [])
-        data["source_event_ids"] = [
-            int(item) for item in json_load(data.pop("source_event_ids_json"), [])
-        ]
+        raw_refs = json_load(data.pop("source_event_ids_json"), [])
+        # Envelope form (#169): {"space","ids",...}; bare list = legacy global ids
+        # that migration already normalized (or pre-migration leftovers).
+        if isinstance(raw_refs, dict):
+            space = str(raw_refs.get("space") or "project_seq")
+            data["source_event_ids"] = [
+                int(item) for item in (raw_refs.get("ids") or [])
+            ]
+            data["source_event_ids_space"] = space
+            if raw_refs.get("ambiguous"):
+                data["source_event_ids_ambiguous"] = raw_refs["ambiguous"]
+            if raw_refs.get("unresolved"):
+                data["source_event_ids_unresolved"] = raw_refs["unresolved"]
+            if raw_refs.get("raw") is not None:
+                data["source_event_ids_raw"] = raw_refs["raw"]
+        else:
+            data["source_event_ids"] = [
+                int(item) for item in (raw_refs or [])
+            ]
+            data["source_event_ids_space"] = "project_seq"
         return data
 
     def _knowledge_review_dict(self, row: Mapping[str, Any]) -> dict[str, Any]:
@@ -7869,7 +7886,7 @@ class AgentChatRoomService:
                     clean_report_id or None,
                     clean_review_id or None,
                     clean_integration_id or None,
-                    json_dump(clean_event_ids),
+                    json_dump({"v": 1, "space": "project_seq", "ids": clean_event_ids}),
                     session_id,
                     previous_version_id,
                     now,
@@ -8578,7 +8595,12 @@ class AgentChatRoomService:
                 before: str | None,
                 after: str | None,
             ) -> tuple[list[dict[str, Any]], bool, bool]:
-                """Return (rows, has_more_older, has_more_newer) using limit+1 probe."""
+                """Return (rows, has_more_older, has_more_newer).
+
+                has_more_* come from real boundary probes against the page window
+                (not total>len, not bool(rows)) so the last page never advertises
+                a fake continuation (#183).
+                """
                 if before and after:
                     raise DomainError(
                         "invalid_page_cursor",
@@ -8604,8 +8626,7 @@ class AgentChatRoomService:
                         params.extend([created_at, created_at, row_id])
                         order_time = "ASC"
                         order_id = "ASC"
-                # Fetch one extra row so has_more reflects actual remainder (#183).
-                params.append(recent_limit + 1)
+                params.append(recent_limit)
                 raw_rows = [
                     dict(row)
                     for row in connection.execute(
@@ -8614,16 +8635,29 @@ class AgentChatRoomService:
                         params,
                     ).fetchall()
                 ]
-                has_more_in_query_dir = len(raw_rows) > recent_limit
                 rows = raw_rows[:recent_limit]
                 if after:
                     rows.reverse()
-                    # Query was ASC (newer): remainder means more newer items.
-                    has_more_newer = has_more_in_query_dir
-                    has_more_older = True if rows else False
-                else:
-                    has_more_older = has_more_in_query_dir
-                    has_more_newer = bool(rows)
+
+                def _exists(direction: str, boundary: Mapping[str, Any]) -> bool:
+                    op = ">" if direction == "newer" else "<"
+                    hit = connection.execute(
+                        f"SELECT 1 FROM {table} WHERE project_id = ? AND "
+                        f"(created_at {op} ? OR (created_at = ? AND id {op} ?)) "
+                        f"LIMIT 1",
+                        (
+                            project_id,
+                            boundary["created_at"],
+                            boundary["created_at"],
+                            boundary["id"],
+                        ),
+                    ).fetchone()
+                    return hit is not None
+
+                if not rows:
+                    return rows, False, False
+                has_more_older = _exists("older", rows[-1])
+                has_more_newer = _exists("newer", rows[0])
                 return rows, has_more_older, has_more_newer
 
             def _fetch_ack_page(
@@ -8666,11 +8700,12 @@ class AgentChatRoomService:
                         order_time = "ASC"
                         order_seq = "ASC"
                         order_session = "ASC"
-                params.append(recent_limit + 1)
+                params.append(recent_limit)
                 raw_rows = [
                     dict(row)
                     for row in connection.execute(
-                        "SELECT e.project_seq AS event_id, a.session_id, a.created_at "
+                        "SELECT e.project_seq AS event_id, a.session_id, a.created_at, "
+                        "e.id AS physical_id "
                         "FROM event_acknowledgements a "
                         "JOIN events e ON e.id = a.event_id "
                         f"WHERE {' AND '.join(where)} "
@@ -8679,15 +8714,36 @@ class AgentChatRoomService:
                         params,
                     ).fetchall()
                 ]
-                has_more_in_query_dir = len(raw_rows) > recent_limit
                 rows = raw_rows[:recent_limit]
                 if after:
                     rows.reverse()
-                    has_more_newer = has_more_in_query_dir
-                    has_more_older = True if rows else False
-                else:
-                    has_more_older = has_more_in_query_dir
-                    has_more_newer = bool(rows)
+
+                def _exists(direction: str, boundary: Mapping[str, Any]) -> bool:
+                    op = ">" if direction == "newer" else "<"
+                    hit = connection.execute(
+                        "SELECT 1 FROM event_acknowledgements a "
+                        "JOIN events e ON e.id = a.event_id "
+                        "WHERE e.project_id = ? AND (a.created_at {op} ? OR "
+                        "(a.created_at = ? AND (e.project_seq {op} ? OR "
+                        "(e.project_seq = ? AND a.session_id {op} ?)))) "
+                        "LIMIT 1".format(op=op),
+                        (
+                            project_id,
+                            boundary["created_at"],
+                            boundary["created_at"],
+                            int(boundary["event_id"]),
+                            int(boundary["event_id"]),
+                            boundary["session_id"],
+                        ),
+                    ).fetchone()
+                    return hit is not None
+
+                if not rows:
+                    return rows, False, False
+                has_more_older = _exists("older", rows[-1])
+                has_more_newer = _exists("newer", rows[0])
+                for row in rows:
+                    row.pop("physical_id", None)
                 return rows, has_more_older, has_more_newer
 
             reports, reports_older, reports_newer = _fetch_tied_page(
@@ -8772,10 +8828,11 @@ class AgentChatRoomService:
                     "before": None,
                 }
                 if rows:
-                    if has_more_newer:
-                        info["before"] = self._encode_page_cursor(
-                            rows[0], *cursor_fields
-                        )
+                    # High-water mark of this window: pass as *_after to fetch
+                    # strictly newer rows (poll), even when nothing is newer yet.
+                    info["before"] = self._encode_page_cursor(
+                        rows[0], *cursor_fields
+                    )
                     if has_more_older:
                         info["next"] = self._encode_page_cursor(
                             rows[-1], *cursor_fields

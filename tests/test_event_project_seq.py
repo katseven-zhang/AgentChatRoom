@@ -427,7 +427,9 @@ def test_migration_25_rewrites_knowledge_source_event_ids_to_project_seq(tmp_pat
         "SELECT source_event_ids_json FROM knowledge_asset_versions WHERE id = 'kav-1'"
     ).fetchone()
     migrated.close()
-    assert _json.loads(row["source_event_ids_json"]) == [1, 2]
+    envelope = _json.loads(row["source_event_ids_json"])
+    assert envelope["space"] == "project_seq"
+    assert envelope["ids"] == [1, 2]
 
 
 def test_migration_25_preserves_already_project_seq_and_maps_pure_global_ids(tmp_path):
@@ -496,9 +498,74 @@ def test_migration_25_preserves_already_project_seq_and_maps_pure_global_ids(tmp
         )
     }
     connection.close()
-    assert got["kav-seq"] == [2], "already project_seq must not be rewritten"
-    assert got["kav-global"] == [3], "pure global id must map to project_seq"
-    assert got["kav-mixed"] == [2, 3], "mixed list: keep seq, map unambiguous global id"
+    # [2] collides: global id=2 (→seq 1) vs project_seq=2 (→id 5). Fail-closed.
+    assert got["kav-seq"]["space"] == "ambiguous"
+    assert got["kav-seq"]["ids"] == []
+    assert got["kav-seq"]["ambiguous"][0]["raw"] == 2
+    assert got["kav-seq"]["raw"] == [2], "collision must keep original for audit"
+    # [20] is only a global id → mapped to project_seq 3 under explicit space.
+    assert got["kav-global"]["space"] == "project_seq"
+    assert got["kav-global"]["ids"] == [3]
+    # Mixed: 2 stays ambiguous (not silently bound), 20 maps to 3.
+    assert got["kav-mixed"]["space"] == "ambiguous"
+    assert got["kav-mixed"]["ids"] == [3]
+    assert got["kav-mixed"]["ambiguous"][0]["raw"] == 2
+
+
+def test_migration_25_unambiguous_project_seq_stays_and_same_event_collides_ok(tmp_path):
+    """#169: seq-only value keeps; id==seq same-event value keeps; no false collision."""
+    import json as _json
+
+    from agentchatroom.database import migrate_knowledge_source_event_ids
+
+    path = tmp_path / "clear_refs.sqlite"
+    connection = sqlite3.connect(path)
+    connection.row_factory = sqlite3.Row
+    connection.executescript(
+        """
+        CREATE TABLE projects (
+            id TEXT PRIMARY KEY, name TEXT NOT NULL,
+            settings_json TEXT NOT NULL DEFAULT '{}',
+            created_at TEXT NOT NULL, updated_at TEXT NOT NULL, archived_at TEXT
+        );
+        CREATE TABLE events (
+            id INTEGER PRIMARY KEY, project_id TEXT NOT NULL, event_type TEXT NOT NULL,
+            actor_session_id TEXT, task_id TEXT,
+            payload_json TEXT NOT NULL DEFAULT '{}', created_at TEXT NOT NULL,
+            project_seq INTEGER
+        );
+        CREATE TABLE knowledge_assets (id TEXT PRIMARY KEY, project_id TEXT NOT NULL);
+        CREATE TABLE knowledge_asset_versions (
+            id TEXT PRIMARY KEY, asset_id TEXT NOT NULL,
+            source_event_ids_json TEXT NOT NULL DEFAULT '[]',
+            body TEXT NOT NULL DEFAULT '', summary TEXT NOT NULL DEFAULT '',
+            title TEXT NOT NULL DEFAULT '', kind TEXT NOT NULL DEFAULT 'decision',
+            status TEXT NOT NULL DEFAULT 'candidate', tags_json TEXT NOT NULL DEFAULT '[]',
+            created_at TEXT NOT NULL, created_by_session_id TEXT
+        );
+        INSERT INTO projects VALUES ('p','P','{}','t','t',NULL);
+        -- id=7,seq=7: number 7 is both spaces for the SAME event
+        -- id=3,seq=9: number 9 is only a project_seq
+        INSERT INTO events(id, project_id, event_type, payload_json, created_at, project_seq)
+        VALUES (7,'p','message.message','{}','t',7),
+               (3,'p','message.message','{}','t',9);
+        INSERT INTO knowledge_assets VALUES ('ka','p');
+        INSERT INTO knowledge_asset_versions
+            (id, asset_id, source_event_ids_json, body, summary, title, kind, status, tags_json, created_at)
+        VALUES ('kav','ka','[7,9]','b','s','t','decision','candidate','[]','t');
+        """
+    )
+    connection.commit()
+    migrate_knowledge_source_event_ids(connection)
+    got = _json.loads(
+        connection.execute(
+            "SELECT source_event_ids_json FROM knowledge_asset_versions WHERE id='kav'"
+        ).fetchone()[0]
+    )
+    connection.close()
+    assert got["space"] == "project_seq"
+    assert got["ids"] == [7, 9]
+    assert "ambiguous" not in got
 
 
 def test_migration_25_sql_is_backend_portable():

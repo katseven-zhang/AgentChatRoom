@@ -810,16 +810,23 @@ MIGRATIONS = {
 
 
 def migrate_knowledge_source_event_ids(connection: Any) -> None:
-    """Rewrite knowledge source_event_ids from global event id → project_seq (#169).
+    """Normalize knowledge source_event_ids to an explicit id-space envelope (#169).
 
-    Applied after MIGRATIONS[25] on every backend. Uses only portable SQL and the
-    stdlib json module so PostgresDatabase can run the same code path.
+    Applied after MIGRATIONS[25] on every backend (portable SQL + stdlib json).
 
-    Semantics (fail-closed on ambiguity — schema24 may already store project_seq):
-    - value is a valid project_seq in this Project → leave unchanged
-      (already correct, or ambiguous with a global id — never rewrite)
-    - else value is only a global events.id in this Project → map to its project_seq
-    - else leave unchanged (dangling / cross-project — never invent a mapping)
+    Historical bare lists are ambiguous: they may be global ``events.id`` values
+    (pre-#169) or already-correct ``project_seq`` values written during schema 24.
+    Fail-closed rules — never silently re-point a historical reference:
+
+    - value is only a ``project_seq`` in this Project → keep under space=project_seq
+    - value is only a global ``events.id`` in this Project → map to its project_seq
+    - value is both, and they resolve to the **same** event → keep
+    - value is both, but **different** events → space=ambiguous (audit-required;
+      not resolved to either target)
+    - value matches neither → space=unresolved (dangling)
+
+    New writes should store ``{"space": "project_seq", "ids": [...]}`` so later
+    readers never have to guess the number space again.
     """
     rows = connection.execute(
         "SELECT id, asset_id, source_event_ids_json FROM knowledge_asset_versions"
@@ -829,10 +836,13 @@ def migrate_knowledge_source_event_ids(connection: Any) -> None:
         if not raw or raw in ("[]", ""):
             continue
         try:
-            ids = json.loads(raw)
+            parsed = json.loads(raw)
         except json.JSONDecodeError:
             continue
-        if not isinstance(ids, list) or not ids:
+        # Already enveloped (re-run / post-#169 writes): leave untouched.
+        if isinstance(parsed, dict) and "space" in parsed:
+            continue
+        if not isinstance(parsed, list) or not parsed:
             continue
         asset = connection.execute(
             "SELECT project_id FROM knowledge_assets WHERE id = ?",
@@ -841,38 +851,67 @@ def migrate_knowledge_source_event_ids(connection: Any) -> None:
         if asset is None:
             continue
         project_id = asset["project_id"]
-        new_ids: list[Any] = []
-        changed = False
-        for value in ids:
+
+        resolved_ids: list[int] = []
+        ambiguous: list[dict[str, Any]] = []
+        unresolved: list[Any] = []
+        for value in parsed:
             try:
                 number = int(value)
             except (TypeError, ValueError):
-                new_ids.append(value)
+                unresolved.append(value)
                 continue
             as_seq = connection.execute(
                 "SELECT id FROM events WHERE project_seq = ? AND project_id = ?",
                 (number, project_id),
             ).fetchone()
-            if as_seq is not None:
-                # Valid project_seq (or collides with one): keep as-is.
-                new_ids.append(number)
-                continue
             as_global = connection.execute(
-                "SELECT project_seq FROM events WHERE id = ? AND project_id = ?",
+                "SELECT project_seq, id FROM events WHERE id = ? AND project_id = ?",
                 (number, project_id),
             ).fetchone()
-            if as_global is None:
-                new_ids.append(number)
-                continue
-            mapped = int(as_global["project_seq"])
-            if mapped != number:
-                changed = True
-            new_ids.append(mapped)
-        if changed:
-            connection.execute(
-                "UPDATE knowledge_asset_versions SET source_event_ids_json = ? WHERE id = ?",
-                (json.dumps(new_ids), row["id"]),
-            )
+            if as_seq is not None and as_global is not None:
+                if int(as_seq["id"]) == int(as_global["id"]):
+                    # Same physical event under both number spaces.
+                    resolved_ids.append(number)
+                else:
+                    # True collision: refuse to pick a target.
+                    ambiguous.append(
+                        {
+                            "raw": number,
+                            "as_project_seq_event_id": int(as_seq["id"]),
+                            "as_global_id_project_seq": int(as_global["project_seq"]),
+                        }
+                    )
+            elif as_seq is not None:
+                resolved_ids.append(number)
+            elif as_global is not None:
+                resolved_ids.append(int(as_global["project_seq"]))
+            else:
+                unresolved.append(number)
+
+        space = "project_seq"
+        if ambiguous:
+            space = "ambiguous"
+        elif unresolved and not resolved_ids:
+            space = "unresolved"
+
+        envelope: dict[str, Any] = {
+            "v": 1,
+            "space": space,
+            "ids": resolved_ids,
+        }
+        if ambiguous:
+            envelope["ambiguous"] = ambiguous
+        if unresolved:
+            envelope["unresolved"] = unresolved
+        # Preserve the pre-migration payload for audit when anything failed closed.
+        if ambiguous or unresolved:
+            envelope["raw"] = parsed
+
+        connection.execute(
+            "UPDATE knowledge_asset_versions SET source_event_ids_json = ? WHERE id = ?",
+            (json.dumps(envelope, ensure_ascii=False), row["id"]),
+        )
 
 
 def ensure_event_number_schema(connection: Any, *, postgres: bool = False) -> None:
