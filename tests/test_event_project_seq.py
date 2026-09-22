@@ -430,6 +430,77 @@ def test_migration_25_rewrites_knowledge_source_event_ids_to_project_seq(tmp_pat
     assert _json.loads(row["source_event_ids_json"]) == [1, 2]
 
 
+def test_migration_25_preserves_already_project_seq_and_maps_pure_global_ids(tmp_path):
+    """#169: schema24 may already store project_seq — never rewrite those (fail-closed).
+
+    Codex repro: events (id=2,seq=1), (id=5,seq=2); knowledge [2] is project_seq=2
+    and must stay [2]. Pure global id 20→seq 3 (no project_seq=20) must map to 3.
+    """
+    import json as _json
+
+    from agentchatroom.database import migrate_knowledge_source_event_ids
+
+    path = tmp_path / "mixed_refs.sqlite"
+    connection = sqlite3.connect(path)
+    connection.row_factory = sqlite3.Row
+    connection.executescript(
+        """
+        CREATE TABLE projects (
+            id TEXT PRIMARY KEY, name TEXT NOT NULL,
+            settings_json TEXT NOT NULL DEFAULT '{}',
+            created_at TEXT NOT NULL, updated_at TEXT NOT NULL, archived_at TEXT
+        );
+        CREATE TABLE events (
+            id INTEGER PRIMARY KEY, project_id TEXT NOT NULL, event_type TEXT NOT NULL,
+            actor_session_id TEXT, task_id TEXT,
+            payload_json TEXT NOT NULL DEFAULT '{}', created_at TEXT NOT NULL,
+            project_seq INTEGER
+        );
+        CREATE TABLE knowledge_assets (id TEXT PRIMARY KEY, project_id TEXT NOT NULL);
+        CREATE TABLE knowledge_asset_versions (
+            id TEXT PRIMARY KEY, asset_id TEXT NOT NULL,
+            source_event_ids_json TEXT NOT NULL DEFAULT '[]',
+            body TEXT NOT NULL DEFAULT '', summary TEXT NOT NULL DEFAULT '',
+            title TEXT NOT NULL DEFAULT '', kind TEXT NOT NULL DEFAULT 'decision',
+            status TEXT NOT NULL DEFAULT 'candidate', tags_json TEXT NOT NULL DEFAULT '[]',
+            created_at TEXT NOT NULL, created_by_session_id TEXT
+        );
+        INSERT INTO projects VALUES ('p','P','{}','t','t',NULL);
+        -- Codex repro shape: global id ≠ project_seq
+        INSERT INTO events(id, project_id, event_type, payload_json, created_at, project_seq)
+        VALUES (2,'p','message.message','{}','t',1),
+               (5,'p','message.message','{}','t',2),
+               (20,'p','message.message','{}','t',3);
+        INSERT INTO knowledge_assets VALUES ('ka','p');
+        -- [2] is already project_seq (event id=5) — must stay [2]
+        INSERT INTO knowledge_asset_versions
+            (id, asset_id, source_event_ids_json, body, summary, title, kind, status, tags_json, created_at)
+        VALUES ('kav-seq','ka','[2]','b','s','t','decision','candidate','[]','t');
+        -- [20] is only a global id (no project_seq=20) — must become [3]
+        INSERT INTO knowledge_asset_versions
+            (id, asset_id, source_event_ids_json, body, summary, title, kind, status, tags_json, created_at)
+        VALUES ('kav-global','ka','[20]','b','s','t','decision','candidate','[]','t');
+        -- Mixed list: keep 2 (valid seq), map 20 → 3
+        INSERT INTO knowledge_asset_versions
+            (id, asset_id, source_event_ids_json, body, summary, title, kind, status, tags_json, created_at)
+        VALUES ('kav-mixed','ka','[2,20]','b','s','t','decision','candidate','[]','t');
+        """
+    )
+    connection.commit()
+
+    migrate_knowledge_source_event_ids(connection)
+    got = {
+        row["id"]: _json.loads(row["source_event_ids_json"])
+        for row in connection.execute(
+            "SELECT id, source_event_ids_json FROM knowledge_asset_versions"
+        )
+    }
+    connection.close()
+    assert got["kav-seq"] == [2], "already project_seq must not be rewritten"
+    assert got["kav-global"] == [3], "pure global id must map to project_seq"
+    assert got["kav-mixed"] == [2, 3], "mixed list: keep seq, map unambiguous global id"
+
+
 def test_migration_25_sql_is_backend_portable():
     """#169: MIGRATIONS[25] must not use SQLite-only json_each/json_group_array."""
     from agentchatroom.database import MIGRATIONS as _M

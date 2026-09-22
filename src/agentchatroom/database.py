@@ -814,6 +814,12 @@ def migrate_knowledge_source_event_ids(connection: Any) -> None:
 
     Applied after MIGRATIONS[25] on every backend. Uses only portable SQL and the
     stdlib json module so PostgresDatabase can run the same code path.
+
+    Semantics (fail-closed on ambiguity — schema24 may already store project_seq):
+    - value is a valid project_seq in this Project → leave unchanged
+      (already correct, or ambiguous with a global id — never rewrite)
+    - else value is only a global events.id in this Project → map to its project_seq
+    - else leave unchanged (dangling / cross-project — never invent a mapping)
     """
     rows = connection.execute(
         "SELECT id, asset_id, source_event_ids_json FROM knowledge_asset_versions"
@@ -839,22 +845,30 @@ def migrate_knowledge_source_event_ids(connection: Any) -> None:
         changed = False
         for value in ids:
             try:
-                old_id = int(value)
+                number = int(value)
             except (TypeError, ValueError):
                 new_ids.append(value)
                 continue
-            match = connection.execute(
-                "SELECT project_seq FROM events WHERE id = ? AND project_id = ?",
-                (old_id, project_id),
+            as_seq = connection.execute(
+                "SELECT id FROM events WHERE project_seq = ? AND project_id = ?",
+                (number, project_id),
             ).fetchone()
-            if match is None:
-                new_ids.append(old_id)
+            if as_seq is not None:
+                # Valid project_seq (or collides with one): keep as-is.
+                new_ids.append(number)
                 continue
-            seq = int(match["project_seq"])
-            if seq != old_id:
+            as_global = connection.execute(
+                "SELECT project_seq FROM events WHERE id = ? AND project_id = ?",
+                (number, project_id),
+            ).fetchone()
+            if as_global is None:
+                new_ids.append(number)
+                continue
+            mapped = int(as_global["project_seq"])
+            if mapped != number:
                 changed = True
-            new_ids.append(seq)
-        if changed or new_ids != ids:
+            new_ids.append(mapped)
+        if changed:
             connection.execute(
                 "UPDATE knowledge_asset_versions SET source_event_ids_json = ? WHERE id = ?",
                 (json.dumps(new_ids), row["id"]),

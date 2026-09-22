@@ -429,17 +429,140 @@ def test_snapshot_cost_bounded_with_many_events_and_reports(
     boundary_created = next_cursor.split("|", 1)[0]
     assert all(row["created_at"] <= boundary_created for row in page2["reports"])
 
-    # Consumable newer page: pass before → reports_after returns the same window head.
+    # Walk to the last older page: has_more/next must go false — no fake next (#183).
+    current = page2
+    seen_ids = set(page1_ids) | set(page2_ids)
+    for _ in range(10):
+        info = current["page_info"]["reports"]
+        if not info["has_more"]:
+            assert info["next"] is None, "last page must not advertise next"
+            break
+        nxt = info["next"]
+        assert nxt
+        current = service.snapshot(project["id"], reports_before=nxt)
+        new_ids = {row["id"] for row in current["reports"]}
+        assert not (new_ids & seen_ids)
+        seen_ids |= new_ids
+    else:
+        raise AssertionError("report pages did not terminate")
+    assert current["page_info"]["reports"]["has_more"] is False
+    assert current["page_info"]["reports"]["next"] is None
+
+    # Consumable newer page: pass before → reports_after returns items newer than head.
     newer = service.snapshot(project["id"], reports_after=before_cursor)
-    # Items strictly newer than the oldest-in-window... before is newest of page1,
-    # so after should return items newer than page1's newest (possibly empty if page1 is newest).
     newer_ids = {row["id"] for row in newer["reports"]}
     assert not (newer_ids & page2_ids)
+
+    # reviews + acknowledgements must page with the same contract (#183).
+    for kind, before_key, after_key in (
+        ("reviews", "reviews_before", "reviews_after"),
+        ("acknowledgements", "acknowledgements_before", "acknowledgements_after"),
+    ):
+        first = service.snapshot(project["id"])
+        info = first["page_info"][kind]
+        assert "next" in info and "before" in info and "has_more" in info
+        if info["has_more"]:
+            assert info["next"]
+            second = service.snapshot(
+                project["id"], **{before_key: info["next"]}
+            )
+            first_keys = {
+                (r.get("created_at"), r.get("id") or r.get("event_id"))
+                for r in first[kind]
+            }
+            second_keys = {
+                (r.get("created_at"), r.get("id") or r.get("event_id"))
+                for r in second[kind]
+            }
+            assert not (first_keys & second_keys)
+            # walk to terminal page
+            cur = second
+            for _ in range(10):
+                cinfo = cur["page_info"][kind]
+                if not cinfo["has_more"]:
+                    assert cinfo["next"] is None
+                    break
+                cur = service.snapshot(
+                    project["id"], **{before_key: cinfo["next"]}
+                )
+            else:
+                raise AssertionError(f"{kind} pages did not terminate")
 
     # Bounded payload: recent window only, not the full 200-report history.
     assert len(encoded) < 2_000_000
     # Bounded projection: must finish quickly even with 5k events + 200 reports.
     assert elapsed < 5.0
+
+
+def test_snapshot_ack_cursor_compares_project_seq_not_physical_id(
+    service, project, joined
+):
+    """#183: ack cursor encodes project_seq; WHERE must compare project_seq."""
+    other = service.post_message(
+        project["id"],
+        body="ack me",
+        session_id=joined["agent"]["id"],
+        token=joined["token"],
+        model_display_name="test",
+        requires_ack=True,
+    )
+    service.acknowledge_event(
+        project["id"],
+        event_id=other["event_id"],
+        session_id=joined["agent"]["id"],
+        token=joined["token"],
+    )
+    # Build two more acks via direct insert so recent_limit=1 has pages.
+    connection = sqlite3.connect(service.database.path)
+    try:
+        connection.execute("BEGIN")
+        for i, seq in enumerate((other["event_id"] + 50, other["event_id"] + 60)):
+            connection.execute(
+                """
+                INSERT INTO events(project_id, event_type, payload_json, created_at, project_seq)
+                VALUES (?, 'message.message', ?, ?, ?)
+                """,
+                (
+                    project["id"],
+                    '{"schema_version":7,"body":"x"}',
+                    iso_now(),
+                    seq,
+                ),
+            )
+            physical = connection.execute("SELECT last_insert_rowid() AS id").fetchone()[0]
+            connection.execute(
+                """
+                INSERT INTO event_acknowledgements(event_id, session_id, created_at)
+                VALUES (?, ?, ?)
+                """,
+                (physical, joined["agent"]["id"], iso_now()),
+            )
+        connection.commit()
+    finally:
+        connection.close()
+
+    service.settings = replace(service.settings, snapshot_recent_limit=1)
+    first = service.snapshot(project["id"])
+    ack_info = first["page_info"]["acknowledgements"]
+    assert ack_info["returned"] <= 1
+    if ack_info["before"]:
+        parts = ack_info["before"].split("|")
+        assert len(parts) == 3
+        # event_id in cursor is project_seq (not physical e.id).
+        assert int(parts[1]) == other["event_id"] or int(parts[1]) >= other["event_id"]
+    assert ack_info["has_more"] is True
+    assert ack_info["next"]
+    page2 = service.snapshot(
+        project["id"], acknowledgements_before=ack_info["next"]
+    )
+    first_keys = {
+        (r["created_at"], r["event_id"], r["session_id"]) for r in first["acknowledgements"]
+    }
+    second_keys = {
+        (r["created_at"], r["event_id"], r["session_id"]) for r in page2["acknowledgements"]
+    }
+    assert not (first_keys & second_keys), "ack pages must not overlap"
+    assert page2["acknowledgements"], "older ack page must be non-empty"
 
 
 def test_snapshot_page_cursor_rejects_malformed_and_both_directions(
