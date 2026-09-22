@@ -37,7 +37,9 @@ def test_background_git_and_backup_commands_do_not_create_consoles(monkeypatch, 
     project_registration._git_info(tmp_path)
     service._collect_git_evidence_from_worktree(tmp_path, 'HEAD')
     backup._run_database_tool(['pg_dump', '--version'], action='test')
-    assert len(calls) == 6
+    # detect_git_info returns after a single failed rev-parse (not a work
+    # tree); evidence collection issues one rev-parse; backup runs one tool.
+    assert len(calls) == 4
 
 
 def test_service_absent_startup_never_initializes_or_spawns(monkeypatch, settings):

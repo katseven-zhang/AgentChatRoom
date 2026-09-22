@@ -60,7 +60,11 @@ from .contracts import (
 )
 from .database import SCHEMA_VERSION, DatabaseBackend
 from .errors import DomainError
-from .project_registration import detect_git_info, derive_logical_path
+from .project_registration import (
+    detect_git_info,
+    derive_logical_path,
+    load_checkout_registration,
+)
 from .task_history import (
     TASK_HISTORY_LIMIT_MAX,
     TASK_HISTORY_SCHEMA_VERSION,
@@ -463,10 +467,21 @@ def patterns_overlap(left: str, right: str) -> bool:
     )
 
 
-def _project_git_info(root: Path) -> tuple[str, Path]:
+GIT_SCOPE_RECHECK_TTL_SECONDS = 30.0
+
+
+def _project_git_info(root: Path) -> tuple[str, Path, bool]:
     # Single shared implementation with checkout registration: Git writes
     # UTF-8 path bytes, which must never be decoded with the process locale.
     return detect_git_info(root)
+
+
+def _project_source_from_disk(remote: str, is_work_tree: bool) -> str:
+    if remote:
+        return "git_remote"
+    if is_work_tree:
+        return "git_local"
+    return "path"
 
 
 def _project_scope(
@@ -502,6 +517,10 @@ class AgentChatRoomService:
             interval_seconds=settings.token_touch_interval_seconds,
             min_calls=settings.token_touch_min_calls,
         )
+        # project_id -> (monotonic_ts, project_source, remote_on_disk)
+        # Caps disk/git re-probes on read paths so GET without a candidate
+        # change does not spawn git or open a write connection every time.
+        self._git_scope_probe_cache: dict[str, tuple[float, str, str]] = {}
 
     def initialize(self) -> None:
         self.database.initialize()
@@ -893,11 +912,26 @@ class AgentChatRoomService:
         data["channel"] = data["payload"].get("channel", default_channel)
         return data
 
-    def _project_dict(self, row: Mapping[str, Any]) -> dict[str, Any]:
+    def _project_dict(
+        self,
+        row: Mapping[str, Any],
+        *,
+        project_source: str | None = None,
+        git_scope_recheck: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
         data = dict(row)
         data["settings"] = normalize_project_settings(
             json_load(data.pop("settings_json"), {})
         )
+        if project_source is None:
+            project_source = (
+                "git_remote"
+                if str(data.get("git_remote") or "").strip()
+                else "path"
+            )
+        data["project_source"] = project_source
+        if git_scope_recheck is not None:
+            data["git_scope_recheck"] = dict(git_scope_recheck)
         return data
 
     def _agent_dict(self, row: Mapping[str, Any]) -> dict[str, Any]:
@@ -1487,7 +1521,7 @@ class AgentChatRoomService:
                 "Project root must be an existing directory",
                 details={"root_path": str(root)},
             )
-        remote, git_root = _project_git_info(root)
+        remote, git_root, is_work_tree = _project_git_info(root)
         logical = derive_logical_path(root, git_root, logical_path)
         candidate_scope = _project_scope(remote, git_root, logical)
         now = iso_now()
@@ -1504,7 +1538,13 @@ class AgentChatRoomService:
                 if project["archived_at"] is None
             ]
             if len(active_conflicts) == 1:
-                return self._project_dict(active_conflicts[0])
+                existing = active_conflicts[0]
+                return self._project_dict(
+                    existing,
+                    project_source=_project_source_from_disk(
+                        str(existing["git_remote"] or ""), is_work_tree
+                    ),
+                )
             if len(active_conflicts) > 1:
                 raise DomainError(
                     "project_scope_conflict",
@@ -1533,7 +1573,12 @@ class AgentChatRoomService:
                 restored = connection.execute(
                     "SELECT * FROM projects WHERE id = ?", (archived["id"],)
                 ).fetchone()
-                return self._project_dict(restored)
+                return self._project_dict(
+                    restored,
+                    project_source=_project_source_from_disk(
+                        str(restored["git_remote"] or ""), is_work_tree
+                    ),
+                )
             if len(archived_scope) > 1:
                 raise DomainError(
                     "project_scope_conflict",
@@ -1582,7 +1627,9 @@ class AgentChatRoomService:
             row = connection.execute(
                 "SELECT * FROM projects WHERE id = ?", (project_id,)
             ).fetchone()
-            return self._project_dict(row)
+            return self._project_dict(
+                row, project_source=_project_source_from_disk(remote, is_work_tree)
+            )
 
     def resolve_project_for_join(
         self,
@@ -1598,7 +1645,7 @@ class AgentChatRoomService:
                 "Project root must be an existing directory",
                 details={"root_path": str(root)},
             )
-        remote, git_root = _project_git_info(root)
+        remote, git_root, _is_work_tree = _project_git_info(root)
         logical = derive_logical_path(root, git_root, logical_path)
         candidate_scope = _project_scope(remote, git_root, logical)
         reg_key = str(registered_project_key or "").strip()
@@ -1695,7 +1742,13 @@ class AgentChatRoomService:
                 project for project in scope_projects if project["archived_at"] is None
             ]
             if len(active_scope) == 1:
-                return self._project_dict(active_scope[0])
+                healed_source = _project_source_from_disk(
+                    str(active_scope[0]["git_remote"] or ""),
+                    _is_work_tree,
+                )
+                return self._project_dict(
+                    active_scope[0], project_source=healed_source
+                )
             if len(active_scope) > 1:
                 raise DomainError(
                     "project_scope_conflict",
@@ -1750,7 +1803,40 @@ class AgentChatRoomService:
             rows = connection.execute(
                 "SELECT * FROM projects WHERE archived_at IS NULL ORDER BY updated_at DESC, name"
             ).fetchall()
-            return [self._project_dict(row) for row in rows]
+            projects = [self._project_dict(row) for row in rows]
+        # Display-only recheck: cheap path-scope rows may already be Git on
+        # disk. No write connection and no scope mutation on the list path.
+        for project in projects:
+            if project.get("project_source") == "path" and str(
+                project.get("root_path") or ""
+            ).strip():
+                project["project_source"] = self._peek_project_source(project)
+        return projects
+
+    def _peek_project_source(self, project: Mapping[str, Any]) -> str:
+        project_id = str(project.get("id") or "")
+        root_path = str(project.get("root_path") or "").strip()
+        if not root_path:
+            return "path"
+        now = time.monotonic()
+        cached = self._git_scope_probe_cache.get(project_id)
+        if (
+            cached
+            and cached[1] == "path"
+            and (now - cached[0]) < GIT_SCOPE_RECHECK_TTL_SECONDS
+        ):
+            return "path"
+        source = "path"
+        try:
+            root = Path(root_path).expanduser().resolve()
+            if root.is_dir():
+                remote, _git_root, is_work_tree = _project_git_info(root)
+                source = _project_source_from_disk(remote, is_work_tree)
+        except (OSError, DomainError):
+            source = "path"
+        if source == "path":
+            self._git_scope_probe_cache[project_id] = (now, source, "")
+        return source
 
     def archive_project(self, project_id: str) -> dict[str, Any]:
         with self.database.connect(write=True) as connection:
@@ -1789,46 +1875,199 @@ class AgentChatRoomService:
             }
 
     def get_project(self, project_id: str) -> dict[str, Any]:
-        with self.database.connect(write=True) as connection:
+        """Read a Project, with ownership-resolved git scope recheck (#170/#172).
+
+        Read path rules:
+        - Already stored as git scope → pure read, no git subprocess, no write.
+        - Path candidates re-probe disk so a later `git remote add` is visible
+          immediately; a write connection opens only for an ownership-clear heal.
+        - list_projects uses the TTL cache for display-only rechecks.
+        - Ambiguous ownership (another active Room owns the candidate scope,
+          same root_path, or registration key mismatch) fails closed: no
+          UPDATE, no project.updated event, response carries git_scope_recheck.
+        """
+        with self.database.connect() as connection:
             project = self._require_project(connection, project_id)
-            if (
-                project["archived_at"] is None
-                and not str(project["git_remote"] or "").strip()
-                and str(project["root_path"] or "").strip()
-            ):
-                try:
-                    root = Path(str(project["root_path"])).expanduser().resolve()
-                    if root.is_dir():
-                        remote, git_root = _project_git_info(root)
-                        if remote:
-                            logical = derive_logical_path(
-                                root, git_root, str(project["logical_path"] or "")
-                            )
-                            now = iso_now()
-                            connection.execute(
-                                """
-                                UPDATE projects
-                                SET git_remote = ?, logical_path = ?, updated_at = ?
-                                WHERE id = ?
-                                """,
-                                (remote, logical, now, project_id),
-                            )
-                            self._emit(
-                                connection,
-                                project_id,
-                                "project.updated",
-                                payload={
-                                    "git_remote": remote,
-                                    "logical_path": logical,
-                                    "scope_healed": True,
-                                },
-                            )
-                            project = connection.execute(
-                                "SELECT * FROM projects WHERE id = ?", (project_id,)
-                            ).fetchone()
-                except (OSError, DomainError):
-                    pass
+            if str(project["git_remote"] or "").strip():
+                return self._project_dict(project, project_source="git_remote")
+            if project["archived_at"] is not None or not str(
+                project["root_path"] or ""
+            ).strip():
+                return self._project_dict(project)
+
+        root_path = str(project["root_path"])
+        now = time.monotonic()
+        try:
+            root = Path(root_path).expanduser().resolve()
+        except (OSError, ValueError):
             return self._project_dict(project)
+        if not root.is_dir():
+            return self._project_dict(project)
+
+        try:
+            remote, git_root, is_work_tree = _project_git_info(root)
+        except (OSError, DomainError):
+            return self._project_dict(project)
+
+        source = _project_source_from_disk(remote, is_work_tree)
+        if not remote:
+            # Local work-tree or plain path: display-only, never write.
+            return self._project_dict(project, project_source=source)
+
+        try:
+            logical = derive_logical_path(
+                root, git_root, str(project["logical_path"] or "")
+            )
+        except DomainError:
+            self._git_scope_probe_cache[project_id] = (now, source, remote)
+            return self._project_dict(
+                project,
+                project_source=source,
+                git_scope_recheck={
+                    "status": "blocked",
+                    "reason": "project_scope_conflict",
+                    "detail": "logical_path does not match git work tree",
+                },
+            )
+
+        candidate_scope = _project_scope(remote, git_root, logical)
+        norm_root = os.path.normcase(str(root))
+
+        # Ownership resolution before any write (#166/#172 fail-closed).
+        with self.database.connect() as connection:
+            current = self._require_project(connection, project_id)
+            if str(current["git_remote"] or "").strip():
+                return self._project_dict(current, project_source="git_remote")
+            if current["archived_at"] is not None:
+                return self._project_dict(current, project_source=source)
+
+            all_projects = connection.execute("SELECT * FROM projects").fetchall()
+            blockers: list[Any] = []
+            for other in all_projects:
+                if other["id"] == project_id or other["archived_at"] is not None:
+                    continue
+                if _stored_project_scope(other) == candidate_scope:
+                    blockers.append(other)
+                    continue
+                try:
+                    other_root = os.path.normcase(
+                        str(Path(str(other["root_path"])).expanduser().resolve())
+                    )
+                except (OSError, ValueError):
+                    continue
+                if other_root == norm_root:
+                    # Same directory already owned by another active Room.
+                    blockers.append(other)
+
+            registration = None
+            registration_unreadable = False
+            try:
+                registration = load_checkout_registration(
+                    root, logical_path=logical
+                )
+            except DomainError:
+                registration = None
+                registration_unreadable = True
+
+            registration_conflict = registration_unreadable
+            if registration is not None:
+                reg_key = str(registration.get("project_key") or "").strip()
+                current_key = str(current["project_key"]).strip()
+                if reg_key and reg_key != current_key:
+                    registration_conflict = True
+                    registered = next(
+                        (
+                            p
+                            for p in all_projects
+                            if str(p["project_key"]).strip() == reg_key
+                        ),
+                        None,
+                    )
+                    if registered is None:
+                        # Orphaned registration: treat as ambiguous, no heal.
+                        registration_conflict = True
+
+            if blockers or registration_conflict:
+                reason = (
+                    "project_registration_conflict"
+                    if registration_conflict and not blockers
+                    else "project_scope_conflict"
+                    if blockers and not registration_conflict
+                    else "project_registration_conflict"
+                )
+                recheck = {
+                    "status": "blocked",
+                    "reason": reason,
+                    "conflicting_project_ids": [str(p["id"]) for p in blockers],
+                    "conflicting_project_keys": [
+                        str(p["project_key"]) for p in blockers
+                    ],
+                    "registered_project_key": (
+                        str(registration.get("project_key") or "")
+                        if registration is not None
+                        else ""
+                    ),
+                }
+                self._git_scope_probe_cache[project_id] = (now, source, remote)
+                return self._project_dict(
+                    current,
+                    project_source=source,
+                    git_scope_recheck=recheck,
+                )
+
+        # Unique ownership: heal inside a write transaction with re-check.
+        with self.database.connect(write=True) as connection:
+            current = self._require_project(connection, project_id)
+            if str(current["git_remote"] or "").strip():
+                return self._project_dict(current, project_source="git_remote")
+            if current["archived_at"] is not None:
+                return self._project_dict(current, project_source=source)
+
+            all_projects = connection.execute("SELECT * FROM projects").fetchall()
+            for other in all_projects:
+                if other["id"] == project_id or other["archived_at"] is not None:
+                    continue
+                if _stored_project_scope(other) == candidate_scope:
+                    self._git_scope_probe_cache[project_id] = (now, source, remote)
+                    return self._project_dict(
+                        current,
+                        project_source=source,
+                        git_scope_recheck={
+                            "status": "blocked",
+                            "reason": "project_scope_conflict",
+                            "conflicting_project_ids": [str(other["id"])],
+                            "conflicting_project_keys": [str(other["project_key"])],
+                        },
+                    )
+
+            heal_time = iso_now()
+            connection.execute(
+                """
+                UPDATE projects
+                SET git_remote = ?, logical_path = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (remote, logical, heal_time, project_id),
+            )
+            self._emit(
+                connection,
+                project_id,
+                "project.updated",
+                payload={
+                    "git_remote": remote,
+                    "logical_path": logical,
+                    "scope_healed": True,
+                },
+            )
+            healed = connection.execute(
+                "SELECT * FROM projects WHERE id = ?", (project_id,)
+            ).fetchone()
+            self._git_scope_probe_cache[project_id] = (now, "git_remote", remote)
+            return self._project_dict(
+                healed,
+                project_source="git_remote",
+                git_scope_recheck={"status": "healed", "reason": ""},
+            )
 
     def update_project(
         self,

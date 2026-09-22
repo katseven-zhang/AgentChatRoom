@@ -229,3 +229,148 @@ def test_resolve_still_accepts_owner_of_claimed_git_scope(test_service, tmp_path
     )
     assert resolved["id"] == project_b["id"]
     assert resolved["git_remote"] == remote_url
+
+
+def _init_git_only(path: Path):
+    subprocess.run(["git", "init"], cwd=str(path), check=True, capture_output=True)
+
+
+def test_get_project_reports_git_local_for_worktree_without_origin(
+    test_service, tmp_path
+):
+    """#170：git init 后无 origin 也显示 Git（本地仓库），且不写库。"""
+    service = test_service
+    project_dir = tmp_path / "local_only"
+    project_dir.mkdir()
+    project = service.create_project(root_path=str(project_dir), name="LocalOnly")
+    assert project["project_source"] == "path"
+
+    _init_git_only(project_dir)
+
+    fetched = service.get_project(project["id"])
+    assert fetched["project_source"] == "git_local"
+    assert fetched["git_remote"] is None
+    with service.database.connect() as connection:
+        row = connection.execute(
+            "SELECT git_remote FROM projects WHERE id = ?", (project["id"],)
+        ).fetchone()
+    assert row["git_remote"] is None
+    events = service.list_events(project["id"], after=0)["events"]
+    assert not [e for e in events if e["event_type"] == "project.updated"]
+
+    listed = next(p for p in service.list_projects() if p["id"] == project["id"])
+    assert listed["project_source"] == "git_local"
+
+
+def test_get_project_heals_unique_path_project_when_remote_appears(
+    test_service, tmp_path
+):
+    """#170/#172 无歧义：详情读取自愈升级，与 #166 加入路径语义一致。"""
+    service = test_service
+    project_dir = tmp_path / "heal_ok"
+    project_dir.mkdir()
+    project = service.create_project(root_path=str(project_dir), name="HealOk")
+    remote_url = "https://github.com/test-org/heal-ok.git"
+    _init_git_with_remote(project_dir, remote_url)
+
+    fetched = service.get_project(project["id"])
+    assert fetched["git_remote"] == remote_url
+    assert fetched["project_source"] == "git_remote"
+    assert fetched["git_scope_recheck"]["status"] == "healed"
+    events = service.list_events(project["id"], after=0)["events"]
+    assert [
+        e
+        for e in events
+        if e["event_type"] == "project.updated"
+        and e["payload"].get("scope_healed") is True
+    ]
+
+
+def test_get_project_fails_closed_when_git_scope_owned_by_other_room(
+    test_service, tmp_path
+):
+    """#172：path 项目 A 升级前若 git scope 已被 B 占用，不得静默双房。"""
+    service = test_service
+    dir_a = tmp_path / "owner_a"
+    dir_b = tmp_path / "owner_b"
+    dir_a.mkdir()
+    dir_b.mkdir()
+    remote_url = "https://github.com/test-org/owned.git"
+
+    _init_git_with_remote(dir_b, remote_url)
+    project_b = service.create_project(root_path=str(dir_b), name="OwnerB")
+    assert project_b["git_remote"] == remote_url
+
+    project_a = service.create_project(root_path=str(dir_a), name="PathA")
+    register_checkout_project(dir_a, project_a)
+    _init_git_with_remote(dir_a, remote_url)
+
+    fetched = service.get_project(project_a["id"])
+    assert fetched["git_remote"] is None
+    assert fetched["project_source"] == "git_remote"
+    assert fetched["git_scope_recheck"]["status"] == "blocked"
+    assert fetched["git_scope_recheck"]["reason"] in {
+        "project_registration_conflict",
+        "project_scope_conflict",
+    }
+    assert project_b["id"] in fetched["git_scope_recheck"]["conflicting_project_ids"]
+
+    with service.database.connect() as connection:
+        row = connection.execute(
+            "SELECT git_remote FROM projects WHERE id = ?", (project_a["id"],)
+        ).fetchone()
+    assert row["git_remote"] is None
+    events = service.list_events(project_a["id"], after=0)["events"]
+    assert not [e for e in events if e["event_type"] == "project.updated"]
+
+
+def test_get_project_without_git_opens_no_write_connection(
+    test_service, tmp_path, monkeypatch
+):
+    """#172：纯路径候选读取不打开写连接、不跑 git 自愈写路径。"""
+    service = test_service
+    project_dir = tmp_path / "plain_read"
+    project_dir.mkdir()
+    project = service.create_project(root_path=str(project_dir), name="PlainRead")
+
+    write_flags: list[bool] = []
+    original_connect = service.database.connect
+
+    def spy_connect(write: bool = False, **kwargs):
+        write_flags.append(write)
+        return original_connect(write=write, **kwargs)
+
+    monkeypatch.setattr(service.database, "connect", spy_connect)
+    fetched = service.get_project(project["id"])
+    assert fetched["project_source"] == "path"
+    assert fetched["git_remote"] is None
+    assert write_flags
+    assert not any(write_flags)
+
+
+def test_list_projects_ttl_avoids_repeat_git_probe(
+    test_service, tmp_path, monkeypatch
+):
+    """#172：列表读取对纯路径候选用 TTL 抑制重复 git 子进程。"""
+    service = test_service
+    project_dir = tmp_path / "list_ttl"
+    project_dir.mkdir()
+    service.create_project(root_path=str(project_dir), name="ListTtl")
+
+    probe_calls = {"n": 0}
+    original_git_info = __import__(
+        "agentchatroom.services", fromlist=["_project_git_info"]
+    )._project_git_info
+
+    def counting_git_info(root):
+        probe_calls["n"] += 1
+        return original_git_info(root)
+
+    monkeypatch.setattr(
+        "agentchatroom.services._project_git_info", counting_git_info
+    )
+    first = service.list_projects()
+    second = service.list_projects()
+    assert first[0]["project_source"] == "path"
+    assert second[0]["project_source"] == "path"
+    assert probe_calls["n"] == 1

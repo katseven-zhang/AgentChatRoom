@@ -85,7 +85,14 @@ def normalize_remote(value: str) -> str:
     return normalized.rstrip("/").lower()
 
 
-def detect_git_info(root: Path) -> tuple[str, Path]:
+def detect_git_info(root: Path) -> tuple[str, Path, bool]:
+    """Return (origin_remote, git_toplevel, is_git_work_tree).
+
+    Work-tree membership comes from ``rev-parse --show-toplevel`` succeeding —
+    not from whether ``remote.origin.url`` exists — so a plain ``git init``
+    is already a Git checkout for source/scope decisions.
+    """
+
     def git_output(*arguments: str) -> str:
         completed = subprocess.run(
             ["git", *arguments],
@@ -101,11 +108,13 @@ def detect_git_info(root: Path) -> tuple[str, Path]:
         return completed.stdout.decode("utf-8", "replace").strip()
 
     try:
-        remote = git_output("-C", str(root), "config", "--get", "remote.origin.url")
         top = git_output("-C", str(root), "rev-parse", "--show-toplevel")
-        return remote, Path(top).resolve() if top else root
+        if not top:
+            return "", root, False
+        remote = git_output("-C", str(root), "config", "--get", "remote.origin.url")
+        return remote, Path(top).resolve(), True
     except (OSError, subprocess.SubprocessError):
-        return "", root
+        return "", root, False
 
 
 _git_info = detect_git_info
@@ -307,7 +316,7 @@ def checkout_scope(
             "Project root must be an existing directory",
             details={"root_path": str(root)},
         )
-    remote, git_root = _git_info(root)
+    remote, git_root, _is_work_tree = _git_info(root)
     logical = derive_logical_path(root, git_root, logical_path)
     if remote:
         return {
@@ -315,6 +324,9 @@ def checkout_scope(
             "identity": normalize_remote(remote),
             "logical_path": logical,
         }
+    # Local work-tree without origin keeps path-scope identity (monorepo
+    # uniqueness stays path+logical); display/source still reports Git via
+    # project_source, and origin discovery later upgrades via #166 heal.
     return {
         "kind": "path",
         "identity": os.path.normcase(str(git_root.resolve())),

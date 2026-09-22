@@ -361,7 +361,10 @@ function agentStatus(status) {
 }
 
 function projectSource(project) {
-  return project.git_remote ? "Git" : "本地路径";
+  const source = project.project_source || (project.git_remote ? "git_remote" : "path");
+  if (source === "git_local") return "Git（本地仓库）";
+  if (source === "git_remote") return "Git（已关联远程）";
+  return "本地路径";
 }
 
 function currentAgentRoster(agentIdentities) {

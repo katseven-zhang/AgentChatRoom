@@ -368,10 +368,11 @@ def test_git_info_decodes_git_output_as_utf8_independent_of_locale(
 
     monkeypatch.setattr(project_registration.subprocess, "run", fake_run)
 
-    remote, git_root = project_registration._git_info(project_root)
+    remote, git_root, is_work_tree = project_registration._git_info(project_root)
 
     assert remote == "git@example.invalid:team/赞助管理工具.git"
     assert git_root == project_root.resolve()
+    assert is_work_tree is True
     assert checkout_scope(project_root) == {
         "kind": "git",
         "identity": "https://example.invalid/team/赞助管理工具",
@@ -396,10 +397,11 @@ def test_service_project_git_info_shares_utf8_decoding(tmp_path, monkeypatch):
 
     monkeypatch.setattr(project_registration.subprocess, "run", fake_run)
 
-    remote, git_root = services._project_git_info(project_root)
+    remote, git_root, is_work_tree = services._project_git_info(project_root)
 
     assert remote == ""
     assert git_root == project_root.resolve()
+    assert is_work_tree is True
     assert derive_logical_path(project_root, git_root) == ""
 
 
