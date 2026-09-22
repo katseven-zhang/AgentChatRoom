@@ -15,6 +15,7 @@ from .database import (
     ensure_project_member_columns,
     ensure_task_assignment_member_column,
     ensure_task_number_schema,
+    migrate_knowledge_source_event_ids,
 )
 
 
@@ -153,6 +154,8 @@ class PostgresDatabase:
                 while version < SCHEMA_VERSION:
                     target = version + 1
                     connection.executescript(MIGRATIONS[target])
+                    if target == 25:
+                        migrate_knowledge_source_event_ids(connection)
                     connection.execute(
                         "UPDATE schema_meta SET version = ?", (target,)
                     )

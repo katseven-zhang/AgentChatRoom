@@ -418,12 +418,30 @@ def test_migration_25_rewrites_knowledge_source_event_ids_to_project_seq(tmp_pat
 
     migrated = sqlite3.connect(path)
     migrated.row_factory = sqlite3.Row
+    # Portable path shared by SQLite and PostgreSQL (#169).
+    from agentchatroom.database import migrate_knowledge_source_event_ids
+
     migrated.executescript(MIGRATIONS[25])
+    migrate_knowledge_source_event_ids(migrated)
     row = migrated.execute(
         "SELECT source_event_ids_json FROM knowledge_asset_versions WHERE id = 'kav-1'"
     ).fetchone()
     migrated.close()
     assert _json.loads(row["source_event_ids_json"]) == [1, 2]
+
+
+def test_migration_25_sql_is_backend_portable():
+    """#169: MIGRATIONS[25] must not use SQLite-only json_each/json_group_array."""
+    from agentchatroom.database import MIGRATIONS as _M
+    from agentchatroom.postgres_database import postgres_script
+
+    script = _M[25]
+    assert "json_each" not in script
+    assert "json_group_array" not in script
+    # postgres_script is a pure string rewrite; must not fail on migration 25.
+    converted = postgres_script(script)
+    assert "json_each" not in converted
+    assert "json_group_array" not in converted
 
 
 def test_migrated_database_continues_numbering_after_backfill(tmp_path):

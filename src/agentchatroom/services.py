@@ -8460,11 +8460,66 @@ class AgentChatRoomService:
             ).fetchone()["cursor"]
         )
 
-    def snapshot(self, project_id: str) -> dict[str, Any]:
-        with self.database.connect() as connection:
-            return self._snapshot(connection, project_id)
+    def snapshot(
+        self,
+        project_id: str,
+        *,
+        reports_before: str | None = None,
+        reports_after: str | None = None,
+        reviews_before: str | None = None,
+        reviews_after: str | None = None,
+        acknowledgements_before: str | None = None,
+        acknowledgements_after: str | None = None,
+    ) -> dict[str, Any]:
+        """Project snapshot with optional list cursors for older/newer pages (#183).
 
-    def _snapshot(self, connection: Any, project_id: str) -> dict[str, Any]:
+        Cursor format is ``created_at|id`` (acks: ``created_at|event_id|session_id``)
+        so ties on ``created_at`` resolve by primary key. Pass ``page_info.*.next``
+        as ``*_before`` to fetch the older page, or ``page_info.*.before`` as
+        ``*_after`` to fetch the newer page.
+        """
+        with self.database.connect() as connection:
+            return self._snapshot(
+                connection,
+                project_id,
+                reports_before=reports_before,
+                reports_after=reports_after,
+                reviews_before=reviews_before,
+                reviews_after=reviews_after,
+                acknowledgements_before=acknowledgements_before,
+                acknowledgements_after=acknowledgements_after,
+            )
+
+    @staticmethod
+    def _encode_page_cursor(row: Mapping[str, Any], *fields: str) -> str:
+        return "|".join(str(row.get(field) or "") for field in fields)
+
+    @staticmethod
+    def _decode_page_cursor(cursor: str | None, expected_parts: int) -> list[str] | None:
+        if not cursor:
+            return None
+        parts = cursor.split("|")
+        if len(parts) != expected_parts or any(not part for part in parts):
+            raise DomainError(
+                "invalid_page_cursor",
+                "Snapshot page cursor must be created_at|id (acks add event_id|session_id)",
+                status_code=422,
+                details={"cursor": cursor},
+            )
+        return parts
+
+    def _snapshot(
+        self,
+        connection: Any,
+        project_id: str,
+        *,
+        reports_before: str | None = None,
+        reports_after: str | None = None,
+        reviews_before: str | None = None,
+        reviews_after: str | None = None,
+        acknowledgements_before: str | None = None,
+        acknowledgements_after: str | None = None,
+    ) -> dict[str, Any]:
             project = self._project_dict(self._require_project(connection, project_id))
             agent_rows = connection.execute(
                 """
@@ -8516,51 +8571,139 @@ class AgentChatRoomService:
                 )
                 if lease["active"]
             ]
-            reports = [
-                {
-                    **dict(row),
-                    "files": json_load(row["files_json"], []),
-                    "tests": json_load(row["tests_json"], []),
-                    "system_evidence": json_load(row["system_evidence_json"], {}),
-                }
-                for row in connection.execute(
-                    """
-                    SELECT * FROM work_reports WHERE project_id = ?
-                    ORDER BY created_at DESC LIMIT ?
-                    """,
-                    (project_id, recent_limit),
-                ).fetchall()
-            ]
+
+            def _fetch_tied_page(
+                table: str,
+                *,
+                before: str | None,
+                after: str | None,
+            ) -> list[dict[str, Any]]:
+                if before and after:
+                    raise DomainError(
+                        "invalid_page_cursor",
+                        "Provide only one of before/after for a snapshot list page",
+                        status_code=422,
+                    )
+                where = ["project_id = ?"]
+                params: list[Any] = [project_id]
+                order_time = "DESC"
+                order_id = "DESC"
+                cursor_parts = self._decode_page_cursor(before or after, 2)
+                if cursor_parts is not None:
+                    created_at, row_id = cursor_parts
+                    if before:
+                        where.append(
+                            "(created_at < ? OR (created_at = ? AND id < ?))"
+                        )
+                        params.extend([created_at, created_at, row_id])
+                    else:
+                        where.append(
+                            "(created_at > ? OR (created_at = ? AND id > ?))"
+                        )
+                        params.extend([created_at, created_at, row_id])
+                        order_time = "ASC"
+                        order_id = "ASC"
+                params.append(recent_limit)
+                rows = [
+                    dict(row)
+                    for row in connection.execute(
+                        f"SELECT * FROM {table} WHERE {' AND '.join(where)} "
+                        f"ORDER BY created_at {order_time}, id {order_id} LIMIT ?",
+                        params,
+                    ).fetchall()
+                ]
+                if after and rows:
+                    rows.reverse()
+                return rows
+
+            def _fetch_ack_page(
+                *,
+                before: str | None,
+                after: str | None,
+            ) -> list[dict[str, Any]]:
+                if before and after:
+                    raise DomainError(
+                        "invalid_page_cursor",
+                        "Provide only one of before/after for a snapshot list page",
+                        status_code=422,
+                    )
+                where = ["e.project_id = ?"]
+                params: list[Any] = [project_id]
+                order_time = "DESC"
+                order_event = "DESC"
+                order_session = "DESC"
+                cursor_parts = self._decode_page_cursor(before or after, 3)
+                if cursor_parts is not None:
+                    created_at, event_id, session_id = cursor_parts
+                    if before:
+                        where.append(
+                            "(a.created_at < ? OR (a.created_at = ? AND "
+                            "(e.id < ? OR (e.id = ? AND a.session_id < ?))))"
+                        )
+                        params.extend(
+                            [
+                                created_at,
+                                created_at,
+                                int(event_id),
+                                int(event_id),
+                                session_id,
+                            ]
+                        )
+                    else:
+                        where.append(
+                            "(a.created_at > ? OR (a.created_at = ? AND "
+                            "(e.id > ? OR (e.id = ? AND a.session_id > ?))))"
+                        )
+                        params.extend(
+                            [
+                                created_at,
+                                created_at,
+                                int(event_id),
+                                int(event_id),
+                                session_id,
+                            ]
+                        )
+                        order_time = "ASC"
+                        order_event = "ASC"
+                        order_session = "ASC"
+                params.append(recent_limit)
+                rows = [
+                    dict(row)
+                    for row in connection.execute(
+                        "SELECT e.project_seq AS event_id, a.session_id, a.created_at "
+                        "FROM event_acknowledgements a "
+                        "JOIN events e ON e.id = a.event_id "
+                        f"WHERE {' AND '.join(where)} "
+                        f"ORDER BY a.created_at {order_time}, e.id {order_event}, "
+                        f"a.session_id {order_session} LIMIT ?",
+                        params,
+                    ).fetchall()
+                ]
+                if after and rows:
+                    rows.reverse()
+                return rows
+
+            reports = _fetch_tied_page(
+                "work_reports", before=reports_before, after=reports_after
+            )
             for report in reports:
-                report.pop("files_json", None)
-                report.pop("tests_json", None)
-                report.pop("system_evidence_json", None)
-            reviews = [
-                {**dict(row), "criteria": json_load(row["criteria_json"], [])}
-                for row in connection.execute(
-                    """
-                    SELECT * FROM reviews WHERE project_id = ?
-                    ORDER BY created_at DESC LIMIT ?
-                    """,
-                    (project_id, recent_limit),
-                ).fetchall()
-            ]
+                report["files"] = json_load(report.pop("files_json", "[]"), [])
+                report["tests"] = json_load(report.pop("tests_json", "[]"), [])
+                report["system_evidence"] = json_load(
+                    report.pop("system_evidence_json", "{}"), {}
+                )
+
+            reviews = _fetch_tied_page(
+                "reviews", before=reviews_before, after=reviews_after
+            )
             for review in reviews:
-                review.pop("criteria_json", None)
-            acknowledgements = [
-                dict(row)
-                for row in connection.execute(
-                    """
-                    SELECT e.project_seq AS event_id, a.session_id, a.created_at
-                    FROM event_acknowledgements a
-                    JOIN events e ON e.id = a.event_id
-                    WHERE e.project_id = ?
-                    ORDER BY a.created_at DESC
-                    LIMIT ?
-                    """,
-                    (project_id, recent_limit),
-                ).fetchall()
-            ]
+                review["criteria"] = json_load(review.pop("criteria_json", "[]"), [])
+
+            acknowledgements = _fetch_ack_page(
+                before=acknowledgements_before,
+                after=acknowledgements_after,
+            )
+
             totals = {
                 "reports": int(
                     connection.execute(
@@ -8607,7 +8750,10 @@ class AgentChatRoomService:
                 }
                 for agent in agents
             ]
-            def _page_cursors(rows: list[dict[str, Any]]) -> dict[str, Any]:
+
+            def _page_cursors(
+                rows: list[dict[str, Any]], *cursor_fields: str
+            ) -> dict[str, Any]:
                 info: dict[str, Any] = {
                     "returned": len(rows),
                     "has_more": False,
@@ -8615,28 +8761,36 @@ class AgentChatRoomService:
                     "before": None,
                 }
                 if rows:
-                    info["before"] = rows[0].get("created_at")
+                    info["before"] = self._encode_page_cursor(rows[0], *cursor_fields)
                 return info
 
-            reports_info = _page_cursors(reports)
+            reports_info = _page_cursors(reports, "created_at", "id")
             reports_info["total"] = totals["reports"]
             reports_info["has_more"] = totals["reports"] > len(reports)
             if reports_info["has_more"] and reports:
-                reports_info["next"] = reports[-1].get("created_at")
+                reports_info["next"] = self._encode_page_cursor(
+                    reports[-1], "created_at", "id"
+                )
 
-            reviews_info = _page_cursors(reviews)
+            reviews_info = _page_cursors(reviews, "created_at", "id")
             reviews_info["total"] = totals["reviews"]
             reviews_info["has_more"] = totals["reviews"] > len(reviews)
             if reviews_info["has_more"] and reviews:
-                reviews_info["next"] = reviews[-1].get("created_at")
+                reviews_info["next"] = self._encode_page_cursor(
+                    reviews[-1], "created_at", "id"
+                )
 
-            acks_info = _page_cursors(acknowledgements)
+            acks_info = _page_cursors(
+                acknowledgements, "created_at", "event_id", "session_id"
+            )
             acks_info["total"] = totals["acknowledgements"]
             acks_info["has_more"] = totals["acknowledgements"] > len(
                 acknowledgements
             )
             if acks_info["has_more"] and acknowledgements:
-                acks_info["next"] = acknowledgements[-1].get("created_at")
+                acks_info["next"] = self._encode_page_cursor(
+                    acknowledgements[-1], "created_at", "event_id", "session_id"
+                )
 
             return {
                 "project": project,

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sqlite3
 import os
 from contextlib import contextmanager
@@ -800,28 +801,64 @@ MIGRATIONS = {
         )
         WHERE last_read_cursor > 0;
     """,
+    # Portable no-op: the real rewrite runs in migrate_knowledge_source_event_ids()
+    # so SQLite and PostgreSQL share one executable path (no json_each/json_group_array).
     25: """
-        UPDATE knowledge_asset_versions
-        SET source_event_ids_json = (
-            SELECT COALESCE(json_group_array(seq), '[]')
-            FROM (
-                SELECT COALESCE(
-                    (
-                        SELECT e.project_seq
-                        FROM events e
-                        JOIN knowledge_assets ka ON ka.project_id = e.project_id
-                        WHERE ka.id = knowledge_asset_versions.asset_id
-                          AND e.id = CAST(j.value AS INTEGER)
-                    ),
-                    CAST(j.value AS INTEGER)
-                ) AS seq
-                FROM json_each(knowledge_asset_versions.source_event_ids_json) AS j
-            )
-        )
-        WHERE source_event_ids_json NOT LIKE '[]'
-          AND source_event_ids_json LIKE '%[%';
+        SELECT 1;
     """,
 }
+
+
+def migrate_knowledge_source_event_ids(connection: Any) -> None:
+    """Rewrite knowledge source_event_ids from global event id → project_seq (#169).
+
+    Applied after MIGRATIONS[25] on every backend. Uses only portable SQL and the
+    stdlib json module so PostgresDatabase can run the same code path.
+    """
+    rows = connection.execute(
+        "SELECT id, asset_id, source_event_ids_json FROM knowledge_asset_versions"
+    ).fetchall()
+    for row in rows:
+        raw = row["source_event_ids_json"]
+        if not raw or raw in ("[]", ""):
+            continue
+        try:
+            ids = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(ids, list) or not ids:
+            continue
+        asset = connection.execute(
+            "SELECT project_id FROM knowledge_assets WHERE id = ?",
+            (row["asset_id"],),
+        ).fetchone()
+        if asset is None:
+            continue
+        project_id = asset["project_id"]
+        new_ids: list[Any] = []
+        changed = False
+        for value in ids:
+            try:
+                old_id = int(value)
+            except (TypeError, ValueError):
+                new_ids.append(value)
+                continue
+            match = connection.execute(
+                "SELECT project_seq FROM events WHERE id = ? AND project_id = ?",
+                (old_id, project_id),
+            ).fetchone()
+            if match is None:
+                new_ids.append(old_id)
+                continue
+            seq = int(match["project_seq"])
+            if seq != old_id:
+                changed = True
+            new_ids.append(seq)
+        if changed or new_ids != ids:
+            connection.execute(
+                "UPDATE knowledge_asset_versions SET source_event_ids_json = ? WHERE id = ?",
+                (json.dumps(new_ids), row["id"]),
+            )
 
 
 def ensure_event_number_schema(connection: Any, *, postgres: bool = False) -> None:
@@ -1017,6 +1054,8 @@ class Database:
                 while version < SCHEMA_VERSION:
                     target = version + 1
                     connection.executescript(MIGRATIONS[target])
+                    if target == 25:
+                        migrate_knowledge_source_event_ids(connection)
                     connection.execute("UPDATE schema_meta SET version = ?", (target,))
                     version = target
 

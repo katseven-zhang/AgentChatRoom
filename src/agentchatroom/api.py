@@ -1714,11 +1714,28 @@ def create_app(
         )
 
     @app.get("/api/v1/projects/{project_id}/snapshot")
-    def project_snapshot(project_id: str, response: Response) -> dict[str, Any]:
+    def project_snapshot(
+        project_id: str,
+        response: Response,
+        reports_before: str | None = Query(None),
+        reports_after: str | None = Query(None),
+        reviews_before: str | None = Query(None),
+        reviews_after: str | None = Query(None),
+        acknowledgements_before: str | None = Query(None),
+        acknowledgements_after: str | None = Query(None),
+    ) -> dict[str, Any]:
         response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
         response.headers["Pragma"] = "no-cache"
         response.headers["Expires"] = "0"
-        return service.snapshot(project_id)
+        return service.snapshot(
+            project_id,
+            reports_before=reports_before,
+            reports_after=reports_after,
+            reviews_before=reviews_before,
+            reviews_after=reviews_after,
+            acknowledgements_before=acknowledgements_before,
+            acknowledgements_after=acknowledgements_after,
+        )
 
     @app.get("/api/v1/projects/{project_id}/members")
     def list_project_members(

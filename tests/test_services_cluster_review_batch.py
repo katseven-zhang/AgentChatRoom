@@ -383,12 +383,13 @@ def test_snapshot_cost_bounded_with_many_events_and_reports(
             connection.execute(
                 """
                 INSERT INTO work_reports(
-                    project_id, task_id, session_id, summary, files_json,
+                    id, project_id, task_id, session_id, summary, files_json,
                     tests_json, system_evidence_json, commit_hash, created_at
                 )
-                VALUES (?, ?, ?, ?, '[]', '[]', '{}', '', ?)
+                VALUES (?, ?, ?, ?, ?, '[]', '[]', '{}', '', ?)
                 """,
                 (
+                    f"wr-bulk-{i:04d}",
                     project["id"],
                     task_id,
                     joined["agent"]["id"],
@@ -413,10 +414,49 @@ def test_snapshot_cost_bounded_with_many_events_and_reports(
     assert snapshot["page_info"]["reports"]["has_more"] is True
     assert snapshot["page_info"]["reports"]["next"]
     assert snapshot["page_info"]["reports"]["before"]
+    # Cursor must carry created_at|id tiebreaker (#183).
+    next_cursor = snapshot["page_info"]["reports"]["next"]
+    before_cursor = snapshot["page_info"]["reports"]["before"]
+    assert "|" in next_cursor and "|" in before_cursor
+
+    # Consumable older page: pass next → reports_before.
+    page2 = service.snapshot(project["id"], reports_before=next_cursor)
+    assert page2["reports"], "older page must be non-empty when has_more"
+    page2_ids = {row["id"] for row in page2["reports"]}
+    page1_ids = {row["id"] for row in snapshot["reports"]}
+    assert not (page1_ids & page2_ids), "pages must not overlap"
+    # Older page items are strictly older than the page1 window boundary.
+    boundary_created = next_cursor.split("|", 1)[0]
+    assert all(row["created_at"] <= boundary_created for row in page2["reports"])
+
+    # Consumable newer page: pass before → reports_after returns the same window head.
+    newer = service.snapshot(project["id"], reports_after=before_cursor)
+    # Items strictly newer than the oldest-in-window... before is newest of page1,
+    # so after should return items newer than page1's newest (possibly empty if page1 is newest).
+    newer_ids = {row["id"] for row in newer["reports"]}
+    assert not (newer_ids & page2_ids)
+
     # Bounded payload: recent window only, not the full 200-report history.
     assert len(encoded) < 2_000_000
     # Bounded projection: must finish quickly even with 5k events + 200 reports.
     assert elapsed < 5.0
+
+
+def test_snapshot_page_cursor_rejects_malformed_and_both_directions(
+    service, project, joined
+):
+    with pytest.raises(DomainError) as bad:
+        service.snapshot(project["id"], reports_before="not-a-cursor")
+    assert bad.value.code == "invalid_page_cursor"
+    assert bad.value.status_code == 422
+
+    with pytest.raises(DomainError) as both:
+        service.snapshot(
+            project["id"],
+            reports_before="2026-01-01T00:00:00Z|x",
+            reports_after="2026-01-01T00:00:00Z|x",
+        )
+    assert both.value.code == "invalid_page_cursor"
 
 
 def test_events_project_type_task_index_exists():
