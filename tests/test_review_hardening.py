@@ -221,7 +221,7 @@ def test_work_report_rejects_unregistered_and_untrusted_worktrees(
     audit = service.query_audit(
         project["id"],
         task_id=hashed["id"],
-        event_type="work_report.commit_unverified",
+        event_type="work.commit_unverified",
     )
     assert audit["events"]
     assert audit["events"][0]["payload"]["commit_hash"] == "unknown"

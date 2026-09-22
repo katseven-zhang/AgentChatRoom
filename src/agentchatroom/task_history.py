@@ -80,7 +80,12 @@ def history_detail_kind(event_type: str) -> str:
         return "message"
     if event_type.startswith("review."):
         return "review"
-    if event_type in {"work.reported", "task.completed"}:
+    if event_type in {
+        "work.reported",
+        "task.completed",
+        "work.commit_unverified",
+        "work_report.commit_unverified",
+    }:
         return "work_report"
     if event_type.startswith("task.integration_"):
         return "integration"

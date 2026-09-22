@@ -420,6 +420,11 @@ def test_every_config_file_schema_key_maps_into_settings(monkeypatch, tmp_path):
             "mcp_message_limit": 7,
             "message_max_body_length": 4096,
             "task_text_max_length": 2048,
+            "list_input_max_count": 25,
+            "test_entry_notes_max_length": 512,
+            "project_document_max_bytes": 4096,
+            "snapshot_recent_limit": 50,
+            "idempotency_retention_days": 7,
             # mcp_message_context_limit is an alias; covered in a dedicated load below.
         },
         "security": {

@@ -22,6 +22,13 @@ def normalize_logical_path(value: str) -> str:
     return value.strip().replace("\\", "/").strip("/")
 
 
+def logical_paths_equal(left: str, right: str) -> bool:
+    """Case-insensitive logical_path equality independent of host OS."""
+    return normalize_logical_path(left).casefold() == normalize_logical_path(
+        right
+    ).casefold()
+
+
 def validate_logical_path(value: str) -> str:
     raw = value.strip()
     if not raw:
@@ -42,7 +49,10 @@ def validate_logical_path(value: str) -> str:
     normalized = posix_path.as_posix().strip("/")
     if normalized == ".":
         return ""
-    return os.path.normcase(normalized).replace("\\", "/")
+    # Preserve path case on every OS so Windows and Linux checkouts of the
+    # same monorepo subproject store the same logical_path. Comparisons use
+    # casefold via logical_paths_equal.
+    return normalized.replace("\\", "/")
 
 
 def derive_logical_path(
@@ -65,7 +75,7 @@ def derive_logical_path(
         ) from error
     derived = validate_logical_path(relative.as_posix())
     requested = validate_logical_path(requested_logical_path)
-    if requested and requested != derived:
+    if requested and not logical_paths_equal(requested, derived):
         raise DomainError(
             "invalid_logical_path",
             "logical_path must match the path derived from project_path",
@@ -395,9 +405,12 @@ def _load_document(path: Path) -> dict[str, Any]:
             raise _invalid_registration(path, "Checkout Project registration has an invalid scope kind")
         if not isinstance(scope.get("identity"), str) or not scope["identity"].strip():
             raise _invalid_registration(path, "Checkout Project registration has an invalid scope identity")
-        if normalize_logical_path(str(scope.get("logical_path", "") or "")) != logical:
+        if not logical_paths_equal(
+            normalize_logical_path(str(scope.get("logical_path", "") or "")),
+            logical,
+        ):
             raise _invalid_registration(path, "Checkout Project registration scope does not match its logical path")
-        seen.add(logical)
+        seen.add(logical.casefold())
     return document
 
 
@@ -412,8 +425,10 @@ def load_checkout_registration(
     matches = [
         registration
         for registration in document["registrations"]
-        if normalize_logical_path(str(registration.get("logical_path", "") or ""))
-        == logical
+        if logical_paths_equal(
+            normalize_logical_path(str(registration.get("logical_path", "") or "")),
+            logical,
+        )
     ]
     return dict(matches[0]) if matches else None
 
@@ -534,8 +549,10 @@ def register_checkout_project(
         (
             registration
             for registration in registrations
-            if normalize_logical_path(str(registration.get("logical_path", "") or ""))
-            == logical
+            if logical_paths_equal(
+                normalize_logical_path(str(registration.get("logical_path", "") or "")),
+                logical,
+            )
         ),
         None,
     )
@@ -590,8 +607,12 @@ def remove_checkout_project_registration(
         registration
         for registration in document["registrations"]
         if not (
-            normalize_logical_path(str(registration.get("logical_path", "") or ""))
-            == logical
+            logical_paths_equal(
+                normalize_logical_path(
+                    str(registration.get("logical_path", "") or "")
+                ),
+                logical,
+            )
             and str(registration.get("project_key", "")).strip() == project_key.strip()
         )
     ]

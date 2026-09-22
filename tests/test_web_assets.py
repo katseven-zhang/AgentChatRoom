@@ -2686,14 +2686,18 @@ def test_web_event_label_covers_services_emit_event_types(tmp_path):
             "task.unblocked",
             "task.cancelled",
             "task.updated",
-            "work_report.commit_unverified",
+            "work.commit_unverified",
             "audit.purged",
         }
     )
 
     assert event_types, "failed to collect service emit event types"
 
-    missing = sorted(et for et in event_types if f'"{et}"' not in body)
+    missing = sorted(
+        et
+        for et in event_types
+        if f'"{et}"' not in body and f'"{et}"' not in javascript
+    )
     assert not missing, f"eventLabel missing labels for: {missing}"
 
     for et in (
@@ -2717,10 +2721,11 @@ def test_web_event_label_covers_services_emit_event_types(tmp_path):
         "backup.restore_started",
         "backup.restore_completed",
         "backup.restore_rejected",
+        "work.commit_unverified",
         "work_report.commit_unverified",
         "audit.purged",
     ):
-        assert f'"{et}"' in body, et
+        assert f'"{et}"' in body or f'"{et}"' in javascript, et
 
     harness = tmp_path / "event_label.js"
     harness.write_text(

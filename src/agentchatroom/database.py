@@ -11,7 +11,7 @@ if TYPE_CHECKING:
     from .config import Settings
 
 
-SCHEMA_VERSION = 22
+SCHEMA_VERSION = 23
 
 
 class DatabaseBackend(Protocol):
@@ -304,6 +304,9 @@ ON events(project_id, id);
 
 CREATE INDEX IF NOT EXISTS idx_events_project_actor_time
 ON events(project_id, actor_session_id, created_at);
+
+CREATE INDEX IF NOT EXISTS idx_events_project_type_task
+ON events(project_id, event_type, task_id);
 
 CREATE TABLE IF NOT EXISTS event_number_sequences (
     project_id TEXT PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,
@@ -779,6 +782,10 @@ MIGRATIONS = {
         SELECT project_id, COALESCE(MAX(project_seq), 0) + 1
         FROM events GROUP BY project_id
         ON CONFLICT(project_id) DO NOTHING;
+    """,
+    23: """
+        CREATE INDEX IF NOT EXISTS idx_events_project_type_task
+        ON events(project_id, event_type, task_id);
     """,
 }
 

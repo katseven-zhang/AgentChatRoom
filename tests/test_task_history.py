@@ -203,6 +203,8 @@ def test_task_history_rest_mcp_and_detail_kind_alignment(
     from agentchatroom import mcp_server
 
     assert history_detail_kind("review.submitted") == "review"
+    assert history_detail_kind("work.commit_unverified") == "work_report"
+    assert history_detail_kind("work_report.commit_unverified") == "work_report"
     executor, _reviewer = joined_agents
     task = service.create_task(
         project["id"],

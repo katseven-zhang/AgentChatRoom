@@ -503,6 +503,7 @@ function eventLabel(type) {
     "lease.released": "释放了文件范围", "lease.conflict": "检测到文件冲突",
     "lease.pre_commit_blocked": "提交前检查被文件占用阻断",
     "work.reported": "提交了工作证据",
+    "work.commit_unverified": "工作证据提交时未核验 Commit",
     "work_report.commit_unverified": "工作证据提交时未核验 Commit",
     "review.submitted": "提交了验证结论",
     "task.integration_completed": "完成了最终集成", "task.integration_failed": "记录了集成失败",

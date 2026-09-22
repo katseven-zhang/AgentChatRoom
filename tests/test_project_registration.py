@@ -307,7 +307,7 @@ def test_checkout_scope_is_detected_by_backend(tmp_path):
     assert checkout_scope(api) == {
         "kind": "git",
         "identity": "https://example.invalid/team/repo",
-        "logical_path": os.path.normcase("packages/api").replace("\\", "/"),
+        "logical_path": "packages/api",
     }
 
 
@@ -325,6 +325,14 @@ def test_logical_path_must_be_repository_relative(project_dir, logical_path):
 def test_logical_path_normalizes_safe_repository_relative_paths():
     assert validate_logical_path(r"packages\\api") == "packages/api"
     assert validate_logical_path(".") == ""
+    assert validate_logical_path("Packages/MyLib") == "Packages/MyLib"
+
+
+def test_logical_paths_equal_is_case_insensitive_across_platforms():
+    from agentchatroom.project_registration import logical_paths_equal
+
+    assert logical_paths_equal("Packages/MyLib", "packages/mylib")
+    assert not logical_paths_equal("Packages/MyLib", "packages/other")
 
 
 def test_logical_path_must_match_actual_project_directory(tmp_path):
@@ -333,7 +341,7 @@ def test_logical_path_must_match_actual_project_directory(tmp_path):
     api.mkdir(parents=True)
     subprocess.run(["git", "-C", str(repository), "init"], check=True, capture_output=True)
 
-    expected = os.path.normcase("packages/api").replace("\\", "/")
+    expected = "packages/api"
     assert derive_logical_path(api, repository) == expected
     with pytest.raises(DomainError) as mismatch:
         derive_logical_path(api, repository, "packages/web")
@@ -426,7 +434,7 @@ def test_checkout_scope_accepts_unicode_repository_subdirectory(tmp_path):
     assert checkout_scope(api) == {
         "kind": "path",
         "identity": os.path.normcase(str(repository.resolve())),
-        "logical_path": os.path.normcase("packages/接口").replace("\\", "/"),
+        "logical_path": "packages/接口",
     }
 
 
@@ -487,8 +495,8 @@ def test_checkout_registration_supports_derived_logical_subprojects_and_removal(
     register_checkout_project(api_dir, api)
     register_checkout_project(web_dir, web)
 
-    api_logical = os.path.normcase("packages/api").replace("\\", "/")
-    web_logical = os.path.normcase("packages/web").replace("\\", "/")
+    api_logical = "packages/api"
+    web_logical = "packages/web"
     assert api["project_key"] != web["project_key"]
     assert api["logical_path"] == api_logical
     assert web["logical_path"] == web_logical
@@ -571,7 +579,7 @@ def test_local_mcp_join_derives_monorepo_subproject_from_project_path(
         agent_name="API Reviewer", client="generic-client"
     )
 
-    expected = os.path.normcase("packages/api").replace("\\", "/")
+    expected = "packages/api"
     assert root_join["result"]["project"]["logical_path"] == ""
     assert api_join["result"]["project"]["logical_path"] == expected
     assert api_repeat["result"]["project"]["id"] == api_join["result"]["project"]["id"]

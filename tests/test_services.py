@@ -2140,6 +2140,10 @@ def test_work_report_non_owner_forged_commit_is_403_with_zero_events(
     events_after = service.list_events(project["id"], after=0)["events"]
     assert events_after == events_before
     assert not any(
+        event["event_type"] == "work.commit_unverified"
+        for event in events_after
+    )
+    assert not any(
         event["event_type"] == "work_report.commit_unverified"
         for event in events_after
     )
@@ -2262,6 +2266,23 @@ def test_task_dependencies_block_claim_until_verified(service, project, joined_a
         token=reviewer["token"],
         verdict="approved",
         criteria=[{"criterion": "Foundation works", "status": "passed"}],
+    )
+    # Approved but not yet integrated still blocks downstream claims.
+    with pytest.raises(DomainError) as pending_integration:
+        service.claim_task(
+            project["id"], dependent["id"], reviewer["agent"]["id"], reviewer["token"]
+        )
+    assert pending_integration.value.code == "task_dependencies_incomplete"
+
+    service.submit_integration(
+        project["id"],
+        prerequisite["id"],
+        integrator_session_id=reviewer["agent"]["id"],
+        token=reviewer["token"],
+        result="done",
+        summary="Foundation integrated",
+        files=["src/foundation.py"],
+        tests=[{"command": "pytest", "exit_code": 0}],
     )
     claimed = service.claim_task(
         project["id"], dependent["id"], reviewer["agent"]["id"], reviewer["token"]

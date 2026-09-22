@@ -488,17 +488,17 @@ def _project_scope(
     remote: str, git_root: Path, logical_path: str
 ) -> tuple[str, str, str]:
     if remote:
-        return ("git", normalize_remote(remote), logical_path)
-    return ("path", os.path.normcase(str(git_root.resolve())), logical_path)
+        return ("git", normalize_remote(remote), logical_path.casefold())
+    return ("path", os.path.normcase(str(git_root.resolve())), logical_path.casefold())
 
 
 def _stored_project_scope(project: Mapping[str, Any]) -> tuple[str, str, str]:
     logical_path = str(project["logical_path"] or "")
     remote = str(project["git_remote"] or "")
     if remote:
-        return ("git", normalize_remote(remote), logical_path)
+        return ("git", normalize_remote(remote), logical_path.casefold())
     root_path = Path(str(project["root_path"])).expanduser().resolve()
-    return ("path", os.path.normcase(str(root_path)), logical_path)
+    return ("path", os.path.normcase(str(root_path)), logical_path.casefold())
 
 
 class AgentChatRoomService:
@@ -506,6 +506,10 @@ class AgentChatRoomService:
         self.database = database
         self.settings = settings
         self._retention_last_run: dict[str, float] = {}
+        # Serializes create_backup / restore_backup (including auto_backup_worker)
+        # so a backup cannot snapshot a half-restored SQLite file and restore
+        # stale checks cannot race concurrent in-process backups.
+        self._backup_restore_lock = threading.RLock()
         # Wired by the API layer to the MCP transport state lookup: "alive",
         # "gone" (reaped transport, tombstone retained) or "unknown" for
         # sessions without an HTTP transport. Presence heartbeats are
@@ -525,6 +529,7 @@ class AgentChatRoomService:
     def initialize(self) -> None:
         self.database.initialize()
         self._purge_stale_credentials()
+        self.enforce_idempotency_retention(force=True)
 
     def _purge_stale_credentials(self) -> None:
         """#147：启动维护时清理已过期与已吊销的失效凭据。
@@ -544,6 +549,106 @@ class AgentChatRoomService:
                 """,
                 (iso_now(),),
             )
+
+    def enforce_idempotency_retention(self, *, force: bool = False) -> dict[str, Any]:
+        """Delete idempotency_records older than the configured retention window.
+
+        0 keeps records forever. Within the window, replaying the same
+        request_id still hits the stored response; after cleanup, an old
+        request_id is treated as a new request.
+        """
+        retention_days = int(getattr(self.settings, "idempotency_retention_days", 30))
+        if retention_days <= 0:
+            return {"deleted": 0, "retention_days": 0}
+        now = time.time()
+        if not force and now - self._retention_last_run.get("idempotency", 0.0) < 3600:
+            return {"deleted": 0, "retention_days": retention_days, "skipped": True}
+        self._retention_last_run["idempotency"] = now
+        cutoff = (utc_now() - timedelta(days=retention_days)).isoformat().replace(
+            "+00:00", "Z"
+        )
+        with self.database.connect(write=True) as connection:
+            cursor = connection.execute(
+                "DELETE FROM idempotency_records WHERE created_at < ?",
+                (cutoff,),
+            )
+            deleted = max(0, int(cursor.rowcount))
+        return {"deleted": deleted, "retention_days": retention_days, "cutoff": cutoff}
+
+    @staticmethod
+    def _require_list_input_limit(
+        field: str,
+        items: Any,
+        *,
+        limit: int,
+        status_code: int = 422,
+    ) -> list[Any]:
+        materialized = list(items or [])
+        if len(materialized) > limit:
+            raise DomainError(
+                "list_input_too_long",
+                f"{field} exceeds list_input_max_count ({limit})",
+                status_code=status_code,
+                details={"field": field, "limit": limit, "count": len(materialized)},
+            )
+        return materialized
+
+    def _validate_test_evidence_list(
+        self, tests: Any, *, field: str = "tests"
+    ) -> list[dict[str, Any]]:
+        materialized = self._require_list_input_limit(
+            field,
+            tests,
+            limit=int(getattr(self.settings, "list_input_max_count", 100)),
+        )
+        allowed_keys = {"command", "exit_code", "notes"}
+        notes_limit = int(getattr(self.settings, "test_entry_notes_max_length", 4000))
+        cleaned: list[dict[str, Any]] = []
+        for test in materialized:
+            if not isinstance(test, dict):
+                raise DomainError(
+                    "invalid_test_evidence",
+                    "Every test entry must be an object with command/exit_code/notes",
+                    status_code=422,
+                    details={"field": field},
+                )
+            unexpected = sorted(set(test) - allowed_keys)
+            if unexpected:
+                raise DomainError(
+                    "invalid_test_evidence",
+                    "Test entries only accept command, exit_code, and notes keys",
+                    status_code=422,
+                    details={"field": field, "unexpected_keys": unexpected},
+                )
+            if not str(test.get("command", "")).strip() or not isinstance(
+                test.get("exit_code"), int
+            ):
+                raise DomainError(
+                    "invalid_test_evidence",
+                    "Every test entry requires a command and integer exit_code",
+                    status_code=422,
+                    details={"field": field},
+                )
+            notes = str(test.get("notes") or "")
+            if len(notes) > notes_limit:
+                raise DomainError(
+                    "invalid_test_evidence",
+                    f"Test notes exceeds test_entry_notes_max_length ({notes_limit})",
+                    status_code=422,
+                    details={
+                        "field": field,
+                        "limit": notes_limit,
+                        "notes_length": len(notes),
+                    },
+                )
+            cleaned.append(
+                {
+                    "command": str(test.get("command")),
+                    "exit_code": int(test.get("exit_code")),
+                    "notes": notes,
+                }
+            )
+        return cleaned
 
     def close(self) -> None:
         self._token_touch.close()
@@ -2864,6 +2969,14 @@ class AgentChatRoomService:
                 "invalid_workspace",
                 f"{field} contains control characters",
             )
+        # Windows UNC / remote filesystem paths would make central git evidence
+        # collection contact an attacker-controlled host (NTLM hash leak).
+        if text.startswith("\\\\") or text.startswith("//"):
+            raise DomainError(
+                "invalid_workspace",
+                f"{field} must be a local path; UNC/remote paths are not allowed",
+                details={"field": field},
+            )
         if not (posixpath.isabs(text) or ntpath.isabs(text)):
             raise DomainError(
                 "invalid_workspace",
@@ -3117,16 +3230,32 @@ class AgentChatRoomService:
                 member_id = str(member["id"])
 
             canonical_agent_key = str(member_id)
-            # Adopt matching pre-managed Sessions so historical role/name aliases
-            # remain audit history under the software installation that created them.
-            connection.execute(
-                """
-                UPDATE agent_sessions SET member_id = ?, agent_key = ?
-                WHERE project_id = ? AND member_id IS NULL
-                  AND lower(trim(client)) = lower(trim(?))
-                """,
-                (member_id, canonical_agent_key, project_id, client),
+            # Adopt pre-managed Sessions only when this client maps to a single
+            # software identity. Multiple active members sharing one client
+            # (e.g. two machines both using "zcode") must not absorb each
+            # other's orphan history; leave member_id NULL for explicit merge.
+            shared_client_members = int(
+                connection.execute(
+                    """
+                    SELECT COUNT(DISTINCT s.member_id) AS member_count
+                    FROM agent_sessions s
+                    WHERE s.project_id = ?
+                      AND s.member_id IS NOT NULL
+                      AND s.member_id != ?
+                      AND lower(trim(s.client)) = lower(trim(?))
+                    """,
+                    (project_id, member_id, client),
+                ).fetchone()["member_count"]
             )
+            if shared_client_members == 0:
+                connection.execute(
+                    """
+                    UPDATE agent_sessions SET member_id = ?, agent_key = ?
+                    WHERE project_id = ? AND member_id IS NULL
+                      AND lower(trim(client)) = lower(trim(?))
+                    """,
+                    (member_id, canonical_agent_key, project_id, client),
+                )
             connection.execute(
                 """
                 INSERT INTO agent_sessions(
@@ -4026,8 +4155,6 @@ class AgentChatRoomService:
                 "session_id and token must be supplied together",
                 status_code=401,
             )
-        if session_id:
-            self.heartbeat(project_id, session_id, token or "")
         with self.database.connect() as connection:
             project = self._require_project(connection, project_id)
             if session_id:
@@ -4050,6 +4177,7 @@ class AgentChatRoomService:
                 )
             snapshot = self._snapshot(connection, project_id)
             unread_count = None
+            read_cursor = None
             if session_id:
                 read_cursor = min(event_result["cursor"], event_result["latest_cursor"])
                 unread_count = int(
@@ -4061,27 +4189,70 @@ class AgentChatRoomService:
                         (project_id, read_cursor),
                     ).fetchone()["unread_count"]
                 )
-        if session_id:
-            read_cursor = min(event_result["cursor"], event_result["latest_cursor"])
+        if session_id and read_cursor is not None:
+            # Single write connection: heartbeat lease/token renewal and
+            # last_read_cursor CASE advance share one BEGIN IMMEDIATE window.
+            # Empty syncs (cursor already current) skip the cursor UPDATE so
+            # the sync still heartbeats without a second write transaction.
             with self.database.connect(write=True) as connection:
                 self._authenticate(connection, project_id, session_id, token or "")
+                now = iso_now()
+                token_expires_at = (
+                    utc_now()
+                    + timedelta(seconds=self.settings.session_token_ttl_seconds)
+                ).isoformat().replace("+00:00", "Z")
                 connection.execute(
                     """
                     UPDATE agent_sessions
-                    SET last_read_cursor = CASE
-                        WHEN last_read_cursor > ? THEN last_read_cursor
-                        ELSE ?
-                    END
+                    SET status = ?, last_heartbeat = ?, token_expires_at = ?
                     WHERE id = ?
                     """,
-                    (read_cursor, read_cursor, session_id),
+                    ("online", now, token_expires_at, session_id),
                 )
+                leases = connection.execute(
+                    """
+                    SELECT id, ttl_seconds FROM file_leases
+                    WHERE project_id = ? AND session_id = ? AND released_at IS NULL
+                      AND expires_at > ?
+                    """,
+                    (project_id, session_id, now),
+                ).fetchall()
+                for lease in leases:
+                    lease_expires_at = (
+                        utc_now() + timedelta(seconds=int(lease["ttl_seconds"]))
+                    ).isoformat().replace("+00:00", "Z")
+                    connection.execute(
+                        "UPDATE file_leases SET expires_at = ?, renewed_at = ? WHERE id = ?",
+                        (lease_expires_at, now, lease["id"]),
+                    )
+                stored_cursor = int(
+                    connection.execute(
+                        "SELECT last_read_cursor FROM agent_sessions WHERE id = ?",
+                        (session_id,),
+                    ).fetchone()["last_read_cursor"]
+                    or 0
+                )
+                if read_cursor > stored_cursor:
+                    connection.execute(
+                        """
+                        UPDATE agent_sessions
+                        SET last_read_cursor = CASE
+                            WHEN last_read_cursor > ? THEN last_read_cursor
+                            ELSE ?
+                        END
+                        WHERE id = ?
+                        """,
+                        (read_cursor, read_cursor, session_id),
+                    )
             for agent in snapshot["agents"]:
                 if agent["id"] == session_id:
                     agent["last_read_cursor"] = max(
                         int(agent.get("last_read_cursor") or 0), read_cursor
                     )
                     agent["unread_count"] = unread_count or 0
+                    agent["last_heartbeat"] = now
+                    agent["status"] = "online"
+                    agent["token_expires_at"] = token_expires_at
         return {
             "snapshot": snapshot,
             **event_result,
@@ -4129,7 +4300,17 @@ class AgentChatRoomService:
         resolved_channel = "system" if kind == "system" else channel
         if task_id and channel == "public":
             resolved_channel = "task"
-        clean_files = sorted({normalize_pattern(path) for path in (files or [])})
+        list_limit = int(getattr(self.settings, "list_input_max_count", 100))
+        clean_files = self._require_list_input_limit(
+            "files",
+            sorted({normalize_pattern(path) for path in (files or [])}),
+            limit=list_limit,
+        )
+        clean_mentions = self._require_list_input_limit(
+            "mentions",
+            list(dict.fromkeys(mentions or [])),
+            limit=list_limit,
+        )
         with self.database.connect(write=True) as connection:
             self._require_project(connection, project_id)
             if session_id:
@@ -4156,7 +4337,7 @@ class AgentChatRoomService:
                     "schema_version": DOMAIN_SCHEMA_VERSION,
                     "body": body.strip(),
                     "model_display_name": clean_model_display_name or None,
-                    "mentions": list(dict.fromkeys(mentions or [])),
+                    "mentions": clean_mentions,
                     "files": clean_files,
                     "requires_ack": requires_ack,
                     "priority": priority,
@@ -4283,6 +4464,17 @@ class AgentChatRoomService:
         if not clean_description:
             raise DomainError(
                 "invalid_task_intake", "A raw task description is required"
+            )
+        if len(clean_description) > self.settings.task_text_max_length:
+            raise DomainError(
+                "task_text_too_long",
+                "Task intake raw_description exceeds task_text_max_length "
+                f"({self.settings.task_text_max_length})",
+                status_code=422,
+                details={
+                    "field": "raw_description",
+                    "limit": self.settings.task_text_max_length,
+                },
             )
         if not clean_member_id:
             raise DomainError(
@@ -4664,7 +4856,12 @@ class AgentChatRoomService:
                 )
         if priority is not None and not 0 <= priority <= 4:
             raise DomainError("invalid_priority", "Priority must be between 0 and 4")
-        criteria = [item.strip() for item in (acceptance_criteria or []) if item.strip()]
+        list_limit = int(getattr(self.settings, "list_input_max_count", 100))
+        criteria = self._require_list_input_limit(
+            "acceptance_criteria",
+            [item.strip() for item in (acceptance_criteria or []) if item.strip()],
+            limit=list_limit,
+        )
         for item in criteria:
             if len(item) > self.settings.task_text_max_length:
                 raise DomainError(
@@ -4678,7 +4875,11 @@ class AgentChatRoomService:
                 "missing_acceptance_criteria",
                 "At least one acceptance criterion is required",
             )
-        dependencies = list(dict.fromkeys(depends_on or []))
+        dependencies = self._require_list_input_limit(
+            "depends_on",
+            list(dict.fromkeys(depends_on or [])),
+            limit=list_limit,
+        )
         now = iso_now()
         task_id = new_id("task")
         with self.database.connect(write=True) as connection:
@@ -5011,8 +5212,10 @@ class AgentChatRoomService:
                 FROM task_dependencies d
                 JOIN tasks t ON t.id = d.depends_on_task_id
                 WHERE d.task_id = ?
-                  AND t.verification_status != 'approved'
-                  AND t.integration_status != 'done'
+                  AND NOT (
+                      t.verification_status = 'approved'
+                      AND t.integration_status = 'done'
+                  )
                 """,
                 (task_id,),
             ).fetchall()
@@ -6251,6 +6454,10 @@ class AgentChatRoomService:
                         details={"field": field_name, "limit": text_limit},
                     )
             if acceptance_criteria is not None:
+                list_limit = int(getattr(self.settings, "list_input_max_count", 100))
+                self._require_list_input_limit(
+                    "acceptance_criteria", acceptance_criteria, limit=list_limit
+                )
                 for item in acceptance_criteria:
                     if len(str(item)) > text_limit:
                         raise DomainError(
@@ -6262,6 +6469,11 @@ class AgentChatRoomService:
                                 "limit": text_limit,
                             },
                         )
+            if depends_on is not None:
+                list_limit = int(getattr(self.settings, "list_input_max_count", 100))
+                self._require_list_input_limit(
+                    "depends_on", depends_on, limit=list_limit
+                )
             if (
                 status is not None
                 and status != task["status"]
@@ -6888,24 +7100,18 @@ class AgentChatRoomService:
         commit_hash: str = "",
         no_code_change_reason: str = "",
     ) -> dict[str, Any]:
-        clean_files = sorted({normalize_pattern(path) for path in files})
+        clean_files = self._require_list_input_limit(
+            "files",
+            sorted({normalize_pattern(path) for path in files}),
+            limit=int(getattr(self.settings, "list_input_max_count", 100)),
+        )
         clean_no_code_reason = no_code_change_reason.strip()
         if not summary.strip() or not tests or (not clean_files and not clean_no_code_reason):
             raise DomainError(
                 "insufficient_work_evidence",
                 "Work report requires summary, test evidence, and either changed files or a no-code-change reason",
             )
-        invalid_tests = [
-            test
-            for test in tests
-            if not str(test.get("command", "")).strip()
-            or not isinstance(test.get("exit_code"), int)
-        ]
-        if invalid_tests:
-            raise DomainError(
-                "invalid_test_evidence",
-                "Every test entry requires a command and integer exit_code",
-            )
+        tests = self._validate_test_evidence_list(tests, field="tests")
         with self.database.connect() as connection:
             agent = self._authenticate(connection, project_id, session_id, token)
             project = self._require_project(connection, project_id)
@@ -6936,7 +7142,7 @@ class AgentChatRoomService:
                 event_id = self._emit(
                     connection,
                     project_id,
-                    "work_report.commit_unverified",
+                    "work.commit_unverified",
                     actor_session_id=session_id,
                     task_id=task_id,
                     payload={
@@ -7228,17 +7434,7 @@ class AgentChatRoomService:
                 "insufficient_integration_evidence",
                 "Integration requires a summary and structured test evidence",
             )
-        invalid_tests = [
-            test
-            for test in tests
-            if not str(test.get("command", "")).strip()
-            or not isinstance(test.get("exit_code"), int)
-        ]
-        if invalid_tests:
-            raise DomainError(
-                "invalid_test_evidence",
-                "Every integration test entry requires a command and integer exit_code",
-            )
+        tests = self._validate_test_evidence_list(tests, field="tests")
         if result == "done" and any(test["exit_code"] != 0 for test in tests):
             raise DomainError(
                 "integration_tests_failed",
@@ -7482,8 +7678,17 @@ class AgentChatRoomService:
         clean_body = body.strip()
         clean_kind = kind.strip()
         clean_summary = summary.strip()
-        clean_tags = sorted({str(tag).strip() for tag in (tags or []) if str(tag).strip()})
-        clean_event_ids = sorted({int(event_id) for event_id in (source_event_ids or [])})
+        list_limit = int(getattr(self.settings, "list_input_max_count", 100))
+        clean_tags = self._require_list_input_limit(
+            "tags",
+            sorted({str(tag).strip() for tag in (tags or []) if str(tag).strip()}),
+            limit=list_limit,
+        )
+        clean_event_ids = self._require_list_input_limit(
+            "source_event_ids",
+            sorted({int(event_id) for event_id in (source_event_ids or [])}),
+            limit=list_limit,
+        )
         if not clean_title or not clean_body:
             raise DomainError(
                 "insufficient_knowledge_content",
@@ -7711,6 +7916,11 @@ class AgentChatRoomService:
             raise DomainError(
                 "missing_review_criteria", "Review must assess acceptance criteria"
             )
+        criteria = self._require_list_input_limit(
+            "criteria",
+            criteria,
+            limit=int(getattr(self.settings, "list_input_max_count", 100)),
+        )
         assessed = {
             str(item.get("criterion", "")).strip(): str(item.get("status", "")).strip()
             for item in criteria
@@ -8260,6 +8470,7 @@ class AgentChatRoomService:
                 ).fetchall(),
             )
             members = self._list_project_members(connection, project_id)
+            recent_limit = int(getattr(self.settings, "snapshot_recent_limit", 200))
             leases = [
                 lease
                 for lease in (
@@ -8284,8 +8495,11 @@ class AgentChatRoomService:
                     "system_evidence": json_load(row["system_evidence_json"], {}),
                 }
                 for row in connection.execute(
-                    "SELECT * FROM work_reports WHERE project_id = ? ORDER BY created_at DESC",
-                    (project_id,),
+                    """
+                    SELECT * FROM work_reports WHERE project_id = ?
+                    ORDER BY created_at DESC LIMIT ?
+                    """,
+                    (project_id, recent_limit),
                 ).fetchall()
             ]
             for report in reports:
@@ -8295,8 +8509,11 @@ class AgentChatRoomService:
             reviews = [
                 {**dict(row), "criteria": json_load(row["criteria_json"], [])}
                 for row in connection.execute(
-                    "SELECT * FROM reviews WHERE project_id = ? ORDER BY created_at DESC",
-                    (project_id,),
+                    """
+                    SELECT * FROM reviews WHERE project_id = ?
+                    ORDER BY created_at DESC LIMIT ?
+                    """,
+                    (project_id, recent_limit),
                 ).fetchall()
             ]
             for review in reviews:
@@ -8310,10 +8527,36 @@ class AgentChatRoomService:
                     JOIN events e ON e.id = a.event_id
                     WHERE e.project_id = ?
                     ORDER BY a.created_at DESC
+                    LIMIT ?
                     """,
-                    (project_id,),
+                    (project_id, recent_limit),
                 ).fetchall()
             ]
+            totals = {
+                "reports": int(
+                    connection.execute(
+                        "SELECT COUNT(*) AS c FROM work_reports WHERE project_id = ?",
+                        (project_id,),
+                    ).fetchone()["c"]
+                ),
+                "reviews": int(
+                    connection.execute(
+                        "SELECT COUNT(*) AS c FROM reviews WHERE project_id = ?",
+                        (project_id,),
+                    ).fetchone()["c"]
+                ),
+                "acknowledgements": int(
+                    connection.execute(
+                        """
+                        SELECT COUNT(*) AS c
+                        FROM event_acknowledgements a
+                        JOIN events e ON e.id = a.event_id
+                        WHERE e.project_id = ?
+                        """,
+                        (project_id,),
+                    ).fetchone()["c"]
+                ),
+            }
             cursor = self.latest_cursor(connection, project_id)
             # 历史接入会话只保留前端渲染与名称查找所需的字段，完整记录
             # 留在数据库；成员身份聚合（agent_identities）基于全量会话计算。
@@ -8347,6 +8590,26 @@ class AgentChatRoomService:
                 "acknowledgements": acknowledgements,
                 "documents": self.list_project_documents(project_id)["documents"],
                 "cursor": cursor,
+                "totals": totals,
+                "page_info": {
+                    "limit": recent_limit,
+                    "reports": {
+                        "returned": len(reports),
+                        "total": totals["reports"],
+                        "has_more": totals["reports"] > len(reports),
+                    },
+                    "reviews": {
+                        "returned": len(reviews),
+                        "total": totals["reviews"],
+                        "has_more": totals["reviews"] > len(reviews),
+                    },
+                    "acknowledgements": {
+                        "returned": len(acknowledgements),
+                        "total": totals["acknowledgements"],
+                        "has_more": totals["acknowledgements"]
+                        > len(acknowledgements),
+                    },
+                },
             }
 
     def _export_knowledge_assets(self, project_id: str) -> list[dict[str, Any]]:
@@ -8447,52 +8710,53 @@ class AgentChatRoomService:
         max_kept: int | None = None,
     ) -> dict[str, Any]:
         """Snapshot the live database into the managed backups directory."""
-        directory = self._backup_directory()
-        directory.mkdir(parents=True, exist_ok=True)
-        stamp = iso_now().replace(":", "").replace("-", "")
-        target = directory / f"backup-{stamp}.sqlite"
-        backend = self.settings.database_backend
-        if backend == "sqlite":
-            result = backup_sqlite(self.database.path, target)
-        elif backend == "postgresql":
-            database_url = os.getenv(self.settings.database_url_env, "")
-            result = backup_postgresql(database_url, target)
-        else:
-            raise DomainError(
-                "backup_backend_unsupported",
-                f"Backups are not supported for backend {backend}",
-                status_code=422,
+        with self._backup_restore_lock:
+            directory = self._backup_directory()
+            directory.mkdir(parents=True, exist_ok=True)
+            stamp = iso_now().replace(":", "").replace("-", "")
+            target = directory / f"backup-{stamp}.sqlite"
+            backend = self.settings.database_backend
+            if backend == "sqlite":
+                result = backup_sqlite(self.database.path, target)
+            elif backend == "postgresql":
+                database_url = os.getenv(self.settings.database_url_env, "")
+                result = backup_postgresql(database_url, target)
+            else:
+                raise DomainError(
+                    "backup_backend_unsupported",
+                    f"Backups are not supported for backend {backend}",
+                    status_code=422,
+                )
+            latest_event_id = self._latest_event_id()
+            manifest_path = Path(result["manifest"])
+            manifest = json_load(manifest_path.read_text(encoding="utf-8"), {})
+            manifest["latest_event_id"] = latest_event_id
+            manifest["source"] = source
+            manifest_path.write_text(
+                json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
             )
-        latest_event_id = self._latest_event_id()
-        manifest_path = Path(result["manifest"])
-        manifest = json_load(manifest_path.read_text(encoding="utf-8"), {})
-        manifest["latest_event_id"] = latest_event_id
-        manifest["source"] = source
-        manifest_path.write_text(
-            json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
-            encoding="utf-8",
-        )
-        self._emit_backup_event(
-            "backup.created",
-            payload={
-                "backend": backend,
-                "output": result["output"],
-                "manifest": str(manifest_path),
-                "latest_event_id": latest_event_id,
-                "source": source,
-            },
-            actor_session_id=actor_session_id,
-        )
-        # The audit event about this backup is part of the protected history:
-        # record the cursor again so a fresh backup is never "stale".
-        latest_event_id = self._latest_event_id()
-        manifest["latest_event_id"] = latest_event_id
-        manifest_path.write_text(
-            json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
-            encoding="utf-8",
-        )
-        kept = self._prune_backups(max_kept)
-        return {**result, "latest_event_id": latest_event_id, "pruned": kept}
+            self._emit_backup_event(
+                "backup.created",
+                payload={
+                    "backend": backend,
+                    "output": result["output"],
+                    "manifest": str(manifest_path),
+                    "latest_event_id": latest_event_id,
+                    "source": source,
+                },
+                actor_session_id=actor_session_id,
+            )
+            # The audit event about this backup is part of the protected history:
+            # record the cursor again so a fresh backup is never "stale".
+            latest_event_id = self._latest_event_id()
+            manifest["latest_event_id"] = latest_event_id
+            manifest_path.write_text(
+                json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+            )
+            kept = self._prune_backups(max_kept)
+            return {**result, "latest_event_id": latest_event_id, "pruned": kept}
 
     def list_backups(self) -> list[dict[str, Any]]:
         directory = self._backup_directory()
@@ -8654,54 +8918,100 @@ class AgentChatRoomService:
                 status_code=409,
                 details={"backup_schema": manifest.get("database_schema_version"), "current_schema": current_schema},
             )
-        if self.settings.database_backend == "sqlite":
-            self._ensure_sqlite_restorable(target)
-        latest_event_id = self._latest_event_id()
         backup_event_id = int(manifest.get("latest_event_id") or 0)
-        stale = backup_event_id < latest_event_id
-        if stale and not allow_data_loss:
-            self._emit_backup_event(
-                "backup.restore_rejected",
-                payload={
-                    "file": str(target),
-                    "reason": "backup_stale",
-                    "backup_latest_event_id": backup_event_id,
-                    "current_latest_event_id": latest_event_id,
-                },
-                actor_session_id=actor_session_id,
-            )
-            raise DomainError(
-                "backup_stale",
-                "The backup is older than the current database; pass allow_data_loss "
-                "to accept losing newer events",
-                status_code=409,
-                details={
-                    "backup_latest_event_id": backup_event_id,
-                    "current_latest_event_id": latest_event_id,
-                },
-            )
-        self._emit_backup_event(
-            "backup.restore_started",
-            payload={"file": str(target), "stale": stale},
-            actor_session_id=actor_session_id,
-        )
-        if self.settings.database_backend == "sqlite":
-            source_connection = sqlite3.connect(
-                f"file:{target.as_posix()}?mode=ro", uri=True
-            )
-            try:
-                # The sqlite backup API requires a destination connection with
-                # no active transaction, so bypass the pooled writer here.
-                live_connection = sqlite3.connect(self.database.path)
+        with self._backup_restore_lock:
+            if self.settings.database_backend == "sqlite":
+                # Hold process mutex + SQLite EXCLUSIVE locking from the stale
+                # check through the page copy so concurrent writers cannot land
+                # in the window that allow_data_loss=False claims is empty.
+                live_connection = sqlite3.connect(self.database.path, timeout=10.0)
                 try:
-                    source_connection.backup(live_connection)
+                    live_connection.execute("PRAGMA busy_timeout=10000")
+                    live_connection.execute("PRAGMA locking_mode=EXCLUSIVE")
+                    row = live_connection.execute(
+                        "SELECT COALESCE(MAX(id), 0) AS latest FROM events"
+                    ).fetchone()
+                    latest_event_id = int(row[0])
+                    stale = backup_event_id < latest_event_id
+                    if stale and not allow_data_loss:
+                        live_connection.close()
+                        live_connection = None
+                        self._emit_backup_event(
+                            "backup.restore_rejected",
+                            payload={
+                                "file": str(target),
+                                "reason": "backup_stale",
+                                "backup_latest_event_id": backup_event_id,
+                                "current_latest_event_id": latest_event_id,
+                            },
+                            actor_session_id=actor_session_id,
+                        )
+                        raise DomainError(
+                            "backup_stale",
+                            "The backup is older than the current database; pass allow_data_loss "
+                            "to accept losing newer events",
+                            status_code=409,
+                            details={
+                                "backup_latest_event_id": backup_event_id,
+                                "current_latest_event_id": latest_event_id,
+                            },
+                        )
+                    source_connection = sqlite3.connect(
+                        f"file:{target.as_posix()}?mode=ro", uri=True
+                    )
+                    try:
+                        # Dest is the same connection that already holds the
+                        # EXCLUSIVE lock and has no open transaction.
+                        source_connection.backup(live_connection)
+                    finally:
+                        source_connection.close()
+                except sqlite3.Error as error:
+                    if live_connection is not None:
+                        live_connection.close()
+                    raise DomainError(
+                        "database_busy",
+                        f"The live database is busy; stop writers before restoring: {error}",
+                        status_code=409,
+                    ) from error
                 finally:
-                    live_connection.close()
-            finally:
-                source_connection.close()
-        else:
-            database_url = os.getenv(self.settings.database_url_env, "")
-            restore_postgresql(database_url, target)
+                    if live_connection is not None:
+                        live_connection.close()
+                self._emit_backup_event(
+                    "backup.restore_started",
+                    payload={"file": str(target), "stale": stale},
+                    actor_session_id=actor_session_id,
+                )
+            else:
+                latest_event_id = self._latest_event_id()
+                stale = backup_event_id < latest_event_id
+                if stale and not allow_data_loss:
+                    self._emit_backup_event(
+                        "backup.restore_rejected",
+                        payload={
+                            "file": str(target),
+                            "reason": "backup_stale",
+                            "backup_latest_event_id": backup_event_id,
+                            "current_latest_event_id": latest_event_id,
+                        },
+                        actor_session_id=actor_session_id,
+                    )
+                    raise DomainError(
+                        "backup_stale",
+                        "The backup is older than the current database; pass allow_data_loss "
+                        "to accept losing newer events",
+                        status_code=409,
+                        details={
+                            "backup_latest_event_id": backup_event_id,
+                            "current_latest_event_id": latest_event_id,
+                        },
+                    )
+                self._emit_backup_event(
+                    "backup.restore_started",
+                    payload={"file": str(target), "stale": stale},
+                    actor_session_id=actor_session_id,
+                )
+                database_url = os.getenv(self.settings.database_url_env, "")
+                restore_postgresql(database_url, target)
         self._emit_backup_event(
             "backup.restore_completed",
             payload={"file": str(target), "restored_latest_event_id": backup_event_id},
@@ -8846,6 +9156,16 @@ class AgentChatRoomService:
             )
         clean_title = str(title or "").strip()
         clean_content = str(content or "")
+        content_bytes = len(clean_content.encode("utf-8"))
+        max_bytes = int(getattr(self.settings, "project_document_max_bytes", 262144))
+        if content_bytes > max_bytes:
+            raise DomainError(
+                "project_document_too_large",
+                "Document content exceeds project_document_max_bytes "
+                f"({max_bytes})",
+                status_code=422,
+                details={"limit": max_bytes, "size": content_bytes},
+            )
         if not clean_title:
             raise DomainError(
                 "invalid_project_document", "Document title is required", status_code=422
@@ -9090,4 +9410,6 @@ class AgentChatRoomService:
         if now - last < 3600:
             return {"purged": 0, "retention_days": None, "skipped": True}
         self._retention_last_run[project_id] = now
-        return self.enforce_audit_retention(project_id)
+        result = self.enforce_audit_retention(project_id)
+        result["idempotency"] = self.enforce_idempotency_retention()
+        return result

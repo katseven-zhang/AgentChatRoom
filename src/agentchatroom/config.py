@@ -61,6 +61,11 @@ CONFIG_FILE_SCHEMA: dict[str, dict[str, tuple[type, ...]]] = {
         "message_max_body_length": (int,),
         "task_text_max_length": (int,),
         "mcp_message_context_limit": (int,),
+        "list_input_max_count": (int,),
+        "test_entry_notes_max_length": (int,),
+        "project_document_max_bytes": (int,),
+        "snapshot_recent_limit": (int,),
+        "idempotency_retention_days": (int,),
     },
     "security": {
         "agent_token_ttl_seconds": (int,),
@@ -214,6 +219,16 @@ class Settings:
     # the append-only event store or every client's next sync.
     message_max_body_length: int = 65536
     task_text_max_length: int = 32768
+    # Bounded collection inputs (acceptance criteria, depends_on, mentions,
+    # files, tests, tags, review criteria, source_event_ids) and document
+    # payloads so a single authenticated request cannot grow DB/snapshot size
+    # without limit. snapshot_recent_limit bounds room_sync projections.
+    # idempotency_retention_days: 0 keeps records forever (audit-style).
+    list_input_max_count: int = 100
+    test_entry_notes_max_length: int = 4000
+    project_document_max_bytes: int = 262144
+    snapshot_recent_limit: int = 200
+    idempotency_retention_days: int = 30
 
     @property
     def mcp_message_context_limit(self) -> int:
@@ -348,6 +363,21 @@ def _merge_toml(path: Path) -> dict[str, Any]:
         ),
         "task_text_max_length": raw.get("coordination", {}).get(
             "task_text_max_length"
+        ),
+        "list_input_max_count": raw.get("coordination", {}).get(
+            "list_input_max_count"
+        ),
+        "test_entry_notes_max_length": raw.get("coordination", {}).get(
+            "test_entry_notes_max_length"
+        ),
+        "project_document_max_bytes": raw.get("coordination", {}).get(
+            "project_document_max_bytes"
+        ),
+        "snapshot_recent_limit": raw.get("coordination", {}).get(
+            "snapshot_recent_limit"
+        ),
+        "idempotency_retention_days": raw.get("coordination", {}).get(
+            "idempotency_retention_days"
         ),
         "mcp_message_limit": (
             raw.get("coordination", {}).get("mcp_message_limit")
@@ -690,11 +720,51 @@ def load_settings(
                 file_values.get("task_text_max_length", 32768),
             )
         ),
+        "list_input_max_count": int(
+            os.getenv(
+                "AGENTCHATROOM_LIST_INPUT_MAX_COUNT",
+                file_values.get("list_input_max_count", 100),
+            )
+        ),
+        "test_entry_notes_max_length": int(
+            os.getenv(
+                "AGENTCHATROOM_TEST_ENTRY_NOTES_MAX_LENGTH",
+                file_values.get("test_entry_notes_max_length", 4000),
+            )
+        ),
+        "project_document_max_bytes": int(
+            os.getenv(
+                "AGENTCHATROOM_PROJECT_DOCUMENT_MAX_BYTES",
+                file_values.get("project_document_max_bytes", 262144),
+            )
+        ),
+        "snapshot_recent_limit": int(
+            os.getenv(
+                "AGENTCHATROOM_SNAPSHOT_RECENT_LIMIT",
+                file_values.get("snapshot_recent_limit", 200),
+            )
+        ),
+        "idempotency_retention_days": int(
+            os.getenv(
+                "AGENTCHATROOM_IDEMPOTENCY_RETENTION_DAYS",
+                file_values.get("idempotency_retention_days", 30),
+            )
+        ),
     }
     if values["message_max_body_length"] <= 0:
         raise ValueError("message_max_body_length must be positive")
     if values["task_text_max_length"] <= 0:
         raise ValueError("task_text_max_length must be positive")
+    if values["list_input_max_count"] <= 0:
+        raise ValueError("list_input_max_count must be positive")
+    if values["test_entry_notes_max_length"] <= 0:
+        raise ValueError("test_entry_notes_max_length must be positive")
+    if values["project_document_max_bytes"] <= 0:
+        raise ValueError("project_document_max_bytes must be positive")
+    if values["snapshot_recent_limit"] <= 0:
+        raise ValueError("snapshot_recent_limit must be positive")
+    if values["idempotency_retention_days"] < 0:
+        raise ValueError("idempotency_retention_days must be >= 0")
     if not 1 <= values["port"] <= 65535:
         raise ValueError("port must be between 1 and 65535")
     if not str(values["host"]).strip():
