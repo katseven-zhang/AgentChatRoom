@@ -152,3 +152,71 @@ def test_windows_package_workflow_builds_and_uploads_single_exe() -> None:
     assert 'if ($LASTEXITCODE -ne 0) { throw "Source regression tests failed" }' in workflow
     assert "tests/test_stdio_runtime.py" in workflow
     assert "test_local_mcp_stdio_waits_for_bootstrap_and_disconnects_on_exit" in workflow
+
+
+def test_spec_hidden_imports_match_package_modules() -> None:
+    """#201: agentchatroom.* hidden_imports must all exist under src/agentchatroom."""
+    import re
+
+    spec_text = (ROOT / "agentchatroom.spec").read_text(encoding="utf-8")
+    entries = re.findall(r'"(agentchatroom(?:\.[A-Za-z0-9_]+)*)"', spec_text)
+    assert entries, "spec must declare agentchatroom hidden imports"
+    package_dir = ROOT / "src" / "agentchatroom"
+    missing = []
+    for entry in entries:
+        parts = entry.split(".")[1:]  # drop package root
+        if not parts:
+            continue
+        module_path = package_dir.joinpath(*parts)
+        if not (
+            module_path.with_suffix(".py").is_file()
+            or (module_path / "__init__.py").is_file()
+            or module_path.is_dir()
+        ):
+            missing.append(entry)
+    assert missing == [], f"stale hidden imports: {missing}"
+    assert "agentchatroom.models" not in entries
+
+    # Modules called out by R8 review must stay on the packaging list.
+    for required in (
+        "agentchatroom.mcp_compat",
+        "agentchatroom.mcp_http_adoption",
+        "agentchatroom.mcp_http_recovery",
+        "agentchatroom.http_identity",
+        "agentchatroom.credential_bundle",
+        "agentchatroom.postgres_database",
+        "agentchatroom.backup",
+    ):
+        assert required in entries, required
+
+
+def test_example_configs_include_documents_inject_max_chars() -> None:
+    """#201: README-documented [documents].inject_max_chars must be discoverable."""
+    for relative in ("config.example.toml", "deploy/config.server.example.toml"):
+        text = (ROOT / relative).read_text(encoding="utf-8")
+        assert "[documents]" in text, relative
+        assert "inject_max_chars = 12000" in text, relative
+
+
+def test_readme_config_sections_appear_in_example_configs() -> None:
+    """#201: every CONFIG_FILE_SCHEMA section README mentions is in some example."""
+    from agentchatroom.config import CONFIG_FILE_SCHEMA
+
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    examples = "\n".join(
+        (ROOT / path).read_text(encoding="utf-8")
+        for path in ("config.example.toml", "deploy/config.server.example.toml")
+    )
+    for section, keys in CONFIG_FILE_SCHEMA.items():
+        mentioned = (
+            f"[{section}]" in readme
+            or any(f"{section}.{key}" in readme for key in keys)
+        )
+        if not mentioned:
+            continue
+        discoverable = f"[{section}]" in examples or any(
+            key in examples for key in keys
+        )
+        assert discoverable, (
+            f"README documents section/key [{section}] but no example config shows it"
+        )

@@ -71,6 +71,11 @@ kinds = [
 # independently verified first.
 require_verified_task = true
 
+[documents]
+# Character cap for binding-document injection on task claim/get responses.
+# Precedence: AGENTCHATROOM_PROJECT_DOC_INJECT_MAX_CHARS > this file key > default.
+inject_max_chars = 12000
+
 [security]
 agent_token_ttl_seconds = 2592000
 max_agent_token_ttl_seconds = 31536000
@@ -83,3 +88,9 @@ management_cookie_name = "agentchatroom_admin"
 [interface]
 product_name = "AgentChatRoom"
 default_theme = "system"
+
+[backup]
+# Auto-backup scheduling (global). Precedence: AGENTCHATROOM_AUTO_BACKUP_* > this file > defaults.
+auto_backup_enabled = false
+auto_backup_interval_seconds = 3600
+auto_backup_max_kept = 10

@@ -33,26 +33,35 @@ _require_working_tcl_tk()
 
 block_cipher = None
 
-# Hidden imports required across CLI, GUI, MCP, FastAPI, and Uvicorn
+# Hidden imports required across CLI, GUI, MCP, FastAPI, and Uvicorn.
+# Keep agentchatroom.* entries ⊆ modules that exist under src/agentchatroom
+# (enforced by tests.test_deployment_artifacts).
 hidden_imports = [
     "agentchatroom",
     "agentchatroom.api",
+    "agentchatroom.backup",
     "agentchatroom.cli",
     "agentchatroom.client_config",
     "agentchatroom.config",
     "agentchatroom.contracts",
+    "agentchatroom.credential_bundle",
     "agentchatroom.database",
     "agentchatroom.desktop",
     "agentchatroom.errors",
     "agentchatroom.gui",
+    "agentchatroom.http_identity",
     "agentchatroom.integrations",
     "agentchatroom.local_mcp",
     "agentchatroom.mcp_server",
     "agentchatroom.mcp_bridge",
-    "agentchatroom.stdio_runtime",
-    "agentchatroom.models",
+    "agentchatroom.mcp_compat",
+    "agentchatroom.mcp_http_adoption",
+    "agentchatroom.mcp_http_recovery",
+    "agentchatroom.postgres_database",
     "agentchatroom.project_registration",
+    "agentchatroom.service_lifetime",
     "agentchatroom.services",
+    "agentchatroom.stdio_runtime",
     "agentchatroom.task_history",
     "tkinter",
     "_tkinter",

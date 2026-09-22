@@ -16,6 +16,7 @@ import urllib.parse
 import urllib.request
 import uuid
 import webbrowser
+from contextlib import contextmanager
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -595,6 +596,57 @@ def access_log_enabled() -> bool:
     }
 
 
+def _lock_start_registry(handle, *, release: bool = False) -> None:
+    """Blocking exclusive lock serializing concurrent serve --detach starts."""
+    handle.seek(0)
+    if os.name == "nt":
+        import msvcrt
+
+        msvcrt.locking(
+            handle.fileno(),
+            msvcrt.LK_UNLCK if release else msvcrt.LK_LOCK,
+            1,
+        )
+        return
+    import fcntl
+
+    fcntl.flock(handle, fcntl.LOCK_UN if release else fcntl.LOCK_EX)
+
+
+@contextmanager
+def _serialize_detached_start(settings):
+    """Serialize check-then-write on server.pid across processes/threads.
+
+    Two concurrent ``serve --detach`` launches must not both spawn: the loser
+    either reuses the winner's live pid or fails cleanly without overwriting
+    the registration (R2 race: orphaned listener + stop targeting the wrong pid).
+    """
+    settings.data_dir.mkdir(parents=True, exist_ok=True)
+    lock_path = settings.data_dir / "server.start.lock"
+    descriptor = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+    with os.fdopen(descriptor, "r+b") as handle:
+        if handle.seek(0, 2) == 0:
+            handle.write(b"1")
+            handle.flush()
+        _lock_start_registry(handle)
+        try:
+            yield
+        finally:
+            _lock_start_registry(handle, release=True)
+
+
+def _claim_pid_file(pid_path: Path, pid: int) -> None:
+    """Create server.pid exclusively so a second writer cannot overwrite it."""
+    try:
+        descriptor = os.open(pid_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+    except FileExistsError as error:
+        raise SystemExit(
+            "AgentChatRoom refused to overwrite an existing server.pid registration"
+        ) from error
+    with os.fdopen(descriptor, "w", encoding="ascii") as handle:
+        handle.write(str(pid))
+
+
 def start_detached_server(
     settings,
     host: str,
@@ -602,6 +654,18 @@ def start_detached_server(
     config_path: str | None = None,
 ) -> dict[str, Any]:
     settings.data_dir.mkdir(parents=True, exist_ok=True)
+    with _serialize_detached_start(settings):
+        return _start_detached_server_locked(
+            settings, host, port, config_path=config_path
+        )
+
+
+def _start_detached_server_locked(
+    settings,
+    host: str,
+    port: int,
+    config_path: str | None = None,
+) -> dict[str, Any]:
     pid_path = settings.data_dir / "server.pid"
     if pid_path.exists():
         try:
@@ -663,7 +727,15 @@ def start_detached_server(
             close_fds=True,
             **popen_options,
         )
-    pid_path.write_text(str(process.pid), encoding="ascii")
+    try:
+        _claim_pid_file(pid_path, process.pid)
+    except SystemExit:
+        process.terminate()
+        try:
+            process.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            process.kill()
+        raise
     display_url = service_url(host, port)
     health_url = f"{display_url}/health"
     deadline = time.monotonic() + 5

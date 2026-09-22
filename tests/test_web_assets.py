@@ -2485,6 +2485,20 @@ def test_web_local_mcp_assistant_offers_generic_only():
     assert "integration-onboarding-prompt" in markup
 
 
+def test_project_source_labels_distinguish_git_local_and_remote():
+    """#170：来源标签按 project_source 区分本地仓库/已关联远程/本地路径。"""
+    javascript = (WEB_DIR / "app.js").read_text(encoding="utf-8")
+
+    assert "function projectSource(project)" in javascript
+    assert 'source === "git_local"' in javascript
+    assert "Git（本地仓库）" in javascript
+    assert 'source === "git_remote"' in javascript
+    assert "Git（已关联远程）" in javascript
+    assert 'return "本地路径"' in javascript
+    # 不得再仅凭 git_remote 有无判定是否 Git。
+    assert 'return project.git_remote ? "Git" : "本地路径"' not in javascript
+
+
 def test_web_lease_contract_has_no_presence_fields_or_recyclable_copy():
     """#195/#119: lease projection strips presence; UI must not read stripped
     fields or claim a silent holder's lease is recyclable."""
@@ -2558,7 +2572,7 @@ def test_web_audit_refresh_merge_surfaces_new_events_after_emit(tmp_path):
         "assert.deepEqual(state.auditEvents.map((e) => e.id), [1, 2, 3, 4, 5]);\n"
         "assert.equal(state.auditEvents[state.auditEvents.length - 1].id, 5);\n"
         "state.auditEvents = [{id: 10}, {id: 11}];\n"
-        "state.auditHasNewer = false;\n"
+        "state.auditHasNewer = true;\n"
         "state.auditPage = 3;\n"
         "const latestMid = state.auditEvents[state.auditEvents.length - 1].id;\n"
         "assert.equal(latestMid, 11);\n"

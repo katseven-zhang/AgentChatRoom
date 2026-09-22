@@ -6,7 +6,9 @@ import os
 import signal
 import socket
 import subprocess
+import sys
 import time
+from pathlib import Path
 
 import pytest
 
@@ -104,6 +106,63 @@ def test_detached_server_starts_and_stops(settings):
     assert not process_is_running(pid)
     assert wait_for_port_to_close(port)
     assert not (settings.data_dir / "server.pid").exists()
+
+
+def test_concurrent_serve_detach_two_processes_leave_one_instance(settings, tmp_path):
+    """#185: dual concurrent serve --detach must register exactly one live pid."""
+    port = available_port()
+    data_dir = settings.data_dir
+    data_dir.mkdir(parents=True, exist_ok=True)
+    go_flag = tmp_path / "go"
+    script = (
+        "import json, os, time\n"
+        "from pathlib import Path\n"
+        "from agentchatroom.config import load_settings\n"
+        "from agentchatroom.cli import start_detached_server\n"
+        f"go = Path({str(go_flag)!r})\n"
+        "while not go.exists():\n"
+        "    time.sleep(0.005)\n"
+        "settings = load_settings()\n"
+        "result = start_detached_server(settings, '127.0.0.1', %d)\n"
+        "print(json.dumps(result))\n"
+    ) % port
+    env = os.environ.copy()
+    env["AGENTCHATROOM_DATA_DIR"] = str(data_dir)
+    root = str(Path(__file__).resolve().parents[1])
+    env["PYTHONPATH"] = os.pathsep.join(
+        [str(Path(root) / "src"), env.get("PYTHONPATH", "")]
+    ).rstrip(os.pathsep)
+    procs = [
+        subprocess.Popen(
+            [sys.executable, "-c", script],
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        for _ in range(2)
+    ]
+    go_flag.write_text("go", encoding="ascii")
+    outputs = []
+    for proc in procs:
+        stdout, stderr = proc.communicate(timeout=60)
+        assert proc.returncode == 0, stderr
+        outputs.append(json.loads(stdout))
+    try:
+        started_flags = [bool(item.get("started")) for item in outputs]
+        pids = {int(item["pid"]) for item in outputs}
+        assert started_flags.count(True) == 1, outputs
+        assert len(pids) == 1, outputs
+        live_pid = next(iter(pids))
+        assert process_is_running(live_pid)
+        stopped = stop_detached_server(settings)
+        assert stopped["stopped"] is True
+        assert stopped["pid"] == live_pid
+        assert not process_is_running(live_pid)
+        assert wait_for_port_to_close(port)
+        assert not (settings.data_dir / "server.pid").exists()
+    finally:
+        stop_detached_server(settings)
 
 
 def test_windows_server_stop_uses_taskkill_for_the_process_tree(monkeypatch):

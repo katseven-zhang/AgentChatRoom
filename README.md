@@ -14,6 +14,7 @@ AgentChatRoom 是一个面向异构 AI 编程 Agent 的项目级实时协作中�
 - 接入指令区分首次配置、已配置软件加入新项目与恢复连接；取消任务不能重新获取文件租约，修复少量动态事件的聚合显示。
 - 自动重命名与占位凭据自愈：多项目凭据包（`credential_bundle`）接入时正确解析对应项目的凭据 ID；仅向导真实派生的占位凭据名称（含“通用（标准 MCP）/Standard MCP”标记的名称，及“Agent 凭据/Token”系列）在 Agent 接入时自动重命名为“{member_name} 凭据”（重名自动递增序号）；用户自定义名称（如「Alice · Custom HTTP」）永远不会被自动改名；已关联成员的历史占位凭据在重新接入时自动自愈更名。
 - 本地路径项目 Git 升级自愈：无 Git 的本地路径项目后续初始化 Git 仓库并配置远程地址时，`resolve_project_for_join` 与 `room_bootstrap` 自动识别物理路径并平滑将项目 scope 与 `git_remote` 从本地路径升级为 Git 仓库，更新 `.agentchatroom/project.json` 登记并推送 `project.updated` 实时事件，消除 `project_registration_orphaned` 错误，前端项目标签即时从「本地路径」同步切换为「Git」。多项目冲突安全：checkout 登记指向的 Room 真实存在但当前仓库 scope 已被另一个活动 Room 占用时，解析显式返回 409 `project_registration_conflict` 并列出双方归属，绝不静默串房；登记 key 已失效（遗留迁移）且 scope 归属无歧义时保留原自愈语义。
+- 管理登录 `POST /api/v1/auth/login` 失败限速（进程内，IP + 全局双键，可配置阈值/窗口/冷却）；SSE 槽位改为生成器内 acquire/`finally` release，首字节前断开不泄漏；SSE 事件轮询的同步 SQLite 查询移入线程池，避免阻塞 HTTP 事件循环。
 
 升级时请替换完整 Windows ZIP 解压目录（包含 `_internal`），并检查各客户端 MCP 配置是否仍引用旧 EXE 路径。关闭旧 MCP 连接和服务后再替换；新进程才会加载修复。仅删除 EXE 会导致连接失败，不代表成功接入。每个并行项目需要独立连接上下文。
 
@@ -283,9 +284,16 @@ CLI 也可以显式创建；作用域已经存在活动 Room 后，其他 Agent�
 域重新为空，后续第一个 Agent可以创建新的 Room。
 
 Project key 是后端生成的无语义外部查询键，默认不在 UI 展示，也不接受 Agent、
-REST、CLI 或 Web 自定义。Agent 只提供实际 `project_path`；后端自动检测工作区
-识别方式：存在有效 Git origin 时使用规范化 Git remote，否则使用规范化本地
-路径。Agent 的 `room_join` 不接受 `logical_path`，Web 也不要求用户填写该内部派生
+REST、CLI 或 Web 自定义。Agent 只提供实际 `project_path`；后端自动检测工作区：
+目录是 Git 工作树（`git rev-parse --show-toplevel` 成功）即视为 Git 项目，来源
+可区分「Git（本地仓库）/Git（已关联远程）」，仅完全不是 Git 仓库时才显示
+「本地路径」；不以是否存在 `remote.origin.url` 作为是否 Git 的唯一依据。作用域
+身份仍优先使用规范化 Git remote，无 origin 时使用规范化本地路径。项目列表/详情
+读取会做带 TTL 的来源重检；详情读取在归属明确（无其它活动 Room 占用同一 scope
+或同一 root_path，且 checkout 登记 key 一致）时才自愈升级 `git_remote` 并写
+`project.updated`（`scope_healed`）；歧义时 fail-closed，不改库、不静默串房，
+响应带 `git_scope_recheck`（沿用 `project_registration_conflict` /
+`project_scope_conflict` 语义）。Agent 的 `room_join` 不接受 `logical_path`，Web 也不要求用户填写该内部派生
 值，不能通过改写作用域参数另建 Room。用户划分单仓库子项目时，应直接选择或
 填写实际子目录作为 `project_path`/`root_path`；后端根据它相对 Git 根目录的
 位置生成 `logical_path`。LAN 或服务器部署不会尝试打开服务器桌面选择器，仍使用
@@ -403,6 +411,25 @@ HTTP 同一路径匹配多个项目或多个 roots 中混有无法解析的路�
 ### Agent 凭据传输约束
 
 Agent Session Token 与 access token 只能放在 JSON 请求体、`Authorization: Bearer` 头，或客户端本地安全配置 / 环境变量中。不得把这些凭据放进 URL 路径、查询参数、Referer、access log、代理日志、消息正文、项目规则或 Git。`release_lease` 等敏感操作必须走请求体或请求头，不能把 `session_id` 或 `token` 拼进查询字符串。服务端 access log 会对 `token=`、`Bearer`、`Authorization` 和 Cookie 值脱敏；脱敏不能替代正确的传输方式。未来使用的远程 Token 同样只允许放在客户端安全配置或环境变量中。
+
+### 管理登录失败限速
+
+`POST /api/v1/auth/login`（管理认证开启时）对失败尝试做进程内限速，按**来源 IP** 与**全局**双键计数（反代场景经 `trusted_proxy_headers` / `trusted_proxy_ips` 取真实 IP）。窗口内失败达到阈值后进入冷却：超限请求返回 **429** `management_login_rate_limited`，响应头与 `error.details.retry_after` 给出需等待的秒数；冷却期内**正确凭据同样被拒绝**。一次成功登录会复位该 IP 与全局计数；成功路径本身不受默认阈值影响。失败只记脱敏日志（不含 Token），不写入请求体内容。
+
+默认值与环境变量（等价 `config` 示例；配置文件 schema 不含这些键，避免与库存清单漂移）：
+
+```toml
+# 等价环境变量（优先于默认值）：
+# AGENTCHATROOM_MANAGEMENT_LOGIN_MAX_FAILURES=5
+# AGENTCHATROOM_MANAGEMENT_LOGIN_WINDOW_SECONDS=60
+# AGENTCHATROOM_MANAGEMENT_LOGIN_LOCKOUT_SECONDS=60
+```
+
+| 配置 | 默认 | 环境变量 | 含义 |
+| --- | --- | --- | --- |
+| `management_login_max_failures` | 5 | `AGENTCHATROOM_MANAGEMENT_LOGIN_MAX_FAILURES` | 窗口内允许的失败次数（每键） |
+| `management_login_window_seconds` | 60 | `AGENTCHATROOM_MANAGEMENT_LOGIN_WINDOW_SECONDS` | 滑动窗口长度（秒） |
+| `management_login_lockout_seconds` | 60 | `AGENTCHATROOM_MANAGEMENT_LOGIN_LOCKOUT_SECONDS` | 达到阈值后的冷却时长（秒） |
 
 ### 本机 MCP 配置助手
 
@@ -595,7 +622,7 @@ REST `GET /api/v1/projects/{project_id}/tasks?phase=`、MCP `task_list(phase=…
 
 Agent Session Token 校验与 `last_used_at` 更新是分开的：校验走只读连接，使用时间在后台批量写入（默认至少间隔 60 秒或累计 32 次调用），进程退出时 flush。`session_heartbeat` 只刷新连接存活，不承担 Token 校验写锁。
 
-浏览器订阅 `events/stream` 必须携带 Agent Session 凭据（请求头）或已建立的浏览器 Session Cookie；匿名订阅返回 401。公开配置提供 `max_sse_clients_per_project`（默认 64）和 `sse_per_ip_limit`（默认 16），超限返回 429。
+浏览器订阅 `events/stream` 必须携带 Agent Session 凭据（请求头）或已建立的浏览器 Session Cookie；匿名订阅返回 401。公开配置提供 `max_sse_clients_per_project`（默认 64）和 `sse_per_ip_limit`（默认 16），超限返回 429。容量预检在响应头之前执行（仍 429），但**占用槽位在生成器首次迭代时才 acquire**、在 `finally` 中 release：客户端在首字节前断开导致生成器从未迭代时不会留下永久占用（#181），反复抖动也不会耗尽槽位。SSE 轮询里的同步 `list_events`（SQLite）经 `asyncio.to_thread` 移出事件循环（#184），多客户端慢查询不再拖住 `/health` 与普通 REST。
 
 Agent 自报的 `worktree` 不会被服务盲目信任。Work Report 采集 Git 证据前必须有已登记 Workspace，路径只能是该 Workspace 的 `local_path` 或其子目录，上报的 `commit_hash` 必须能在该 worktree 内解析；否则拒绝，不会把伪造路径或伪造 commit 写成事实。
 
