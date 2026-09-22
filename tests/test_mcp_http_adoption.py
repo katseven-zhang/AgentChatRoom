@@ -5,7 +5,11 @@ from types import SimpleNamespace
 
 import pytest
 
-from agentchatroom.mcp_http_adoption import with_session_adoption
+from agentchatroom.mcp_http_adoption import (
+    PayloadTooLargeError,
+    _read_request_body,
+    with_session_adoption,
+)
 
 MCP_SESSION_ID = "mcp-session-id"
 
@@ -353,3 +357,111 @@ async def test_parked_handshakes_are_bounded_and_fail_closed():
     # (still unknown) bookmark instead of being adopted.
     assert app.requests[-1]["headers"][MCP_SESSION_ID] == "reaped-2"
     assert app.requests[-1]["payload"].get("method") == "tools/call"
+
+
+@pytest.mark.asyncio
+async def test_read_request_body_rejects_oversize_single_chunk():
+    """#192: body over limit raises instead of silently truncating."""
+    body = b"x" * 33
+
+    async def receive():
+        return {"type": "http.request", "body": body, "more_body": False}
+
+    with pytest.raises(PayloadTooLargeError) as exc_info:
+        await _read_request_body(receive, limit=32)
+    assert exc_info.value.limit == 32
+
+
+@pytest.mark.asyncio
+async def test_read_request_body_rejects_when_more_body_pending_at_limit():
+    """#192: at limit with more_body still coming is truncation — fail closed."""
+
+    async def receive():
+        return {"type": "http.request", "body": b"y" * 32, "more_body": True}
+
+    with pytest.raises(PayloadTooLargeError):
+        await _read_request_body(receive, limit=32)
+
+
+@pytest.mark.asyncio
+async def test_read_request_body_accepts_exact_limit_without_more_body():
+    async def receive():
+        return {"type": "http.request", "body": b"z" * 32, "more_body": False}
+
+    assert await _read_request_body(receive, limit=32) == b"z" * 32
+
+
+@pytest.mark.asyncio
+async def test_read_request_body_stitches_chunks_under_limit():
+    chunks = [
+        {"type": "http.request", "body": b"ab", "more_body": True},
+        {"type": "http.request", "body": b"cd", "more_body": False},
+    ]
+    index = {"i": 0}
+
+    async def receive():
+        message = chunks[index["i"]]
+        index["i"] += 1
+        return message
+
+    assert await _read_request_body(receive, limit=8) == b"abcd"
+
+
+@pytest.mark.asyncio
+async def test_oversized_adoption_post_returns_413_not_truncated_replay():
+    """#192: adoption-path oversize body answers structured 413, not parse error."""
+    app = FakeMcpApp()
+    middleware = _middleware(app, body_limit=16)
+
+    body = json.dumps(_business_call("reaped-1")).encode("utf-8")
+    assert len(body) > 16
+
+    scope = {
+        "type": "http",
+        "method": "POST",
+        "path": "/mcp",
+        "headers": [(b"mcp-session-id", b"reaped-1")],
+        "query_string": b"",
+    }
+    messages: list[dict] = []
+    delivered = {"done": False}
+
+    async def receive():
+        if delivered["done"]:
+            return {"type": "http.disconnect"}
+        delivered["done"] = True
+        return {"type": "http.request", "body": body, "more_body": False}
+
+    async def send(message):
+        messages.append(message)
+
+    await middleware(scope, receive, send)
+
+    start = next(m for m in messages if m["type"] == "http.response.start")
+    assert start["status"] == 413
+    response_body = b"".join(
+        m.get("body") or b"" for m in messages if m["type"] == "http.response.body"
+    )
+    error = json.loads(response_body)["error"]
+    assert error["code"] == "payload_too_large"
+    assert error["data"]["limit"] == 16
+    assert error["data"]["required_action"] == "reduce_request_size"
+    assert app.requests == []
+
+
+@pytest.mark.asyncio
+async def test_normal_sized_adoption_post_still_replays():
+    """#192: bodies under the limit keep the existing adoption path."""
+    app = FakeMcpApp()
+    middleware = _middleware(app, body_limit=8 * 1024 * 1024)
+
+    messages = await _call(
+        middleware,
+        headers={MCP_SESSION_ID: "reaped-1"},
+        payload=_business_call("reaped-1"),
+    )
+    start, body = _response(messages)
+    assert start["status"] == 200
+    assert json.loads(body)["ok"] is True
+    methods = [r["payload"].get("method") for r in app.requests]
+    assert methods == ["initialize", "notifications/initialized", "tools/call"]

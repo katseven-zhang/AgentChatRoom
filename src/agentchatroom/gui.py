@@ -19,7 +19,7 @@ import webbrowser
 from dataclasses import replace
 from pathlib import Path
 from queue import Empty, Queue
-from typing import Any
+from typing import Any, Callable
 
 from .cli import (
     process_is_running,
@@ -129,6 +129,32 @@ def button_states(
     if action_active:
         return (False, False)
     return (not service_running, service_running)
+
+
+# Sink event kinds that end an in-flight start/restart/stop action (#191).
+WORKER_TERMINAL_EVENTS = frozenset(
+    {"started", "start_failed", "restart_aborted", "stopped", "stop_failed"}
+)
+
+
+def action_after_worker_event(action_active: bool, kind: str) -> bool:
+    """Return the action_active flag after applying a worker sink event.
+
+    Terminal worker events always clear the flag so the buttons re-enable;
+    plain ``log`` lines never change it. Workers must therefore always emit a
+    terminal event — including for unexpected exceptions — or the console
+    stays stuck with every button disabled.
+    """
+    if kind in WORKER_TERMINAL_EVENTS:
+        return False
+    return action_active
+
+
+def format_worker_error(error: BaseException) -> str:
+    """Render a worker exception for the GUI log area (#191)."""
+    if isinstance(error, SystemExit):
+        return str(error)
+    return f"{type(error).__name__}: {error}"
 
 
 def close_action(service_running: bool, user_choice: str | None) -> str:
@@ -295,6 +321,101 @@ def _drain(sink: Queue) -> list[Any]:
             items.append(sink.get_nowait())
         except Empty:
             return items
+
+
+def run_start_worker(
+    sink: Queue,
+    *,
+    host: str,
+    port: int,
+    settings: Settings,
+    start_fn: Callable[[str, int], dict[str, Any]],
+    port_probe: Callable[[str, int], bool] | None = None,
+) -> None:
+    """Start the detached service; always emit a terminal sink event (#191)."""
+    probe = port_probe if port_probe is not None else port_is_free
+    try:
+        if not probe(host, port):
+            sink.put(
+                (
+                    "start_failed",
+                    f"端口 {port} 已被占用：可能已有一个服务在运行，"
+                    "请先停止或更换端口。",
+                )
+            )
+            return
+        result = start_fn(host, port)
+        sink.put(("started", result))
+        if host != settings.host or port != settings.port:
+            try:
+                update_config_values(
+                    config_file_path(settings), host=host, port=port
+                )
+                sink.put(
+                    (
+                        "log",
+                        f"{host}:{port} 已写入配置，后续启动将使用该配置。",
+                    )
+                )
+            except (OSError, ValueError) as error:
+                sink.put(("log", f"[配置写入失败] {error}"))
+            if os.getenv("AGENTCHATROOM_PORT", "").strip() or os.getenv(
+                "AGENTCHATROOM_HOST", ""
+            ).strip():
+                sink.put(
+                    (
+                        "log",
+                        "检测到 AGENTCHATROOM_HOST/PORT 环境变量：其他启动入口仍以环境变量优先。",
+                    )
+                )
+    except SystemExit as error:
+        sink.put(("start_failed", format_worker_error(error)))
+    except Exception as error:
+        # Catch-all (#191): unexpected errors must clear action_active via a
+        # terminal event and show the failure in the log area.
+        sink.put(("start_failed", format_worker_error(error)))
+
+
+def run_restart_worker(
+    sink: Queue,
+    *,
+    is_running: Callable[[], bool],
+    stop_fn: Callable[[], dict[str, Any]],
+    start_body: Callable[[], None],
+) -> None:
+    """Stop then start; always emit a terminal sink event (#191)."""
+    try:
+        if restart_steps(is_running()) == ("stop", "start"):
+            result = stop_fn()
+            if not result.get("stopped"):
+                sink.put(
+                    (
+                        "restart_aborted",
+                        f"旧服务停止未完成：{result.get('reason')}",
+                    )
+                )
+                return
+            sink.put(("log", "旧服务已停止，正在重新启动..."))
+        start_body()
+    except SystemExit as error:
+        sink.put(("restart_aborted", format_worker_error(error)))
+    except Exception as error:
+        # Not stop_failed: a restart failure is reported as restart_aborted.
+        sink.put(("restart_aborted", format_worker_error(error)))
+
+
+def run_stop_worker(
+    sink: Queue,
+    *,
+    stop_fn: Callable[[], dict[str, Any]],
+) -> None:
+    """Stop the detached service; always emit a terminal sink event (#191)."""
+    try:
+        sink.put(("stopped", stop_fn()))
+    except SystemExit as error:
+        sink.put(("stop_failed", format_worker_error(error)))
+    except Exception as error:
+        sink.put(("stop_failed", format_worker_error(error)))
 
 
 def build_tray_menu_spec() -> list[tuple[str, str, bool]]:
@@ -532,8 +653,11 @@ def run_gui(config_path: str | None = None) -> None:
             kind, payload = message
             if kind == "log":
                 self.append_log(str(payload))
-            elif kind == "started":
-                self.action_active = False
+                return
+            self.action_active = action_after_worker_event(
+                self.action_active, kind
+            )
+            if kind == "started":
                 self.running_port = self._launched_port(payload)
                 note = "服务已在运行" if payload.get("already_running") else "服务已启动"
                 self.append_log(
@@ -541,15 +665,12 @@ def run_gui(config_path: str | None = None) -> None:
                 )
                 self.refresh_state()
             elif kind == "start_failed":
-                self.action_active = False
                 self.refresh_state()
                 self.append_log(f"[启动失败] {payload}")
             elif kind == "restart_aborted":
-                self.action_active = False
                 self.refresh_state()
                 self.append_log(f"[重启中止] {payload}")
             elif kind == "stopped":
-                self.action_active = False
                 stopped = bool(payload.get("stopped"))
                 if stopped:
                     self.append_log("服务已停止。")
@@ -563,7 +684,6 @@ def run_gui(config_path: str | None = None) -> None:
                 if self.pending_exit_after_stop:
                     self.finish_exit_after_stop(stopped)
             elif kind == "stop_failed":
-                self.action_active = False
                 self.refresh_state()
                 self.append_log(f"[停止失败] {payload}")
                 if self.pending_exit_after_stop:
@@ -610,44 +730,13 @@ def run_gui(config_path: str | None = None) -> None:
             ).start()
 
         def start_worker(self, host: str, port: int) -> None:
-            try:
-                if not port_is_free(host, port):
-                    sink.put(
-                        (
-                            "start_failed",
-                            f"端口 {port} 已被占用：可能已有一个服务在运行，"
-                            "请先停止或更换端口。",
-                        )
-                    )
-                    return
-                result = controller.start(host, port)
-                sink.put(("started", result))
-                if host != settings.host or port != settings.port:
-                    try:
-                        update_config_values(
-                            config_file_path(settings), host=host, port=port
-                        )
-                        sink.put(
-                            (
-                                "log",
-                                f"{host}:{port} 已写入配置，后续启动将使用该配置。",
-                            )
-                        )
-                    except (OSError, ValueError) as error:
-                        sink.put(("log", f"[配置写入失败] {error}"))
-                    if os.getenv("AGENTCHATROOM_PORT", "").strip() or os.getenv(
-                        "AGENTCHATROOM_HOST", ""
-                    ).strip():
-                        sink.put(
-                            (
-                                "log",
-                                "检测到 AGENTCHATROOM_HOST/PORT 环境变量：其他启动入口仍以环境变量优先。",
-                            )
-                        )
-            except SystemExit as error:
-                sink.put(("start_failed", str(error)))
-            except OSError as error:
-                sink.put(("start_failed", f"{type(error).__name__}: {error}"))
+            run_start_worker(
+                sink,
+                host=host,
+                port=port,
+                settings=settings,
+                start_fn=controller.start,
+            )
 
         def on_restart(self) -> None:
             if self.action_active:
@@ -669,21 +758,12 @@ def run_gui(config_path: str | None = None) -> None:
             ).start()
 
         def restart_worker(self, host: str, port: int) -> None:
-            try:
-                if restart_steps(controller.is_running()) == ("stop", "start"):
-                    result = controller.stop()
-                    if not result.get("stopped"):
-                        sink.put(
-                            (
-                                "restart_aborted",
-                                f"旧服务停止未完成：{result.get('reason')}",
-                            )
-                        )
-                        return
-                    sink.put(("log", "旧服务已停止，正在重新启动..."))
-                self.start_worker(host, port)
-            except OSError as error:
-                sink.put(("stop_failed", f"{type(error).__name__}: {error}"))
+            run_restart_worker(
+                sink,
+                is_running=controller.is_running,
+                stop_fn=controller.stop,
+                start_body=lambda: self.start_worker(host, port),
+            )
 
         def on_frontend(self) -> None:
             if controller.running_pid() is None:
@@ -711,10 +791,7 @@ def run_gui(config_path: str | None = None) -> None:
             threading.Thread(target=self.stop_worker, daemon=True).start()
 
         def stop_worker(self) -> None:
-            try:
-                sink.put(("stopped", controller.stop()))
-            except OSError as error:
-                sink.put(("stop_failed", f"{type(error).__name__}: {error}"))
+            run_stop_worker(sink, stop_fn=controller.stop)
 
         def on_close(self) -> None:
             if self.tray is not None:

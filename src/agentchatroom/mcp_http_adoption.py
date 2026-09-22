@@ -49,6 +49,9 @@ ADOPTION_PROTOCOL_VERSION = "2025-06-18"
 ADOPTION_HANDSHAKE_TIMEOUT_SECONDS = 10.0
 ADOPTION_MAP_LIMIT = 512
 ADOPTION_MAP_TTL_SECONDS = 86400.0
+# Max adoption-path request body. Oversized bodies fail closed with 413
+# rather than being silently truncated before replay (#192).
+ADOPTION_BODY_LIMIT = 8 * 1024 * 1024
 
 Scope = MutableMapping[str, Any]
 Message = MutableMapping[str, Any]
@@ -87,6 +90,14 @@ def _replace_header(
     if not replaced:
         result.append((name, value))
     return result
+
+
+class PayloadTooLargeError(Exception):
+    """Raised when an adoption-path request body exceeds the configured limit."""
+
+    def __init__(self, limit: int) -> None:
+        super().__init__(f"request body exceeds {limit} bytes")
+        self.limit = limit
 
 
 class _Recorder:
@@ -158,6 +169,7 @@ class TolerantSessionAdoptionMiddleware:
         map_ttl_seconds: float = ADOPTION_MAP_TTL_SECONDS,
         handshake_timeout_seconds: float = ADOPTION_HANDSHAKE_TIMEOUT_SECONDS,
         max_parked_handshakes: int = 32,
+        body_limit: int = ADOPTION_BODY_LIMIT,
     ) -> None:
         self.app = app
         self.session_manager = session_manager
@@ -169,6 +181,7 @@ class TolerantSessionAdoptionMiddleware:
         self._map_ttl_seconds = float(map_ttl_seconds)
         self._handshake_timeout_seconds = float(handshake_timeout_seconds)
         self._max_parked = max(1, int(max_parked_handshakes))
+        self._body_limit = max(1, int(body_limit))
         self._adopted: dict[str, tuple[str, float]] = {}
         # Parked synthetic handshake tasks (kept referenced so they are never
         # garbage-collected while still running; each ends when its transport
@@ -200,7 +213,15 @@ class TolerantSessionAdoptionMiddleware:
             await self.app(scope, receive, send)
             return
 
-        body = await _read_request_body(receive) if method == "POST" else b""
+        body = b""
+        if method == "POST":
+            try:
+                body = await _read_request_body(receive, limit=self._body_limit)
+            except PayloadTooLargeError as error:
+                # Fail closed with a structured 413 instead of replaying a
+                # silently truncated body that only fails as a parse error (#192).
+                await self._send_payload_too_large(send, error.limit)
+                return
         surrogate = self._active_surrogate(session_id)
         if surrogate is None:
             surrogate = await self._open_surrogate(scope)
@@ -269,6 +290,37 @@ class TolerantSessionAdoptionMiddleware:
         if binding is None:
             return
         self._adopt_binding(surrogate, binding)
+
+    async def _send_payload_too_large(
+        self, send: Callable[[Message], Awaitable[None]], limit: int
+    ) -> None:
+        payload = json.dumps(
+            {
+                "error": {
+                    "code": "payload_too_large",
+                    "message": f"Request body exceeds {limit} bytes",
+                    "data": {
+                        "code": "payload_too_large",
+                        "limit": limit,
+                        "required_action": "reduce_request_size",
+                    },
+                }
+            }
+        ).encode("utf-8")
+        logger.warning(
+            "Adoption rejected oversized request body (limit=%d bytes)", limit
+        )
+        await send(
+            {
+                "type": "http.response.start",
+                "status": 413,
+                "headers": [
+                    (b"content-type", b"application/json"),
+                    (b"content-length", str(len(payload)).encode("latin-1")),
+                ],
+            }
+        )
+        await send({"type": "http.response.body", "body": payload})
 
     async def _open_surrogate(self, scope: Scope) -> str | None:
         """Run the MCP initialisation handshake and return the new session id."""
@@ -435,16 +487,28 @@ class TolerantSessionAdoptionMiddleware:
 async def _read_request_body(
     receive: Callable[[], Awaitable[Message]],
     *,
-    limit: int = 8 * 1024 * 1024,
+    limit: int = ADOPTION_BODY_LIMIT,
 ) -> bytes:
+    """Buffer a POST body, failing closed past ``limit`` bytes (#192).
+
+    Never returns a truncated body: hitting the limit raises
+    :class:`PayloadTooLargeError` so the middleware can answer 413 instead
+    of replaying incomplete JSON-RPC downstream.
+    """
     chunks = bytearray()
     while True:
         message = await receive()
         if message.get("type") != "http.request":
             break
         chunks.extend(message.get("body") or b"")
-        if not message.get("more_body") or len(chunks) >= limit:
+        if len(chunks) > limit:
+            raise PayloadTooLargeError(limit)
+        if not message.get("more_body"):
             break
+        if len(chunks) >= limit:
+            # More body is still coming but we are already at the limit —
+            # truncating here would silently corrupt the replayed request.
+            raise PayloadTooLargeError(limit)
     return bytes(chunks)
 
 
@@ -459,6 +523,7 @@ def with_session_adoption(
     map_limit: int = ADOPTION_MAP_LIMIT,
     map_ttl_seconds: float = ADOPTION_MAP_TTL_SECONDS,
     max_parked_handshakes: int = 32,
+    body_limit: int = ADOPTION_BODY_LIMIT,
 ) -> TolerantSessionAdoptionMiddleware:
     """Wrap a Streamable HTTP MCP ASGI app with tolerant session adoption."""
     return TolerantSessionAdoptionMiddleware(
@@ -471,4 +536,5 @@ def with_session_adoption(
         map_limit=map_limit,
         map_ttl_seconds=map_ttl_seconds,
         max_parked_handshakes=max_parked_handshakes,
+        body_limit=body_limit,
     )

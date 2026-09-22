@@ -22,15 +22,20 @@ from agentchatroom.gui import (
     STAY,
     STOP_AND_CLOSE,
     ServiceController,
+    action_after_worker_event,
     build_tray_menu_spec,
     button_states,
     close_action,
     config_file_path,
+    format_worker_error,
     host_requires_management_auth,
     port_is_free,
     redact_line,
     restart_steps,
     resolve_frontend_url,
+    run_restart_worker,
+    run_start_worker,
+    run_stop_worker,
     running_url_from_log,
     tray_icon_image,
     update_config_port,
@@ -166,6 +171,108 @@ def test_button_states_follow_service_and_action_state() -> None:
     assert button_states(service_running=True, action_active=False) == (False, True)
     assert button_states(service_running=False, action_active=True) == (False, False)
     assert button_states(service_running=True, action_active=True) == (False, False)
+
+
+def test_action_after_worker_event_clears_only_terminal_kinds() -> None:
+    assert action_after_worker_event(True, "start_failed") is False
+    assert action_after_worker_event(True, "restart_aborted") is False
+    assert action_after_worker_event(True, "stop_failed") is False
+    assert action_after_worker_event(True, "stopped") is False
+    assert action_after_worker_event(True, "started") is False
+    assert action_after_worker_event(True, "log") is True
+    assert action_after_worker_event(False, "log") is False
+
+
+def test_format_worker_error_covers_system_exit_and_exception() -> None:
+    assert format_worker_error(SystemExit("gone")) == "gone"
+    assert format_worker_error(ValueError("boom")) == "ValueError: boom"
+
+
+def test_start_worker_unexpected_error_resets_action_and_reports(
+    settings,
+) -> None:
+    """#191: non-OSError in start_worker must surface and re-enable buttons."""
+    sink: Queue = Queue()
+
+    def boom(host: str, port: int) -> dict:
+        raise ValueError("ctypes boundary")
+
+    run_start_worker(
+        sink,
+        host="127.0.0.1",
+        port=8765,
+        settings=settings,
+        start_fn=boom,
+        port_probe=lambda _h, _p: True,
+    )
+
+    events = []
+    while not sink.empty():
+        events.append(sink.get_nowait())
+    assert events, "error must be visible in the log sink"
+    kind, message = events[-1]
+    assert kind == "start_failed"
+    assert "ValueError" in message
+    assert "ctypes boundary" in message
+
+    action_active = action_after_worker_event(True, kind)
+    assert action_active is False
+    start_enabled, stop_enabled = button_states(False, action_active)
+    assert start_enabled is True
+    assert stop_enabled is False
+
+
+def test_restart_worker_unexpected_error_reports_restart_aborted(
+    settings,
+) -> None:
+    """#191: restart failures use restart_aborted, not stop_failed."""
+    sink: Queue = Queue()
+
+    def boom() -> dict:
+        raise ValueError("pid file decode")
+
+    run_restart_worker(
+        sink,
+        is_running=lambda: True,
+        stop_fn=boom,
+        start_body=lambda: None,
+    )
+
+    kind, message = sink.get_nowait()
+    assert kind == "restart_aborted"
+    assert "ValueError" in message
+    assert action_after_worker_event(True, kind) is False
+    assert button_states(True, False) == (False, True)
+
+
+def test_stop_worker_unexpected_error_reports_stop_failed() -> None:
+    """#191: stop failures emit stop_failed so pending exit can continue."""
+    sink: Queue = Queue()
+
+    def boom() -> dict:
+        raise RuntimeError("tree kill failed")
+
+    run_stop_worker(sink, stop_fn=boom)
+
+    kind, message = sink.get_nowait()
+    assert kind == "stop_failed"
+    assert "RuntimeError" in message
+    assert action_after_worker_event(True, kind) is False
+
+
+def test_start_worker_port_busy_still_reports_without_raising(settings) -> None:
+    sink: Queue = Queue()
+    run_start_worker(
+        sink,
+        host="127.0.0.1",
+        port=9,
+        settings=settings,
+        start_fn=lambda h, p: {"started": True},
+        port_probe=lambda _h, _p: False,
+    )
+    kind, message = sink.get_nowait()
+    assert kind == "start_failed"
+    assert "已被占用" in message
 
 
 def test_close_action_maps_all_three_running_choices() -> None:
