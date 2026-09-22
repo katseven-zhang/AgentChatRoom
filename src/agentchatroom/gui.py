@@ -33,11 +33,6 @@ MIN_PORT = 1
 MAX_PORT = 65535
 _DIGITS_ONLY = re.compile(r"\A[0-9]+\Z")
 _RUNNING_URL = re.compile(r"running on (https?://\S+)")
-_SENSITIVE_ASSIGNMENT = re.compile(
-    r"(?i)\b(token|secret|password|api[_-]?key)\s*[=:]\s*([^\s&\"']+)"
-)
-_SENSITIVE_BEARER = re.compile(r"(?i)bearer\s+[A-Za-z0-9._~+/-]+=*")
-_SENSITIVE_PROVIDER_KEY = re.compile(r"\bsk-(?:proj-|svcacct-)?[A-Za-z0-9_-]{8,}\b")
 
 # Mirrors the server config rule: only loopback targets may bind without
 # management authentication.
@@ -117,12 +112,14 @@ def port_is_free(host: str, port: int) -> bool:
 
 
 def redact_line(line: str) -> str:
-    """Mask credential-looking fragments before showing a log line."""
-    redacted = _SENSITIVE_ASSIGNMENT.sub(
-        lambda match: f"{match.group(1)}=***", line
-    )
-    redacted = _SENSITIVE_BEARER.sub("Bearer ***", redacted)
-    return _SENSITIVE_PROVIDER_KEY.sub("sk-***", redacted)
+    """Mask credential-looking fragments before showing a log line.
+
+    Delegates to the shared API policy so GUI tails match server.log and
+    the admin_runtime log view (single redaction standard).
+    """
+    from .api import redact_log_line
+
+    return redact_log_line(line)
 
 
 def button_states(

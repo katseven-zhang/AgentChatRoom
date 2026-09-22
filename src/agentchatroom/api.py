@@ -355,8 +355,13 @@ class BackupRestoreRequest(StrictModel):
 _CREDENTIAL_VALUE = r"[^\s,;}\]&\"']+"
 
 
-def _redact_log_line(line: str) -> str:
-    """Keep operational context while removing common credential-shaped values."""
+def redact_log_line(line: str) -> str:
+    """Single log-redaction policy shared by API filters and the GUI log view.
+
+    Keeps operational context while masking authorization/bearer/cookie/token
+    assignments, provider API keys (sk-/ghp_/gho_/xox*), and bare ``acr.*``
+    Agent Token literals so server.log, admin_runtime, and GUI tails match.
+    """
     redacted = re.sub(
         r"(?i)(authorization\s*[:=]\s*)[^\r\n]+",
         r"\1[REDACTED]",
@@ -373,15 +378,37 @@ def _redact_log_line(line: str) -> str:
         redacted,
     )
     redacted = re.sub(
-        r"(?i)((?:^|[;,\s])[a-z0-9_-]*cookie[a-z0-9_-]*\s*[:=]\s*)" + _CREDENTIAL_VALUE,
+        r"(?i)((?:^|[;,\s])[a-z0-9_-]*cookie[a-z0-9_-]*\s*[:=]\s*)"
+        + _CREDENTIAL_VALUE,
         r"\1[REDACTED]",
         redacted,
     )
-    return re.sub(
+    redacted = re.sub(
         r"(?i)(token|secret|password|api[_-]?key)(\s*[:=]\s*)" + _CREDENTIAL_VALUE,
         r"\1\2[REDACTED]",
         redacted,
     )
+    redacted = re.sub(
+        r"\bsk-(?:proj-|svcacct-)?[A-Za-z0-9_-]{8,}\b",
+        "[REDACTED]",
+        redacted,
+    )
+    redacted = re.sub(
+        r"\b(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{20,}\b",
+        "[REDACTED]",
+        redacted,
+    )
+    redacted = re.sub(
+        r"\bxox[baprs]-[A-Za-z0-9-]{10,}\b",
+        "[REDACTED]",
+        redacted,
+    )
+    return re.sub(r"\bacr\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b", "[REDACTED]", redacted)
+
+
+# Internal alias so existing call sites and tests keep one name while the
+# GUI imports the public shared policy.
+_redact_log_line = redact_log_line
 
 
 class CredentialRedactingLogFilter(logging.Filter):
@@ -754,6 +781,33 @@ class SSELimiter:
         self._project_counts: dict[str, int] = {}
         self._ip_counts: dict[str, int] = {}
 
+    def ensure_available(self, project_id: str, client_ip: str) -> None:
+        """Raise 429 when a new stream would exceed limits, without taking a slot.
+
+        Capacity is reserved inside the generator (first iteration) so a client
+        that disconnects before the body starts never holds a slot.
+        """
+        with self._guard:
+            project_count = self._project_counts.get(project_id, 0)
+            ip_count = self._ip_counts.get(client_ip, 0)
+            if project_count >= self.max_per_project:
+                raise DomainError(
+                    "sse_limit_exceeded",
+                    "Too many event stream clients for this Project",
+                    status_code=429,
+                    details={
+                        "limit": self.max_per_project,
+                        "scope": "project",
+                    },
+                )
+            if ip_count >= self.max_per_ip:
+                raise DomainError(
+                    "sse_limit_exceeded",
+                    "Too many event stream clients from this address",
+                    status_code=429,
+                    details={"limit": self.max_per_ip, "scope": "ip"},
+                )
+
     def acquire(self, project_id: str, client_ip: str) -> None:
         with self._guard:
             project_count = self._project_counts.get(project_id, 0)
@@ -790,6 +844,71 @@ class SSELimiter:
                 self._ip_counts[client_ip] = ip_count
             else:
                 self._ip_counts.pop(client_ip, None)
+
+
+class LoginRateLimiter:
+    """In-process failure throttle for management login (IP + global keys)."""
+
+    def __init__(
+        self,
+        *,
+        max_failures: int,
+        window_seconds: float,
+        lockout_seconds: float,
+        now: Callable[[], float] | None = None,
+    ) -> None:
+        self.max_failures = max_failures
+        self.window_seconds = window_seconds
+        self.lockout_seconds = lockout_seconds
+        self._now = now or time.time
+        self._guard = threading.Lock()
+        self._failures: dict[str, list[float]] = {}
+        self._locked_until: dict[str, float] = {}
+
+    def _prune(self, key: str, now: float) -> list[float]:
+        stamps = [
+            stamp
+            for stamp in self._failures.get(key, ())
+            if 0.0 <= now - stamp < self.window_seconds
+        ]
+        if stamps:
+            self._failures[key] = stamps
+        else:
+            self._failures.pop(key, None)
+        return stamps
+
+    def retry_after(self, key: str) -> float | None:
+        """Seconds until this key may attempt login again, or None if allowed."""
+        now = self._now()
+        with self._guard:
+            locked_until = self._locked_until.get(key, 0.0)
+            if locked_until > now:
+                return locked_until - now
+            if locked_until:
+                self._locked_until.pop(key, None)
+                self._failures.pop(key, None)
+            stamps = self._prune(key, now)
+            if len(stamps) >= self.max_failures:
+                lock_until = stamps[-1] + self.lockout_seconds
+                if lock_until > now:
+                    self._locked_until[key] = lock_until
+                    return lock_until - now
+                self._failures.pop(key, None)
+            return None
+
+    def record_failure(self, key: str) -> None:
+        now = self._now()
+        with self._guard:
+            stamps = self._prune(key, now)
+            stamps.append(now)
+            self._failures[key] = stamps
+            if len(stamps) >= self.max_failures:
+                self._locked_until[key] = now + self.lockout_seconds
+
+    def record_success(self, key: str) -> None:
+        with self._guard:
+            self._failures.pop(key, None)
+            self._locked_until.pop(key, None)
 
 
 _BACKUP_SETTINGS_OVERRIDE: dict[str, Any] = {}
@@ -1130,6 +1249,11 @@ def create_app(
         max_per_project=resolved.max_sse_clients_per_project,
         max_per_ip=resolved.sse_per_ip_limit,
     )
+    login_rate_limiter = LoginRateLimiter(
+        max_failures=resolved.management_login_max_failures,
+        window_seconds=resolved.management_login_window_seconds,
+        lockout_seconds=resolved.management_login_lockout_seconds,
+    )
 
     app.add_middleware(
         ManagementAuthASGIMiddleware,
@@ -1228,20 +1352,43 @@ def create_app(
         return response
 
     @app.post("/api/v1/auth/login")
-    def management_login(body: AdminLogin) -> JSONResponse:
-        if resolved.management_auth_required and not hmac.compare_digest(
-            body.token, management_token
-        ):
-            return JSONResponse(
-                status_code=401,
-                content={
-                    "error": {
-                        "code": "invalid_management_token",
-                        "message": "Management token is invalid",
-                        "details": {},
-                    }
-                },
-            )
+    def management_login(request: Request, body: AdminLogin) -> JSONResponse:
+        if resolved.management_auth_required:
+            client_ip = event_stream_client_ip(request)
+            ip_key = f"ip:{client_ip}"
+            for key in (ip_key, "global"):
+                wait = login_rate_limiter.retry_after(key)
+                if wait is not None:
+                    retry_after = max(1, int(wait + 0.999))
+                    return JSONResponse(
+                        status_code=429,
+                        content={
+                            "error": {
+                                "code": "management_login_rate_limited",
+                                "message": "Too many failed management login attempts",
+                                "details": {"retry_after": retry_after},
+                            }
+                        },
+                        headers={"Retry-After": str(retry_after)},
+                    )
+            if not hmac.compare_digest(body.token, management_token):
+                login_rate_limiter.record_failure(ip_key)
+                login_rate_limiter.record_failure("global")
+                logging.getLogger(__name__).warning(
+                    "management login failed client_ip=%s", client_ip
+                )
+                return JSONResponse(
+                    status_code=401,
+                    content={
+                        "error": {
+                            "code": "invalid_management_token",
+                            "message": "Management token is invalid",
+                            "details": {},
+                        }
+                    },
+                )
+            login_rate_limiter.record_success(ip_key)
+            login_rate_limiter.record_success("global")
         session_id, response = issue_browser_session()
         return attach_browser_cookie(response, session_id)
 
@@ -1650,7 +1797,9 @@ def create_app(
         service.get_project(project_id)
         authorize_event_stream(request, project_id)
         client_ip = event_stream_client_ip(request)
-        sse_limiter.acquire(project_id, client_ip)
+        # Dry-run capacity check only: taking the slot here would leak it when
+        # the client disconnects before StreamingResponse starts the generator.
+        sse_limiter.ensure_available(project_id, client_ip)
         header_cursor = request.headers.get("last-event-id", "")
         if header_cursor.isdigit():
             after = max(after, int(header_cursor))
@@ -1658,10 +1807,22 @@ def create_app(
         async def event_stream():
             cursor = after
             idle_ticks = 0
+            acquired = False
             try:
+                # Acquire on first iteration so a cancel before body start never
+                # holds a slot; once iteration begins Starlette runs finally.
+                try:
+                    sse_limiter.acquire(project_id, client_ip)
+                    acquired = True
+                except DomainError:
+                    # Lost a race after ensure_available; headers already 200.
+                    return
                 yield ": connected\n\n"
                 while not await request.is_disconnected():
-                    result = service.list_events(project_id, after=cursor, limit=200)
+                    # Sync SQLite must not run on the event loop (#184).
+                    result = await asyncio.to_thread(
+                        service.list_events, project_id, after=cursor, limit=200
+                    )
                     if result["events"]:
                         for event in result["events"]:
                             cursor = event["id"]
@@ -1677,9 +1838,21 @@ def create_app(
                             idle_ticks = 0
                     await asyncio.sleep(resolved.sse_poll_interval_seconds)
             finally:
-                sse_limiter.release(project_id, client_ip)
+                if acquired:
+                    sse_limiter.release(project_id, client_ip)
 
-        return StreamingResponse(
+        class _EnsureCloseStreamingResponse(StreamingResponse):
+            """Always aclose the body iterator so generator finally (SSE release) runs."""
+
+            async def stream_response(self, send) -> None:  # type: ignore[override]
+                try:
+                    await super().stream_response(send)
+                finally:
+                    aclose = getattr(self.body_iterator, "aclose", None)
+                    if aclose is not None:
+                        await aclose()
+
+        return _EnsureCloseStreamingResponse(
             event_stream(),
             media_type="text/event-stream",
             headers={

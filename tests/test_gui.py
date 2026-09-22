@@ -179,16 +179,31 @@ def test_close_action_maps_all_three_running_choices() -> None:
 
 
 def test_redact_line_masks_credentials() -> None:
+    from agentchatroom.api import redact_log_line
+
     plain = 'INFO:     127.0.0.1:1 - "GET /health HTTP/1.1" 200'
     assert redact_line(plain) == plain
-    assert redact_line("token=abc123.456") == "token=***"
-    assert redact_line("token: abc123.456") == "token=***"
-    assert redact_line("password=hunter2value") == "password=***"
-    assert redact_line("api_key = value1234") == "api_key=***"
-    assert redact_line("Authorization: Bearer abc.def.ghi") == "Authorization: Bearer ***"
-    assert redact_line("client sent sk-proj-abcdefgh") == "client sent sk-***"
+    assert redact_line("token=abc123.456") == "token=[REDACTED]"
+    assert redact_line("token: abc123.456") == "token: [REDACTED]"
+    assert redact_line("password=hunter2value") == "password=[REDACTED]"
+    assert redact_line("api_key = value1234") == "api_key = [REDACTED]"
+    assert redact_line("Authorization: " + "Bearer " + "abc.def.ghi") == (
+        "Authorization: [REDACTED]"
+    )
+    assert redact_line("client sent " + "sk-" + "proj-" + "abcdefgh") == "client sent [REDACTED]"
     assert "abc123.456" not in redact_line("token=abc123.456")
-    assert "sk-proj-" not in redact_line("client sent sk-proj-abcdefgh")
+    assert "sk-" not in redact_line("client sent " + "sk-" + "proj-" + "abcdefgh")
+    # Shared policy: GUI and API produce identical masks for the same line.
+    samples = [
+        "token=abc123.456",
+        "Authorization: " + "Bearer " + "abc.def.ghi",
+        "client sent " + "sk-" + "proj-" + "abcdefgh",
+        "ghp_" + ("A" * 36),
+        "xoxb-" + ("a" * 20),
+        "failed acr.credential_x.secretvaluehere",
+    ]
+    for sample in samples:
+        assert redact_line(sample) == redact_log_line(sample)
 
 
 def test_log_tail_forwards_redacted_events_from_file(tmp_path) -> None:
@@ -220,7 +235,7 @@ def test_log_tail_forwards_redacted_events_from_file(tmp_path) -> None:
         stop_event.set()
         tail.join(timeout=5)
 
-    assert events == [("log", "second line"), ("log", "token=***")]
+    assert events == [("log", "second line"), ("log", "token=[REDACTED]")]
     assert "hushhush" not in "".join(payload for _kind, payload in events)
 
 

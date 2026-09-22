@@ -183,6 +183,10 @@ class Settings:
     management_token_env: str = "AGENTCHATROOM_ADMIN_TOKEN"
     management_session_ttl_seconds: int = 43200
     management_cookie_name: str = "agentchatroom_admin"
+    # Failed management login attempts allowed per key (IP + global) before lockout.
+    management_login_max_failures: int = 5
+    management_login_window_seconds: float = 60.0
+    management_login_lockout_seconds: float = 60.0
     heartbeat_timeout_seconds: int = 45
     presence_keepalive_enabled: bool = True
     presence_keepalive_interval_seconds: float = 15.0
@@ -533,6 +537,24 @@ def load_settings(
             "AGENTCHATROOM_MANAGEMENT_COOKIE_NAME",
             file_values.get("management_cookie_name", "agentchatroom_admin"),
         ),
+        "management_login_max_failures": int(
+            os.getenv(
+                "AGENTCHATROOM_MANAGEMENT_LOGIN_MAX_FAILURES",
+                file_values.get("management_login_max_failures", 5),
+            )
+        ),
+        "management_login_window_seconds": float(
+            os.getenv(
+                "AGENTCHATROOM_MANAGEMENT_LOGIN_WINDOW_SECONDS",
+                file_values.get("management_login_window_seconds", 60.0),
+            )
+        ),
+        "management_login_lockout_seconds": float(
+            os.getenv(
+                "AGENTCHATROOM_MANAGEMENT_LOGIN_LOCKOUT_SECONDS",
+                file_values.get("management_login_lockout_seconds", 60.0),
+            )
+        ),
         "heartbeat_timeout_seconds": int(
             os.getenv(
                 "AGENTCHATROOM_HEARTBEAT_TIMEOUT_SECONDS",
@@ -745,6 +767,12 @@ def load_settings(
         raise ValueError("management token environment variable name must not be empty")
     if not str(values["management_cookie_name"]).strip():
         raise ValueError("management cookie name must not be empty")
+    if values["management_login_max_failures"] < 1:
+        raise ValueError("management login max failures must be at least 1")
+    if values["management_login_window_seconds"] <= 0:
+        raise ValueError("management login window must be positive")
+    if values["management_login_lockout_seconds"] <= 0:
+        raise ValueError("management login lockout must be positive")
     if values["host"] not in {"127.0.0.1", "localhost", "::1"} and not values[
         "management_auth_required"
     ]:

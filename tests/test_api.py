@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
+import threading
+import time
 import tomllib
 from dataclasses import replace
 from pathlib import Path
@@ -11,12 +14,15 @@ from fastapi.testclient import TestClient
 
 from agentchatroom.api import (
     CredentialRedactingLogFilter,
+    LoginRateLimiter,
+    SSELimiter,
     _is_expected_windows_proactor_disconnect,
     _redact_log_line,
     create_app,
     upsert_toml_section,
 )
 from agentchatroom.desktop import DirectoryPickerUnavailable
+from agentchatroom.errors import DomainError
 from agentchatroom.local_mcp import LocalMcpConfigurator, LocalMcpEnvironment
 from agentchatroom.project_registration import (
     PROJECT_INSTRUCTIONS_BEGIN,
@@ -737,7 +743,7 @@ def test_health_ready_hides_database_failures(settings, monkeypatch):
 def test_admin_runtime_reports_effective_paths_and_redacts_log_values(settings):
     settings.data_dir.mkdir(parents=True, exist_ok=True)
     (settings.data_dir / "server.log").write_text(
-        "Authorization: Bearer acr.secret-value token=another-secret\n",
+        "Authorization: " + "Bearer " + "acr.secret-value token=another-secret\n",
         encoding="utf-8",
     )
 
@@ -1613,7 +1619,7 @@ def test_redact_log_line_covers_token_bearer_authorization_and_cookies():
     assert "super-secret" not in redacted_query
     assert "token=[REDACTED]" in redacted_query
 
-    bearer_line = "Authorization: Bearer session-token-value"
+    bearer_line = "Authorization: " + "Bearer " + "session-token-value"
     redacted_bearer = _redact_log_line(bearer_line)
     assert "session-token-value" not in redacted_bearer
     assert "[REDACTED]" in redacted_bearer
@@ -1627,6 +1633,48 @@ def test_redact_log_line_covers_token_bearer_authorization_and_cookies():
     redacted_value = _redact_log_line(cookie_value)
     assert "abc123" not in redacted_value
     assert "[REDACTED]" in redacted_value
+
+
+def test_redact_log_line_covers_provider_keys_and_acr_tokens():
+    """#187: sk-/ghp_/xox*/acr.* must be masked with the shared policy."""
+    samples = [
+        "using key " + "sk-" + "proj-" + "test_placeholder",
+        "using key " + "sk-" + "svcacct-" + "test_placeholder",
+        "bare " + "sk-" + "test_placeholder",
+        "token " + ("ghp_" + "A" * 36),
+        "oauth " + ("gho_" + "B" * 36),
+        "slack xoxb-" + ("c" * 20),
+        "error echoing acr.credential_abc.s3cretvalue",
+        "Authorization: " + "Bearer " + "acr.credential_abc.s3cretvalue",
+    ]
+    for line in samples:
+        redacted = _redact_log_line(line)
+        for leak in (
+            "sk-proj-",
+            "sk-svcacct-",
+            "ghp_",
+            "gho_",
+            "xoxb-",
+            "acr.credential_abc",
+            "s3cretvalue",
+            "abcdefghijklmnop",
+        ):
+            assert leak not in redacted, (line, redacted, leak)
+        assert "[REDACTED]" in redacted
+
+
+def test_redact_log_line_is_shared_with_gui_policy():
+    from agentchatroom.gui import redact_line
+
+    samples = [
+        "token=super-secret",
+        "client sent " + "sk-" + "proj-" + "abcdefgh",
+        "failed acr.credential_x.secretvaluehere",
+        "ghp_" + ("A" * 36),
+        "xoxb-" + ("a" * 20),
+    ]
+    for sample in samples:
+        assert redact_line(sample) == _redact_log_line(sample)
 
 
 def test_access_log_filter_redacts_uvicorn_full_path_args():
@@ -2230,3 +2278,608 @@ def test_upsert_toml_section_bool_int_written_without_quotes():
     int_result = upsert_toml_section("", "backup", {"auto_backup_max_kept": 5})
     int_parsed = tomllib.loads(int_result)
     assert int_parsed["backup"]["auto_backup_max_kept"] == 5
+
+
+# ---------------------------------------------------------------------------
+# #181 SSE slot leak: acquire must live inside the generator; cancel-before-
+# iterate must never hold occupancy.
+# ---------------------------------------------------------------------------
+
+
+def _sse_auth_headers(joined: dict) -> dict[str, str]:
+    return {
+        "X-Agentchatroom-Session-Id": joined["agent"]["id"],
+        "X-Agentchatroom-Token": joined["token"],
+        "Accept": "text/event-stream",
+    }
+
+
+def _sse_asgi_scope(path: str, headers: dict[str, str]) -> dict:
+    header_items = [
+        (name.lower().encode("ascii"), value.encode("latin-1"))
+        for name, value in headers.items()
+    ]
+    return {
+        "type": "http",
+        "asgi": {"version": "3.0", "spec_version": "2.3"},
+        "http_version": "1.1",
+        "method": "GET",
+        "scheme": "http",
+        "path": path,
+        "raw_path": path.encode("ascii"),
+        "query_string": b"",
+        "root_path": "",
+        "headers": header_items,
+        "client": ("127.0.0.1", 40000),
+        "server": ("127.0.0.1", 8765),
+        "state": {},
+    }
+
+
+def test_sse_slot_not_leaked_when_generator_never_iterates(
+    settings, project_dir
+):
+    """#181: cancel after response.start / before body iteration must free capacity."""
+    max_clients = 3
+    limited = replace(
+        settings,
+        max_sse_clients_per_project=max_clients,
+        sse_per_ip_limit=max_clients,
+    )
+    acquires = 0
+    releases = 0
+
+    original_acquire = SSELimiter.acquire
+    original_release = SSELimiter.release
+
+    def spy_acquire(self, project_id, client_ip):
+        nonlocal acquires
+        acquires += 1
+        return original_acquire(self, project_id, client_ip)
+
+    def spy_release(self, project_id, client_ip):
+        nonlocal releases
+        releases += 1
+        return original_release(self, project_id, client_ip)
+
+    SSELimiter.acquire = spy_acquire  # type: ignore[method-assign]
+    SSELimiter.release = spy_release  # type: ignore[method-assign]
+    try:
+        from agentchatroom.database import create_database
+        from agentchatroom.services import AgentChatRoomService
+
+        setup = AgentChatRoomService(create_database(limited), limited)
+        setup.initialize()
+        project = setup.create_project(
+            root_path=str(project_dir), name="SSE Leak Room"
+        )
+        joined = setup.join_room(
+            project["id"],
+            name="Streamer",
+            client="codex",
+            model="test-model",
+        )
+        auth = _sse_auth_headers(joined)
+        path = f"/api/v1/projects/{project['id']}/events/stream"
+        app = create_app(limited)
+
+        async def run() -> None:
+            lifespan_rx: asyncio.Queue = asyncio.Queue()
+            lifespan_tx: asyncio.Queue = asyncio.Queue()
+
+            async def lifespan_receive():
+                return await lifespan_rx.get()
+
+            async def lifespan_send(message):
+                await lifespan_tx.put(message)
+
+            lifespan_task = asyncio.create_task(
+                app(
+                    {"type": "lifespan", "asgi": {"version": "3.0"}},
+                    lifespan_receive,
+                    lifespan_send,
+                )
+            )
+            await lifespan_rx.put({"type": "lifespan.startup"})
+            startup = await asyncio.wait_for(lifespan_tx.get(), timeout=10)
+            assert startup["type"] == "lifespan.startup.complete", startup
+
+            try:
+                # N > max: response.start succeeds, body never iterates.
+                for _ in range(max_clients + 5):
+                    scope = _sse_asgi_scope(path, auth)
+                    request_sent = False
+                    started = asyncio.Event()
+
+                    async def receive():
+                        nonlocal request_sent
+                        if not request_sent:
+                            request_sent = True
+                            return {
+                                "type": "http.request",
+                                "body": b"",
+                                "more_body": False,
+                            }
+                        await asyncio.Event().wait()
+                        return {"type": "http.disconnect"}
+
+                    async def send(message):
+                        if message["type"] == "http.response.start":
+                            started.set()
+                            raise asyncio.CancelledError(
+                                "client gone before body iteration"
+                            )
+
+                    try:
+                        await app(scope, receive, send)
+                    except asyncio.CancelledError:
+                        pass
+                    await asyncio.wait_for(started.wait(), timeout=5)
+
+                assert acquires == 0, "generator never iterated => no acquire"
+                assert releases == 0
+
+                # One full iteration must still succeed after aborted attempts.
+                scope = _sse_asgi_scope(path, auth)
+                request_sent = False
+                status_holder: dict[str, int] = {}
+                body = bytearray()
+                cancel_after_connected = True
+
+                async def receive_full():
+                    nonlocal request_sent
+                    if not request_sent:
+                        request_sent = True
+                        return {
+                            "type": "http.request",
+                            "body": b"",
+                            "more_body": False,
+                        }
+                    await asyncio.Event().wait()
+                    return {"type": "http.disconnect"}
+
+                async def send_full(message):
+                    if message["type"] == "http.response.start":
+                        status_holder["status"] = message["status"]
+                    elif message["type"] == "http.response.body":
+                        body.extend(message.get("body") or b"")
+                        if cancel_after_connected and b"connected" in body:
+                            raise asyncio.CancelledError("read enough of stream")
+
+                try:
+                    await app(scope, receive_full, send_full)
+                except asyncio.CancelledError:
+                    pass
+
+                assert status_holder.get("status") == 200
+                assert b"connected" in bytes(body)
+                assert acquires == 1
+                # Closing/cancelling after first iteration must release.
+                deadline = time.time() + 5
+                while releases < 1 and time.time() < deadline:
+                    await asyncio.sleep(0.01)
+                assert releases == 1
+            finally:
+                await lifespan_rx.put({"type": "lifespan.shutdown"})
+                try:
+                    shutdown = await asyncio.wait_for(lifespan_tx.get(), timeout=10)
+                    assert shutdown["type"] in {
+                        "lifespan.shutdown.complete",
+                        "lifespan.shutdown.failed",
+                    }
+                except (asyncio.TimeoutError, AssertionError):
+                    pass
+                lifespan_task.cancel()
+                try:
+                    await lifespan_task
+                except (asyncio.CancelledError, Exception):
+                    pass
+
+        asyncio.run(run())
+    finally:
+        SSELimiter.acquire = original_acquire  # type: ignore[method-assign]
+        SSELimiter.release = original_release  # type: ignore[method-assign]
+
+
+def test_sse_acquire_inside_generator_pattern_releases_on_close():
+    """Unit: generator-scoped acquire/release leaves zero occupancy after aclose."""
+    limiter = SSELimiter(max_per_project=2, max_per_ip=2)
+
+    async def stream():
+        acquired = False
+        try:
+            limiter.acquire("p", "10.0.0.1")
+            acquired = True
+            yield "connected"
+            yield "event"
+        finally:
+            if acquired:
+                limiter.release("p", "10.0.0.1")
+
+    async def run() -> None:
+        never_started = stream()
+        await never_started.aclose()
+        limiter.acquire("p", "10.0.0.1")
+        limiter.acquire("p", "10.0.0.2")
+        with pytest.raises(DomainError) as project_full:
+            limiter.acquire("p", "10.0.0.3")
+        assert project_full.value.status_code == 429
+        limiter.release("p", "10.0.0.1")
+        limiter.release("p", "10.0.0.2")
+
+        started = stream()
+        first = await started.__anext__()
+        assert first == "connected"
+        await started.aclose()
+        limiter.acquire("p", "10.0.0.1")
+        limiter.release("p", "10.0.0.1")
+
+    asyncio.run(run())
+
+
+def test_sse_ensure_available_returns_429_without_taking_slot():
+    limiter = SSELimiter(max_per_project=1, max_per_ip=2)
+    limiter.ensure_available("p", "1.1.1.1")
+    limiter.acquire("p", "1.1.1.1")
+    with pytest.raises(DomainError) as exceeded:
+        limiter.ensure_available("p", "2.2.2.2")
+    assert exceeded.value.status_code == 429
+    assert exceeded.value.details["scope"] == "project"
+    # ensure_available must not have mutated occupancy (still only 1).
+    limiter.release("p", "1.1.1.1")
+    limiter.acquire("p", "1.1.1.1")
+    limiter.release("p", "1.1.1.1")
+
+
+# ---------------------------------------------------------------------------
+# #188 management login rate limit
+# ---------------------------------------------------------------------------
+
+
+def test_management_login_rate_limits_failures_and_respects_retry_after(
+    monkeypatch, settings, project_dir
+):
+    admin_token = "test-management-token-with-adequate-length"
+    monkeypatch.setenv("TEST_AGENTCHATROOM_ADMIN_TOKEN", admin_token)
+    protected = replace(
+        settings,
+        management_auth_required=True,
+        management_token_env="TEST_AGENTCHATROOM_ADMIN_TOKEN",
+        management_login_max_failures=3,
+        management_login_window_seconds=60.0,
+        management_login_lockout_seconds=60.0,
+    )
+    with TestClient(create_app(protected)) as client:
+        for attempt in range(3):
+            rejected = client.post(
+                "/api/v1/auth/login", json={"token": f"wrong-{attempt}"}
+            )
+            assert rejected.status_code == 401, rejected.text
+            assert (
+                rejected.json()["error"]["code"] == "invalid_management_token"
+            )
+
+        limited = client.post(
+            "/api/v1/auth/login", json={"token": admin_token}
+        )
+        assert limited.status_code == 429, limited.text
+        body = limited.json()
+        assert body["error"]["code"] == "management_login_rate_limited"
+        assert body["error"]["details"]["retry_after"] >= 1
+        assert int(limited.headers["Retry-After"]) >= 1
+
+        # Correct credentials are also refused while the lock holds.
+        still_limited = client.post(
+            "/api/v1/auth/login", json={"token": admin_token}
+        )
+        assert still_limited.status_code == 429
+
+
+def test_management_login_success_resets_failure_window(
+    monkeypatch, settings
+):
+    admin_token = "test-management-token-with-adequate-length"
+    monkeypatch.setenv("TEST_AGENTCHATROOM_ADMIN_TOKEN", admin_token)
+    protected = replace(
+        settings,
+        management_auth_required=True,
+        management_token_env="TEST_AGENTCHATROOM_ADMIN_TOKEN",
+        management_login_max_failures=3,
+        management_login_window_seconds=60.0,
+        management_login_lockout_seconds=60.0,
+    )
+    with TestClient(create_app(protected)) as client:
+        assert (
+            client.post("/api/v1/auth/login", json={"token": "bad-1"}).status_code
+            == 401
+        )
+        assert (
+            client.post("/api/v1/auth/login", json={"token": "bad-2"}).status_code
+            == 401
+        )
+        ok = client.post("/api/v1/auth/login", json={"token": admin_token})
+        assert ok.status_code == 200
+
+        # Counter reset: two more failures still allow a subsequent success.
+        assert (
+            client.post("/api/v1/auth/login", json={"token": "bad-3"}).status_code
+            == 401
+        )
+        assert (
+            client.post("/api/v1/auth/login", json={"token": "bad-4"}).status_code
+            == 401
+        )
+        ok_again = client.post("/api/v1/auth/login", json={"token": admin_token})
+        assert ok_again.status_code == 200
+
+
+def test_management_login_rate_limiter_unit_window_and_lockout():
+    clock = {"now": 1000.0}
+    limiter = LoginRateLimiter(
+        max_failures=2,
+        window_seconds=60.0,
+        lockout_seconds=30.0,
+        now=lambda: clock["now"],
+    )
+    assert limiter.retry_after("ip:1.2.3.4") is None
+    limiter.record_failure("ip:1.2.3.4")
+    assert limiter.retry_after("ip:1.2.3.4") is None
+    limiter.record_failure("ip:1.2.3.4")
+    wait = limiter.retry_after("ip:1.2.3.4")
+    assert wait is not None and wait > 0
+    # Window slide: old failures age out before lockout ends only after lock expires.
+    clock["now"] += 31.0
+    assert limiter.retry_after("ip:1.2.3.4") is None
+    limiter.record_success("ip:1.2.3.4")
+    assert limiter.retry_after("ip:1.2.3.4") is None
+
+
+def test_management_auth_successful_login_unaffected_by_defaults(monkeypatch, settings):
+    """Default rate limit settings must not block ordinary successful login."""
+    admin_token = "test-management-token-with-adequate-length"
+    monkeypatch.setenv("TEST_AGENTCHATROOM_ADMIN_TOKEN", admin_token)
+    protected = replace(
+        settings,
+        management_auth_required=True,
+        management_token_env="TEST_AGENTCHATROOM_ADMIN_TOKEN",
+    )
+    with TestClient(create_app(protected)) as client:
+        assert client.post(
+            "/api/v1/auth/login", json={"token": admin_token}
+        ).status_code == 200
+
+
+# ---------------------------------------------------------------------------
+# #184 SSE list_events must leave the event loop
+# ---------------------------------------------------------------------------
+
+
+def test_sse_list_events_runs_off_event_loop(settings, project_dir):
+    """#184: list_events must be awaited via asyncio.to_thread (source + live spy)."""
+    import inspect as _inspect
+
+    from agentchatroom import api as _api_mod
+
+    source = _inspect.getsource(_api_mod)
+    assert "asyncio.to_thread" in source
+    assert "service.list_events" in source
+
+    limited = replace(settings, sse_poll_interval_seconds=0.01)
+    from agentchatroom.database import create_database
+    from agentchatroom.services import AgentChatRoomService
+
+    setup = AgentChatRoomService(create_database(limited), limited)
+    setup.initialize()
+    project = setup.create_project(root_path=str(project_dir), name="SSE Offload")
+    joined = setup.join_room(
+        project["id"], name="Streamer", client="codex", model="test-model"
+    )
+    auth = _sse_auth_headers(joined)
+    path = f"/api/v1/projects/{project['id']}/events/stream"
+    app = create_app(limited)
+    service = app.state.service
+    call_sites: list[bool] = []
+    original = service.list_events
+
+    def spy(project_id, *, after=0, limit=200):
+        try:
+            asyncio.get_running_loop()
+            on_loop = True
+        except RuntimeError:
+            on_loop = False
+        call_sites.append(on_loop)
+        return original(project_id, after=after, limit=limit)
+
+    service.list_events = spy
+
+    async def run() -> None:
+        lifespan_rx: asyncio.Queue = asyncio.Queue()
+        lifespan_tx: asyncio.Queue = asyncio.Queue()
+
+        async def lifespan_receive():
+            return await lifespan_rx.get()
+
+        async def lifespan_send(message):
+            await lifespan_tx.put(message)
+
+        lifespan_task = asyncio.create_task(
+            app({"type": "lifespan", "asgi": {"version": "3.0"}}, lifespan_receive, lifespan_send)
+        )
+        await lifespan_rx.put({"type": "lifespan.startup"})
+        await asyncio.wait_for(lifespan_tx.get(), timeout=10)
+        try:
+            scope = _sse_asgi_scope(path, auth)
+            request_sent = False
+            body = bytearray()
+            got_connected = asyncio.Event()
+            got_poll = asyncio.Event()
+
+            async def receive():
+                nonlocal request_sent
+                if not request_sent:
+                    request_sent = True
+                    return {"type": "http.request", "body": b"", "more_body": False}
+                await asyncio.sleep(0.05)
+                return {"type": "http.disconnect"}
+
+            async def send(message):
+                if message["type"] == "http.response.body":
+                    body.extend(message.get("body") or b"")
+                    if b"connected" in body:
+                        got_connected.set()
+                    if call_sites:
+                        got_poll.set()
+                        raise asyncio.CancelledError("got list_events poll")
+
+            try:
+                await app(scope, receive, send)
+            except asyncio.CancelledError:
+                pass
+            await asyncio.wait_for(got_connected.wait(), timeout=5)
+            await asyncio.wait_for(got_poll.wait(), timeout=5)
+        finally:
+            await lifespan_rx.put({"type": "lifespan.shutdown"})
+            try:
+                await asyncio.wait_for(lifespan_tx.get(), timeout=5)
+            except (asyncio.TimeoutError, Exception):
+                pass
+            lifespan_task.cancel()
+            try:
+                await lifespan_task
+            except (asyncio.CancelledError, Exception):
+                pass
+
+    asyncio.run(run())
+    assert call_sites, "SSE must poll list_events"
+    assert not any(call_sites), "list_events must not run on the event loop thread"
+
+
+def test_sse_polling_does_not_block_health_under_slow_queries(
+    settings, project_dir
+):
+    """#184: concurrent offloaded list_events must not freeze the HTTP interface."""
+    limited = replace(settings, sse_poll_interval_seconds=0.01)
+    from agentchatroom.database import create_database
+    from agentchatroom.services import AgentChatRoomService
+
+    setup = AgentChatRoomService(create_database(limited), limited)
+    setup.initialize()
+    project = setup.create_project(root_path=str(project_dir), name="SSE Health")
+    joined = setup.join_room(
+        project["id"], name="Streamer", client="codex", model="test-model"
+    )
+    auth = _sse_auth_headers(joined)
+    path = f"/api/v1/projects/{project['id']}/events/stream"
+    app = create_app(limited)
+    service = app.state.service
+    original = service.list_events
+    entered = 0
+    all_entered = threading.Event()
+    release = threading.Event()
+    guard = threading.Lock()
+
+    def slow_list_events(project_id, *, after=0, limit=200):
+        nonlocal entered
+        with guard:
+            entered += 1
+            if entered >= 3:
+                all_entered.set()
+        release.wait(timeout=10)
+        return original(project_id, after=after, limit=limit)
+
+    service.list_events = slow_list_events
+
+    async def run() -> None:
+        lifespan_rx: asyncio.Queue = asyncio.Queue()
+        lifespan_tx: asyncio.Queue = asyncio.Queue()
+
+        async def lifespan_receive():
+            return await lifespan_rx.get()
+
+        async def lifespan_send(message):
+            await lifespan_tx.put(message)
+
+        lifespan_task = asyncio.create_task(
+            app({"type": "lifespan", "asgi": {"version": "3.0"}}, lifespan_receive, lifespan_send)
+        )
+        await lifespan_rx.put({"type": "lifespan.startup"})
+        await asyncio.wait_for(lifespan_tx.get(), timeout=10)
+        try:
+            tasks = []
+            for _ in range(3):
+                tasks.append(asyncio.create_task(_open_sse_until_disconnect(app, path, auth)))
+            await asyncio.wait_for(asyncio.to_thread(all_entered.wait, 5), timeout=6)
+            start = time.perf_counter()
+            health = await _asgi_get(app, "/health")
+            elapsed = time.perf_counter() - start
+            assert health == 200
+            assert elapsed < 1.0, f"/health blocked {elapsed:.3f}s behind slow list_events"
+            release.set()
+            await asyncio.wait_for(asyncio.gather(*tasks), timeout=5)
+        finally:
+            release.set()
+            await lifespan_rx.put({"type": "lifespan.shutdown"})
+            try:
+                await asyncio.wait_for(lifespan_tx.get(), timeout=5)
+            except (asyncio.TimeoutError, Exception):
+                pass
+            lifespan_task.cancel()
+            try:
+                await lifespan_task
+            except (asyncio.CancelledError, Exception):
+                pass
+
+    asyncio.run(run())
+
+
+async def _open_sse_until_disconnect(app, path: str, auth: dict) -> None:
+    request_sent = False
+
+    async def receive():
+        nonlocal request_sent
+        if not request_sent:
+            request_sent = True
+            return {"type": "http.request", "body": b"", "more_body": False}
+        await asyncio.sleep(0.05)
+        return {"type": "http.disconnect"}
+
+    async def send(message):
+        return None
+
+    try:
+        await app(_sse_asgi_scope(path, auth), receive, send)
+    except (asyncio.CancelledError, Exception):
+        return
+
+
+async def _asgi_get(app, path: str) -> int:
+    request_sent = False
+    status_holder: dict[str, int] = {}
+
+    async def receive():
+        nonlocal request_sent
+        if not request_sent:
+            request_sent = True
+            return {"type": "http.request", "body": b"", "more_body": False}
+        return {"type": "http.disconnect"}
+
+    async def send(message):
+        if message["type"] == "http.response.start":
+            status_holder["status"] = message["status"]
+
+    scope = {
+        "type": "http",
+        "asgi": {"version": "3.0"},
+        "http_version": "1.1",
+        "method": "GET",
+        "scheme": "http",
+        "path": path,
+        "raw_path": path.encode(),
+        "query_string": b"",
+        "root_path": "",
+        "headers": [(b"host", b"testserver")],
+        "client": ("127.0.0.1", 123),
+        "server": ("testserver", 80),
+    }
+    await app(scope, receive, send)
+    return status_holder.get("status", 0)

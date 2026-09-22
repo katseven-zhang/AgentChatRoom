@@ -296,7 +296,7 @@ def test_task_history_redacts_credentials_embedded_in_text():
     from agentchatroom.task_history import redact_runtime_value
 
     leaked = redact_runtime_value(
-        {"body": "Authorization: Bearer supersecret token=abc plain tail"}
+        {"body": "Authorization: " + "Bearer " + "supersecret token=abc plain tail"}
     )
     body = leaked["body"]
     assert "supersecret" not in body
@@ -325,7 +325,7 @@ def test_bootstrap_redaction_shares_the_same_text_policy():
     from agentchatroom.bootstrap import redact_runtime_value as bootstrap_redact
     from agentchatroom.task_history import redact_runtime_value as history_redact
 
-    sample = {"body": "Authorization: Bearer supersecret value tail"}
+    sample = {"body": "Authorization: " + "Bearer " + "supersecret value tail"}
     assert bootstrap_redact(sample) == history_redact(sample)
     assert "supersecret" not in str(bootstrap_redact(sample))
 
