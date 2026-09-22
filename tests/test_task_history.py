@@ -14,6 +14,7 @@ def test_history_unknown_event_type_degrades_without_secrets():
     item = project_history_item(
         {
             "id": 9,
+            "project_seq": 42,
             "event_type": "future.unknown_event",
             "created_at": "2026-09-04T00:00:00Z",
             "task_id": "task_x",
@@ -26,7 +27,9 @@ def test_history_unknown_event_type_degrades_without_secrets():
         acknowledgements=[],
     )
     assert item["detail_kind"] == "unknown"
-    assert item["event_id"] == 9
+    assert item["event_id"] == 42
+    assert item["project_seq"] == 42
+    assert item["internal_id"] == 9
     assert "secret-token-value" not in str(item)
     assert "token" not in item["payload"]
 

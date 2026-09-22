@@ -987,7 +987,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     sync = commands.add_parser("room-sync", help="Read room state and events")
     sync.add_argument("project_id")
-    sync.add_argument("--after", type=int, default=0)
+    sync.add_argument(
+        "--after",
+        type=int,
+        default=0,
+        help="project_seq cursor (Agent-visible event number), not global id",
+    )
     sync.add_argument("--session-id")
     sync.add_argument("--token")
 
@@ -1002,8 +1007,18 @@ def build_parser() -> argparse.ArgumentParser:
 
     audit = commands.add_parser("audit", help="Query project audit events")
     audit.add_argument("project_id")
-    audit.add_argument("--after", type=int, default=0)
-    audit.add_argument("--before", type=int, default=0)
+    audit.add_argument(
+        "--after",
+        type=int,
+        default=0,
+        help="project_seq lower bound (exclusive)",
+    )
+    audit.add_argument(
+        "--before",
+        type=int,
+        default=0,
+        help="project_seq upper bound (exclusive)",
+    )
     audit.add_argument("--limit", type=int, default=200)
     audit.add_argument("--event-type")
     audit.add_argument("--actor-session")
@@ -1131,9 +1146,24 @@ def build_parser() -> argparse.ArgumentParser:
     )
     task_history.add_argument("project_id")
     task_history.add_argument("task_id")
-    task_history.add_argument("--after", type=int, default=0)
-    task_history.add_argument("--before", type=int, default=0)
-    task_history.add_argument("--cursor", type=int, default=0)
+    task_history.add_argument(
+        "--after",
+        type=int,
+        default=0,
+        help="project_seq lower bound (exclusive)",
+    )
+    task_history.add_argument(
+        "--before",
+        type=int,
+        default=0,
+        help="project_seq upper bound (exclusive)",
+    )
+    task_history.add_argument(
+        "--cursor",
+        type=int,
+        default=0,
+        help="forward-pagination alias of --after (project_seq)",
+    )
     task_history.add_argument("--limit", type=int, default=50)
     task_history.add_argument("--event-type", default="")
 

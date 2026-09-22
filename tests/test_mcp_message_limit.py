@@ -157,8 +157,8 @@ def test_mcp_context_filtering_and_boundaries(service, project, joined_agents):
 
     # Must be the last 5 messages in chronological ascending order
     expected_ids = message_event_ids[-5:]
-    assert [ev["id"] for ev in events] == expected_ids
-    assert events[0]["id"] < events[-1]["id"]
+    assert [ev["project_seq"] for ev in events] == expected_ids
+    assert events[0]["project_seq"] < events[-1]["project_seq"]
 
     # Test custom limit = 1
     service.update_project(project["id"], settings={"mcp_message_limit": 1})
@@ -170,7 +170,7 @@ def test_mcp_context_filtering_and_boundaries(service, project, joined_agents):
         initial_inject=True,
     )
     assert len(result_1["events"]) == 1
-    assert result_1["events"][0]["id"] == message_event_ids[-1]
+    assert result_1["events"][0]["project_seq"] == message_event_ids[-1]
 
     # Test custom limit = 10
     service.update_project(project["id"], settings={"mcp_message_limit": 10})
@@ -182,7 +182,7 @@ def test_mcp_context_filtering_and_boundaries(service, project, joined_agents):
         initial_inject=True,
     )
     assert len(result_10["events"]) == 10
-    assert [ev["id"] for ev in result_10["events"]] == message_event_ids[-10:]
+    assert [ev["project_seq"] for ev in result_10["events"]] == message_event_ids[-10:]
 
 
 def test_mcp_cursor_and_repeated_sync(service, project, joined_agents):
@@ -245,7 +245,7 @@ def test_mcp_cursor_and_repeated_sync(service, project, joined_agents):
         mcp_context=True,
     )
     assert len(third_sync["events"]) == 2
-    assert [ev["id"] for ev in third_sync["events"]] == [new_msg1["event_id"], new_msg2["event_id"]]
+    assert [ev["project_seq"] for ev in third_sync["events"]] == [new_msg1["event_id"], new_msg2["event_id"]]
 
 
 def test_configuration_precedence(monkeypatch, tmp_path, service, project, joined_agents):

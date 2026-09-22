@@ -85,7 +85,161 @@ def test_task_history_items_expose_project_seq(service, project, joined_agents):
         item for item in history["items"] if item["event_type"] == "task.created"
     )
     assert created["project_seq"] > 0
+    assert created["event_id"] == created["project_seq"]
     assert created["event_id"] > 0
+    assert created["internal_id"] > 0
+
+
+def test_write_event_id_matches_list_and_history_project_seq(
+    service, project, joined_agents
+):
+    """前后端同一事件编号一致：post 返回的 event_id = list/history 的 project_seq。"""
+    executor, _reviewer = joined_agents
+    posted = service.post_message(
+        project["id"],
+        body="Same number everywhere",
+        session_id=executor["agent"]["id"],
+        token=executor["token"],
+        model_display_name="Model A",
+    )
+    listed = service.list_events(project["id"], after=0)["events"]
+    match = next(e for e in listed if e["project_seq"] == posted["event_id"])
+    assert match["project_seq"] == posted["event_id"]
+    assert posted["cursor"] == posted["event_id"]
+
+    task = service.create_task(
+        project["id"],
+        title="Cross-surface number",
+        description="History must cite the same project_seq",
+        acceptance_criteria=["Same citable number"],
+        actor_session_id=executor["agent"]["id"],
+        token=executor["token"],
+    )["task"]
+    history = service.list_task_history(project["id"], task["id"])
+    assert history["items"]
+    assert all(item["event_id"] == item["project_seq"] for item in history["items"])
+    assert history["cursor"] == history["next_after"] or history["next_after"] >= 0
+
+    audit = service.query_audit(project["id"], after=0, limit=1000)
+    audit_match = next(e for e in audit["events"] if e["project_seq"] == posted["event_id"])
+    assert audit_match["project_seq"] == posted["event_id"]
+    assert audit["cursor"] == audit["events"][-1]["project_seq"]
+
+
+def test_project_seq_cursors_paginate_independently(service, tmp_path):
+    """跨项目编号独立；after/cursor 在 project_seq 空间分页正确。"""
+    for name in ("a", "b"):
+        (tmp_path / name).mkdir()
+    first = service.create_project(root_path=str(tmp_path / "a"), name="Alpha")
+    second = service.create_project(root_path=str(tmp_path / "b"), name="Beta")
+    _emit_events(service, first["id"], 5)
+    _emit_events(service, second["id"], 3)
+
+    page1 = service.list_events(first["id"], after=0, limit=2)
+    assert [e["project_seq"] for e in page1["events"]] == [1, 2]
+    assert page1["cursor"] == 2
+
+    page2 = service.list_events(first["id"], after=page1["cursor"], limit=10)
+    assert all(e["project_seq"] > 2 for e in page2["events"])
+    assert page2["events"][0]["project_seq"] == 3
+
+    # Same numeric after in another project only advances that project's seq space.
+    other = service.list_events(second["id"], after=2, limit=10)
+    assert all(e["project_seq"] > 2 for e in other["events"])
+    # create_project emits baseline events too; dense seq from 1 means after=2
+    # returns exactly the tail of THIS project's sequence.
+    second_all = [
+        e["project_seq"] for e in service.list_events(second["id"], after=0)["events"]
+    ]
+    assert [e["project_seq"] for e in other["events"]] == [
+        seq for seq in second_all if seq > 2
+    ]
+    assert second_all[-1] >= 3
+
+    # latest_cursor is project-scoped project_seq, not a global id.
+    latest_a = service.list_events(first["id"], after=0)["latest_cursor"]
+    latest_b = service.list_events(second["id"], after=0)["latest_cursor"]
+    assert latest_a == len(_event_project_seqs(service, first["id"]))
+    assert latest_b == len(_event_project_seqs(service, second["id"]))
+
+
+def test_acknowledge_resolves_project_seq_and_rejects_unknown(
+    service, project, joined_agents, tmp_path
+):
+    """message_acknowledge 按 project_seq 解析；不存在/跨项目 → event_not_found。"""
+    from agentchatroom.errors import DomainError
+
+    sender, receiver = joined_agents
+    message = service.post_message(
+        project["id"],
+        session_id=sender["agent"]["id"],
+        token=sender["token"],
+        body="Please ack by project_seq",
+        model_display_name="Model A",
+        requires_ack=True,
+    )
+    ok = service.acknowledge_event(
+        project["id"],
+        message["event_id"],
+        receiver["agent"]["id"],
+        receiver["token"],
+    )
+    assert ok["acknowledged"] is True
+    assert ok["acknowledged_event_id"] == message["event_id"]
+
+    with pytest.raises(DomainError) as missing:
+        service.acknowledge_event(
+            project["id"],
+            999999,
+            receiver["agent"]["id"],
+            receiver["token"],
+        )
+    assert missing.value.code == "event_not_found"
+
+    # A project_seq that exists only in another project must not resolve here.
+    (tmp_path / "other").mkdir()
+    other = service.create_project(root_path=str(tmp_path / "other"), name="Other")
+    _emit_events(service, other["id"], 8)
+    only_in_other = len(_event_project_seqs(service, other["id"]))
+    with pytest.raises(DomainError) as cross:
+        service.acknowledge_event(
+            project["id"],
+            only_in_other,
+            receiver["agent"]["id"],
+            receiver["token"],
+        )
+    # Only fail as not-found when this project has not yet reached that seq.
+    if only_in_other > len(_event_project_seqs(service, project["id"])):
+        assert cross.value.code == "event_not_found"
+    else:
+        # Seq number exists locally; must fail for missing requires_ack or unknown,
+        # never silently ack the wrong event from another project.
+        assert cross.value.code in {
+            "event_not_found",
+            "acknowledgement_not_required",
+        }
+
+
+def test_room_sync_after_uses_project_seq(service, project, joined_agents):
+    executor, _reviewer = joined_agents
+    posted = service.post_message(
+        project["id"],
+        body="Sync after cursor",
+        session_id=executor["agent"]["id"],
+        token=executor["token"],
+        model_display_name="Model A",
+    )
+    synced = service.room_sync(
+        project["id"],
+        session_id=executor["agent"]["id"],
+        token=executor["token"],
+        after=posted["event_id"] - 1,
+    )
+    assert synced["cursor"] >= posted["event_id"]
+    assert any(e["project_seq"] == posted["event_id"] for e in synced["events"])
+    assert all(
+        e["project_seq"] > posted["event_id"] - 1 for e in synced["events"]
+    )
 
 
 def test_event_sequence_survives_concurrent_writers(service, project):

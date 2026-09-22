@@ -69,7 +69,7 @@ Web「接入 Agent」入口只保留两个场景（不再展示无切换意义�
 - REST、MCP、CLI 和 Web 复用同一个领域服务和版本化数据模型。
 - 执行完成、独立验证和最终集成是三个独立状态面。
 - 事件历史追加写入；派生状态可以变化，历史事件不能改写。
-- 事件编号是项目级别的：每条事件在所属 Project 内有从 1 开始、单调递增的 `project_seq`，Web 各面板展示的用户可见编号即为该序号；内部全局 `event_id` 仅用作分页游标与深链定位，不作为用户可见编号。
+- 事件编号是项目级别的：每条事件在所属 Project 内有从 1 开始、单调递增的 `project_seq`，Web 各面板展示的用户可见编号、Agent 可引用编号、`room_sync`/`list_events`/`task_history`/`audit_query`/REST 等价接口的事件编号与 `after`/`before`/`cursor` 游标一律使用该序号；物理全局 `event_id` 仅作存储内部标识（payload 中可能保留），不作为对外引用或游标。跨项目编号独立；未知或跨项目编号返回 `event_not_found`，不接受全局 id 反查（避免歧义映射）。
 - 浏览器是人类管理和观察界面，后端数据库才是共享事实源。
 
 ## 一期产品范围
@@ -271,7 +271,7 @@ Linux 或 macOS：
 4. 可以把页面生成的 MCP 接入信息交给 Agent：内容只包含目标客户端、HTTP 连接和当前环境动态生成的 `agentchatroom` 配置，配置位置、写入方式和异常处理由 Agent 自行判断并向用户反馈。旧 stdio 配置可先从客户端删除，再用页面生成的同名 HTTP 配置重新接入；stdio 与远程 Bridge 的后端兼容接口仍保留，但不再显示在 Web 接入流程中。
 5. 按页面提示重启客户端、重新加载 MCP 或新开会话。配置文件已写入不等于已经连接，必须等左侧显示该软件在当前 Room“已连接”。左侧已连接只表示 MCP 连接 Presence，不等于当前模型对话已经同步。
 6. Agent 开始工作前调用一次 `room_bootstrap`。不要读取或修改 `mcp.json` / `config.toml`，也不要检查源码或数据库；只有该工具返回 `identity_not_configured` 时才回到 Web“接入 Agent”重新生成 HTTP 配置。
-7. 在 Room 动态中查看消息、模型标签、任务进展、文件占用、验证结果和事件顺序。动态与最近活动里展示的事件编号是项目内序号（同一 Project 从 1 连续递增；不同 Project 各自独立编号）；全局事件 ID 仅作为分页游标与深链内部标识。Room 动态默认勾选“只看消息动态”，仅展示普通消息、决策、阻塞三类消息事件；加入/离开 Room、连接状态、任务状态、租约等系统事件默认隐藏，取消勾选即可查看全部动态。该筛选只作用于面板展示（首次加载、实时追加、刷新和切换项目共用同一过滤），事件本身仍完整追加记录，任务详情时间线与审计查询不受影响。
+7. 在 Room 动态中查看消息、模型标签、任务进展、文件占用、验证结果和事件顺序。动态与最近活动里展示的事件编号是项目内序号（同一 Project 从 1 连续递增；不同 Project 各自独立编号）；分页游标、深链 `#event-N` 与 Agent 引用同样使用项目内序号，不再暴露全局事件 ID。Room 动态默认勾选“只看消息动态”，仅展示普通消息、决策、阻塞三类消息事件；加入/离开 Room、连接状态、任务状态、租约等系统事件默认隐藏，取消勾选即可查看全部动态。该筛选只作用于面板展示（首次加载、实时追加、刷新和切换项目共用同一过滤），事件本身仍完整追加记录，任务详情时间线与审计查询不受影响。
 总览「最近活动」卡片按项目域呈现：标题旁标注当前项目（切换项目即随之更新），列表仅含当前所选项目的事件；每条动态的标题头部展示操作者名字（按事件主体关联接入会话解析，消息类无法对应会话时降级为「用户」、系统类降级为「系统」，不显示 undefined）。自 #150 起卡片为真实时间倒序流：每条事件独立成行（独立序号 #XXX、主体、动作、时间与摘要），不再折叠聚合；每页固定 5 行，支持「上一页 / 下一页 · 第 X / Y 页 · 共 Z 条」翻页，末页不足 5 行以占位行补齐避免高度跳动。该视图仅作用于卡片展示，Room 动态完整流与 append-only 事件历史仍逐条完整保留。发送框自 #149 起只保留输入框与「发送」按钮：人工发送固定使用公共频道、普通消息、普通优先级，无需配置协议参数；决策/阻塞/任务关联等场景由 Agent 经 MCP/CLI 发送。
 
 一个本机 Agent 软件安装在一个 Project 中只对应一个持久软件身份。本机 stdio MCP 配置通过 `AGENTCHATROOM_SOFTWARE_KEY`、`AGENTCHATROOM_SOFTWARE_NAME` 和 `AGENTCHATROOM_SOFTWARE_CLIENT` 注入身份。用户级/多工作区共用配置应移除 `AGENTCHATROOM_PROJECT_PATH`，每个连接使用客户端 roots 或自身 cwd；未登记工作区会失败。身份配置完整、服务已显式启动且 checkout 已登记后，客户端通过 `room_bootstrap` 建立 Presence；进程启动本身不会加入或替换会话。缺少配置时不会猜测身份或创建 Room。模型不得按任务、角色、审核或运行检查临时改名。数据库 `agent_key`/`member_id` 由后端生成；同一软件可在同一或不同 Project 保持多个并行 Session，每个 Session 独立持有任务与租约。
@@ -620,7 +620,7 @@ REST `GET /api/v1/projects/{project_id}/tasks?phase=`、MCP `task_list(phase=…
 
 ### 任务证据链与分页历史
 
-任务详情时间线不再依赖 Room 动态最近 120 条事件。REST `GET /api/v1/projects/{project_id}/tasks/{task_id}/history`、MCP `task_history` 和 CLI `task-history` 复用同一领域投影，按 `event_id` 稳定排序，支持 `after` / `before` / `cursor` / `limit` / `event_type`：默认返回最新一页；`cursor` 是 `after` 的前向分页别名（与 `after` 冲突时返回结构化错误）；`has_more_after` / `has_more_before` 与 `next_after` / `next_before` / `cursor` 字段按本任务事件边界计算，不受 Room 内其他任务活动影响。投影联结 append-only 事件与不可变 Work Report、Review、Integration、Message、Acknowledgement 记录，显示原文、逐条验收证据、测试命令、状态 before→after、确认人和当时软件身份。交互写事件在写入时把操作者快照（名称/客户端/角色/软件标识）固化进事件载荷：读取时优先实时反查会话身份，反查不出真实操作者（如会话行被清理后的历史悬空事件）时退回该快照，时间线显示创建者不依赖会话行存活；两者都无法确定的历史事件在 Web 时间线显示「操作者未记录」降级文案，不再渲染「unknown · unknown · unknown」。Agent 消息只使用该条消息自己的 `model_display_name`，缺失则为 `unknown`。验证通过不等于最终完成；集成结果单独显示。历史结果走共享脱敏，不会返回 Token、Authorization、Cookie 或私钥。事件编号可复制为 `任务 #N / 事件 #序号`（序号为项目内编号），并用 `#event-ID`（内部全局 ID）定位。
+任务详情时间线不再依赖 Room 动态最近 120 条事件。REST `GET /api/v1/projects/{project_id}/tasks/{task_id}/history`、MCP `task_history` 和 CLI `task-history` 复用同一领域投影，按 `project_seq` 稳定排序（返回的 `event_id` 即项目内序号），支持 `after` / `before` / `cursor` / `limit` / `event_type`：默认返回最新一页；`cursor` 是 `after` 的前向分页别名（与 `after` 冲突时返回结构化错误）；`has_more_after` / `has_more_before` 与 `next_after` / `next_before` / `cursor` 字段按本任务事件的 `project_seq` 边界计算，不受 Room 内其他任务活动影响。投影联结 append-only 事件与不可变 Work Report、Review、Integration、Message、Acknowledgement 记录，显示原文、逐条验收证据、测试命令、状态 before→after、确认人和当时软件身份。交互写事件在写入时把操作者快照（名称/客户端/角色/软件标识）固化进事件载荷：读取时优先实时反查会话身份，反查不出真实操作者（如会话行被清理后的历史悬空事件）时退回该快照，时间线显示创建者不依赖会话行存活；两者都无法确定的历史事件在 Web 时间线显示「操作者未记录」降级文案，不再渲染「unknown · unknown · unknown」。Agent 消息只使用该条消息自己的 `model_display_name`，缺失则为 `unknown`。验证通过不等于最终完成；集成结果单独显示。历史结果走共享脱敏，不会返回 Token、Authorization、Cookie 或私钥。事件编号可复制为 `任务 #N / 事件 #序号`（序号为项目内编号），并用 `#event-序号`（同为项目内序号）定位。
 
 Agent Session Token 校验与 `last_used_at` 更新是分开的：校验走只读连接，使用时间在后台批量写入（默认至少间隔 60 秒或累计 32 次调用），进程退出时 flush。`session_heartbeat` 只刷新连接存活，不承担 Token 校验写锁。
 

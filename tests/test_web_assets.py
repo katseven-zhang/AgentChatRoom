@@ -786,6 +786,11 @@ def test_web_supports_human_reading_and_guided_interactions():
     assert "function eventIdBadge(projectSeq, eventId)" in javascript
     assert "eventIdBadge(event.project_seq, event.id)" in javascript
     assert javascript.count("eventIdBadge(event.project_seq, event.id)") >= 4
+    # Deep links and Agent-visible numbers use project_seq, not the physical global id.
+    assert 'data-open-event="${seq}"' in javascript
+    assert "function eventFromCaches(eventSeq)" in javascript
+    assert "location.hash = `event-${seq}`" in javascript
+    assert "Number(event.project_seq) === seq" in javascript
     # Navigation labels describe user destinations, not internal release status.
     assert 'class="tab-status"' not in markup
     assert 'aria-label="文件占用，只读视图"' in markup

@@ -288,7 +288,12 @@ def test_dual_room_writes_do_not_leak(service, tmp_path):
     events_b = service.list_events(project_b["id"])
     event_blob = json.dumps(events_b, ensure_ascii=False)
     assert "secret-from-room-a" not in event_blob
-    assert posted["event_id"] not in {event["id"] for event in events_b["events"]}
+    # Project B must not contain Room A's message content (project_seq numbers
+    # are independent and may numerically collide across projects).
+    assert all(
+        (event.get("payload") or {}).get("body") != "secret-from-room-a"
+        for event in events_b["events"]
+    )
 
 
 def test_http_bound_unregistered_roots_include_http_action(monkeypatch, service, tmp_path):

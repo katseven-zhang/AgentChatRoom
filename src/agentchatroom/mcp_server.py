@@ -1318,7 +1318,12 @@ def room_sync(
     token: str = "",
     after: int = 0,
 ) -> dict[str, Any]:
-    """Return the room snapshot and events newer than the supplied cursor."""
+    """Return the room snapshot and events newer than the supplied cursor.
+
+    ``after`` is a project_seq cursor (Agent-visible event number), not the
+    physical global event id. Returned ``cursor`` / ``latest_cursor`` and each
+    message/event's citable number are also project_seq.
+    """
     try:
         _authorize_remote(project_id, "room:read")
     except DomainError as error:
@@ -1437,7 +1442,12 @@ def message_acknowledge(
     token: str = "",
     request_id: str = "",
 ) -> dict[str, Any]:
-    """Acknowledge a room message that explicitly requires confirmation."""
+    """Acknowledge a room message that explicitly requires confirmation.
+
+    ``event_id`` is the Agent-visible project_seq (same number Web shows).
+    Unknown or cross-project numbers return ``event_not_found``; physical
+    global ids are not accepted.
+    """
     try:
         _authorize_remote(project_id, "message:write")
     except DomainError as error:
@@ -1558,7 +1568,11 @@ def task_history(
     limit: int = 50,
     event_type: str = "",
 ) -> dict[str, Any]:
-    """Return a paginated, redacted evidence chain for one task."""
+    """Return a paginated, redacted evidence chain for one task.
+
+    Event numbers (items' ``event_id`` / ``project_seq``, and ``after`` /
+    ``before`` / ``cursor`` / ``next_after`` / ``next_before``) are project_seq.
+    """
     try:
         _authorize_remote(project_id, "room:read")
     except DomainError as error:
@@ -1747,7 +1761,11 @@ def audit_query(
     actor_session_id: str = "",
     task_id: str = "",
 ) -> dict[str, Any]:
-    """Query append-only Project audit events with optional stable filters."""
+    """Query append-only Project audit events with optional stable filters.
+
+    ``after`` / ``before`` / returned ``cursor`` / ``latest_cursor`` use
+    project_seq (Agent-visible event number), not the physical global id.
+    """
     try:
         _authorize_remote(project_id, "audit:read")
     except DomainError as error:

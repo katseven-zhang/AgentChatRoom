@@ -995,7 +995,7 @@ def test_agent_message_model_is_required_and_preserved_per_event(
     )
 
     events = {
-        event["id"]: event
+        event["project_seq"]: event
         for event in service.list_events(project["id"], after=0)["events"]
     }
     assert events[first["event_id"]]["payload"]["model_display_name"] == "Hy3"
@@ -1007,7 +1007,7 @@ def test_human_message_cannot_claim_an_agent_model(service, project):
     event = next(
         event
         for event in service.list_events(project["id"], after=0)["events"]
-        if event["id"] == posted["event_id"]
+        if event["project_seq"] == posted["event_id"]
     )
     assert event["actor_session_id"] is None
     assert event["payload"]["model_display_name"] is None
@@ -1380,7 +1380,7 @@ def test_manager_can_assign_without_impersonating_an_agent(
     event = next(
         item
         for item in service.list_events(project["id"], after=0)["events"]
-        if item["id"] == assigned["event_id"]
+        if item["project_seq"] == assigned["event_id"]
     )
     assert event["actor_session_id"] is None
     assert event["payload"]["assigned_by"] == "manager"
@@ -1504,7 +1504,7 @@ def test_manager_can_request_handoff_without_impersonating_owner(
     event = next(
         item
         for item in service.list_events(project["id"], after=0)["events"]
-        if item["id"] == requested["event_id"]
+        if item["project_seq"] == requested["event_id"]
     )
     assert event["actor_session_id"] is None
     assert event["payload"]["requested_by"] == "manager"
@@ -1673,7 +1673,7 @@ def test_work_must_be_independently_reviewed(service, project, joined_agents):
     completion_event = next(
         event for event in events_before_review if event["event_type"] == "task.completed"
     )
-    assert completion_event["id"] == report["event_id"]
+    assert completion_event["project_seq"] == report["event_id"]
 
     with pytest.raises(DomainError) as failure:
         service.submit_review(
@@ -1716,7 +1716,7 @@ def test_work_must_be_independently_reviewed(service, project, joined_agents):
     review_event = next(
         event for event in events_after_review if event["event_type"] == "review.submitted"
     )
-    assert completion_event["id"] < review_event["id"]
+    assert completion_event["project_seq"] < review_event["project_seq"]
 
     with pytest.raises(DomainError) as direct_done:
         service.update_task(project["id"], task["id"], status="done",
@@ -1756,7 +1756,7 @@ def test_work_must_be_independently_reviewed(service, project, joined_agents):
         for event in service.list_events(project["id"], after=0)["events"]
         if event["event_type"] == "task.integration_completed"
     )
-    assert review_event["id"] < integration_event["id"]
+    assert review_event["project_seq"] < integration_event["project_seq"]
 
 
 def test_same_software_cannot_become_an_independent_reviewer_by_reconnecting(
@@ -1953,7 +1953,7 @@ def test_changes_requested_preserves_completion_history_and_allows_resubmission(
     assert rejected["verification_status"] == "changes_requested"
     history_after_rejection = service.list_events(project["id"], after=0)["events"]
     assert any(
-        event["id"] == first_report["event_id"]
+        event["project_seq"] == first_report["event_id"]
         and event["event_type"] == "task.completed"
         for event in history_after_rejection
     )
@@ -1983,7 +1983,7 @@ def test_changes_requested_preserves_completion_history_and_allows_resubmission(
         for event in service.list_events(project["id"], after=0)["events"]
         if event["event_type"] == "task.completed"
     ]
-    assert [event["id"] for event in completion_events] == [
+    assert [event["project_seq"] for event in completion_events] == [
         first_report["event_id"],
         second_report["event_id"],
     ]
@@ -2068,7 +2068,7 @@ def test_changes_requested_task_can_be_reassigned_after_owner_leaves(
     assignment_event = next(
         event
         for event in service.list_events(project["id"], after=0)["events"]
-        if event["id"] == accepted["event_id"]
+        if event["project_seq"] == accepted["event_id"]
     )
     assert assignment_event["event_type"] == "task.assignment_acknowledged"
     assert assignment_event["payload"]["reclaimed_from_session_id"] == executor["agent"]["id"]
@@ -3961,25 +3961,28 @@ def test_query_audit_supports_backward_paging_with_filters(service, project):
     assert len(forward["events"]) == 2
 
     tail = service.query_audit(project["id"], before=latest + 1, limit=3)
-    assert [event["id"] for event in tail["events"]] == sorted(
-        event["id"] for event in tail["events"]
+    assert [event["project_seq"] for event in tail["events"]] == sorted(
+        event["project_seq"] for event in tail["events"]
     )
-    assert tail["events"][-1]["id"] == latest
+    assert tail["events"][-1]["project_seq"] == latest
     assert tail["has_newer"] is False
     assert tail["has_older"] is True
 
     earlier = service.query_audit(
-        project["id"], before=tail["events"][0]["id"], limit=3
+        project["id"], before=tail["events"][0]["project_seq"], limit=3
     )
-    assert earlier["events"] and earlier["events"][-1]["id"] < tail["events"][0]["id"]
+    assert earlier["events"] and earlier["events"][-1]["project_seq"] < tail["events"][0]["project_seq"]
     assert earlier["has_newer"] is True
 
     window = service.query_audit(
-        project["id"], after=earlier["events"][-1]["id"], before=latest + 1, limit=100
+        project["id"],
+        after=earlier["events"][-1]["project_seq"],
+        before=latest + 1,
+        limit=100,
     )
-    merged = [event["id"] for event in window["events"]]
+    merged = [event["project_seq"] for event in window["events"]]
     assert merged == sorted(set(merged))
-    assert window["events"][0]["id"] == earlier["events"][-1]["id"] + 1
+    assert window["events"][0]["project_seq"] == earlier["events"][-1]["project_seq"] + 1
 
     with pytest.raises(DomainError) as conflicted:
         service.query_audit(project["id"], after=5, before=5)

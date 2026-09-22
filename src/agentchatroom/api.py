@@ -1825,7 +1825,8 @@ def create_app(
                     )
                     if result["events"]:
                         for event in result["events"]:
-                            cursor = event["id"]
+                            # SSE id / Last-Event-ID use project_seq (same space as ?after=).
+                            cursor = event["project_seq"]
                             payload = json.dumps(
                                 event, ensure_ascii=False, separators=(",", ":")
                             )

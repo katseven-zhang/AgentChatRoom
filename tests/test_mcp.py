@@ -1062,7 +1062,7 @@ async def test_mcp_compatibility_is_schema_directed(monkeypatch, service, projec
     message_event = next(
         event
         for event in service.list_events(project_id, after=0)["events"]
-        if event["id"] == posted["result"]["event_id"]
+        if event["project_seq"] == posted["result"]["event_id"]
     )
     assert message_event["payload"]["body"] == "123"
     assert message_event["payload"]["model_display_name"] == "Compatibility Model"

@@ -979,7 +979,7 @@ class AgentChatRoomService:
             """
             INSERT INTO events(project_id, event_type, actor_session_id, task_id, payload_json, project_seq, created_at)
             VALUES (?, ?, ?, ?, ?, ?, ?)
-            RETURNING id
+            RETURNING id, project_seq
             """,
             (
                 project_id,
@@ -993,7 +993,8 @@ class AgentChatRoomService:
         ).fetchone()
         if row is None:
             raise RuntimeError("Event insert did not return an id")
-        return int(row["id"])
+        # 对外事件编号统一为 project_seq；物理主键 id 仅作存储内部标识。
+        return int(row["project_seq"])
 
     def _event_dict(
         self, row: Mapping[str, Any], connection: Any | None = None
@@ -3658,21 +3659,22 @@ class AgentChatRoomService:
         limit: int = 200,
     ) -> dict[str, Any]:
         limit = max(1, min(limit, 1000))
+        after = max(0, int(after or 0))
         rows = connection.execute(
             """
             SELECT * FROM events
-            WHERE project_id = ? AND id > ?
-            ORDER BY id ASC LIMIT ?
+            WHERE project_id = ? AND project_seq > ?
+            ORDER BY project_seq ASC LIMIT ?
             """,
             (project_id, after, limit),
         ).fetchall()
         events = [self._event_dict(row, connection) for row in rows]
-        cursor = events[-1]["id"] if events else after
+        cursor = events[-1]["project_seq"] if events else after
         latest = connection.execute(
-            "SELECT COALESCE(MAX(id), 0) AS cursor FROM events WHERE project_id = ?",
+            "SELECT COALESCE(MAX(project_seq), 0) AS cursor FROM events WHERE project_id = ?",
             (project_id,),
         ).fetchone()["cursor"]
-        return {"events": events, "cursor": cursor, "latest_cursor": latest}
+        return {"events": events, "cursor": int(cursor), "latest_cursor": int(latest)}
 
     def get_project_mcp_message_limit(
         self, project_id: str, *, connection: Any | None = None
@@ -3726,8 +3728,8 @@ class AgentChatRoomService:
                 SELECT * FROM events
                 WHERE project_id = ?
                   AND event_type IN ({placeholders})
-                  AND id > ?
-                ORDER BY id DESC
+                  AND project_seq > ?
+                ORDER BY project_seq DESC
                 LIMIT ?
             """
             params = (project_id, *MCP_CONTEXT_EVENT_TYPES, effective_after, limit)
@@ -3736,7 +3738,7 @@ class AgentChatRoomService:
                 SELECT * FROM events
                 WHERE project_id = ?
                   AND event_type IN ({placeholders})
-                ORDER BY id DESC
+                ORDER BY project_seq DESC
                 LIMIT ?
             """
             params = (project_id, *MCP_CONTEXT_EVENT_TYPES, limit)
@@ -3744,15 +3746,15 @@ class AgentChatRoomService:
         rows = connection.execute(query, params).fetchall()
         events = [self._event_dict(row, connection) for row in reversed(rows)]
         latest = connection.execute(
-            "SELECT COALESCE(MAX(id), 0) AS cursor FROM events WHERE project_id = ?",
+            "SELECT COALESCE(MAX(project_seq), 0) AS cursor FROM events WHERE project_id = ?",
             (project_id,),
         ).fetchone()["cursor"]
         cursor = latest if (initial_inject or effective_after <= 0) else max(after, latest)
         return {
             "events": events,
             "messages": events,
-            "cursor": cursor,
-            "latest_cursor": latest,
+            "cursor": int(cursor),
+            "latest_cursor": int(latest),
         }
 
     def verify_session(
@@ -3776,11 +3778,12 @@ class AgentChatRoomService:
     ) -> dict[str, Any]:
         """Page through the append-only audit log in either direction.
 
-        ``after``/``before`` bound an exclusive ``(after, before)`` id window;
-        ``before=0`` keeps the historical forward-only behavior (ascending from
-        ``after``). With ``before`` set, the window returns the ``limit``
-        events closest below ``before`` in ascending order, so clients can
-        load earlier pages without losing their position. ``has_older`` and
+        ``after``/``before`` bound an exclusive window in ``project_seq``
+        space (the Agent-visible event number); ``before=0`` keeps the
+        historical forward-only behavior (ascending from ``after``). With
+        ``before`` set, the window returns the ``limit`` events closest
+        below ``before`` in ascending order, so clients can load earlier
+        pages without losing their position. ``has_older`` and
         ``has_newer`` report continuation under the same filters.
         """
         self.enforce_audit_retention_throttled(project_id)
@@ -3805,8 +3808,8 @@ class AgentChatRoomService:
             clauses.append("task_id = ?")
             parameters.append(task_id)
         base_where = " AND ".join(clauses)
-        forward_where = f"{base_where} AND id > ?"
-        backward_where = f"{base_where} AND id > ? AND id < ?"
+        forward_where = f"{base_where} AND project_seq > ?"
+        backward_where = f"{base_where} AND project_seq > ? AND project_seq < ?"
         with self.database.connect() as connection:
             self._require_project(connection, project_id)
             if before:
@@ -3814,7 +3817,7 @@ class AgentChatRoomService:
                     f"""
                     SELECT * FROM events
                     WHERE {backward_where}
-                    ORDER BY id DESC LIMIT ?
+                    ORDER BY project_seq DESC LIMIT ?
                     """,
                     [*parameters, after, before, limit],
                 ).fetchall()
@@ -3825,27 +3828,27 @@ class AgentChatRoomService:
                     f"""
                     SELECT * FROM events
                     WHERE {forward_where}
-                    ORDER BY id ASC LIMIT ?
+                    ORDER BY project_seq ASC LIMIT ?
                     """,
                     [*parameters, after, limit],
                 ).fetchall()
                 older_where, older_params = forward_where, [*parameters, after]
             events = [self._event_dict(row, connection) for row in rows]
-            cursor = events[-1]["id"] if events else after
-            first_id = events[0]["id"] if events else None
+            cursor = events[-1]["project_seq"] if events else after
+            first_id = events[0]["project_seq"] if events else None
             has_newer = False
             has_older = False
             if events:
                 has_newer = (
                     connection.execute(
-                        f"SELECT 1 FROM events WHERE {base_where} AND id > ? LIMIT 1",
+                        f"SELECT 1 FROM events WHERE {base_where} AND project_seq > ? LIMIT 1",
                         [*parameters, cursor],
                     ).fetchone()
                     is not None
                 )
                 has_older = (
                     connection.execute(
-                        f"SELECT 1 FROM events WHERE {older_where} AND id < ? LIMIT 1",
+                        f"SELECT 1 FROM events WHERE {older_where} AND project_seq < ? LIMIT 1",
                         [*older_params, first_id],
                     ).fetchone()
                     is not None
@@ -3928,10 +3931,10 @@ class AgentChatRoomService:
             page_parameters = list(parameters)
             descending = after == 0 and before > 0
             if after:
-                page_clauses.append("id > ?")
+                page_clauses.append("project_seq > ?")
                 page_parameters.append(after)
             if before:
-                page_clauses.append("id < ?")
+                page_clauses.append("project_seq < ?")
                 page_parameters.append(before)
             order = "DESC" if descending or (before and not after) else "ASC"
             if after == 0 and before == 0:
@@ -3941,7 +3944,7 @@ class AgentChatRoomService:
                 f"""
                 SELECT * FROM events
                 WHERE {' AND '.join(page_clauses)}
-                ORDER BY id {order} LIMIT ?
+                ORDER BY project_seq {order} LIMIT ?
                 """,
                 page_parameters,
             ).fetchall()
@@ -3955,7 +3958,7 @@ class AgentChatRoomService:
             # pagination bounds must be computed from THIS task's events:
             # only an event of this task after ``next_after`` means more.
             task_latest_sql = (
-                f"SELECT MAX(id) AS max_id FROM events WHERE {' AND '.join(clauses)}"
+                f"SELECT MAX(project_seq) AS max_id FROM events WHERE {' AND '.join(clauses)}"
             )
             task_latest_row = connection.execute(task_latest_sql, parameters).fetchone()
             task_latest = int(task_latest_row["max_id"] or 0)
@@ -4184,7 +4187,7 @@ class AgentChatRoomService:
                     connection.execute(
                         """
                         SELECT COUNT(*) AS unread_count
-                        FROM events WHERE project_id = ? AND id > ?
+                        FROM events WHERE project_id = ? AND project_seq > ?
                         """,
                         (project_id, read_cursor),
                     ).fetchone()["unread_count"]
@@ -4358,14 +4361,22 @@ class AgentChatRoomService:
         session_id: str,
         token: str,
     ) -> dict[str, Any]:
+        """Acknowledge by Agent-visible ``event_id`` (= ``project_seq``).
+
+        Cross-project or unknown numbers raise ``event_not_found``; the
+        physical global id is never accepted as a reference (no ambiguous
+        dual mapping during transition).
+        """
+        project_seq = max(0, int(event_id or 0))
         with self.database.connect(write=True) as connection:
             self._authenticate(connection, project_id, session_id, token)
             event = connection.execute(
-                "SELECT * FROM events WHERE id = ? AND project_id = ?",
-                (event_id, project_id),
+                "SELECT * FROM events WHERE project_seq = ? AND project_id = ?",
+                (project_seq, project_id),
             ).fetchone()
             if event is None:
                 raise DomainError("event_not_found", "Event does not exist", status_code=404)
+            physical_event_id = int(event["id"])
             payload = json_load(event["payload_json"], {})
             if not payload.get("requires_ack"):
                 raise DomainError(
@@ -4379,7 +4390,7 @@ class AgentChatRoomService:
                 VALUES (?, ?, ?)
                 ON CONFLICT(event_id, session_id) DO NOTHING
                 """,
-                (event_id, session_id, iso_now()),
+                (physical_event_id, session_id, iso_now()),
             ).rowcount
             if inserted != 1:
                 # Duplicate acknowledge: keep append-only history stable and
@@ -4388,7 +4399,7 @@ class AgentChatRoomService:
                 return {
                     "acknowledged": True,
                     "already_acknowledged": True,
-                    "acknowledged_event_id": event_id,
+                    "acknowledged_event_id": project_seq,
                     "event_id": None,
                     "cursor": self.latest_cursor(connection, project_id),
                 }
@@ -4398,11 +4409,11 @@ class AgentChatRoomService:
                 "message.acknowledged",
                 actor_session_id=session_id,
                 task_id=event["task_id"],
-                payload={"event_id": event_id},
+                payload={"event_id": project_seq},
             )
             return {
                 "acknowledged": True,
-                "acknowledged_event_id": event_id,
+                "acknowledged_event_id": project_seq,
                 "event_id": cursor,
                 "cursor": cursor,
             }
@@ -7642,13 +7653,14 @@ class AgentChatRoomService:
             )
         for event_id in source_event_ids:
             row = connection.execute(
-                "SELECT id FROM events WHERE id = ? AND project_id = ?",
+                "SELECT id FROM events WHERE project_seq = ? AND project_id = ?",
                 (event_id, project_id),
             ).fetchone()
             if row is None:
                 raise DomainError(
                     "knowledge_source_not_found",
-                    "source_event_ids must reference events in this project",
+                    "source_event_ids must reference events in this project "
+                    "(Agent-visible numbers are project_seq)",
                     status_code=404,
                     details={"event_id": event_id},
                 )
@@ -8424,9 +8436,10 @@ class AgentChatRoomService:
         }
 
     def latest_cursor(self, connection: Any, project_id: str) -> int:
+        # 对外游标空间 = project_seq（与 Web 展示、Agent 引用一致）。
         return int(
             connection.execute(
-                "SELECT COALESCE(MAX(id), 0) AS cursor FROM events WHERE project_id = ?",
+                "SELECT COALESCE(MAX(project_seq), 0) AS cursor FROM events WHERE project_id = ?",
                 (project_id,),
             ).fetchone()["cursor"]
         )
@@ -8449,7 +8462,7 @@ class AgentChatRoomService:
                     SELECT COUNT(*)
                     FROM events e
                     WHERE e.project_id = a.project_id
-                      AND e.id > a.last_read_cursor
+                      AND e.project_seq > a.last_read_cursor
                 ) AS unread_count
                 FROM agent_sessions a
                 WHERE a.project_id = ?
@@ -8522,7 +8535,7 @@ class AgentChatRoomService:
                 dict(row)
                 for row in connection.execute(
                     """
-                    SELECT a.event_id, a.session_id, a.created_at
+                    SELECT e.project_seq AS event_id, a.session_id, a.created_at
                     FROM event_acknowledgements a
                     JOIN events e ON e.id = a.event_id
                     WHERE e.project_id = ?
@@ -8651,11 +8664,13 @@ class AgentChatRoomService:
         after = 0
         while after < cursor:
             batch = self.list_events(project_id, after=after, limit=1000)
-            current = [event for event in batch["events"] if event["id"] <= cursor]
+            current = [
+                event for event in batch["events"] if event["project_seq"] <= cursor
+            ]
             if not current:
                 break
             events.extend(current)
-            after = current[-1]["id"]
+            after = current[-1]["project_seq"]
         return {
             "export_schema_version": 1,
             "exported_at": iso_now(),

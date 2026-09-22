@@ -11,7 +11,7 @@ if TYPE_CHECKING:
     from .config import Settings
 
 
-SCHEMA_VERSION = 23
+SCHEMA_VERSION = 24
 
 
 class DatabaseBackend(Protocol):
@@ -786,6 +786,19 @@ MIGRATIONS = {
     23: """
         CREATE INDEX IF NOT EXISTS idx_events_project_type_task
         ON events(project_id, event_type, task_id);
+    """,
+    24: """
+        UPDATE agent_sessions
+        SET last_read_cursor = COALESCE(
+            (
+                SELECT e.project_seq
+                FROM events e
+                WHERE e.id = agent_sessions.last_read_cursor
+                  AND e.project_id = agent_sessions.project_id
+            ),
+            0
+        )
+        WHERE last_read_cursor > 0;
     """,
 }
 

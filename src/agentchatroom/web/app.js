@@ -556,13 +556,13 @@ function messageModelBadge(event) {
 
 function eventIdBadge(projectSeq, eventId) {
   const internalId = Number(eventId);
-  if (!Number.isFinite(internalId)) return "";
   const seq = Number(projectSeq);
-  // 用户可见编号是项目级序号；全局 event_id 只作内部深链定位。
+  // 用户可见编号与深链/引用一律使用 project_seq；全局 id 仅作 payload 内部字段。
   if (!Number.isFinite(seq) || seq <= 0) {
-    return `<button type="button" class="event-id" data-open-event="${internalId}" title="打开并定位事件（全局 ID ${internalId}）" aria-label="事件 全局 ID ${internalId}">#${internalId}</button>`;
+    if (!Number.isFinite(internalId)) return "";
+    return `<button type="button" class="event-id" data-open-event="${internalId}" title="打开并定位事件（内部 ID ${internalId}）" aria-label="事件 内部 ID ${internalId}">#${internalId}</button>`;
   }
-  return `<button type="button" class="event-id" data-open-event="${internalId}" title="事件编号 #${seq}（项目内序号，全局 ID ${internalId}）" aria-label="事件编号 ${seq}">#${seq}</button>`;
+  return `<button type="button" class="event-id" data-open-event="${seq}" title="事件编号 #${seq}（项目内序号）" aria-label="事件编号 ${seq}">#${seq}</button>`;
 }
 
 function avatarColorClass(seed) {
@@ -976,7 +976,7 @@ async function loadEventWindow(buildPage, windowSize, { tailJump = true, maxPage
     const result = await api(buildPage(after, windowSize));
     collected = collected.concat(result.events);
     latest = result.latest_cursor;
-    if (result.events.length) after = result.events[result.events.length - 1].id;
+    if (result.events.length) after = result.events[result.events.length - 1].project_seq;
     if (result.events.length < windowSize || after >= latest) break;
     if (tailJump && latest - after > windowSize) after = latest - windowSize;
   }
@@ -1054,7 +1054,7 @@ async function loadOlderAuditEvents() {
   if (!state.projectId || !state.auditHasOlder || !state.auditEvents.length) return;
   const eventType = elements["audit-event-filter"].value;
   const page = await api(auditQueryUrl(state.projectId, {
-    before: state.auditEvents[0].id,
+    before: state.auditEvents[0].project_seq,
     eventType,
   }));
   if (!page.events.length) {
@@ -1073,7 +1073,7 @@ async function loadNewerAuditEvents() {
   if (!state.projectId || !state.auditHasNewer || !state.auditEvents.length) return;
   const eventType = elements["audit-event-filter"].value;
   const page = await api(auditQueryUrl(state.projectId, {
-    after: state.auditEvents[state.auditEvents.length - 1].id,
+    after: state.auditEvents[state.auditEvents.length - 1].project_seq,
     eventType,
   }));
   if (!page.events.length) {
@@ -2233,7 +2233,7 @@ async function refreshManagement() {
   // current right edge. Filter change or empty list: reset to the live tail.
   const hasLoadedWindow = eventType === state.auditFilter && state.auditEvents.length > 0;
   const latestId = hasLoadedWindow
-    ? state.auditEvents[state.auditEvents.length - 1].id
+    ? state.auditEvents[state.auditEvents.length - 1].project_seq
     : 0;
   const viewingLiveTail = !state.auditHasNewer;
   const auditRefresh = hasLoadedWindow
@@ -2333,7 +2333,7 @@ function renderEvents(agents, tasks) {
       const task = taskMap[event.task_id];
       if (event.event_type.startsWith("message.") && event.payload?.body !== undefined) {
         const kind = event.event_type.split(".")[1];
-        const ackCount = state.snapshot.acknowledgements.filter((item) => item.event_id === event.id).length;
+        const ackCount = state.snapshot.acknowledgements.filter((item) => item.event_id === event.project_seq).length;
         return `<article class="event-item kind-${escapeHtml(kind)}">
           <span class="event-avatar ${avatarColorClass(event.actor_session_id || agent?.name)}">${escapeHtml(initials(agent?.name || "用户"))}</span>
           <div class="event-content">
@@ -3903,7 +3903,7 @@ function renderTaskTimeline(task) {
   elements["task-history-load-later"].disabled = !history?.has_more_after;
   elements["task-timeline"].innerHTML = items.length
     ? `<ol class="timeline-list">${items.map((item) => `
-      <li class="timeline-item${state.focusEventId === item.event_id ? " is-focused" : ""}" id="history-event-${item.event_id}">
+      <li class="timeline-item${state.focusEventId === item.event_id || state.focusEventId === item.project_seq ? " is-focused" : ""}" id="history-event-${item.event_id}">
         <span class="timeline-marker" aria-hidden="true"></span>
         <div class="timeline-content">
           <div class="timeline-heading">
@@ -3915,7 +3915,7 @@ function renderTaskTimeline(task) {
           ${item.result ? `<p>集成结果：${escapeHtml(item.result)}。验证通过不等于最终完成。</p>` : ""}
           ${renderHistoryEvidence(item)}
           ${renderHistoryAcknowledgements(item)}
-          <small class="secondary-text">${eventIdBadge(item.project_seq, item.event_id)}${item.task_number ? ` · 任务 #${escapeHtml(item.task_number)}` : ""} <button type="button" class="link-button" data-copy-event="${item.event_id}" data-copy-seq="${item.project_seq || ""}" data-task-number="${item.task_number || ""}">复制引用</button></small>
+          <small class="secondary-text">${eventIdBadge(item.project_seq, item.internal_id || item.event_id)}${item.task_number ? ` · 任务 #${escapeHtml(item.task_number)}` : ""} <button type="button" class="link-button" data-copy-event="${item.event_id}" data-copy-seq="${item.project_seq || item.event_id || ""}" data-task-number="${item.task_number || ""}">复制引用</button></small>
         </div>
       </li>`).join("")}</ol>`
     : '<div class="empty-state">尚无协作事件</div>';
@@ -4026,7 +4026,7 @@ async function openTaskDetails(taskId, options = {}) {
   elements["task-edit-dialog"].showModal();
   try {
     await loadTaskHistory(taskId);
-    if (state.focusEventId && !(state.taskHistory.items || []).some((item) => item.event_id === state.focusEventId)) {
+    if (state.focusEventId && !(state.taskHistory.items || []).some((item) => item.event_id === state.focusEventId || item.project_seq === state.focusEventId)) {
       await loadTaskHistoryUntil(taskId, state.focusEventId);
     }
     const currentTask = state.snapshot?.tasks.find((item) => item.id === taskId) || task;
@@ -4036,11 +4036,11 @@ async function openTaskDetails(taskId, options = {}) {
   }
 }
 
-async function loadTaskHistoryUntil(taskId, eventId) {
+async function loadTaskHistoryUntil(taskId, eventSeq) {
   for (let attempt = 0; attempt < 8; attempt += 1) {
-    if ((state.taskHistory.items || []).some((item) => item.event_id === eventId)) return;
+    if ((state.taskHistory.items || []).some((item) => item.event_id === eventSeq || item.project_seq === eventSeq)) return;
     if (!state.taskHistory.has_more_before && !state.taskHistory.has_more_after) return;
-    if (state.taskHistory.next_before && eventId < (state.taskHistory.items[0]?.event_id || eventId + 1)) {
+    if (state.taskHistory.next_before && eventSeq < (state.taskHistory.items[0]?.event_id || eventSeq + 1)) {
       await loadTaskHistory(taskId, { direction: "earlier" });
     } else if (state.taskHistory.has_more_after) {
       await loadTaskHistory(taskId, { direction: "later" });
@@ -4051,11 +4051,11 @@ async function loadTaskHistoryUntil(taskId, eventId) {
 }
 
 async function copyEventReference(eventId, taskNumber, projectSeq) {
-  // 用户可读编号是项目内序号；全局 ID 保留在深链里用于内部定位。
-  const seq = Number(projectSeq);
+  // 用户可读编号与深链都使用 project_seq；全局 id 不再对外暴露。
+  const seq = Number(projectSeq) || Number(eventId);
   const label = Number.isFinite(seq) && seq > 0 ? `事件 #${seq}` : `事件 #${eventId}`;
   const text = taskNumber ? `任务 #${taskNumber} / ${label}` : label;
-  location.hash = `event-${eventId}`;
+  location.hash = `event-${seq}`;
   try {
     await navigator.clipboard.writeText(text);
     showToast("已复制事件引用");
@@ -4064,19 +4064,21 @@ async function copyEventReference(eventId, taskNumber, projectSeq) {
   }
 }
 
-function eventFromCaches(eventId) {
-  return (state.events || []).find((event) => Number(event.id) === Number(eventId))
-    || (state.taskHistory?.items || []).find((item) => Number(item.event_id) === Number(eventId));
+function eventFromCaches(eventSeq) {
+  const seq = Number(eventSeq);
+  return (state.events || []).find((event) => Number(event.project_seq) === seq)
+    || (state.taskHistory?.items || []).find((item) => Number(item.event_id) === seq || Number(item.project_seq) === seq)
+    || (state.auditEvents || []).find((event) => Number(event.project_seq) === seq);
 }
 
-async function openEventReference(eventId) {
-  const event = eventFromCaches(eventId);
+async function openEventReference(eventSeq) {
+  const event = eventFromCaches(eventSeq);
   const taskId = event?.task_id || state.editingTaskId;
   if (!taskId) {
     showToast("当前缓存中没有该事件的任务关联", "error");
     return;
   }
-  await openTaskDetails(taskId, { focusEventId: Number(eventId) });
+  await openTaskDetails(taskId, { focusEventId: Number(eventSeq) });
 }
 
 async function openTaskAssignmentDialog() {
