@@ -166,6 +166,43 @@ def test_create_tray_icon_degrades_without_pystray(monkeypatch) -> None:
     assert gui_module.create_tray_icon(lambda action: None) is None
 
 
+def test_create_tray_icon_actions_have_pystray_compatible_signatures(monkeypatch) -> None:
+    import inspect
+    import types
+
+    import agentchatroom.gui as gui_module
+
+    actions: list[str] = []
+    menu_items = []
+
+    def menu_item(label, callback, *, default=False):
+        assert len(inspect.signature(callback).parameters) == 2
+        menu_items.append((label, callback, default))
+        return label, callback, default
+
+    class Icon:
+        def __init__(self, name, image, title, menu):
+            self.menu = menu
+            self.visible = False
+
+        def run_detached(self):
+            pass
+
+    monkeypatch.setitem(
+        sys.modules,
+        "pystray",
+        types.SimpleNamespace(Menu=lambda *items: items, MenuItem=menu_item, Icon=Icon),
+    )
+    monkeypatch.setattr(gui_module, "tray_icon_image", lambda: object())
+
+    icon = gui_module.create_tray_icon(actions.append)
+    assert icon is not None
+    assert icon.visible is True
+    for _label, callback, _default in menu_items:
+        callback(icon, None)
+    assert actions == [action for _label, action, _default in build_tray_menu_spec()]
+
+
 def test_button_states_follow_service_and_action_state() -> None:
     assert button_states(service_running=False, action_active=False) == (True, False)
     assert button_states(service_running=True, action_active=False) == (False, True)

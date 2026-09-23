@@ -461,11 +461,17 @@ def create_tray_icon(handle_action):
     image = tray_icon_image()
     if image is None:
         return None
+    def menu_action(action_key: str):
+        def invoke(icon, item):
+            handle_action(action_key)
+
+        return invoke
+
     menu = pystray.Menu(
         *[
             pystray.MenuItem(
                 label,
-                lambda icon, item, action=action: handle_action(action),
+                menu_action(action),
                 default=default,
             )
             for label, action, default in build_tray_menu_spec()

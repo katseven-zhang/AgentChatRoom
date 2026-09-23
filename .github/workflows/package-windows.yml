@@ -79,8 +79,8 @@ jobs:
         shell: pwsh
         run: |
           # #161: the default double-click path is the Tk console; the
-          # package is unusable if it exits immediately (e.g. missing
-          # init.tcl after tkinter was excluded at build time).
+          # package is unusable if it exits immediately or displays an
+          # unhandled-exception dialog (which keeps the process alive).
           $bundle = "dist\agentchatroom"
           $initTcl = Get-ChildItem -Path $bundle -Recurse -Filter "init.tcl" | Select-Object -First 1
           if (-not $initTcl) {
@@ -88,12 +88,21 @@ jobs:
           }
           $exe = Join-Path (Resolve-Path $bundle).Path "agentchatroom.exe"
           $proc = Start-Process -FilePath $exe -WorkingDirectory (Resolve-Path $bundle).Path -PassThru
-          Start-Sleep -Seconds 15
-          if ($proc.HasExited) {
-            throw "Default GUI exited immediately with code $($proc.ExitCode); Tcl/Tk console did not start"
+          try {
+            Start-Sleep -Seconds 15
+            $proc.Refresh()
+            if ($proc.HasExited) {
+              throw "Default GUI exited immediately with code $($proc.ExitCode); Tcl/Tk console did not start"
+            }
+            $windowTitle = (Get-Process -Id $proc.Id).MainWindowTitle
+            if ($windowTitle -ne "AgentChatRoom 控制台") {
+              throw "Default GUI did not open the expected console window; actual title: '$windowTitle'"
+            }
+          } finally {
+            $proc.Refresh()
+            if (-not $proc.HasExited) { Stop-Process -Id $proc.Id -Force }
           }
-          Stop-Process -Id $proc.Id -Force
-          Write-Host "Default GUI smoke passed: process stayed alive and init.tcl is bundled."
+          Write-Host "Default GUI smoke passed: console window opened and init.tcl is bundled."
 
       - name: Create downloadable archive
         shell: pwsh
