@@ -1069,7 +1069,7 @@ async def test_expired_http_session_reports_recovery_and_reclaims_unfinished_tas
         settings,
         heartbeat_timeout_seconds=0.5,
         presence_keepalive_interval_seconds=0.05,
-        mcp_http_session_idle_timeout_seconds=0.3,
+        mcp_http_session_idle_timeout_seconds=1.0,
         mcp_http_session_adoption=False,
     )
     app = create_app(tuned)
@@ -1167,7 +1167,7 @@ async def test_expired_http_session_reports_recovery_and_reclaims_unfinished_tas
             assert claimed["ok"], claimed
 
             # Exceed the configured idle timeout without any request at all.
-            await asyncio.sleep(0.6)
+            await asyncio.sleep(1.3)
 
             expired = await client.post(
                 url,

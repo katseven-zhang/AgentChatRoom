@@ -121,7 +121,9 @@ def _tuned(settings, **overrides):
     base = {
         "heartbeat_timeout_seconds": 30,
         "presence_keepalive_interval_seconds": 0.05,
-        "mcp_http_session_idle_timeout_seconds": 0.3,
+        # Leave room for bootstrap and the first write on loaded runners;
+        # the sleeps below still force an actual idle expiry.
+        "mcp_http_session_idle_timeout_seconds": 1.0,
     }
     base.update(overrides)
     return replace(settings, **base)
@@ -192,7 +194,7 @@ async def test_adopted_reaped_session_replays_writes_and_resumes_room_session(
             room_session_id = booted["result"]["session"]["id"]
 
             # Let the stateful transport exceed the configured idle timeout.
-            await asyncio.sleep(0.6)
+            await asyncio.sleep(1.3)
 
             replayed = await session.call(
                 client,
@@ -247,7 +249,7 @@ async def test_strict_mode_keeps_the_expired_session_contract(settings, project_
                 )
             )
             assert booted["ok"], booted
-            await asyncio.sleep(0.6)
+            await asyncio.sleep(1.3)
 
             expired = await session.call(client, "room_sync", {})
             assert expired.status_code == 404, expired.text
@@ -288,7 +290,7 @@ async def test_parallel_adopted_sessions_stay_isolated(settings, project_dir):
                 sessions[label] = booted["result"]["session"]["id"]
             assert sessions["first"] != sessions["second"]
 
-            await asyncio.sleep(0.6)
+            await asyncio.sleep(1.3)
 
             for label, session in (("first", first), ("second", second)):
                 replayed = await session.call(
@@ -297,7 +299,8 @@ async def test_parallel_adopted_sessions_stay_isolated(settings, project_dir):
                     {"body": f"#117 parallel {label}", "model_display_name": "test"},
                 )
                 assert replayed.status_code == 200, replayed.text
-                assert _tool_payload(replayed)["ok"]
+                payload = _tool_payload(replayed)
+                assert payload["ok"], payload
                 adopted = replayed.headers["mcp-session-id"]
                 binding = mcp_server.get_runtime_binding(
                     f"{mcp_server.HTTP_TRANSPORT_KEY_PREFIX}{adopted}"
@@ -345,7 +348,7 @@ async def test_adoption_refuses_a_foreign_credential_bookmark(settings, tmp_path
             assert booted["ok"], booted
             room_session_b = booted["result"]["session"]["id"]
 
-        await asyncio.sleep(0.6)
+        await asyncio.sleep(1.3)
 
         async with httpx.AsyncClient(headers=headers_a, timeout=10.0) as client_a:
             intruder = _HttpSession(url, headers_a)
@@ -402,7 +405,7 @@ async def test_adoption_without_a_tombstone_degrades_safely(settings, project_di
                 )
             )
             assert booted["ok"], booted
-            await asyncio.sleep(0.6)
+            await asyncio.sleep(1.3)
 
             # Simulate a restart that lost both live bindings and tombstones.
             mcp_server.clear_runtime_binding()
@@ -530,7 +533,7 @@ async def test_adopted_replay_works_in_sse_response_mode(settings, project_dir):
             )
             assert booted["ok"], booted
 
-            await asyncio.sleep(0.6)
+            await asyncio.sleep(1.3)
 
             replayed = await session.call(
                 client,
