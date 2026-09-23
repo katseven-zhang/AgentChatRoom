@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import pytest
 from dataclasses import replace
@@ -142,27 +143,42 @@ def test_resolve_project_for_join_without_registered_key_autosyncs(test_service,
     assert resolved["git_remote"] == remote_url
 
 
-def test_is_path_to_git_upgrade_safety():
+def test_is_path_to_git_upgrade_safety(tmp_path):
     """_is_path_to_git_upgrade returns False if directory identity does not match."""
+    project_dir = tmp_path / "project"
+    project_dir.mkdir()
+    other_dir = tmp_path / "other"
+    other_dir.mkdir()
+    registered_path = {"kind": "path", "identity": str(project_dir.resolve())}
+    requested_git = {"kind": "git", "identity": "https://github.com/foo/bar"}
+
     # When identity matches:
     assert _is_path_to_git_upgrade(
-        r"C:\my\project",
-        {"kind": "path", "identity": r"c:\my\project"},
-        {"kind": "git", "identity": "https://github.com/foo/bar"},
+        project_dir,
+        registered_path,
+        requested_git,
     ) is True
+
+    if os.name == "nt":
+        # Windows paths are case-insensitive; POSIX paths are not.
+        assert _is_path_to_git_upgrade(
+            project_dir,
+            {"kind": "path", "identity": str(project_dir.resolve()).swapcase()},
+            requested_git,
+        ) is True
 
     # When registered scope is already git:
     assert _is_path_to_git_upgrade(
-        r"C:\my\project",
+        project_dir,
         {"kind": "git", "identity": "https://github.com/old/repo"},
         {"kind": "git", "identity": "https://github.com/new/repo"},
     ) is False
 
     # When directory does not match registered identity:
     assert _is_path_to_git_upgrade(
-        r"C:\different\project",
-        {"kind": "path", "identity": r"c:\my\project"},
-        {"kind": "git", "identity": "https://github.com/foo/bar"},
+        other_dir,
+        registered_path,
+        requested_git,
     ) is False
 
 
