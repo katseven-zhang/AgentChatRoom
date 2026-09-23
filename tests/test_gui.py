@@ -203,6 +203,35 @@ def test_create_tray_icon_actions_have_pystray_compatible_signatures(monkeypatch
     assert actions == [action for _label, action, _default in build_tray_menu_spec()]
 
 
+def test_gui_status_uses_full_width_row(monkeypatch, settings) -> None:
+    try:
+        import tkinter as tk
+    except ImportError as error:
+        pytest.skip(f"Tk unavailable: {error}")
+    try:
+        probe = tk.Tk()
+        probe.withdraw()
+        probe.destroy()
+    except tk.TclError as error:
+        pytest.skip(f"Tk display unavailable: {error}")
+
+    import agentchatroom.gui as gui_module
+
+    windows = []
+    monkeypatch.setattr(gui_module, "load_settings", lambda _config: settings)
+    monkeypatch.setattr(gui_module, "create_tray_icon", lambda _action: None)
+    monkeypatch.setattr(tk.Tk, "mainloop", lambda self: windows.append(self))
+
+    gui_module.run_gui()
+    window = windows[0]
+    try:
+        window.update_idletasks()
+        assert window.status_label.pack_info()["side"] == "top"
+        assert window.status_label.winfo_width() >= window.winfo_width() - 40
+    finally:
+        window.destroy()
+
+
 def test_button_states_follow_service_and_action_state() -> None:
     assert button_states(service_running=False, action_active=False) == (True, False)
     assert button_states(service_running=True, action_active=False) == (False, True)

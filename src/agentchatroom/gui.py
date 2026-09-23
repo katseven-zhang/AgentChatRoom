@@ -568,28 +568,30 @@ def run_gui(config_path: str | None = None) -> None:
 
             top = ttk.Frame(self, padding=(10, 10, 10, 4))
             top.pack(fill="x")
-            ttk.Label(top, text="IP:").pack(side="left")
-            self.host_entry = ttk.Entry(top, width=13, justify="center")
+            controls = ttk.Frame(top)
+            controls.pack(fill="x")
+            ttk.Label(controls, text="IP:").pack(side="left")
+            self.host_entry = ttk.Entry(controls, width=13, justify="center")
             self.host_entry.insert(0, settings.host)
             self.host_entry.pack(side="left", padx=(4, 8))
-            ttk.Label(top, text="端口:").pack(side="left")
-            self.port_entry = ttk.Entry(top, width=7, justify="center")
+            ttk.Label(controls, text="端口:").pack(side="left")
+            self.port_entry = ttk.Entry(controls, width=7, justify="center")
             self.port_entry.insert(0, str(settings.port))
             self.port_entry.pack(side="left", padx=(4, 14))
-            self.start_button = ttk.Button(top, text="启动服务", command=self.on_start)
+            self.start_button = ttk.Button(controls, text="启动服务", command=self.on_start)
             self.start_button.pack(side="left", padx=(0, 6))
             self.restart_button = ttk.Button(
-                top, text="重启服务", command=self.on_restart
+                controls, text="重启服务", command=self.on_restart
             )
             self.restart_button.pack(side="left", padx=(0, 6))
-            self.stop_button = ttk.Button(top, text="停止服务", command=self.on_stop)
+            self.stop_button = ttk.Button(controls, text="停止服务", command=self.on_stop)
             self.stop_button.pack(side="left", padx=(0, 6))
             self.frontend_button = ttk.Button(
-                top, text="打开前端", command=self.on_frontend
+                controls, text="打开前端", command=self.on_frontend
             )
             self.frontend_button.pack(side="left")
-            self.status_label = ttk.Label(top, text="", padding=(14, 0, 0, 0))
-            self.status_label.pack(side="left")
+            self.status_label = ttk.Label(top, text="")
+            self.status_label.pack(fill="x", anchor="w", pady=(6, 0))
 
             self.log_view = scrolledtext.ScrolledText(
                 self, height=20, state="disabled", wrap="word"
