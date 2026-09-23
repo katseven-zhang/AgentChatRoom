@@ -44,6 +44,7 @@ def _args(**overrides) -> argparse.Namespace:
         "token": "",
         "message": "",
         "report_task": "",
+        "takeover": False,
         "summary": "",
         "file": [],
         "test": [],
@@ -137,6 +138,52 @@ async def test_submit_posts_message_and_report_with_only_a_credential(
             if item["id"] == task["id"]
         )
         assert stored["state_view"]["phase"] == "awaiting_review"
+    finally:
+        await _stop(server, server_task)
+
+
+@pytest.mark.asyncio
+async def test_submit_requires_explicit_takeover_for_live_same_identity_owner(
+    settings, project_dir
+):
+    app = create_app(settings)
+    project, member, credential = _prepared_project(app, project_dir)
+    owner = app.state.service.join_room(
+        project["id"], name="OpenCode owner", client="opencode", model="unknown",
+        member_id=member["id"],
+    )
+    task = app.state.service.create_task(
+        project["id"],
+        title="Live owner submit fallback",
+        acceptance_criteria=["Explicit same-identity takeover is required"],
+        actor_session_id=owner["agent"]["id"],
+        token=owner["token"],
+    )["task"]
+    app.state.service.claim_task(
+        project["id"], task["id"], owner["agent"]["id"], owner["token"]
+    )
+
+    server, server_task, url = await _serve(app)
+    try:
+        result = await asyncio.to_thread(
+            run_submit,
+            _args(
+                token=credential["token"],
+                report_task=str(task["task_number"]),
+                summary="Finished after explicit takeover",
+                file=["src/example.py"],
+                test=["pytest tests/test_cli_submit.py::0"],
+                cwd=str(project_dir),
+                takeover=True,
+            ),
+            url,
+        )
+        assert result["task_reclaimed"] is True
+        assert result["report"]["task_id"] == task["id"]
+        events = app.state.service.query_audit(project["id"], task_id=task["id"])["events"]
+        takeovers = [event for event in events if event["event_type"] == "task.reclaimed"]
+        assert len(takeovers) == 1
+        assert takeovers[0]["payload"]["explicit_live_takeover"] is True
     finally:
         await _stop(server, server_task)
 

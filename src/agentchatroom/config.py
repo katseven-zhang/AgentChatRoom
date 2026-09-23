@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import sys
 import tomllib
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -110,6 +111,13 @@ def default_application_root(explicit: str | Path | None = None) -> Path:
     explicit = explicit or os.getenv("AGENTCHATROOM_ROOT")
     if explicit:
         return Path(explicit).expanduser().resolve()
+
+    # A login startup entry has no dependable working directory. Preserve the
+    # established checkout runtime when an EXE lives under its source tree;
+    # standalone onedir releases keep data next to the executable instead.
+    if getattr(sys, "frozen", False):
+        executable = Path(sys.executable).resolve()
+        return _find_repository_root(executable) or executable.parent
 
     for start in (Path.cwd(), Path(__file__)):
         repository_root = _find_repository_root(start)

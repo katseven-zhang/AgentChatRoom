@@ -1938,6 +1938,80 @@ def test_task_claim_reclaim_passes_through_rest_api(settings, project_dir):
         assert reclaimed.json()["task"]["owner_session_id"] == joined_b["agent"]["id"]
 
 
+def test_task_claim_explicit_live_takeover_passes_through_rest_api(
+    settings, project_dir
+):
+    """#205: REST exposes the same explicit, fenced transfer as MCP and CLI."""
+    with TestClient(create_app(settings)) as client:
+        created = client.post(
+            "/api/v1/projects",
+            json={"root_path": str(project_dir), "name": "Live takeover room"},
+        )
+        assert created.status_code == 201
+        project = created.json()
+        owner = _join_agent(
+            client, project, software_key="codex", name="Codex",
+            client="codex", model="unknown", role="executor",
+        )
+        sibling = _join_agent(
+            client, project, software_key="codex", name="Codex",
+            client="codex", model="unknown", role="executor",
+        )
+        task = client.post(
+            f"/api/v1/projects/{project['id']}/tasks",
+            json={
+                "title": "Live takeover through REST",
+                "acceptance_criteria": ["Same-identity explicit transfer works"],
+                "actor_session_id": owner["agent"]["id"],
+                "token": owner["token"],
+            },
+        ).json()["task"]
+        task_url = f"/api/v1/projects/{project['id']}/tasks/{task['id']}"
+        claimed = client.post(
+            f"{task_url}/claim",
+            json={"session_id": owner["agent"]["id"], "token": owner["token"]},
+        )
+        assert claimed.status_code == 200
+
+        blocked = client.post(
+            f"{task_url}/claim",
+            json={
+                "session_id": sibling["agent"]["id"],
+                "token": sibling["token"],
+                "reclaim": True,
+            },
+        )
+        assert blocked.status_code == 409
+        assert blocked.json()["error"]["code"] == "task_owner_session_connected"
+        assert (
+            blocked.json()["error"]["details"]["explicit_takeover"]
+            == "task_claim(takeover=true)"
+        )
+
+        taken = client.post(
+            f"{task_url}/claim",
+            json={
+                "session_id": sibling["agent"]["id"],
+                "token": sibling["token"],
+                "takeover": True,
+            },
+        )
+        assert taken.status_code == 200, taken.text
+        assert taken.json()["explicit_live_takeover"] is True
+        assert taken.json()["task"]["owner_session_id"] == sibling["agent"]["id"]
+
+        stale = client.patch(
+            task_url,
+            json={
+                "title": "Stale owner write",
+                "session_id": owner["agent"]["id"],
+                "token": owner["token"],
+            },
+        )
+        assert stale.status_code == 403
+        assert stale.json()["error"]["code"] == "not_task_owner"
+
+
 def test_task_update_over_rest_requires_owner_credentials_or_management(
     monkeypatch, settings, project_dir
 ):

@@ -124,6 +124,43 @@ def test_application_root_override_keeps_runtime_under_that_root(
     assert default_data_dir() == (checkout / ".agentchatroom" / "runtime").resolve()
 
 
+def test_frozen_login_launch_uses_executable_directory_not_working_directory(
+    monkeypatch, tmp_path
+):
+    import agentchatroom.config as config
+
+    bundle = tmp_path / "安装 目录" / "agentchatroom"
+    bundle.mkdir(parents=True)
+    other_cwd = tmp_path / "unrelated"
+    other_cwd.mkdir()
+    monkeypatch.delenv("AGENTCHATROOM_DATA_DIR", raising=False)
+    monkeypatch.delenv("AGENTCHATROOM_ROOT", raising=False)
+    monkeypatch.setattr(config.sys, "frozen", True, raising=False)
+    monkeypatch.setattr(config.sys, "executable", str(bundle / "agentchatroom.exe"))
+    monkeypatch.chdir(other_cwd)
+
+    assert default_data_dir() == bundle / ".agentchatroom" / "runtime"
+
+
+def test_frozen_executable_inside_checkout_preserves_existing_runtime(
+    monkeypatch, tmp_path
+):
+    import agentchatroom.config as config
+
+    checkout = tmp_path / "checkout"
+    bundle = checkout / "dist" / "agentchatroom"
+    (checkout / "src" / "agentchatroom").mkdir(parents=True)
+    bundle.mkdir(parents=True)
+    (checkout / "pyproject.toml").write_text("[project]\nname='agentchatroom'\n", encoding="utf-8")
+    monkeypatch.delenv("AGENTCHATROOM_DATA_DIR", raising=False)
+    monkeypatch.delenv("AGENTCHATROOM_ROOT", raising=False)
+    monkeypatch.setattr(config.sys, "frozen", True, raising=False)
+    monkeypatch.setattr(config.sys, "executable", str(bundle / "agentchatroom.exe"))
+    monkeypatch.chdir(tmp_path)
+
+    assert default_data_dir() == checkout / ".agentchatroom" / "runtime"
+
+
 def test_invalid_config_fails_with_a_clear_error(monkeypatch, tmp_path):
     monkeypatch.setenv("AGENTCHATROOM_DATA_DIR", str(tmp_path / "data"))
     monkeypatch.setenv("AGENTCHATROOM_PORT", "70000")

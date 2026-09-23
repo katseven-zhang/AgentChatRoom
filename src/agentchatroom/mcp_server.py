@@ -1923,9 +1923,10 @@ def task_claim(
     session_id: str = "",
     token: str = "",
     reclaim: bool = False,
+    takeover: bool = False,
     request_id: str = "",
 ) -> dict[str, Any]:
-    """Claim an available task, or explicitly reclaim same-identity work after disconnect."""
+    """Claim work; same-identity takeover is explicit even if the owner is online."""
     try:
         _authorize_remote(project_id, "task:write")
     except DomainError as error:
@@ -1937,6 +1938,7 @@ def task_claim(
         session_id,
         token,
         reclaim=reclaim,
+        takeover=takeover,
         request_id=_mcp_request_id(request_id),
     )
 

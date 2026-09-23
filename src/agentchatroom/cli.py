@@ -366,7 +366,12 @@ def run_submit(args: argparse.Namespace, base_url: str) -> dict[str, Any]:
                 base_url,
                 "POST",
                 f"/api/v1/projects/{project_id}/tasks/{task_id}/claim",
-                {"session_id": session_id, "token": session_token, "reclaim": True},
+                {
+                    "session_id": session_id,
+                    "token": session_token,
+                    "reclaim": True,
+                    "takeover": bool(args.takeover),
+                },
             )
             result["task_reclaimed"] = True
         except SystemExit:
@@ -852,6 +857,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     gui = commands.add_parser("gui", help="Open the local GUI controller")
     gui.add_argument("--config")
+    gui.add_argument("--autostart", action="store_true", help="Launched at Windows login")
 
     logs = commands.add_parser("logs", help="Show the detached service log")
     logs.add_argument("--config")
@@ -1055,6 +1061,14 @@ def build_parser() -> argparse.ArgumentParser:
     submit.add_argument(
         "--report-task", default="", help="Task id or number for the work report"
     )
+    submit.add_argument(
+        "--takeover",
+        action="store_true",
+        help=(
+            "Explicitly take over a live same-identity owner and its leases "
+            "before submitting a work report"
+        ),
+    )
     submit.add_argument("--summary", default="", help="Work report summary")
     submit.add_argument(
         "--file", action="append", default=[], help="Changed file pattern; repeatable"
@@ -1229,6 +1243,14 @@ def build_parser() -> argparse.ArgumentParser:
             "Reclaim an unfinished task from a disconnected Session of the "
             "same software identity; rejected while the owner is connected "
             "or belongs to another identity"
+        ),
+    )
+    claim.add_argument(
+        "--takeover",
+        action="store_true",
+        help=(
+            "Explicitly transfer an unfinished task and its leases from another "
+            "Session of the same software identity, even when that Session is online"
         ),
     )
 
@@ -1473,7 +1495,10 @@ def main(argv: list[str] | None = None) -> None:
     if args.command == "gui":
         from .gui import run_gui
 
-        run_gui(args.config)
+        if args.autostart:
+            run_gui(args.config, autostart=True)
+        else:
+            run_gui(args.config)
         return
     if args.command == "logs":
         if args.lines < 1:
@@ -1872,6 +1897,7 @@ def main(argv: list[str] | None = None) -> None:
                 "session_id": args.session_id,
                 "token": args.token,
                 "reclaim": args.reclaim,
+                "takeover": args.takeover,
             },
         )
     elif args.command == "task-release":

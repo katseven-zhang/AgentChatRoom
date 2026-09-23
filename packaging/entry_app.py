@@ -36,7 +36,10 @@ def main() -> None:
             flag_index = gui_args.index("--config")
             if flag_index + 1 < len(gui_args):
                 config_path = gui_args[flag_index + 1]
-        run_gui(config_path)
+        if "--autostart" in gui_args:
+            run_gui(config_path, autostart=True)
+        else:
+            run_gui(config_path)
         return
     from agentchatroom.cli import main as cli_main
 

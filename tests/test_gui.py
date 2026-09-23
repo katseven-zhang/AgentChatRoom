@@ -43,6 +43,10 @@ from agentchatroom.gui import (
     validate_host,
     validate_port,
 )
+from agentchatroom.gui_autostart import LoginStartup, is_temporary_executable, startup_command
+from agentchatroom.gui_event_log import (
+    RoomEventTail, format_room_event, format_service_line, sanitize_gui_text,
+)
 
 
 def available_port() -> int:
@@ -232,6 +236,128 @@ def test_gui_status_uses_full_width_row(monkeypatch, settings) -> None:
         window.destroy()
 
 
+def test_gui_login_checkbox_and_autostart_action(monkeypatch, settings) -> None:
+    try:
+        import tkinter as tk
+        probe = tk.Tk()
+        probe.withdraw()
+        probe.destroy()
+    except (ImportError, tk.TclError) as error:
+        pytest.skip(f"Tk display unavailable: {error}")
+
+    import agentchatroom.gui as gui_module
+
+    class FakeStartup:
+        active = False
+
+        def enabled(self):
+            return self.active
+
+        def is_current(self):
+            return True
+
+        def enable(self):
+            self.active = True
+
+        def disable(self):
+            self.active = False
+
+    startup = FakeStartup()
+    windows = []
+    monkeypatch.setattr(gui_module, "load_settings", lambda _config: settings)
+    monkeypatch.setattr(gui_module, "LoginStartup", lambda: startup)
+    monkeypatch.setattr(gui_module, "create_tray_icon", lambda _action: None)
+    monkeypatch.setattr(tk.Tk, "mainloop", lambda self: windows.append(self))
+
+    gui_module.run_gui(autostart=True)
+    window = windows[0]
+    try:
+        assert window.login_startup_checkbox.cget("text") == "开机启动"
+        assert window.login_startup_var.get() is False
+        window.login_startup_var.set(True)
+        window.on_login_startup_toggle()
+        assert startup.active is True
+        window.login_startup_var.set(False)
+        window.on_login_startup_toggle()
+        assert startup.active is False
+        calls = []
+        window.on_start = lambda: calls.append("start")
+        window.start_after_login()
+        assert calls == ["start"]
+    finally:
+        window.destroy()
+
+
+@pytest.mark.parametrize("same_data_dir", [False, True])
+def test_login_autostart_config_error_keeps_gui_open_for_retry(
+    monkeypatch, settings, same_data_dir
+) -> None:
+    try:
+        import tkinter as tk
+        probe = tk.Tk()
+        probe.withdraw()
+        probe.destroy()
+    except (ImportError, tk.TclError) as error:
+        pytest.skip(f"Tk display unavailable: {error}")
+
+    import agentchatroom.gui as gui_module
+
+    attempts = []
+    def load(_path):
+        attempts.append(1)
+        if len(attempts) == 1:
+            raise ValueError("invalid port")
+        return settings
+
+    log_tails = []
+    room_tails = []
+
+    class FakeLogTail:
+        def __init__(self, path, _sink, stop_event):
+            self.path, self.stop_event = path, stop_event
+            log_tails.append(self)
+
+        def start(self):
+            pass
+
+    class FakeRoomTail:
+        def __init__(self, active_settings, _sink, stop_event):
+            self.settings, self.stop_event = active_settings, stop_event
+            self.cursors, self.presence = {}, {}
+            room_tails.append(self)
+
+        def start(self):
+            pass
+
+    windows = []
+    def mainloop(window):
+        windows.append(window)
+        assert window._retry_config_load() is True
+
+    monkeypatch.setattr(gui_module, "load_settings", load)
+    monkeypatch.setattr(
+        gui_module, "default_data_dir",
+        lambda: settings.data_dir if same_data_dir else settings.data_dir / "fallback",
+    )
+    monkeypatch.setattr(gui_module, "LogTail", FakeLogTail)
+    monkeypatch.setattr(gui_module, "RoomEventTail", FakeRoomTail)
+    monkeypatch.setattr(gui_module, "create_tray_icon", lambda _action: None)
+    monkeypatch.setattr(tk.Tk, "mainloop", mainloop)
+    gui_module.run_gui(autostart=True)
+    window = windows[0]
+    try:
+        assert "配置读取失败" in window.log_view.get("1.0", "end")
+        assert len(attempts) == 2
+        assert len(room_tails) == 2
+        assert len(log_tails) == (1 if same_data_dir else 2)
+        assert (room_tails[0].settings.database_path == settings.database_path) is same_data_dir
+        assert room_tails[1].settings.database_path == settings.database_path
+        assert log_tails[-1].path == settings.data_dir / "server.log"
+        assert room_tails[0].stop_event.is_set()
+    finally:
+        window.destroy()
+
+
 def test_button_states_follow_service_and_action_state() -> None:
     assert button_states(service_running=False, action_active=False) == (True, False)
     assert button_states(service_running=True, action_active=False) == (False, True)
@@ -398,7 +524,7 @@ def test_log_tail_forwards_redacted_events_from_file(tmp_path) -> None:
         return collected
 
     try:
-        assert collect(1) == [("log", "startup line")]
+        assert collect(1) == [("log", "历史服务日志：服务输出：startup line")]
 
         with log_path.open("a", encoding="utf-8") as handle:
             handle.write("second line\ntoken=hushhush\n")
@@ -408,7 +534,7 @@ def test_log_tail_forwards_redacted_events_from_file(tmp_path) -> None:
         stop_event.set()
         tail.join(timeout=5)
 
-    assert events == [("log", "second line"), ("log", "token=[REDACTED]")]
+    assert events == [("log", "服务输出：second line"), ("log", "服务输出：token=[REDACTED]")]
     assert "hushhush" not in "".join(payload for _kind, payload in events)
 
 
@@ -425,6 +551,29 @@ def test_running_url_from_log_returns_latest_address(tmp_path) -> None:
         encoding="utf-8",
     )
     assert running_url_from_log(log_path) == "http://127.0.0.1:8765"
+
+
+def test_log_tail_recovers_after_service_log_truncated(tmp_path) -> None:
+    log_path = tmp_path / "server.log"
+    log_path.write_text("old line\n", encoding="utf-8")
+    sink, stop_event = Queue(), threading.Event()
+    tail = LogTail(log_path, sink, stop_event)
+    tail.start()
+    try:
+        deadline = time.monotonic() + 3
+        while sink.empty() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert "历史服务日志：服务输出：old line" == sink.get_nowait()[1]
+        log_path.write_text("", encoding="utf-8")
+        time.sleep(0.35)
+        log_path.write_text("Application startup complete\n", encoding="utf-8")
+        deadline = time.monotonic() + 3
+        while sink.empty() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert sink.get_nowait() == ("log", "服务初始化完成。")
+    finally:
+        stop_event.set()
+        tail.join(timeout=3)
 
     log_path.write_text(
         "INFO: Uvicorn running on http://127.0.0.1:8765\n"
@@ -691,6 +840,281 @@ def test_entry_app_routes_gui_config_flag(monkeypatch) -> None:
     entry_app.main()
 
     assert calls == [("gui", "custom.toml")]
+
+
+def test_entry_app_routes_login_autostart_flag(monkeypatch) -> None:
+    import agentchatroom.gui as gui_module
+    import agentchatroom.stdio_runtime as stdio_runtime
+
+    entry_app = _load_entry_app()
+    calls = []
+    monkeypatch.setattr(stdio_runtime, "prepare_standard_streams", lambda: None)
+    monkeypatch.setattr(gui_module, "run_gui", lambda path, *, autostart: calls.append((path, autostart)))
+    monkeypatch.setattr(sys, "argv", ["agentchatroom.exe", "gui", "--autostart"])
+    entry_app.main()
+    assert calls == [(None, True)]
+
+
+def test_login_startup_command_quotes_unicode_and_spaces(tmp_path) -> None:
+    executable = tmp_path / "中文 目录" / "agentchatroom.exe"
+    command = startup_command(executable=executable, frozen=True)
+    assert command == f'"{executable.resolve()}" gui --autostart'
+    assert is_temporary_executable(executable)
+
+
+def test_login_startup_registry_round_trip_uses_only_own_value(monkeypatch, tmp_path) -> None:
+    import types
+
+    values = {"Another App": "keep"}
+
+    class Key:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+    def query(_key, name):
+        if name not in values:
+            raise FileNotFoundError(name)
+        return values[name], 1
+
+    fake = types.SimpleNamespace(
+        HKEY_CURRENT_USER=1, KEY_READ=1, KEY_SET_VALUE=2, REG_SZ=1,
+        OpenKey=lambda *_args: Key(), CreateKeyEx=lambda *_args: Key(),
+        QueryValueEx=query,
+        SetValueEx=lambda _key, name, _reserved, _kind, value: values.__setitem__(name, value),
+        DeleteValue=lambda _key, name: values.pop(name),
+    )
+    monkeypatch.setitem(sys.modules, "winreg", fake)
+    monkeypatch.setattr("agentchatroom.gui_autostart.is_temporary_executable", lambda _p: False)
+    startup = LoginStartup(executable=tmp_path / "中文 目录" / "agentchatroom.exe", frozen=True)
+    assert not startup.enabled()
+    startup.enable()
+    assert startup.enabled() and startup.is_current()
+    startup.enable()
+    assert len(values) == 2
+    startup.disable()
+    assert not startup.enabled()
+    assert values == {"Another App": "keep"}
+
+
+@pytest.mark.parametrize("previous", [None, "old startup command"])
+@pytest.mark.parametrize("read_raises", [False, True])
+def test_login_startup_failed_verification_restores_own_previous_value(
+    monkeypatch, tmp_path, previous, read_raises
+) -> None:
+    import types
+
+    values = {"Another App": "keep"}
+    if previous is not None:
+        values["AgentChatRoom"] = previous
+
+    class Key:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+    def query(_key, name):
+        if name not in values:
+            raise FileNotFoundError(name)
+        return values[name], 1
+
+    fake = types.SimpleNamespace(
+        HKEY_CURRENT_USER=1, KEY_READ=1, KEY_SET_VALUE=2, REG_SZ=1,
+        OpenKey=lambda *_args: Key(), CreateKeyEx=lambda *_args: Key(),
+        QueryValueEx=query,
+        SetValueEx=lambda _key, name, _reserved, _kind, value: values.__setitem__(name, value),
+        DeleteValue=lambda _key, name: values.pop(name),
+    )
+    monkeypatch.setitem(sys.modules, "winreg", fake)
+    monkeypatch.setattr("agentchatroom.gui_autostart.is_temporary_executable", lambda _p: False)
+    startup = LoginStartup(executable=tmp_path / "agentchatroom.exe", frozen=True)
+    if read_raises:
+        def unreadable():
+            raise PermissionError("read denied")
+        monkeypatch.setattr(startup, "read_command", unreadable)
+    else:
+        monkeypatch.setattr(startup, "read_command", lambda: "unreadable")
+    with pytest.raises(OSError, match="校验失败"):
+        startup.enable()
+    assert values["Another App"] == "keep"
+    assert values.get("AgentChatRoom") == previous
+
+
+def test_login_startup_write_failure_does_not_report_enabled(monkeypatch, tmp_path) -> None:
+    import types
+
+    def deny(*_args):
+        raise PermissionError("denied")
+
+    fake = types.SimpleNamespace(
+        HKEY_CURRENT_USER=1, KEY_READ=1, KEY_SET_VALUE=2, CreateKeyEx=deny
+    )
+    monkeypatch.setitem(sys.modules, "winreg", fake)
+    monkeypatch.setattr("agentchatroom.gui_autostart.is_temporary_executable", lambda _p: False)
+    with pytest.raises(PermissionError):
+        LoginStartup(executable=tmp_path / "agentchatroom.exe", frozen=True).enable()
+
+
+def test_login_startup_detects_stale_executable_path(monkeypatch, tmp_path) -> None:
+    startup = LoginStartup(executable=tmp_path / "new place" / "agentchatroom.exe", frozen=True)
+    monkeypatch.setattr(startup, "read_command", lambda: r'"C:\old place\agentchatroom.exe" gui --autostart')
+    assert startup.enabled()
+    assert not startup.is_current()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows current-user startup registry only")
+def test_live_windows_login_startup_round_trip_opt_in() -> None:
+    executable = os.getenv("AGENTCHATROOM_TEST_STARTUP_EXE", "")
+    if not executable:
+        pytest.skip("set AGENTCHATROOM_TEST_STARTUP_EXE for the opt-in registry test")
+    path = Path(executable).resolve()
+    assert path.is_file()
+    startup = LoginStartup(executable=path, frozen=True)
+    assert not startup.enabled(), "pre-existing startup entry; do not overwrite it"
+    try:
+        startup.enable()
+        assert startup.enabled() and startup.is_current()
+    finally:
+        startup.disable()
+    assert not startup.enabled()
+
+
+def test_chinese_room_event_formatting_and_state_separation() -> None:
+    base = {"project_seq": 1, "created_at": "2026-09-23T01:00:00Z",
+            "task_number": 203, "payload": {"actor": {"name": "Codex"}, "title": "中文日志"}}
+    created = format_room_event({**base, "event_type": "task.created"}, "agentchatroom")
+    assert "发布了任务 #203「中文日志」" in created
+    assert "[agentchatroom]" in created
+    assert "等待独立验收（尚未集成）" in format_room_event(
+        {**base, "event_type": "task.completed"}, "agentchatroom")
+    assert "已完成集成" in format_room_event(
+        {**base, "event_type": "task.integration_completed"}, "agentchatroom")
+    assert "主动离开" in format_room_event(
+        {**base, "event_type": "agent.left"}, "agentchatroom")
+    assert "重新接入" in format_room_event(
+        {**base, "event_type": "agent.joined"}, "agentchatroom", reconnected=True)
+    assert "显式接管" in format_room_event(
+        {**base, "event_type": "task.reclaimed", "payload": {
+            **base["payload"], "explicit_live_takeover": True,
+        }}, "agentchatroom")
+
+
+def test_room_event_fallback_and_redaction() -> None:
+    event = {"event_type": "future.event", "created_at": "bad",
+             "payload": {"title": "token=supersecret\nfoo"}}
+    assert "future.event" in format_room_event(event, "项目")
+    assert "事件 #7" in format_room_event({**event, "project_seq": 7}, "项目")
+    assert "supersecret" not in format_room_event(
+        {**event, "event_type": "task.created", "task_number": 1}, "项目")
+    assert "supersecret" not in sanitize_gui_text("token=supersecret")
+    assert "[路径已隐藏]" in sanitize_gui_text(r"failed C:\Users\Person\secret.txt")
+    assert format_service_line("Application startup complete") == "服务初始化完成。"
+
+
+def test_gui_suppresses_routine_mcp_requests_and_hides_transport_identifiers() -> None:
+    assert format_service_line(
+        'INFO: 127.0.0.1:60000 - "POST /mcp HTTP/1.1" 200 OK'
+    ) is None
+    assert format_service_line(
+        'INFO: HTTP Request: POST http://127.0.0.1:8765/mcp "HTTP/1.1 200 OK"'
+    ) is None
+    assert format_service_line("Received request of type CallToolRequest") is None
+    assert format_service_line("Created MCP session ID: a1234567-b123-c123-d123-e123456789ab") is None
+    assert format_service_line("Terminating session: 27ecf87bea34b5b8ffcba4a3d6df6c9") is None
+    assert format_service_line("Session 27ecf87bea34b5b8ffcba4a3d6df6c9 idle timeout") is None
+    assert format_service_line("Transport for session 27ecf87bea34b5b8ffcba4a3d6df6c9 is gone: keepalive") is None
+    assert format_service_line("StreamableHTTP session manager started") is None
+    assert format_service_line("Adopted reaped MCP session fd1841d7889946c2 as 57fa3d95") is None
+    assert format_service_line("INFO: routine library detail") is None
+    assert "27ecf87bea34b5b8ffcba4a3d6df6c9" not in sanitize_gui_text(
+        "Session 27ecf87bea34b5b8ffcba4a3d6df6c9 disconnected"
+    )
+    assert "服务错误" in format_service_line(
+        "Terminating session: 27ecf87bea34b5b8ffcba4a3d6df6c9 failed"
+    )
+    assert "服务错误" in format_service_line("MCP session ID rotation failed")
+    assert format_service_line(
+        'INFO: 127.0.0.1:60000 - "POST /mcp HTTP/1.1" 500 Internal Server Error'
+    ) == "服务接口请求失败（HTTP 500）；详情请查看服务日志。"
+    sanitized = sanitize_gui_text("session_id=agent_1234567890abcdef")
+    assert "agent_1234567890abcdef" not in sanitized
+    assert "[已隐藏]" in sanitized
+    assert "secretopaque" not in sanitize_gui_text("mcpSessionId=secretopaque")
+
+
+def test_room_event_tail_baselines_and_delivers_each_new_event_once() -> None:
+    class Service:
+        def __init__(self):
+            self.events = [{"project_seq": 1, "event_type": "agent.joined", "payload": {"name": "Old"}}]
+
+        def list_projects(self):
+            return [{"id": "p", "name": "测试项目"}]
+
+        def list_events(self, _project, *, after, limit):
+            rows = [e for e in self.events if e["project_seq"] > after][:limit]
+            return {"events": rows, "latest_cursor": self.events[-1]["project_seq"]}
+
+        def get_task(self, _project, _task):
+            return {"title": "新任务"}
+
+    service = Service()
+    sink = Queue()
+    tail = RoomEventTail.__new__(RoomEventTail)
+    tail.service, tail.sink, tail.cursors, tail.replaced_sessions = service, sink, {}, set()
+    tail.poll_once()
+    assert sink.empty()
+    service.events.append({"project_seq": 2, "event_type": "task.created", "task_number": 204,
+                           "task_id": "t", "created_at": "2026-09-23T01:00:00Z", "payload": {}})
+    tail.poll_once()
+    tail.poll_once()
+    assert sink.qsize() == 1
+    assert "发布了任务 #204「新任务」" in sink.get_nowait()[1]
+
+
+def test_room_event_tail_reads_real_persisted_stream(service, project, settings) -> None:
+    sink = Queue()
+    tail = RoomEventTail(settings, sink, threading.Event(), service=service)
+    tail.poll_once()  # existing project history is only a baseline
+    assert sink.empty()
+    with service.database.connect(write=True) as connection:
+        service._emit(connection, project["id"], "agent.joined", payload={"name": "测试 Agent"})
+        service._emit(connection, project["id"], "task.created", payload={
+            "task_number": 204, "title": "开机启动"})
+        service._emit(connection, project["id"], "agent.left", payload={"name": "测试 Agent"})
+    tail.poll_once()
+    lines = [sink.get_nowait()[1] for _ in range(3)]
+    assert "测试 Agent 接入 Room" in lines[0]
+    assert "发布了任务 #204「开机启动」" in lines[1]
+    assert "测试 Agent 主动离开 Room" in lines[2]
+
+
+def test_room_presence_timeout_is_not_reported_as_active_leave() -> None:
+    class Service:
+        state = "online"
+
+        def list_projects(self):
+            return [{"id": "p", "name": "测试项目"}]
+
+        def snapshot(self, _project):
+            return {"agents": [{"id": "s", "name": "MiniMax", "status": self.state,
+                                "left_at": None}]}
+
+    service = Service()
+    sink = Queue()
+    tail = RoomEventTail.__new__(RoomEventTail)
+    tail.service, tail.sink, tail.presence = service, sink, {}
+    tail.poll_presence_once()
+    service.state = "offline"
+    tail.poll_presence_once()
+    tail.poll_presence_once()
+    assert sink.qsize() == 1
+    message = sink.get_nowait()[1]
+    assert "心跳/活动超时" in message
+    assert "不是主动离开" in message
 
 
 def test_entry_app_routes_service_subcommands_to_cli(monkeypatch) -> None:

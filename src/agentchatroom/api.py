@@ -625,6 +625,7 @@ class TaskClaim(StrictModel):
     session_id: str
     token: str
     reclaim: bool = False
+    takeover: bool = False
 
 
 class TaskRelease(StrictModel):
@@ -2245,6 +2246,7 @@ def create_app(
             body.session_id,
             body.token,
             reclaim=body.reclaim,
+            takeover=body.takeover,
             request_id=request.state.request_id,
         )
 

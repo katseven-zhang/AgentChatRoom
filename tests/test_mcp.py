@@ -90,6 +90,31 @@ def test_mcp_exposes_standard_tool_set():
     }
 
 
+def test_mcp_task_claim_passes_explicit_takeover(monkeypatch):
+    captured = {}
+
+    class Service:
+        def claim_task(self, *args, **kwargs):
+            captured["args"] = args
+            captured["kwargs"] = kwargs
+            return {"task": {"id": "task-example"}}
+
+    monkeypatch.setattr(mcp_server, "get_service", lambda: Service())
+    monkeypatch.setattr(mcp_server, "_authorize_remote", lambda *_: None)
+
+    result = mcp_server.task_claim(
+        "project-example", "task-example", "session-example", "credential-example",
+        takeover=True,
+    )
+
+    assert result["ok"] is True
+    assert captured["args"] == (
+        "project-example", "task-example", "session-example", "credential-example",
+    )
+    assert captured["kwargs"]["reclaim"] is False
+    assert captured["kwargs"]["takeover"] is True
+
+
 def test_bridge_adds_request_id_only_to_retryable_cached_writes():
     original = {"project_id": "project_1", "body": "hello"}
     forwarded = prepare_tool_arguments("message_post", original)

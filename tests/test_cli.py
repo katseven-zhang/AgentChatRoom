@@ -935,13 +935,29 @@ def test_task_claim_cli_passes_reclaim_flag(monkeypatch, capsys):
             "agent_example",
             "--token",
             "session-token",
+            "--takeover",
+        ]
+    )
+    main(
+        [
+            "task-claim",
+            "project_example",
+            "task_example",
+            "--session-id",
+            "agent_example",
+            "--token",
+            "session-token",
         ]
     )
 
     assert captured[0]["method"] == "POST"
     assert captured[0]["path"].endswith("/tasks/task_example/claim")
     assert captured[0]["body"]["reclaim"] is True
+    assert captured[0]["body"]["takeover"] is False
     assert captured[0]["body"]["session_id"] == "agent_example"
     assert captured[0]["body"]["token"] == "session-token"
     assert captured[1]["body"]["reclaim"] is False
-    assert capsys.readouterr().out.count('"ok": true') == 2
+    assert captured[1]["body"]["takeover"] is True
+    assert captured[2]["body"]["reclaim"] is False
+    assert captured[2]["body"]["takeover"] is False
+    assert capsys.readouterr().out.count('"ok": true') == 3

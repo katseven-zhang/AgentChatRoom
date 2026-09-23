@@ -1112,6 +1112,77 @@ def test_bootstrap_restores_the_runtime_session_instead_of_creating_one(
     assert posted["event_id"]
 
 
+def test_bootstrap_restores_session_with_newly_selected_credential(
+    monkeypatch, service, project_dir
+):
+    """#205: credential linking must not crash the #136 restore path."""
+    _configure_software(monkeypatch)
+    project = _register_project(service, project_dir)
+    first = _bootstrap(service, project_dir)
+    assert first.binding is not None
+    issued = service.issue_agent_token(project["id"], name="Agent Token")
+    credential_id = issued["credential"]["id"]
+    task = service.create_task(
+        project["id"], title="Keep ownership across bootstrap",
+        acceptance_criteria=["Original Session remains task owner"],
+        actor_session_id=first.binding.session_id, token=first.binding.token,
+    )["task"]
+    service.claim_task(
+        project["id"], task["id"], first.binding.session_id, first.binding.token
+    )
+    lease = service.acquire_lease(
+        project["id"], session_id=first.binding.session_id,
+        token=first.binding.token, task_id=task["id"], path_pattern="src/restore.py",
+    )["lease"]
+    session_count = len(service.snapshot(project["id"])["agents"])
+
+    restored = _bootstrap(
+        service,
+        project_dir,
+        restore_binding=first.binding,
+        credential_id=credential_id,
+    )
+
+    assert restored.public["connection"]["room_session"] == "restored"
+    assert restored.binding.session_id == first.binding.session_id
+    assert len(service.snapshot(project["id"])["agents"]) == session_count
+    assert service.get_task(project["id"], task["id"])["owner_session_id"] == first.binding.session_id
+    assert any(
+        item["id"] == lease["id"] and item["session_id"] == first.binding.session_id
+        for item in service.snapshot(project["id"])["leases"]
+    )
+    credential = next(
+        item for item in service.list_agent_tokens(project["id"])
+        if item["id"] == credential_id
+    )
+    assert credential["member_id"] is not None
+
+
+def test_bootstrap_rejects_restoring_with_credential_pinned_to_another_member(
+    monkeypatch, service, project_dir
+):
+    _configure_software(monkeypatch)
+    project = _register_project(service, project_dir)
+    first = _bootstrap(service, project_dir)
+    assert first.binding is not None
+    other = service.create_project_member(
+        project["id"], member_key="other-client", name="Other client"
+    )["member"]
+    credential = service.issue_agent_token(
+        project["id"], name="Other member credential", member_id=other["id"]
+    )["credential"]
+
+    rejected = _bootstrap(
+        service, project_dir,
+        restore_binding=first.binding,
+        credential_id=credential["id"],
+    )
+    assert rejected.public["status"] == "room_unavailable"
+    assert rejected.public["details"]["code"] == "credential_already_linked"
+    assert rejected.binding is None
+    assert service.list_agent_tokens(project["id"])[0]["member_id"] == other["id"]
+
+
 def test_restored_session_keeps_task_ownership_after_a_cleared_context(
     monkeypatch, service, project_dir
 ):

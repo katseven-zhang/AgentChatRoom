@@ -719,22 +719,20 @@ def bootstrap_local_room(
                 client=client,
             )
             if restored_outcome is not None:
-                if credential_id:
-                    session_info = restored_outcome.payload.get("session") or {}
-                    session_id = session_info.get("id")
-                    if session_id:
-                        with service.database.connect(write=False) as conn:
-                            srow = conn.execute(
-                                "SELECT member_id FROM agent_sessions WHERE id = ?",
-                                (session_id,),
-                            ).fetchone()
-                            if srow and srow["member_id"]:
-                                try:
-                                    service.link_credential_member(
-                                        project["id"], credential_id, str(srow["member_id"])
-                                    )
-                                except DomainError:
-                                    pass
+                if credential_id and restored_outcome.binding is not None:
+                    with service.database.connect(write=False) as conn:
+                        srow = conn.execute(
+                            "SELECT member_id FROM agent_sessions WHERE id = ?",
+                            (restored_outcome.binding.session_id,),
+                        ).fetchone()
+                        member_id = str(srow["member_id"]) if srow and srow["member_id"] else ""
+                    if member_id:
+                        # A credential already pinned to another member is a
+                        # real identity mismatch, not a recoverable naming
+                        # failure.  Never return a restored binding under it.
+                        service.link_credential_member(
+                            project["id"], credential_id, member_id
+                        )
                 return restored_outcome
         registered = (
             service.register_workspace(

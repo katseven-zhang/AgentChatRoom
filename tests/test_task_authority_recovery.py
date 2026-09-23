@@ -19,7 +19,9 @@ Session id explicitly was rejected by the runtime binding
 from __future__ import annotations
 
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
+from threading import Barrier
 
 import pytest
 
@@ -227,7 +229,8 @@ def test_reclaim_states_a_bounded_next_step_and_rejects_the_status_bypass(
 
     details = connected.value.details
     assert connected.value.code == "task_owner_session_connected"
-    assert details["required_action"] == "wait_for_owner_release_or_reclaim"
+    assert details["required_action"] == "restore_owner_or_explicit_takeover"
+    assert details["explicit_takeover"] == "task_claim(takeover=true)"
     assert details["owner_session_id"] == owner["agent"]["id"]
     assert details["retry_after_seconds"] >= 1
     assert details["heartbeat_timeout_seconds"] == 0.3
@@ -278,6 +281,157 @@ def test_transport_tombstone_allows_immediate_reclaim_without_the_window(
     )
 
     assert reclaimed["task"]["owner_session_id"] == sibling["agent"]["id"]
+
+
+def test_explicit_same_identity_takeover_fences_connected_owner_and_transfers_lease(
+    service, project
+):
+    """#205: only an explicit takeover can move live same-identity work."""
+    owner, sibling, foreign = _two_sessions(service, project["id"])
+    task = _claimed_task(service, project["id"], owner)
+    lease = service.acquire_lease(
+        project["id"],
+        session_id=owner["agent"]["id"],
+        token=owner["token"],
+        task_id=task["id"],
+        path_pattern="src/recovery.py",
+    )["lease"]
+
+    with pytest.raises(DomainError) as ordinary:
+        service.claim_task(
+            project["id"], task["id"], sibling["agent"]["id"], sibling["token"]
+        )
+    assert ordinary.value.code == "task_already_claimed"
+    with pytest.raises(DomainError) as foreign_denied:
+        service.claim_task(
+            project["id"], task["id"], foreign["agent"]["id"], foreign["token"],
+            takeover=True,
+        )
+    assert foreign_denied.value.code == "task_reclaim_forbidden"
+
+    transferred = service.claim_task(
+        project["id"], task["id"], sibling["agent"]["id"], sibling["token"],
+        takeover=True,
+    )
+    assert transferred["explicit_live_takeover"] is True
+    assert transferred["task"]["owner_session_id"] == sibling["agent"]["id"]
+    stored_lease = next(
+        item for item in service.snapshot(project["id"])["leases"]
+        if item["id"] == lease["id"]
+    )
+    assert stored_lease["session_id"] == sibling["agent"]["id"]
+
+    with pytest.raises(DomainError) as stale_update:
+        service.update_task(
+            project["id"], task["id"], progress_percent=50,
+            session_id=owner["agent"]["id"], token=owner["token"],
+        )
+    assert stale_update.value.code == "not_task_owner"
+    with pytest.raises(DomainError) as stale_report:
+        service.submit_work_report(
+            project["id"], task["id"],
+            session_id=owner["agent"]["id"], token=owner["token"],
+            summary="Old owner must not submit", files=["src/recovery.py"],
+            tests=[{"command": "pytest", "exit_code": 0}],
+        )
+    assert stale_report.value.code == "not_task_owner"
+    with pytest.raises(DomainError) as stale_lease:
+        service.release_lease(
+            project["id"], lease["id"], owner["agent"]["id"], owner["token"]
+        )
+    assert stale_lease.value.code == "not_lease_owner"
+    events = service.query_audit(project["id"], task_id=task["id"])["events"]
+    takeovers = [event for event in events if event["event_type"] == "task.reclaimed"]
+    assert len(takeovers) == 1
+    assert takeovers[0]["payload"]["explicit_live_takeover"] is True
+    assert lease["id"] in takeovers[0]["payload"]["transferred_lease_ids"]
+
+
+def test_concurrent_explicit_takeovers_keep_one_owner_and_one_lease_holder(
+    service, project
+):
+    """#205: concurrent requests serialize into auditable ownership changes."""
+    owner, first, _ = _two_sessions(service, project["id"])
+    second = service.join_room(
+        project["id"],
+        name="WorkBuddy third conversation",
+        client="workbuddy",
+        model="unknown",
+        member_id=owner["agent"]["member_id"],
+    )
+    task = _claimed_task(service, project["id"], owner)
+    lease = service.acquire_lease(
+        project["id"],
+        session_id=owner["agent"]["id"],
+        token=owner["token"],
+        task_id=task["id"],
+        path_pattern="src/concurrent.py",
+    )["lease"]
+    barrier = Barrier(2)
+
+    def take_over(session):
+        barrier.wait(timeout=5)
+        return service.claim_task(
+            project["id"], task["id"], session["agent"]["id"],
+            session["token"], takeover=True,
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures = [pool.submit(take_over, session) for session in (first, second)]
+        results = [future.result(timeout=10) for future in futures]
+
+    final_owner = service.get_task(project["id"], task["id"])["owner_session_id"]
+    contenders = {first["agent"]["id"], second["agent"]["id"]}
+    assert final_owner in contenders
+    assert {result["task"]["owner_session_id"] for result in results} == contenders
+    stored_lease = next(
+        item for item in service.snapshot(project["id"])["leases"]
+        if item["id"] == lease["id"]
+    )
+    assert stored_lease["session_id"] == final_owner
+    takeovers = [
+        event for event in service.query_audit(project["id"], task_id=task["id"])["events"]
+        if event["event_type"] == "task.reclaimed"
+    ]
+    assert len(takeovers) == 2
+    assert all(lease["id"] in event["payload"]["transferred_lease_ids"] for event in takeovers)
+    for session in (owner, first, second):
+        if session["agent"]["id"] == final_owner:
+            continue
+        with pytest.raises(DomainError) as stale:
+            service.update_task(
+                project["id"], task["id"], progress_percent=60,
+                session_id=session["agent"]["id"], token=session["token"],
+            )
+        assert stale.value.code == "not_task_owner"
+
+
+def test_explicit_takeover_rejects_task_awaiting_independent_review(
+    service, project, joined_agents
+):
+    owner, _reviewer = joined_agents
+    sibling = service.join_room(
+        project["id"], name="Builder sibling", client="codex", model="unknown",
+        member_id=owner["agent"]["member_id"],
+        workspace_id=owner["agent"]["workspace_id"],
+        host_id=owner["agent"]["host_id"],
+        worktree=project["root_path"],
+    )
+    task = _claimed_task(service, project["id"], owner)
+    reported = service.submit_work_report(
+        project["id"], task["id"],
+        session_id=owner["agent"]["id"], token=owner["token"],
+        summary="No code change in this isolated test", files=[],
+        tests=[{"command": "isolated check", "exit_code": 0}],
+        no_code_change_reason="Only the task state is under test",
+    )
+    assert reported["task_status"] == "awaiting_review"
+    with pytest.raises(DomainError) as denied:
+        service.claim_task(
+            project["id"], task["id"], sibling["agent"]["id"], sibling["token"],
+            takeover=True,
+        )
+    assert denied.value.code == "task_reclaim_forbidden"
 
 
 def test_foreign_identity_cannot_reclaim_a_live_sessions_task(quiet_service, project):

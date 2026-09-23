@@ -5100,6 +5100,7 @@ class AgentChatRoomService:
         token: str,
         *,
         reclaim: bool = False,
+        takeover: bool = False,
     ) -> dict[str, Any]:
         with self.database.connect(write=True) as connection:
             claimant = self._authenticate(connection, project_id, session_id, token)
@@ -5129,7 +5130,7 @@ class AgentChatRoomService:
                     # is disconnected: claimed, in_progress, and blocked.
                     and task["execution_status"] in {"claimed", "in_progress", "blocked"}
                 )
-                if not reclaim:
+                if not (reclaim or takeover):
                     raise DomainError(
                         "task_already_claimed",
                         "Task is already owned by another Session",
@@ -5138,6 +5139,7 @@ class AgentChatRoomService:
                             "owner_session_id": task["owner_session_id"],
                             "status": task["status"],
                             "can_reclaim_if_disconnected": can_reclaim,
+                            "can_explicitly_take_over": can_reclaim,
                         },
                     )
                 if not can_reclaim or owner is None:
@@ -5169,10 +5171,11 @@ class AgentChatRoomService:
                         )
                         if transport_state == "gone":
                             owner_connected = False
-                if owner_connected:
-                    # Bound and actionable: the caller cannot bypass this with
-                    # task_update(status=todo), so it must know exactly when the
-                    # owner stops being treated as connected and what to do.
+                if owner_connected and not takeover:
+                    # An ordinary reclaim never preempts a live owner.  A same-
+                    # identity caller can choose an explicit, audited takeover
+                    # when the transport/heartbeat is a ghost or continuation
+                    # in the old conversation is impossible.
                     stale_after = last_seen + timedelta(
                         seconds=self.settings.heartbeat_timeout_seconds
                     )
@@ -5181,7 +5184,7 @@ class AgentChatRoomService:
                     )
                     raise DomainError(
                         "task_owner_session_connected",
-                        "The owning Session is still connected; continue in that conversation, release the task there, or wait for it to be treated as disconnected",
+                        "The owning Session is still connected; restore that conversation, or explicitly take over its task and leases with takeover=true",
                         status_code=409,
                         details={
                             "owner_session_id": task["owner_session_id"],
@@ -5194,7 +5197,9 @@ class AgentChatRoomService:
                             "retry_after_seconds": retry_after,
                             "owner_transport_state": transport_state,
                             "heartbeat_timeout_seconds": self.settings.heartbeat_timeout_seconds,
-                            "required_action": "wait_for_owner_release_or_reclaim",
+                            "required_action": "restore_owner_or_explicit_takeover",
+                            "optional_wait_seconds": retry_after,
+                            "explicit_takeover": "task_claim(takeover=true)",
                             "forbidden_bypass": "task_update(status=todo)",
                         },
                     )
@@ -5231,6 +5236,7 @@ class AgentChatRoomService:
                         "owner_session_id": session_id,
                         "transferred_lease_ids": lease_ids,
                         "execution_status": task["execution_status"],
+                        "explicit_live_takeover": bool(takeover and owner_connected),
                     },
                 )
                 row = connection.execute(
@@ -5243,6 +5249,7 @@ class AgentChatRoomService:
                     ),
                     "event_id": event_id,
                     "cursor": event_id,
+                    "explicit_live_takeover": bool(takeover and owner_connected),
                 }
             if task["execution_status"] != "todo":
                 raise DomainError(

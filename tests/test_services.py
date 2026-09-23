@@ -572,7 +572,8 @@ def test_blocked_task_same_identity_reclaim_after_disconnect(service, project):
         model="unknown",
     )
 
-    # Owner still connected: reject with the bounded reconnect contract.
+    # Owner still connected: ordinary reclaim rejects and points to explicit
+    # same-identity takeover instead of implying an indefinitely bounded wait.
     with pytest.raises(DomainError) as connected:
         service.claim_task(
             project["id"],
@@ -585,8 +586,9 @@ def test_blocked_task_same_identity_reclaim_after_disconnect(service, project):
     assert connected.value.details["retry_after_seconds"] >= 1
     assert (
         connected.value.details["required_action"]
-        == "wait_for_owner_release_or_reclaim"
+        == "restore_owner_or_explicit_takeover"
     )
+    assert connected.value.details["explicit_takeover"] == "task_claim(takeover=true)"
 
     # Different software identity: always forbidden.
     with pytest.raises(DomainError) as foreign_denied:

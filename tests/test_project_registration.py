@@ -158,8 +158,7 @@ def test_managed_instructions_keep_workspace_mismatch_rule_across_refresh(
         assert phrase in text
 
 
-# #136：托管规则必须说明会话恢复语义、禁止伪造旧绑定、禁止用 task_update
-# 绕过授权，并区分“恢复原会话”与“新建会话后仍需 reclaim”。
+# #136/#205：托管规则必须说明恢复优先、显式同身份在线接管及禁止越权。
 RECOVERY_RULE_PHRASES = (
     "`connection.room_session`",
     "`restored` means the same Room Session and unchanged task ownership",
@@ -167,11 +166,11 @@ RECOVERY_RULE_PHRASES = (
     "Never fabricate the previous binding",
     "`runtime_context_mismatch`",
     "bootstrap itself is not proof that task ownership was recovered",
-    "the heartbeat window lapses",
-    "`required_action` and `retry_after_seconds`",
+    "`task_claim(reclaim=true)` succeeds after the same-identity owner is treated as disconnected",
+    "`task_claim(takeover=true)` as an explicit, audited alternative",
+    "Only use live takeover when the user has directed this conversation",
     "`task_owner_session_connected`",
-    "`task_reclaim_forbidden`",
-    "Do not try to bypass this with `task_update(status=todo)`",
+    "Never bypass ownership with `task_update(status=todo)`",
     "A missing Session credential is not management authority",
     "`management_auth_required`",
 )

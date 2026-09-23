@@ -16,10 +16,12 @@ import sys
 import threading
 import tomllib
 import webbrowser
+from collections.abc import Callable
 from dataclasses import replace
+from datetime import datetime
 from pathlib import Path
 from queue import Empty, Queue
-from typing import Any, Callable
+from typing import Any
 
 from .cli import (
     process_is_running,
@@ -27,7 +29,9 @@ from .cli import (
     start_detached_server,
     stop_detached_server,
 )
-from .config import Settings, load_settings
+from .config import Settings, default_data_dir, load_settings
+from .gui_autostart import GuiInstanceGuard, LoginStartup
+from .gui_event_log import RoomEventTail, format_service_line, sanitize_gui_text
 
 MIN_PORT = 1
 MAX_PORT = 65535
@@ -294,6 +298,7 @@ class LogTail(threading.Thread):
 
     def run(self) -> None:
         handle = None
+        historical = self.path.exists()
         try:
             while not self.stop_event.is_set():
                 if handle is None:
@@ -301,12 +306,30 @@ class LogTail(threading.Thread):
                         self.stop_event.wait(0.5)
                         continue
                     handle = self.path.open("r", encoding="utf-8", errors="replace")
-                    for line in handle.readlines()[-self.tail_lines :]:
-                        self.sink.put(("log", redact_line(line.rstrip("\r\n"))))
+                    for line in handle.read().splitlines()[-self.tail_lines :]:
+                        formatted = format_service_line(line.rstrip("\r\n"))
+                        if formatted:
+                            self.sink.put(("log", f"历史服务日志：{formatted}" if historical else formatted))
+                    historical = False
+                    continue
+                try:
+                    current = self.path.stat()
+                    opened = os.fstat(handle.fileno())
+                    if (current.st_dev, current.st_ino) != (opened.st_dev, opened.st_ino):
+                        handle.close()
+                        handle = None
+                        continue
+                    if current.st_size < handle.tell():
+                        handle.seek(0)
+                except FileNotFoundError:
+                    handle.close()
+                    handle = None
                     continue
                 line = handle.readline()
                 if line:
-                    self.sink.put(("log", redact_line(line.rstrip("\r\n"))))
+                    formatted = format_service_line(line.rstrip("\r\n"))
+                    if formatted:
+                        self.sink.put(("log", formatted))
                 else:
                     self.stop_event.wait(0.2)
         finally:
@@ -314,13 +337,14 @@ class LogTail(threading.Thread):
                 handle.close()
 
 
-def _drain(sink: Queue) -> list[Any]:
+def _drain(sink: Queue, *, limit: int = 200) -> list[Any]:
     items = []
-    while True:
+    while len(items) < limit:
         try:
             items.append(sink.get_nowait())
         except Empty:
-            return items
+            break
+    return items
 
 
 def run_start_worker(
@@ -516,7 +540,7 @@ def _show_fatal_gui_dialog(message: str) -> None:
         pass
 
 
-def run_gui(config_path: str | None = None) -> None:
+def run_gui(config_path: str | None = None, *, autostart: bool = False) -> None:
     """Open the local GUI window (requires tkinter, imported lazily)."""
     os.environ.setdefault("AGENTCHATROOM_ACCESS_LOG", "0")
     try:
@@ -549,10 +573,75 @@ def run_gui(config_path: str | None = None) -> None:
         _show_fatal_gui_dialog(message)
         raise SystemExit(message) from error
 
-    settings = load_settings(config_path)
+    startup_config_error: Exception | None = None
+    try:
+        settings = load_settings(config_path)
+    except (OSError, TypeError, ValueError) as error:
+        if not autostart:
+            raise
+        # Login startup must leave a usable diagnostic GUI rather than
+        # disappearing when a user-edited config becomes invalid. No service
+        # starts from these fallback values until the config loads again.
+        startup_config_error = error
+        settings = Settings(
+            data_dir=default_data_dir(),
+            config_path=Path(config_path) if config_path else None,
+        )
+    instance_guard = GuiInstanceGuard()
+    if not instance_guard.acquire():
+        return
     controller = ServiceController(settings)
+    login_startup = LoginStartup()
     sink: Queue = Queue()
-    stop_log_event = threading.Event()
+    tails: dict[str, tuple[threading.Event, threading.Thread]] = {}
+
+    def stop_tails(*, wait: bool = False) -> None:
+        for stop_event, _thread in tails.values():
+            stop_event.set()
+        if wait:
+            for _stop_event, thread in tails.values():
+                if isinstance(thread, threading.Thread) and thread.is_alive():
+                    thread.join(timeout=2)
+
+    def start_tails(active_settings: Settings, *, previous_settings: Settings | None = None) -> None:
+        old_room = tails.get("room")
+        old_log = tails.get("log")
+        reuse_log = bool(
+            old_log is not None and previous_settings is not None
+            and not old_log[0].is_set()
+            and previous_settings.data_dir == active_settings.data_dir
+        )
+        if reuse_log and old_room is not None:
+            old_room[0].set()
+            thread = old_room[1]
+            if isinstance(thread, threading.Thread) and thread.is_alive():
+                thread.join(timeout=2)
+        else:
+            stop_tails(wait=True)
+        if reuse_log and old_log is not None:
+            log_stop, log_tail = old_log
+        else:
+            log_stop = threading.Event()
+            log_tail = LogTail(active_settings.data_dir / "server.log", sink, log_stop)
+        room_stop = threading.Event()
+        room_events = RoomEventTail(active_settings, sink, room_stop)
+        if (old_room is not None and previous_settings is not None
+                and previous_settings.database_path == active_settings.database_path
+                and previous_settings.database_backend == active_settings.database_backend
+                and (not isinstance(old_room[1], threading.Thread)
+                     or not old_room[1].is_alive())):
+            # A configuration retry using the same database must not drop events
+            # between the old tail stopping and the new one beginning.
+            previous_room = old_room[1]
+            room_events.cursors = previous_room.cursors.copy()
+            room_events.presence = {
+                key: value.copy() for key, value in previous_room.presence.items()
+            }
+        tails["log"] = (log_stop, log_tail)
+        tails["room"] = (room_stop, room_events)
+        if not reuse_log:
+            log_tail.start()
+        room_events.start()
 
     class ControllerWindow(tk.Tk):
         def __init__(self) -> None:
@@ -592,6 +681,12 @@ def run_gui(config_path: str | None = None) -> None:
             self.frontend_button.pack(side="left")
             self.status_label = ttk.Label(top, text="")
             self.status_label.pack(fill="x", anchor="w", pady=(6, 0))
+            self.login_startup_var = tk.BooleanVar(value=False)
+            self.login_startup_checkbox = ttk.Checkbutton(
+                top, text="开机启动", variable=self.login_startup_var,
+                command=self.on_login_startup_toggle,
+            )
+            self.login_startup_checkbox.pack(anchor="w", pady=(4, 0))
 
             self.log_view = scrolledtext.ScrolledText(
                 self, height=20, state="disabled", wrap="word"
@@ -600,19 +695,85 @@ def run_gui(config_path: str | None = None) -> None:
 
             self.protocol("WM_DELETE_WINDOW", self.on_close)
             self.bind("<Unmap>", self.on_unmap)
-            self.append_log(f"数据目录: {settings.data_dir}")
+            self._refresh_login_startup()
+            self.append_log("数据目录已加载。")
+            if startup_config_error is not None:
+                self.append_log(f"配置读取失败：{startup_config_error}；修复配置后可点击启动服务重试。")
             self.append_log("就绪。点击「启动服务」开始；关闭或最小化窗口会收起到系统托盘。")
             self.refresh_state()
             self.after(100, self.drain_events)
             self.after(2000, self.poll_state)
+            if autostart:
+                self.after(250, self.start_after_login)
 
         def append_log(self, text: str) -> None:
+            clean = sanitize_gui_text(text)
+            if not clean:
+                return
+            if not re.match(r"^\[\d{4}-\d{2}-\d{2} ", clean):
+                clean = f"[{datetime.now().astimezone():%Y-%m-%d %H:%M:%S}] {clean}"
             self.log_view.configure(state="normal")
-            self.log_view.insert("end", text + "\n")
+            self.log_view.insert("end", clean + "\n")
             self.log_view.see("end")
             if int(self.log_view.index("end-1c").split(".")[0]) > 5000:
                 self.log_view.delete("1.0", "2000.0")
             self.log_view.configure(state="disabled")
+
+        def _refresh_login_startup(self) -> None:
+            try:
+                enabled = login_startup.enabled()
+                self.login_startup_var.set(enabled)
+                if enabled and not login_startup.is_current():
+                    self.append_log("开机启动项指向旧程序位置；请取消勾选后重新勾选以更新。")
+            except OSError as error:
+                self.login_startup_var.set(False)
+                self.append_log(f"读取开机启动项失败：{type(error).__name__}")
+            if os.name != "nt":
+                self.login_startup_checkbox.state(["disabled"])
+
+        def on_login_startup_toggle(self) -> None:
+            requested = self.login_startup_var.get()
+            try:
+                if requested:
+                    login_startup.enable()
+                    self.append_log("已启用开机启动：下次登录将打开控制台并启动 Room 服务。")
+                else:
+                    login_startup.disable()
+                    self.append_log("已关闭开机启动；当前服务不会因此停止。")
+            except OSError as error:
+                self.append_log(f"设置开机启动失败：{error}")
+                self._refresh_login_startup()
+                messagebox.showerror("开机启动设置失败", sanitize_gui_text(error))
+
+        def start_after_login(self) -> None:
+            if controller.is_running():
+                self.append_log("登录后启动：Room 服务已在运行，不重复启动。")
+                self.refresh_state()
+            else:
+                self.append_log("登录后启动：正在使用现有配置启动 Room 服务。")
+                self.on_start()
+
+        def _retry_config_load(self) -> bool:
+            nonlocal settings, startup_config_error
+            if startup_config_error is None:
+                return True
+            try:
+                refreshed = load_settings(config_path)
+            except (OSError, TypeError, ValueError) as error:
+                startup_config_error = error
+                self.append_log(f"配置仍不可用：{error}；请修复后重试。")
+                return False
+            previous_settings = settings
+            settings = refreshed
+            controller.settings = refreshed
+            start_tails(refreshed, previous_settings=previous_settings)
+            startup_config_error = None
+            self.host_entry.delete(0, "end")
+            self.host_entry.insert(0, refreshed.host)
+            self.port_entry.delete(0, "end")
+            self.port_entry.insert(0, str(refreshed.port))
+            self.append_log("配置已重新加载，可以启动服务。")
+            return True
 
         def refresh_state(self) -> None:
             pid = controller.running_pid()
@@ -726,6 +887,8 @@ def run_gui(config_path: str | None = None) -> None:
         def on_start(self) -> None:
             if self.action_active:
                 return
+            if not self._retry_config_load():
+                return
             target = self._validated_host_port()
             if target is None:
                 return
@@ -748,6 +911,8 @@ def run_gui(config_path: str | None = None) -> None:
 
         def on_restart(self) -> None:
             if self.action_active:
+                return
+            if not self._retry_config_load():
                 return
             target = self._validated_host_port()
             if target is None:
@@ -910,13 +1075,12 @@ def run_gui(config_path: str | None = None) -> None:
                 self.refresh_state()
 
         def shutdown_app(self) -> None:
-            stop_log_event.set()
+            stop_tails()
             if self.tray is not None:
                 self.tray.stop()
             self.destroy()
 
-    log_tail = LogTail(controller.log_path, sink, stop_log_event)
-    log_tail.start()
+    start_tails(settings)
     window = ControllerWindow()
     window.tray = create_tray_icon(
         lambda action: window.after(0, window.handle_tray_action, action)
@@ -930,4 +1094,5 @@ def run_gui(config_path: str | None = None) -> None:
     try:
         window.mainloop()
     finally:
-        stop_log_event.set()
+        stop_tails()
+        instance_guard.release()
