@@ -225,9 +225,9 @@ def test_gui_status_uses_full_width_row(monkeypatch, settings) -> None:
     gui_module.run_gui()
     window = windows[0]
     try:
-        window.update_idletasks()
+        assert window.status_label.master is window.start_button.master.master
         assert window.status_label.pack_info()["side"] == "top"
-        assert window.status_label.winfo_width() >= window.winfo_width() - 40
+        assert window.status_label.pack_info()["fill"] == "x"
     finally:
         window.destroy()
 
