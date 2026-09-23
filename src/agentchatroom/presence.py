@@ -183,6 +183,11 @@ class LocalPresenceManager:
                     "session_closed",
                 }:
                     self.unregister(session.session_id)
+                if error.code == "session_closed":
+                    # Explicit leave can close a session after this heartbeat
+                    # copied its registration. The leave event is the fact to
+                    # show; this expected race is not a service failure.
+                    continue
                 logger.warning(
                     "Presence heartbeat failed for session %s: %s",
                     session.session_id,

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import logging
+
 from agentchatroom.presence import LocalPresenceManager
 
 
@@ -149,3 +151,29 @@ def test_heartbeat_is_connection_liveness_not_manual_activity(service, project):
     assert identity["connection_status"] == "connected"
     assert identity["activity_status"] is None
     assert identity["status"] == "online"
+
+
+def test_explicit_leave_racing_with_heartbeat_does_not_log_failure(
+    service, project, caplog,
+):
+    joined = service.join_room(
+        project["id"], name="Test Agent", client="test", model="unknown",
+    )
+    session_id = joined["agent"]["id"]
+    manager = LocalPresenceManager(service, enabled=True, interval_seconds=60)
+    manager.register(
+        project["id"], session_id, joined["token"],
+        agent_key=joined["agent"]["agent_key"],
+    )
+
+    # The heartbeat may have copied the registration just before the explicit
+    # leave removed it. A closed session is expected, not an operator error.
+    service.leave_session(project["id"], session_id, joined["token"])
+    with caplog.at_level(logging.WARNING, logger="agentchatroom.presence"):
+        manager.heartbeat_once()
+
+    assert session_id not in manager._sessions
+    assert not any(
+        "Presence heartbeat failed" in record.getMessage()
+        for record in caplog.records
+    )
