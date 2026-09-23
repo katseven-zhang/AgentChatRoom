@@ -4,6 +4,12 @@ AgentChatRoom 是一个面向异构 AI 编程 Agent 的项目级实时协作中�
 
 当前产品提供 Python 后端、浏览器管理端、REST、SSE、本机 MCP stdio、**HTTP 直连（Streamable HTTP `/mcp`）**、CLI 和 SQLite 本地档案。本机也优先使用 HTTP 直连，共用一个服务，避免每条 MCP 连接拉起独立适配器进程；stdio 保留为兼容与开发调试入口，远程 stdio Bridge 用于客户端只能拉起本地进程时转发。PostgreSQL 和更完整的云端多租户适配仍按后续阶段演进。
 
+## v0.3.1 更新说明
+
+- Windows 控制台日志增加中文 Room 业务事件，展示 Agent 接入/重连、任务流转、报告、验收和集成；过滤常规传输噪声，并遮蔽会话标识和敏感路径。
+- Windows GUI 增加当前用户「开机启动」复选框，默认关闭；启停项会校验实际注册表结果，并避免重复打开控制台或重复启动服务。
+- 修复 Room 摘要/重连后的会话恢复异常；增加同身份显式接管路径，在同一事务中转移任务与租约并隔离旧会话写入。
+
 ## v0.3.0 更新说明
 
 - Windows 图形入口改为轻量 Tk 控制台，提供服务启停、重启、监听地址配置、日志和系统托盘；Web 管理端由系统默认浏览器打开。Windows ZIP 继续使用稳定的 `dist/agentchatroom/` onedir 目录。
