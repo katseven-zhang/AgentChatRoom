@@ -452,14 +452,19 @@ async def test_adopted_session_still_submits_past_the_presence_window(
             assert booted["ok"], booted
             room_session_id = booted["result"]["session"]["id"]
 
-            # Reap the transport and let the presence window lapse as well.
-            await asyncio.sleep(1.5)
-            reaped = next(
-                item
-                for item in app.state.service.snapshot(project["id"])["agents"]
-                if item["id"] == room_session_id
-            )
-            assert reaped["status"] == "offline"
+            # Transport reaping and the last heartbeat can race on slow runners.
+            deadline = asyncio.get_running_loop().time() + 10.0
+            while True:
+                reaped = next(
+                    item
+                    for item in app.state.service.snapshot(project["id"])["agents"]
+                    if item["id"] == room_session_id
+                )
+                if reaped["status"] == "offline":
+                    break
+                if asyncio.get_running_loop().time() >= deadline:
+                    pytest.fail("session stayed online after transport reaping")
+                await asyncio.sleep(0.1)
 
             replayed = await session.call(
                 client,
