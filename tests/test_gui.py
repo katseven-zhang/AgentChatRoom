@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import socket
 import sys
+import tempfile
 import threading
 import time
 import tomllib
@@ -47,6 +48,21 @@ from agentchatroom.gui_autostart import LoginStartup, is_temporary_executable, s
 from agentchatroom.gui_event_log import (
     RoomEventTail, format_room_event, format_service_line, sanitize_gui_text,
 )
+
+
+@pytest.fixture
+def isolated_gui_instance_guard(monkeypatch) -> None:
+    """Keep GUI layout tests independent of the user's running controller."""
+    import agentchatroom.gui as gui_module
+
+    class Guard:
+        def acquire(self) -> bool:
+            return True
+
+        def release(self) -> None:
+            pass
+
+    monkeypatch.setattr(gui_module, "GuiInstanceGuard", Guard)
 
 
 def available_port() -> int:
@@ -207,7 +223,9 @@ def test_create_tray_icon_actions_have_pystray_compatible_signatures(monkeypatch
     assert actions == [action for _label, action, _default in build_tray_menu_spec()]
 
 
-def test_gui_status_uses_full_width_row(monkeypatch, settings) -> None:
+def test_gui_status_uses_full_width_row(
+    monkeypatch, settings, isolated_gui_instance_guard
+) -> None:
     try:
         import tkinter as tk
     except ImportError as error:
@@ -236,7 +254,9 @@ def test_gui_status_uses_full_width_row(monkeypatch, settings) -> None:
         window.destroy()
 
 
-def test_gui_login_checkbox_and_autostart_action(monkeypatch, settings) -> None:
+def test_gui_login_checkbox_and_autostart_action(
+    monkeypatch, settings, isolated_gui_instance_guard
+) -> None:
     try:
         import tkinter as tk
         probe = tk.Tk()
@@ -290,7 +310,7 @@ def test_gui_login_checkbox_and_autostart_action(monkeypatch, settings) -> None:
 
 @pytest.mark.parametrize("same_data_dir", [False, True])
 def test_login_autostart_config_error_keeps_gui_open_for_retry(
-    monkeypatch, settings, same_data_dir
+    monkeypatch, settings, isolated_gui_instance_guard, same_data_dir
 ) -> None:
     try:
         import tkinter as tk
@@ -855,8 +875,8 @@ def test_entry_app_routes_login_autostart_flag(monkeypatch) -> None:
     assert calls == [(None, True)]
 
 
-def test_login_startup_command_quotes_unicode_and_spaces(tmp_path) -> None:
-    executable = tmp_path / "中文 目录" / "agentchatroom.exe"
+def test_login_startup_command_quotes_unicode_and_spaces() -> None:
+    executable = Path(tempfile.gettempdir()) / "中文 目录" / "agentchatroom.exe"
     command = startup_command(executable=executable, frozen=True)
     assert command == f'"{executable.resolve()}" gui --autostart'
     assert is_temporary_executable(executable)
