@@ -164,6 +164,8 @@ AgentChatRoom 提供单 exe 轻量控制台（tkinter 图形界面）与 PyInsta
 - **`mcp`**：MCP Server stdio 入口，供 Cursor、Windsurf、VS Code、Claude Desktop 等 Agent 宿主通过标准 stdio 协议接入。开发期推荐 `python -m agentchatroom.mcp_server`；打包形态为 `dist/agentchatroom/agentchatroom.exe mcp`（稳定 onedir 目录名，不要改成 `dist/release-x.y.z/` 这类按版本号命名的路径）。`mcp-config` 在冻结 exe 下会生成**当前这个 exe** 的绝对路径；升级后若客户端仍指向旧目录，必须更新配置。该入口暴露完整 MCP 工具面（含 `room_bootstrap` / `room_join` / `room_sync` 等），不是精简消息子集。无协议 stdin（空管道或立即 EOF）时向 stderr 输出 `startup_failed/no_protocol_stdin` 并以非 0 退出。
 - **其余 CLI 子命令**（`serve`、`stop`、`logs` 等）：供命令行、批处理复用；分离后台服务的子进程就是同一个 exe 以 `serve` 子命令拉起的，不存在第二套启动逻辑。
 
+本机模式下，新建项目的「选择文件夹」会打开系统目录选择窗口，选中后回填完整路径；取消不修改原路径。源码启动与 Windows EXE 均支持此功能，EXE 通过内置 `pick-directory` 子进程入口运行选择器，无需另装 Python。桌面环境不可用时仍可手动输入路径。
+
 ### 托盘与关闭语义
 
 - **最小化/关闭到托盘**：安装了托盘依赖（`pip install "agentchatroom[gui]"`，含 pystray 与 Pillow）时，控制台最小化或关闭窗口都会收起到系统托盘继续运行，后台服务不受影响；双击托盘图标恢复窗口。

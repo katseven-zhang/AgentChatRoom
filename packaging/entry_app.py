@@ -7,6 +7,7 @@ selects the delivery mode so every capability ships inside that exe:
   control console (the default double-click behavior; the console
   starts and stops the detached service, and accepts ``--config``);
 - ``mcp``: run the MCP stdio server for Agent host integration;
+- ``pick-directory``: run the native folder chooser helper;
 - any other subcommand: delegate to the console CLI (``serve``,
   ``stop``, ``logs``, ...).
 """
@@ -27,6 +28,10 @@ def main() -> None:
     from agentchatroom.stdio_runtime import prepare_standard_streams
 
     prepare_standard_streams()
+    if command == "pick-directory":
+        from agentchatroom.desktop import run_directory_picker
+
+        raise SystemExit(run_directory_picker(args[1] if len(args) > 1 else ""))
     if command == "" or command == "gui" or command.startswith("-"):
         from agentchatroom.gui import run_gui
 
