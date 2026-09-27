@@ -44,7 +44,9 @@ from agentchatroom.gui import (
     validate_host,
     validate_port,
 )
-from agentchatroom.gui_autostart import LoginStartup, is_temporary_executable, startup_command
+from agentchatroom.gui_autostart import (
+    GuiInstanceGuard, LoginStartup, is_temporary_executable, startup_command,
+)
 from agentchatroom.gui_event_log import (
     RoomEventTail, format_room_event, format_service_line, sanitize_gui_text,
 )
@@ -56,8 +58,14 @@ def isolated_gui_instance_guard(monkeypatch) -> None:
     import agentchatroom.gui as gui_module
 
     class Guard:
+        def __init__(self, *, window_title: str):
+            assert window_title
+
         def acquire(self) -> bool:
             return True
+
+        def activation_requested(self) -> bool:
+            return False
 
         def release(self) -> None:
             pass
@@ -69,6 +77,67 @@ def available_port() -> int:
     with socket.socket() as listener:
         listener.bind(("127.0.0.1", 0))
         return int(listener.getsockname()[1])
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows named mutex and event")
+def test_second_gui_launch_signals_existing_instance() -> None:
+    from uuid import uuid4
+
+    name = f"AgentChatRoom_Test_GUI_{uuid4().hex}"
+    owner = GuiInstanceGuard(name)
+    contender = GuiInstanceGuard(name)
+    successor = GuiInstanceGuard(name)
+    try:
+        assert owner.acquire() is True
+        assert owner.activation_requested() is False
+        assert contender.acquire() is False
+        assert owner.activation_requested() is True
+        assert owner.activation_requested() is False
+    finally:
+        contender.release()
+        owner.release()
+    try:
+        assert successor.acquire() is True
+    finally:
+        successor.release()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows GUI window activation")
+def test_second_gui_launch_restores_minimized_window() -> None:
+    import ctypes
+    from ctypes import wintypes
+    from uuid import uuid4
+
+    try:
+        import tkinter as tk
+    except ImportError as error:
+        pytest.skip(f"Tk display unavailable: {error}")
+    try:
+        window = tk.Tk()
+    except tk.TclError as error:
+        pytest.skip(f"Tk display unavailable: {error}")
+    title = f"AgentChatRoom GUI test {uuid4().hex}"
+    name = f"AgentChatRoom_Test_GUI_{uuid4().hex}"
+    owner = GuiInstanceGuard(name, title)
+    contender = GuiInstanceGuard(name, title)
+    try:
+        window.title(title)
+        window.update()
+        user32 = ctypes.windll.user32
+        user32.FindWindowW.restype = wintypes.HWND
+        handle = user32.FindWindowW(None, title)
+        assert handle
+        assert owner.acquire() is True
+        user32.ShowWindow(handle, 6)  # SW_MINIMIZE
+        assert user32.IsIconic(handle)
+        assert contender.acquire() is False
+        window.update()
+        assert user32.IsWindowVisible(handle)
+        assert not user32.IsIconic(handle)
+    finally:
+        contender.release()
+        owner.release()
+        window.destroy()
 
 
 def port_is_listening(port: int) -> bool:

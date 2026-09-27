@@ -587,7 +587,9 @@ def run_gui(config_path: str | None = None, *, autostart: bool = False) -> None:
             data_dir=default_data_dir(),
             config_path=Path(config_path) if config_path else None,
         )
-    instance_guard = GuiInstanceGuard()
+    instance_guard = GuiInstanceGuard(
+        window_title=f"{settings.product_name} 控制台"
+    )
     if not instance_guard.acquire():
         return
     controller = ServiceController(settings)
@@ -1082,6 +1084,17 @@ def run_gui(config_path: str | None = None, *, autostart: bool = False) -> None:
 
     start_tails(settings)
     window = ControllerWindow()
+
+    def restore_on_second_launch() -> None:
+        if instance_guard.activation_requested():
+            window.deiconify()
+            window.lift()
+            window.focus_force()
+            window.attributes("-topmost", True)
+            window.after(300, lambda: window.attributes("-topmost", False))
+        window.after(150, restore_on_second_launch)
+
+    window.after(150, restore_on_second_launch)
     window.tray = create_tray_icon(
         lambda action: window.after(0, window.handle_tray_action, action)
     )
