@@ -262,8 +262,12 @@ MCP_INSTRUCTIONS = (
     "tokens stay in MCP configuration. One MCP Session binds one Project and "
     "cannot switch to another; parallel client tasks use parallel Sessions and "
     "keep independent task ownership. A new Session never moves another "
-    "Session's work. Use task_claim(reclaim=true) only to explicitly resume an "
-    "unfinished task whose same-software owner is disconnected. Do not copy project_id, "
+    "Session's work. Software identity is the backend member registered from "
+    "validated client configuration, not the displayed Agent name. "
+    "task_claim(reclaim=true) is an explicit, server-checked recovery of "
+    "unfinished work: it refuses a different software identity and refuses "
+    "to preempt a connected owner. Only takeover=true can explicitly preempt "
+    "a connected owner of that same identity. Do not copy project_id, "
     "session_id, or token between tools. Presence from MCP startup is not "
     "conversation sync. If room_bootstrap returns identity_not_configured, use "
     "the local MCP configuration assistant; otherwise follow the single "
@@ -1926,7 +1930,16 @@ def task_claim(
     takeover: bool = False,
     request_id: str = "",
 ) -> dict[str, Any]:
-    """Claim work; same-identity takeover is explicit even if the owner is online."""
+    """Claim a free task or explicitly recover work owned by this software identity.
+
+    The backend compares authenticated member identities, never Agent display
+    names. With reclaim=true, it transfers unfinished work only from a
+    disconnected Session of the same identity. A connected owner yields
+    task_owner_session_connected without changing ownership; a different
+    identity yields task_reclaim_forbidden without changing ownership.
+    takeover=true is the separate, explicit path for a connected owner of
+    the same identity and can preempt that Session and its task leases.
+    """
     try:
         _authorize_remote(project_id, "task:write")
     except DomainError as error:

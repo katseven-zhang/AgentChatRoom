@@ -115,6 +115,22 @@ def test_mcp_task_claim_passes_explicit_takeover(monkeypatch):
     assert captured["kwargs"]["takeover"] is True
 
 
+def test_mcp_claim_description_explains_server_checked_identity_and_reclaim():
+    description = next(
+        tool.description for tool in mcp_server.mcp._tool_manager.list_tools()
+        if tool.name == "task_claim"
+    )
+    description = " ".join(description.split())
+    assert "authenticated member identities" in description
+    assert "never Agent display names" in description
+    assert "reclaim=true" in description
+    assert "disconnected Session" in description
+    assert "task_owner_session_connected" in description
+    assert "task_reclaim_forbidden" in description
+    assert "without changing ownership" in description
+    assert "takeover=true" in description
+
+
 def test_bridge_adds_request_id_only_to_retryable_cached_writes():
     original = {"project_id": "project_1", "body": "hello"}
     forwarded = prepare_tool_arguments("message_post", original)
@@ -1299,6 +1315,15 @@ async def test_mcp_stdio_round_trip(tmp_path, project_dir, request, mcp_stdio_co
             "room_join",
             "room_sync",
         }
+        claim = next(
+            tool for tool in tools["result"]["tools"]
+            if tool["name"] == "task_claim"
+        )
+        claim_description = " ".join(claim["description"].split())
+        assert "reclaim=true" in claim_description
+        assert "authenticated member identities" in claim_description
+        assert "task_owner_session_connected" in claim_description
+        assert "task_reclaim_forbidden" in claim_description
 
         joined = await exchange(
             {
