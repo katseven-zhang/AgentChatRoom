@@ -47,6 +47,7 @@ Web「接入 Agent」入口只保留两个场景（不再展示无切换意义�
 ## 2026-09-03 新会话入口与任务筛选
 
 - 已配置且已登记的本机 stdio Agent 新开对话时调用一次零参数 `room_bootstrap`。HTTP 多项目配置调用 `room_bootstrap(project_name="<完整接入提示词给出的 Project 名称>")`；一次性提示词包含配置所需的明文 Project↔Token 映射，Token 写入 MCP 后不得进入 Room、日志或仓库。
+- MiniMax Code 桌面端若将 `roots/list` 固定返回为唯一的 `name=home`、URI 为操作系统用户主目录，HTTP 多项目凭据包接入时会将这一根视为客户端未提供工作区。只有凭据明确选中的 Project 已授权、且服务端登记的 Project 根目录存在时才用该根绑定；真实工作区根、多根、其他名称、无效凭据或缺失的服务端根仍按原规则校验或拒绝。客户端仍须自行核对当前对话选择的工作区与绑定的 Project 一致。
 - Session Token 只保存在本机 MCP 进程内存中，不出现在工具结果、日志、URL、Room 消息或 checkout 登记里；后续 MCP 工具从当前绑定注入 `project_id` / `session_id` / `token`。
 - MCP 启动后的自动 Presence 仍然只表示进程在线，不等于当前模型对话已同步。
 - Web 任务展示改为方案 D 投影：导航 7 入口（需要处理 / 待认领 / 进行中 / 待验收 / 待集成 / 已完成 / 已取消）+ 全部任务重置；`state_view.phase` 由共享领域合同派生，已提交 Work Report 显示「待验收」，已验证待集成显示「待集成」，被退回显示「已退回」，集成失败有独立入口。

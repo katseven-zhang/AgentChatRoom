@@ -539,6 +539,54 @@ async def test_optional_bundle_roots_are_used_when_client_advertises_them(tmp_pa
 
 
 @pytest.mark.asyncio
+async def test_named_bundle_ignores_only_single_home_placeholder(service, tmp_path):
+    selected_root = tmp_path / "selected-workspace"
+    selected_root.mkdir()
+    selected = service.create_project(root_path=str(selected_root), name="Selected")
+    home_root = types.Root(uri=Path.home().resolve().as_uri(), name="home")
+
+    class RootsSession:
+        client_params = SimpleNamespace(
+            capabilities=SimpleNamespace(roots=object())
+        )
+        advertised = [home_root]
+
+        async def list_roots(self):
+            return types.ListRootsResult(roots=self.advertised)
+
+    session = RootsSession()
+    context = SimpleNamespace(session=session)
+    roots = await mcp_server.collect_mcp_workspace_roots(
+        context, required=False, allow_home_placeholder=True
+    )
+    assert roots == []
+    bound = _boot(
+        service,
+        key="bundle-agent",
+        name="Bundle Agent",
+        client="minimax-code",
+        workspace_roots=roots,
+        cwd=None,
+        selected_project_id=selected["id"],
+    )
+    assert bound.binding is not None
+    assert bound.binding.project_id == selected["id"]
+    assert bound.public["notices"][0]["code"] == "server_project_root_registered"
+
+    assert await mcp_server.collect_mcp_workspace_roots(
+        context, required=False
+    ) == [Path.home().resolve()]
+    session.advertised = [types.Root(uri=Path.home().resolve().as_uri(), name="workspace")]
+    assert await mcp_server.collect_mcp_workspace_roots(
+        context, required=False, allow_home_placeholder=True
+    ) == [Path.home().resolve()]
+    session.advertised = [home_root, types.Root(uri=selected_root.resolve().as_uri())]
+    assert await mcp_server.collect_mcp_workspace_roots(
+        context, required=False, allow_home_placeholder=True
+    ) == [Path.home().resolve(), selected_root.resolve()]
+
+
+@pytest.mark.asyncio
 async def test_bundle_rejects_tokens_from_different_software_identities(
     service, tmp_path
 ):
@@ -806,6 +854,27 @@ async def test_http_transport_presence_keeps_idle_session_online_and_closes_on_d
                     break
                 await asyncio.sleep(0.05)
             assert agent["status"] == "offline"
+
+            async def home_placeholder(_context):
+                return types.ListRootsResult(
+                    roots=[types.Root(uri=Path.home().resolve().as_uri(), name="home")]
+                )
+
+            async with streamable_http_client(url, http_client=http_client) as (read, write, _):
+                async with ClientSession(
+                    read,
+                    write,
+                    list_roots_callback=home_placeholder,
+                    client_info=types.Implementation(name="MiniMax Code", version="1"),
+                ) as session:
+                    await session.initialize()
+                    payload = _parse_tool(
+                        await session.call_tool(
+                            "room_bootstrap", {"project_name": project["name"]}
+                        )
+                    )
+                    assert payload["ok"], payload
+                    assert payload["result"]["project"]["id"] == project["id"]
     finally:
         server.should_exit = True
         await server_task

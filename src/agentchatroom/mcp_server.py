@@ -204,6 +204,7 @@ class ServiceBoundToolManager(CompatibleToolManager):
                         context,
                         timeout_seconds=get_service().settings.mcp_roots_timeout_seconds,
                         required=not uses_bundle,
+                        allow_home_placeholder=bool(uses_bundle and bundled_project_id),
                     )
                 )
                 if self.service_provider is not None:
@@ -646,6 +647,7 @@ async def collect_mcp_workspace_roots(
     *,
     timeout_seconds: float = 5.0,
     required: bool = True,
+    allow_home_placeholder: bool = False,
 ) -> list[Path]:
     bound = _bound_service_provider.get() is not None
     if context is None:
@@ -680,8 +682,9 @@ async def collect_mcp_workspace_roots(
         raise DomainError("workspace_roots_unavailable", "Workspace roots timed out; restore the client connection before bootstrap", status_code=409) from error
     except Exception as error:
         raise DomainError("workspace_roots_unavailable", "Workspace roots failed; restore the client connection before bootstrap", status_code=409) from error
+    advertised_roots = list(getattr(result, "roots", None) or [])
     roots: list[Path] = []
-    for root in getattr(result, "roots", None) or []:
+    for root in advertised_roots:
         uri = str(getattr(root, "uri", "") or "")
         path = workspace_path_from_file_uri(uri)
         if path is not None:
@@ -690,6 +693,19 @@ async def collect_mcp_workspace_roots(
             raise DomainError("workspace_roots_unavailable", "Workspace root is not a valid file URI", status_code=409)
     if not roots:
         raise DomainError("workspace_roots_unavailable", "Client supplied an empty workspace", status_code=409)
+    if allow_home_placeholder and len(roots) == 1:
+        # Some clients advertise homedir() as a hardcoded "home" root, even
+        # when the conversation is in another workspace. Treat that exact
+        # signature like absent roots only for a named credential bundle. The
+        # selected Project must still pass authorization and have a usable
+        # server-registered root in bootstrap_local_room.
+        home = Path.home()
+        if (
+            str(getattr(advertised_roots[0], "name", "") or "").casefold() == "home"
+            and os.path.normcase(str(roots[0].resolve()))
+            == os.path.normcase(str(home.resolve()))
+        ):
+            return []
     return roots
 
 
