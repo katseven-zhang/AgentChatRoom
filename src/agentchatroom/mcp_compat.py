@@ -54,6 +54,26 @@ def _resolve_schema(
     return {**target, **{key: item for key, item in schema.items() if key != "$ref"}}
 
 
+def _unwrap_nullable_schema(schema: dict[str, Any]) -> dict[str, Any]:
+    for key in ("anyOf", "oneOf"):
+        variants = schema.get(key)
+        if not isinstance(variants, list) or len(variants) != 2:
+            continue
+        concrete = [
+            item for item in variants
+            if isinstance(item, dict) and item.get("type") != "null"
+        ]
+        if len(concrete) == 1 and any(
+            isinstance(item, dict) and item.get("type") == "null"
+            for item in variants
+        ):
+            return {
+                **concrete[0],
+                **{name: value for name, value in schema.items() if name != key},
+            }
+    return schema
+
+
 def coerce_schema_value(
     value: Any,
     schema: dict[str, Any],
@@ -61,6 +81,8 @@ def coerce_schema_value(
     field: str,
     root_schema: dict[str, Any] | None = None,
 ) -> Any:
+    schema = _resolve_schema(schema, root_schema)
+    schema = _unwrap_nullable_schema(schema)
     schema = _resolve_schema(schema, root_schema)
     expected = _single_schema_type(schema)
     converted = value

@@ -587,6 +587,113 @@ async def test_named_bundle_ignores_only_single_home_placeholder(service, tmp_pa
 
 
 @pytest.mark.asyncio
+async def test_http_integration_normalizes_nested_integer_string_before_storage(
+    settings, project_dir
+):
+    app = create_app(settings)
+    service = app.state.service
+    project = service.create_project(root_path=str(project_dir), name="Nested Evidence")
+    registered = service.register_workspace(
+        project["id"], host_key="nested-evidence-host", host_name="Test Host",
+        local_path=str(project_dir),
+    )
+    executor = service.join_room(
+        project["id"], software_key="evidence-executor", name="Executor",
+        client="test", model="unknown", worktree=str(project_dir),
+        host_id=registered["host"]["id"], workspace_id=registered["workspace"]["id"],
+    )
+    reviewer = service.join_room(
+        project["id"], software_key="evidence-reviewer", name="Reviewer",
+        client="test", model="unknown",
+    )
+    task = service.create_task(
+        project["id"], title="Nested integer evidence",
+        acceptance_criteria=["Evidence remains numeric"],
+        actor_session_id=executor["agent"]["id"], token=executor["token"],
+    )["task"]
+    service.claim_task(project["id"], task["id"], executor["agent"]["id"], executor["token"])
+    service.submit_work_report(
+        project["id"], task["id"], session_id=executor["agent"]["id"],
+        token=executor["token"], summary="Ready for review", files=["src/evidence.py"],
+        tests=[{"command": "pytest", "exit_code": 0}],
+    )
+    service.submit_review(
+        project["id"], task["id"], reviewer_session_id=reviewer["agent"]["id"],
+        token=reviewer["token"], verdict="approved",
+        criteria=[{"criterion": "Evidence remains numeric", "status": "passed"}],
+    )
+    credential = service.issue_agent_token(project["id"], name="Integrator")
+    bundle = encode_project_credential_bundle(
+        [{"name": project["name"], "token": credential["token"]}]
+    )
+    with socket.socket() as listener:
+        listener.bind(("127.0.0.1", 0))
+        port = listener.getsockname()[1]
+    server = uvicorn.Server(
+        uvicorn.Config(app, host="127.0.0.1", port=port, log_level="error")
+    )
+    server_task = asyncio.create_task(server.serve())
+    deadline = asyncio.get_running_loop().time() + 10
+    while not server.started and asyncio.get_running_loop().time() < deadline:
+        await asyncio.sleep(0.02)
+    assert server.started
+    url = f"http://127.0.0.1:{port}{settings.mcp_http_path}"
+    headers = {
+        "Authorization": f"Bearer {bundle}",
+        "X-AgentChatRoom-Software-Key": "nested-evidence-integrator",
+        "X-AgentChatRoom-Software-Name": "Nested Evidence Integrator",
+        "X-AgentChatRoom-Software-Client": "minimax-code",
+    }
+    outgoing_codes = []
+
+    async def capture_request(request):
+        if request.method != "POST" or request.url.path != settings.mcp_http_path:
+            return
+        try:
+            payload = json.loads(request.content)
+        except (ValueError, TypeError):
+            return
+        if payload.get("method") == "tools/call" and payload.get("params", {}).get("name") == "integration_submit":
+            outgoing_codes.append(payload["params"]["arguments"]["tests"][0]["exit_code"])
+
+    async def list_roots(_context):
+        return types.ListRootsResult(roots=[types.Root(uri=project_dir.resolve().as_uri())])
+
+    try:
+        async with httpx.AsyncClient(
+            headers=headers, timeout=10.0, event_hooks={"request": [capture_request]}
+        ) as http_client:
+            async with streamable_http_client(url, http_client=http_client) as (read, write, _):
+                async with ClientSession(read, write, list_roots_callback=list_roots) as session:
+                    await session.initialize()
+                    boot = _parse_tool(await session.call_tool(
+                        "room_bootstrap", {"project_name": project["name"]}
+                    ))
+                    assert boot["ok"], boot
+                    integrated = _parse_tool(await session.call_tool(
+                        "integration_submit", {
+                            "task_id": task["id"], "result": "done",
+                            "summary": "Integrated", "tests": [
+                                {"command": "pytest", "exit_code": "0"}
+                            ],
+                        }
+                    ))
+                    assert integrated["ok"], integrated
+                    assert outgoing_codes == ["0"]
+                    stored = integrated["result"]["integration"]["tests"][0]["exit_code"]
+                    assert type(stored) is int and stored == 0
+                    event = next(
+                        item for item in service.list_events(project["id"], after=0)["events"]
+                        if item["event_type"] == "task.integration_completed"
+                    )
+                    persisted = event["payload"]["tests"][0]["exit_code"]
+                    assert type(persisted) is int and persisted == 0
+    finally:
+        server.should_exit = True
+        await server_task
+
+
+@pytest.mark.asyncio
 async def test_bundle_rejects_tokens_from_different_software_identities(
     service, tmp_path
 ):

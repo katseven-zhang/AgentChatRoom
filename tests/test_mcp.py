@@ -22,8 +22,7 @@ from agentchatroom.mcp_bridge import (
     ReconnectingUpstream,
     prepare_tool_arguments,
 )
-from agentchatroom.mcp_compat import coerce_schema_value
-from agentchatroom.mcp_compat import coerce_schema_value
+from agentchatroom.mcp_compat import coerce_schema_value, normalize_mcp_arguments
 from agentchatroom.project_registration import register_checkout_project
 
 
@@ -175,6 +174,26 @@ def test_mcp_evidence_tools_publish_nested_scalar_schema():
     integration_item = integration.parameters["$defs"]["TestEvidence"]
     assert work_item["properties"]["exit_code"]["type"] == "integer"
     assert integration_item["properties"]["exit_code"]["type"] == "integer"
+
+
+@pytest.mark.parametrize("tool_name", ["work_report", "integration_submit"])
+def test_mcp_nullable_evidence_array_normalizes_nested_integer(tool_name):
+    tool = mcp_server.mcp._tool_manager.get_tool(tool_name)
+    for exit_code in (0, "0", "-1"):
+        normalized = normalize_mcp_arguments(
+            {"tests": [{"command": "pytest", "exit_code": exit_code}]},
+            tool.parameters,
+        )
+        code = normalized["tests"][0]["exit_code"]
+        assert type(code) is int
+        assert code == int(exit_code)
+
+    for invalid in ("0.0", "1e0", "true", "not-a-number"):
+        with pytest.raises(ToolError):
+            normalize_mcp_arguments(
+                {"tests": [{"command": "pytest", "exit_code": invalid}]},
+                tool.parameters,
+            )
 
 
 def test_mcp_message_post_requires_message_level_model_provenance():
@@ -1230,6 +1249,17 @@ async def test_local_mcp_stdio_waits_for_bootstrap_and_disconnects_on_exit(
         reply = await receive(2)
         assert json.loads(reply['result']['content'][0]['text'])['ok']
         assert bootstrap_service.snapshot(project['id'])['agent_identities'][0]['active_session_count'] == 1
+
+        await send({'jsonrpc':'2.0', 'id':3, 'method':'tools/call', 'params':{
+            'name':'work_report', 'arguments':{
+                'task_id':'task_missing', 'summary':'Nested integer smoke',
+                'no_code_change_reason':'Packaged adapter check',
+                'tests':[{'command':'pytest', 'exit_code':'0'}],
+            },
+        }})
+        evidence_reply = await receive(3)
+        evidence = json.loads(evidence_reply['result']['content'][0]['text'])
+        assert evidence['error']['code'] == 'task_not_found'
 
         process.stdin.close()
         await process.stdin.wait_closed()
