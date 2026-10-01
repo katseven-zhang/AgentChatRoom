@@ -2741,6 +2741,11 @@ class AgentChatRoomService:
                     project_id,
                 ),
             )
+            revocation: dict[str, Any] | None = None
+            if clean_status == "revoked":
+                revocation = self._revoke_member_access_locked(
+                    connection, project_id, member_id, now, actor_session_id
+                )
             event_id = self._emit(
                 connection,
                 project_id,
@@ -2750,6 +2755,7 @@ class AgentChatRoomService:
                     "member_id": member_id,
                     "changed_fields": changed_fields,
                     "status": clean_status,
+                    **({"access_revocation": revocation} if revocation else {}),
                 },
             )
             updated = connection.execute(
@@ -2761,9 +2767,107 @@ class AgentChatRoomService:
                 "cursor": event_id,
             }
 
-    @idempotent_write("project_member.revoke")
-    def revoke_project_member(
+    def _revoke_member_access_locked(
         self,
+        connection: Any,
+        project_id: str,
+        member_id: str,
+        now: str,
+        actor_session_id: str | None,
+    ) -> dict[str, Any]:
+        """End every write path a member still holds when it is revoked.
+
+        The roster row is only a display: the credentials, the Sessions already
+        joined and the file leases those Sessions hold are what grant write
+        authority. Revoking the roster alone left a removed identity posting
+        messages, claiming tasks and reporting work forever - and the heartbeat
+        kept renewing its token and leases on top of that.
+        """
+        credentials = connection.execute(
+            """
+            SELECT id FROM agent_credentials
+            WHERE project_id = ? AND member_id = ? AND revoked_at IS NULL
+            """,
+            (project_id, member_id),
+        ).fetchall()
+        if credentials:
+            placeholders = _sql_placeholders(len(credentials))
+            connection.execute(
+                f"""
+                UPDATE agent_credentials SET revoked_at = ?
+                WHERE project_id = ? AND member_id = ? AND revoked_at IS NULL
+                  AND id IN ({placeholders})
+                """,
+                (now, project_id, member_id, *[row["id"] for row in credentials]),
+            )
+        sessions = connection.execute(
+            """
+            SELECT id FROM agent_sessions
+            WHERE project_id = ? AND member_id = ? AND left_at IS NULL
+            """,
+            (project_id, member_id),
+        ).fetchall()
+        closed_session_ids = [row["id"] for row in sessions]
+        released_lease_ids: list[str] = []
+        if closed_session_ids:
+            session_placeholders = _sql_placeholders(len(closed_session_ids))
+            leased = connection.execute(
+                f"""
+                SELECT id FROM file_leases
+                WHERE project_id = ? AND released_at IS NULL
+                  AND session_id IN ({session_placeholders})
+                """,
+                (project_id, *closed_session_ids),
+            ).fetchall()
+            released_lease_ids = [row["id"] for row in leased]
+            if released_lease_ids:
+                lease_placeholders = _sql_placeholders(len(released_lease_ids))
+                connection.execute(
+                    f"""
+                    UPDATE file_leases SET released_at = ?
+                    WHERE project_id = ? AND released_at IS NULL
+                      AND id IN ({lease_placeholders})
+                    """,
+                    (now, project_id, *released_lease_ids),
+                )
+            connection.execute(
+                f"""
+                UPDATE agent_sessions
+                SET status = 'offline', left_at = ?, token_expires_at = ?
+                WHERE project_id = ? AND id IN ({session_placeholders})
+                """,
+                (now, now, project_id, *closed_session_ids),
+            )
+        for credential in credentials:
+            self._emit(
+                connection,
+                project_id,
+                "credential.revoked",
+                actor_session_id=actor_session_id,
+                payload={
+                    "credential_id": credential["id"],
+                    "reason": "member_revoked",
+                },
+            )
+        for closed_session_id in closed_session_ids:
+            self._emit(
+                connection,
+                project_id,
+                "session.leave",
+                actor_session_id=actor_session_id,
+                payload={
+                    "session_id": closed_session_id,
+                    "reason": "member_revoked",
+                },
+            )
+        return {
+            "credentials_revoked": len(credentials),
+            "sessions_closed": len(closed_session_ids),
+            "leases_released": len(released_lease_ids),
+        }
+
+    @idempotent_write("project_member.revoke")
+    def revoke_project_member(        self,
         project_id: str,
         member_id: str,
         *,
@@ -2908,11 +3012,25 @@ class AgentChatRoomService:
                 )
             if row["revoked_at"] is not None:
                 raise DomainError(
-                    "agent_token_revoked", "Agent token has been revoked", status_code=401
+                    "agent_token_revoked",
+                    "Agent token has been revoked",
+                    status_code=401,
+                    details={
+                        "required_action": CREDENTIAL_FAILURE_ACTIONS[
+                            PROJECT_CREDENTIAL_REVOKED
+                        ]
+                    },
                 )
             if parse_time(row["expires_at"]) <= utc_now():
                 raise DomainError(
-                    "agent_token_expired", "Agent token has expired", status_code=401
+                    "agent_token_expired",
+                    "Agent token has expired",
+                    status_code=401,
+                    details={
+                        "required_action": CREDENTIAL_FAILURE_ACTIONS[
+                            PROJECT_CREDENTIAL_EXPIRED
+                        ]
+                    },
                 )
             if project_id is not None and row["project_id"] != project_id:
                 raise DomainError(

@@ -717,7 +717,7 @@ Web 端采用现代科技感设计系统与零构建原生 CSS 资产交付：
 | 入口 | 什么时候才需要点 | 说明 |
 | --- | --- | --- |
 | 签发 / 修改权限 / 续期 Token | 通过 Web 为 Agent 生成或维护 HTTP 直连接入配置时 | Token 按 Project 与软件身份签发；列表标题和每张 Token 卡片都显示所属 Project，新签发 Token 的默认名称也包含 Project 名。卡片不显示权限明细，「修改权限」在弹窗中调整同一个 Token 的权限，「续期」从当前到期时间增加有效天数（已过期则从当前时间起算），两者都不更换 Token、无需重新接入。同一客户端可在一个 `agentchatroom` MCP 配置中保存多个 Project 凭据；吊销始终可用 |
-| 成员吊销 | 某个软件身份离开团队或需要禁用时 | 成员由 Agent 接入时自动创建；Web 不提供手工添加/编辑（REST `member_create`/`member_update` 仍可用于管理端脚本化场景） |
+| 成员吊销 | 某个软件身份离开团队或需要禁用时 | 成员由 Agent 接入时自动创建；Web 不提供手工添加/编辑（REST `member_create`/`member_update` 仍可用于管理端脚本化场景）。吊销在同一写事务内级联收权：该成员的 Project Token 全部置 `revoked_at`、其未退出的 Session 全部关闭（`left_at`、置离线、token 立即到期）、其未释放的文件租约全部释放，并逐条追加 `credential.revoked` / `session.leave` 事件；`member.revoked` 事件 payload 的 `access_revocation` 记录三类收权数量。吊销之后旧 Session 凭据写消息/申请租约/认领任务/提交报告与评审一律被拒（`session_closed` 或 `session_token_expired`），`session_heartbeat` 不再为其续期 token 或租约，凭 token 直连则在 token 网关返回 `agent_token_revoked`（`required_action=issue_new_project_token_and_update_bundle`）；历史事件、任务归属与审计记录仍原样保留 |
 | Workspace 列表 | 排查跨电脑项目路径登记是否正确 | 只读自动列表：Agent 通过 `room_join` 自动登记，Web 不再提供手动登记入口（REST 仍可编程登记） |
 | 审计筛选/翻页 | 需要追溯某个事件类型或更早的历史 | 审计历史按服务端分页加载，支持「加载更早」「加载更新」，刷新不丢已加载窗口；窗口大小由受验证配置 `coordination.audit_window_size`（默认 100，环境变量 `AGENTCHATROOM_AUDIT_WINDOW_SIZE`）控制。真实消费点是 Web 审计列表分页（`app.js` 的 `auditPageSize()` 从运行时 `settings.audit_window_size` 取页大小，非法或缺省回退 100），该键保留在 `CONFIG_FILE_SCHEMA` 与 `Settings` 中，不迁移删除 |
 
