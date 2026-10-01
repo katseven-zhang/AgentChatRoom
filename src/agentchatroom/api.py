@@ -14,7 +14,7 @@ import threading
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any, Callable, Literal
+from typing import Any, Callable, Literal, Mapping
 
 from fastapi import FastAPI, Query, Request, Response
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
@@ -980,9 +980,6 @@ class LoginRateLimiter:
             self._locked_until.pop(key, None)
 
 
-_BACKUP_SETTINGS_OVERRIDE: dict[str, Any] = {}
-
-
 def upsert_toml_section(text: str, section: str, values: dict[str, Any]) -> str:
     """Insert or replace key/value pairs inside one ``[section]`` block.
 
@@ -1029,42 +1026,64 @@ def run_auto_backup_cycle(service: Any, max_kept: int | None = None) -> dict[str
         return None
 
 
-def effective_backup_settings(settings: Any) -> dict[str, Any]:
-    """Runtime backup settings: management overrides over loaded config."""
+def effective_backup_settings(
+    settings: Any, overrides: Mapping[str, Any] | None = None
+) -> dict[str, Any]:
+    """Runtime backup settings: management overrides over loaded config.
+
+    The overrides belong to one application instance. They used to live in a
+    module-level dict, so a second ``create_app`` in the same process - a test,
+    a GUI window, a management call - silently changed the first one's backup
+    worker.
+    """
+    values = overrides or {}
     return {
-        "auto_backup_enabled": _BACKUP_SETTINGS_OVERRIDE.get(
+        "auto_backup_enabled": values.get(
             "auto_backup_enabled", settings.auto_backup_enabled
         ),
-        "auto_backup_interval_seconds": _BACKUP_SETTINGS_OVERRIDE.get(
+        "auto_backup_interval_seconds": values.get(
             "auto_backup_interval_seconds", settings.auto_backup_interval_seconds
         ),
-        "auto_backup_max_kept": _BACKUP_SETTINGS_OVERRIDE.get(
+        "auto_backup_max_kept": values.get(
             "auto_backup_max_kept", settings.auto_backup_max_kept
         ),
     }
 
 
 def auto_backup_worker(
-    service: Any, settings: Any, stop_event: "threading.Event"
+    service: Any,
+    settings: Any,
+    stop_event: "threading.Event",
+    overrides: Mapping[str, Any] | None = None,
 ) -> None:
     """Backup loop: re-reads effective settings every cycle, so management
     toggles (enable / interval / retention) apply without a restart."""
     while not stop_event.wait(
-        timeout=max(60, int(effective_backup_settings(settings)["auto_backup_interval_seconds"]))
+        timeout=max(
+            60,
+            int(
+                effective_backup_settings(settings, overrides)[
+                    "auto_backup_interval_seconds"
+                ]
+            ),
+        )
     ):
-        state = effective_backup_settings(settings)
+        state = effective_backup_settings(settings, overrides)
         if not state["auto_backup_enabled"]:
             continue
         run_auto_backup_cycle(service, state["auto_backup_max_kept"])
 
 
 def start_auto_backup_worker(
-    service: Any, settings: Any, stop_event: "threading.Event"
+    service: Any,
+    settings: Any,
+    stop_event: "threading.Event",
+    overrides: dict[str, Any] | None = None,
 ) -> "threading.Thread":
     """Start the daemon backup worker; per-cycle gating happens in the loop."""
     worker = threading.Thread(
         target=auto_backup_worker,
-        args=(service, settings, stop_event),
+        args=(service, settings, stop_event, overrides),
         name="agentchatroom-auto-backup",
         daemon=True,
     )
@@ -1179,7 +1198,7 @@ def create_app(
                 _windows_http_exception_handler(previous_exception_handler)
             )
         auto_backup_worker = start_auto_backup_worker(
-            service, resolved, auto_backup_stop
+            service, resolved, auto_backup_stop, backup_settings_override
         )
         try:
             with running_service(resolved):
@@ -1209,6 +1228,10 @@ def create_app(
     app.state.mcp_server = mcp_server
     app.state.http_presence_manager = http_presence_manager
     app.state.directory_picker = resolved_directory_picker
+    # Per-application backup overrides: the management writer and this app's own
+    # worker share this dict and nothing else does.
+    backup_settings_override: dict[str, Any] = {}
+    app.state.backup_settings_override = backup_settings_override
     app.state.local_mcp_configurator = resolved_local_mcp_configurator
 
     def management_session_valid(session_id: str) -> bool:
@@ -2077,7 +2100,7 @@ def create_app(
         return service.register_workspace(project_id, **body.model_dump())
 
     def _backup_settings_payload() -> dict[str, Any]:
-        effective = effective_backup_settings(resolved)
+        effective = effective_backup_settings(resolved, backup_settings_override)
         return {
             "auto_backup_enabled": effective["auto_backup_enabled"],
             "auto_backup_interval_seconds": effective["auto_backup_interval_seconds"],
@@ -2125,7 +2148,7 @@ def create_app(
         updated_text = upsert_toml_section(existing_text, "backup", applied)
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(updated_text, encoding="utf-8")
-        _BACKUP_SETTINGS_OVERRIDE.update(applied)
+        backup_settings_override.update(applied)
         payload = _backup_settings_payload()
         # 保留份数立即生效：保存即按新上限清理现存备份，无需等下一次备份。
         payload["pruned"] = service.enforce_backup_retention(
