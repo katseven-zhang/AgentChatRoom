@@ -2079,6 +2079,16 @@ def test_changes_requested_task_can_be_reassigned_after_owner_leaves(
     service.leave_session(
         project["id"], executor["agent"]["id"], executor["token"]
     )
+    # A different software identity cannot take over unfinished execution work by
+    # accepting an assignment (#233): management releases it first, and the new
+    # owner claims it from the claimable pool.
+    service.release_task(
+        project["id"],
+        task["id"],
+        reason_code="agent_unavailable",
+        reason="Original owner left the Room.",
+        management_authorized=True,
+    )
 
     assigned = service.assign_task(
         project["id"],
@@ -2106,7 +2116,7 @@ def test_changes_requested_task_can_be_reassigned_after_owner_leaves(
         if event["project_seq"] == accepted["event_id"]
     )
     assert assignment_event["event_type"] == "task.assignment_acknowledged"
-    assert assignment_event["payload"]["reclaimed_from_session_id"] == executor["agent"]["id"]
+    assert assignment_event["payload"]["reclaimed_from_session_id"] is None
 
     revised = service.submit_work_report(
         project["id"],

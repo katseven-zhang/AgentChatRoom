@@ -1711,6 +1711,62 @@ class AgentChatRoomService:
         second_key = str(second_data.get("agent_key") or "").strip()
         return bool(first_key and second_key and first_key == second_key)
 
+    def _owner_liveness(
+        self,
+        connection: Any,
+        project_id: str,
+        owner_session_id: str,
+    ) -> dict[str, Any]:
+        """How alive an owning Session is, by the evidence ``task_claim`` trusts.
+
+        ``left_at`` alone is not proof of absence: a Session that stopped
+        heartbeating without leaving still holds a transport, and a Session whose
+        transport was reaped is gone even inside the heartbeat window. Every path
+        that moves ownership between Sessions has to use this one judgement.
+        """
+        owner = connection.execute(
+            """
+            SELECT a.*,
+                   (SELECT MAX(e.created_at) FROM events e
+                    WHERE e.project_id = a.project_id
+                      AND e.actor_session_id = a.id) AS last_activity_at
+            FROM agent_sessions a
+            WHERE a.id = ? AND a.project_id = ?
+            """,
+            (owner_session_id, project_id),
+        ).fetchone()
+        if owner is None:
+            return {
+                "owner": None,
+                "connected": False,
+                "transport_state": "owner_missing",
+                "last_seen": None,
+            }
+        last_seen = parse_time(owner["last_heartbeat"])
+        if owner["last_activity_at"]:
+            last_seen = max(last_seen, parse_time(owner["last_activity_at"]))
+        connected = owner["left_at"] is None and (
+            utc_now() - last_seen
+            <= timedelta(seconds=self.settings.heartbeat_timeout_seconds)
+        )
+        transport_state = "not_checked"
+        if connected:
+            state_check = self.transport_liveness_check
+            if state_check is None:
+                transport_state = "unavailable"
+            else:
+                transport_state = (
+                    str(state_check(project_id, str(owner["id"])) or "") or "unknown"
+                )
+                if transport_state == "gone":
+                    connected = False
+        return {
+            "owner": owner,
+            "connected": connected,
+            "transport_state": transport_state,
+            "last_seen": last_seen,
+        }
+
     def _host_dict(self, row: Mapping[str, Any]) -> dict[str, Any]:
         data = dict(row)
         data["metadata"] = json_load(data.pop("metadata_json"), {})
@@ -5884,17 +5940,10 @@ class AgentChatRoomService:
                     "cursor": self.latest_cursor(connection, project_id),
                 }
             if task["owner_session_id"] is not None:
-                owner = connection.execute(
-                    """
-                    SELECT a.*,
-                           (SELECT MAX(e.created_at) FROM events e
-                            WHERE e.project_id = a.project_id
-                              AND e.actor_session_id = a.id) AS last_activity_at
-                    FROM agent_sessions a
-                    WHERE a.id = ? AND a.project_id = ?
-                    """,
-                    (task["owner_session_id"], project_id),
-                ).fetchone()
+                liveness = self._owner_liveness(
+                    connection, project_id, str(task["owner_session_id"])
+                )
+                owner = liveness["owner"]
                 can_reclaim = bool(
                     owner is not None
                     and self._same_agent_identity(claimant, owner)
@@ -5920,29 +5969,9 @@ class AgentChatRoomService:
                         "Only the same software identity can reclaim unfinished execution work",
                         status_code=403,
                     )
-                last_seen = parse_time(owner["last_heartbeat"])
-                if owner["last_activity_at"]:
-                    last_seen = max(last_seen, parse_time(owner["last_activity_at"]))
-                owner_connected = owner["left_at"] is None and (
-                    utc_now() - last_seen
-                    <= timedelta(seconds=self.settings.heartbeat_timeout_seconds)
-                )
-                transport_state = "not_checked"
-                if owner_connected:
-                    # Presence is display-only, but a reaped transport is hard
-                    # evidence the owning client is gone: allow the same
-                    # identity to reclaim immediately instead of waiting out
-                    # the heartbeat window.
-                    state_check = self.transport_liveness_check
-                    if state_check is None:
-                        transport_state = "unavailable"
-                    else:
-                        transport_state = (
-                            str(state_check(project_id, str(owner["id"])) or "")
-                            or "unknown"
-                        )
-                        if transport_state == "gone":
-                            owner_connected = False
+                last_seen = liveness["last_seen"]
+                owner_connected = bool(liveness["connected"])
+                transport_state = str(liveness["transport_state"])
                 if owner_connected and not takeover:
                     # An ordinary reclaim never preempts a live owner.  A same-
                     # identity caller can choose an explicit, audited takeover
@@ -6797,25 +6826,51 @@ class AgentChatRoomService:
                     status_code=409,
                 )
             reclaimed_from_session_id: str | None = None
+            transferred_lease_ids: list[str] = []
             if response == "accepted":
                 if task["owner_session_id"] not in {None, session_id}:
-                    previous_owner = connection.execute(
-                        "SELECT left_at FROM agent_sessions WHERE id = ? AND project_id = ?",
-                        (task["owner_session_id"], project_id),
-                    ).fetchone()
-                    can_reclaim = (
+                    previous_owner_id = str(task["owner_session_id"])
+                    liveness = self._owner_liveness(
+                        connection, project_id, previous_owner_id
+                    )
+                    # Accepting an assignment is explicit intent for this task,
+                    # but taking it away from another Session is a reclaim and
+                    # must satisfy the same contract task_claim enforces:
+                    # same software identity, provable absence, unfinished work.
+                    if not self._same_agent_identity(agent, liveness["owner"]):
+                        raise DomainError(
+                            "task_reclaim_forbidden",
+                            "Only the owning software identity may take back "
+                            "unfinished execution work through an assignment",
+                            status_code=403,
+                            details={
+                                "owner_session_id": previous_owner_id,
+                                "required_action": "task_claim_by_owner_identity_or_management_reassignment",
+                            },
+                        )
+                    if not (
                         task["execution_status"] == "in_progress"
                         and task["verification_status"] == "changes_requested"
-                        and previous_owner is not None
-                        and previous_owner["left_at"] is not None
-                    )
-                    if not can_reclaim:
+                    ):
                         raise DomainError(
                             "task_already_claimed",
                             "Task is already owned by another Agent",
                             status_code=409,
+                            details={"owner_session_id": previous_owner_id},
                         )
-                    reclaimed_from_session_id = task["owner_session_id"]
+                    if liveness["connected"]:
+                        raise DomainError(
+                            "task_owner_session_connected",
+                            "The owning Session is still connected; it must release "
+                            "the task or its own identity has to take over explicitly",
+                            status_code=409,
+                            details={
+                                "owner_session_id": previous_owner_id,
+                                "owner_transport_state": liveness["transport_state"],
+                                "required_action": "task_claim(takeover=true)_by_owner_identity",
+                            },
+                        )
+                    reclaimed_from_session_id = previous_owner_id
                 if task["execution_status"] not in {"todo", "claimed"} and not (
                     task["execution_status"] == "in_progress"
                     and task["verification_status"] == "changes_requested"
@@ -6856,6 +6911,35 @@ class AgentChatRoomService:
                         "Task was modified concurrently",
                         status_code=409,
                     )
+                if reclaimed_from_session_id is not None:
+                    # Ownership moved, so the departed owner's task-scoped
+                    # exclusive leases have to move with it; leaving them behind
+                    # blocks the new owner on its own task until the TTL expires.
+                    lease_rows = connection.execute(
+                        """
+                        SELECT id FROM file_leases
+                        WHERE project_id = ? AND task_id = ? AND session_id = ?
+                          AND released_at IS NULL
+                        """,
+                        (project_id, task_id, reclaimed_from_session_id),
+                    ).fetchall()
+                    transferred_lease_ids = [str(row["id"]) for row in lease_rows]
+                    if transferred_lease_ids:
+                        connection.execute(
+                            """
+                            UPDATE file_leases
+                            SET session_id = ?, renewed_at = ?
+                            WHERE project_id = ? AND task_id = ? AND session_id = ?
+                              AND released_at IS NULL
+                            """,
+                            (
+                                session_id,
+                                iso_now(),
+                                project_id,
+                                task_id,
+                                reclaimed_from_session_id,
+                            ),
+                        )
             now = iso_now()
             updated_assignment = connection.execute(
                 """
@@ -6883,6 +6967,7 @@ class AgentChatRoomService:
                     "response": response,
                     "note": note.strip(),
                     "reclaimed_from_session_id": reclaimed_from_session_id,
+                    "transferred_lease_ids": transferred_lease_ids,
                 },
             )
             updated_assignment = connection.execute(
