@@ -512,7 +512,8 @@ room_bootstrap
 | 待验收 → 待集成 | `review_submit verdict=approved` | 独立身份 | awaiting_review；逐条验收标准 passed | `acceptance_criteria_not_satisfied` | verification=approved |
 | 待集成 → 已完成/集成失败 | `integration_submit` | Agent 或管理端 | verification=approved | `task_not_ready_for_integration`、`task_already_integrated`、`integration_tests_failed` | integration=done/failed；done 要求测试全过 |
 | 已认领/执行中/阻塞/已退回 → 待认领 | `task_release` | owner 自助或管理端代释放 | 未进入待验收及之后阶段 | `not_task_owner`、`task_not_releasable`、`task_release_conflict` | 原子清 owner 与活跃租约、失效 pending 指派/交接、保留进度与 changes_requested |
-| 任意未完成 → 已取消 | `task_update status=cancelled` | 用户/owner | 非终态 | `invalid_transition` | 终态，不可再认领 |
+| 任意未完成 → 已取消 | `task_update status=cancelled` | **owner 本人凭据或已认证管理端**（无 owner 的任务不再允许任意已认证 Session 取消） | 非终态 | `management_auth_required`、`not_task_owner`、`invalid_transition` | 终态，不可再认领；原子释放该任务租约与 pending 指派/交接（Session 发起时只清理该 Session 自己持有的租约，管理端发起才做整任务清理） |
+| 已取消 → 任何状态 | — | — | 已取消是终态，转移表不再提供回 `todo` 的边 | `task_is_terminal` | 需要重做时新建替代任务，不重开原任务，避免无归属的 todo↔cancelled 静默跳态 |
 | → 待认领（重派） | `task_assign` + 目标确认 | 管理端/Agent | 目标身份已接入且未吊销（可离线） | `assignment_target_not_found`、`assignment_target_revoked`、`invalid_assignment_target` | pending 指派留痕，重连后可受理 |
 
 租约、验证证据与任务状态分别由各自领域服务维护；上表副作用中涉及的租约清理均调用同一租约服务。
@@ -658,7 +659,7 @@ REST `GET /api/v1/projects/{project_id}/tasks?phase=`、MCP `task_list(phase=…
 | 结构化原因 | `reason_code`：quota_exhausted / agent_unavailable / user_requested / reassignment_needed / other + 自由文本 reason | 无需释放原因 |
 | 可执行阶段 | claimed / in_progress / blocked（含验收退回后的返修）；todo 重复释放幂等；待验收、已通过、已集成、已取消等阶段明确拒绝 | 未完成的任务 |
 | 保留内容 | 进度、步骤、任务合同、依赖、Work Report、Review、Integration 与历史 owner 全部保留；验收退回后释放保留 `changes_requested`，下一位 Agent 可从「待认领」和「需要处理」两个入口找到 | — |
-| 附带处理 | 原子释放该任务活跃文件租约、失效 pending 指派/交接并留痕 | — |
+| 附带处理 | 原子释放该任务活跃文件租约、失效 pending 指派/交接并留痕 | 同样原子清理：该任务的未释放文件租约全部释放、pending 指派/交接全部取消。清理只由目标状态决定，与中间状态无关——`blocked → cancelled` 记的是 `task.cancelled`（不会被误判为 `task.unblocked` 而跳过清理），`todo/claimed/in_progress/blocked/awaiting_review/verified` 任何一条通往取消的边都留下同一个事件与同一份清理结果 |
 
 当前 owner 可自助释放；owner 离线、失联或额度耗尽时，具有任务管理权限的用户/管理端（Web 与 REST 的管理身份）可代为释放。
 

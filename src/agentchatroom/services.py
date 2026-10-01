@@ -5586,21 +5586,33 @@ class AgentChatRoomService:
         a task is cancelled. Runs inside an open write transaction so the
         terminal state never leaves orphan resources behind."""
         now = iso_now()
+        # A Session-driven cancellation only cleans up what that Session owns.
+        # Another Agent's exclusive lease on the task must survive: before this
+        # was scoped, cancelling an unowned task released leases held by an
+        # unrelated Agent that had bound work to it. A management cancellation
+        # carries no actor Session and keeps the documented whole-task sweep.
+        actor_clause = ""
+        lease_params: tuple[Any, ...] = (project_id, task_id)
+        if actor_session_id:
+            actor_clause = " AND session_id = ?"
+            lease_params = (project_id, task_id, actor_session_id)
         active_leases = connection.execute(
-            """
+            f"""
             SELECT id FROM file_leases
-            WHERE project_id = ? AND task_id = ? AND released_at IS NULL
+            WHERE project_id = ? AND task_id = ? AND released_at IS NULL{actor_clause}
             """,
-            (project_id, task_id),
+            lease_params,
         ).fetchall()
         released_lease_ids = [row["id"] for row in active_leases]
         if released_lease_ids:
+            placeholders = _sql_placeholders(len(released_lease_ids))
             connection.execute(
-                """
+                f"""
                 UPDATE file_leases SET released_at = ?
                 WHERE project_id = ? AND task_id = ? AND released_at IS NULL
+                  AND id IN ({placeholders})
                 """,
-                (now, project_id, task_id),
+                (now, project_id, task_id, *released_lease_ids),
             )
         pending_assignments = connection.execute(
             """
@@ -6740,6 +6752,38 @@ class AgentChatRoomService:
             if not session_id and not management_authorized:
                 raise _management_authorization_required("update this task")
             next_status = status or task["status"]
+            is_cancelling = next_status == "cancelled" and task["status"] != "cancelled"
+            # Cancellation is an ownership decision, not a field edit. An
+            # unowned task used to fall through the ownership check above, so
+            # any authenticated Session could cancel it and, through the
+            # terminal cleanup, release another Agent's exclusive lease on it.
+            # A cancelled task must never be reopened through this method: it
+            # is terminal, and the state machine below no longer offers the
+            # edge that made a silent cancelled -> todo hop possible.
+            if is_cancelling and not (is_owner or management_authorized):
+                raise DomainError(
+                    "management_auth_required",
+                    "Cancelling a task requires the task owner's own credentials "
+                    "or an authenticated management request",
+                    status_code=403,
+                    details={
+                        "required_action": (
+                            "use_task_owner_credentials_or_management_authorization"
+                        ),
+                        "attempted_status": next_status,
+                    },
+                )
+            if task["status"] == "cancelled" and next_status != "cancelled":
+                raise DomainError(
+                    "task_is_terminal",
+                    "A cancelled task is terminal and cannot be reopened through "
+                    "task_update; create a replacement task instead",
+                    status_code=409,
+                    details={
+                        "required_action": "create_a_replacement_task",
+                        "status": task["status"],
+                    },
+                )
             text_limit = self.settings.task_text_max_length
             for field_name, value in (
                 ("title", title),
@@ -7031,18 +7075,26 @@ class AgentChatRoomService:
                         """,
                         (task_id, dependency_id, iso_now()),
                     )
-            if next_status == "blocked" and task["status"] != "blocked":
+            # Cancellation is decided by the target state alone. It used to sit
+            # behind the unblocked branch, so a blocked -> cancelled move was
+            # recorded as task.unblocked and skipped the terminal cleanup
+            # entirely: the task's exclusive leases stayed held for their full
+            # TTL and its pending assignments/handoffs stayed actionable.
+            is_cancellation = (
+                next_status == "cancelled" and task["status"] != "cancelled"
+            )
+            if is_cancellation:
+                event_type = "task.cancelled"
+            elif next_status == "blocked" and task["status"] != "blocked":
                 event_type = "task.blocked"
             elif next_status == "todo" and task["owner_session_id"]:
                 event_type = "task.released"
             elif task["status"] == "blocked" and next_status != "blocked":
                 event_type = "task.unblocked"
-            elif next_status == "cancelled" and task["status"] != "cancelled":
-                event_type = "task.cancelled"
             else:
                 event_type = "task.updated"
             cancellation_cleanup: dict[str, Any] | None = None
-            if event_type == "task.cancelled":
+            if is_cancellation:
                 cancellation_cleanup = self._cancel_task_resources_locked(
                     connection, project_id, task_id, session_id
                 )

@@ -32,7 +32,9 @@ LEGACY_TASK_TRANSITIONS = {
     "awaiting_review": {"awaiting_review", "cancelled"},
     "verified": {"verified", "done", "cancelled"},
     "done": {"done"},
-    "cancelled": {"cancelled", "todo"},
+    # Cancelled is terminal: no edge back to todo. Reopening used to be a
+    # silent todo <-> cancelled hop with no owner and no dedicated event.
+    "cancelled": {"cancelled"},
 }
 
 TASK_EXECUTION_STATUSES = {
