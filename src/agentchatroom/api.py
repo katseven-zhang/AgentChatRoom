@@ -295,6 +295,50 @@ class RequestIdASGIMiddleware:
         await self.app(scope, receive, send_with_request_id)
 
 
+def _tail_text_lines(
+    path: Path,
+    limit: int,
+    *,
+    chunk_bytes: int = 65536,
+    max_scan_bytes: int = 8 * 1024 * 1024,
+) -> tuple[list[str], bool]:
+    """Return the last ``limit`` lines and whether the scan hit its byte budget.
+
+    ``server.log`` grows without bound because the detached process writes its
+    whole output there and nothing rotates it yet, so reading the entire file to
+    show 80 lines made this request cost linear in log size on the management
+    path. Scanning backwards in fixed blocks keeps the work proportional to what
+    is actually returned, and ``max_scan_bytes`` bounds the worst case.
+    """
+    if limit <= 0:
+        return [], False
+    try:
+        size = path.stat().st_size
+    except OSError:
+        return [], False
+    scanned = 0
+    end = size
+    buffer = b""
+    truncated = False
+    with path.open("rb") as handle:
+        while end > 0 and buffer.count(b"\n") <= limit:
+            start = max(0, end - chunk_bytes)
+            handle.seek(start)
+            buffer = handle.read(end - start) + buffer
+            scanned += end - start
+            end = start
+            if scanned >= max_scan_bytes:
+                truncated = end > 0
+                break
+    if truncated and end > 0:
+        # Drop the first partial line so the caller never sees a fragment.
+        newline = buffer.find(b"\n")
+        if newline != -1:
+            buffer = buffer[newline + 1 :]
+    lines = buffer.decode("utf-8", errors="replace").splitlines()
+    return lines[-limit:], truncated
+
+
 def _same_origin_browser_request(request: Request) -> bool:
     """Did the browser itself send this from the app's own page?
 
@@ -1565,14 +1609,26 @@ def create_app(
         """Expose safe operational state for the authenticated management UI."""
         log_path = resolved.data_dir / "server.log"
         log_lines: list[str] = []
-        if lines and log_path.is_file():
-            log_lines = [
-                _redact_log_line(line)
-                for line in log_path.read_text(encoding="utf-8", errors="replace")
-                .splitlines()[-lines:]
-            ]
+        log_size_bytes = 0
+        log_truncated = False
+        if log_path.is_file():
+            try:
+                log_size_bytes = log_path.stat().st_size
+            except OSError:
+                log_size_bytes = 0
+            tail, log_truncated = _tail_text_lines(log_path, lines)
+            log_lines = [_redact_log_line(line) for line in tail]
         pid_path = resolved.data_dir / "server.pid"
-        pid = pid_path.read_text(encoding="ascii").strip() if pid_path.is_file() else ""
+        # A pid file is written by another process: it can be empty, half-written,
+        # or hold bytes that are not ASCII. Decoding must never turn the management
+        # view into a 500, and a non-numeric value is not a live pid.
+        raw_pid = ""
+        if pid_path.is_file():
+            try:
+                raw_pid = pid_path.read_text(encoding="utf-8", errors="replace").strip()
+            except OSError:
+                raw_pid = ""
+        pid = raw_pid if raw_pid.isdigit() else ""
         return {
             "settings": resolved.public_dict(),
             "paths": {
@@ -1582,7 +1638,12 @@ def create_app(
                 "pid_path": str(pid_path),
             },
             "process": {"pid": pid, "managed": bool(pid)},
-            "log": {"lines": log_lines, "returned": len(log_lines)},
+            "log": {
+                "lines": log_lines,
+                "returned": len(log_lines),
+                "size_bytes": log_size_bytes,
+                "truncated": log_truncated,
+            },
         }
 
     @app.get("/api/v1/runtime/effective-config")

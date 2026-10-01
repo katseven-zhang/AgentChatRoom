@@ -891,6 +891,14 @@ Windows 与 Ubuntu 上依次跑 `pytest` → `node --check` → `compileall` →
 - **本机日志与 GUI 诊断保持可读**：这是本地单人工具，`server.log`、GUI 面板和排错
   输出刻意不做全量脱敏，以免信息缺失无法定位问题；日志侧只对凭据值做定点处理。
   隐私约束的位置是版本控制与发布面，不是日志。
+- **`server.log` 目前不轮转，读取端有硬上限**：后台服务把整个标准输出写进
+  `server.log`，仓库里还没有 `RotatingFileHandler` 一类的轮转器，文件会一直增长。
+  因此所有读取端都改成「反向定块 tail」而不是整文件 `read_text()`：
+  `GET /api/v1/admin/runtime` 每次最多回扫 8 MiB（默认 64 KiB 一块），响应里带
+  `log.size_bytes` 与 `log.truncated`，超预算时只返回读到的最新块并明确标记被截断，
+  请求成本随返回行数而不是文件大小增长；`server.pid` 也改为容错读取，内容不是纯数字
+  （半写入、被别的进程占位、含非 ASCII 字节）时按「未托管」处理而不再抛 UnicodeDecodeError 变成 500。
+  真正的写入端轮转/上限仍未落地，属于独立事项，不并入本条已修复范围。
 
 测试夹具必须包含 Windows 路径、内网地址或 id 形状字符串时，使用行级
 `# audit-allow:<rule>` 或模块首三行内的 `# audit-allow-file:<rules>` 显式声明豁免，
