@@ -762,6 +762,33 @@ class AgentChatRoomService:
             )
         return materialized
 
+    @staticmethod
+    def _review_criteria_map(criteria: list[Any]) -> dict[str, str]:
+        """Criterion name -> verdict, with the shape every review surface accepts.
+
+        Reviews are append-only evidence: a blank criterion or a status outside
+        passed/failed would otherwise be permanently readable as an assessment.
+        """
+        assessed: dict[str, str] = {}
+        for item in criteria:
+            if not isinstance(item, Mapping):
+                raise DomainError(
+                    "invalid_review_criteria",
+                    "Every review criterion must be an object with criterion/status",
+                    status_code=422,
+                )
+            criterion = str(item.get("criterion", "")).strip()
+            status = str(item.get("status", "")).strip()
+            if not criterion or status not in {"passed", "failed"}:
+                raise DomainError(
+                    "invalid_review_criteria",
+                    "Every review criterion requires a criterion and passed/failed status",
+                    status_code=422,
+                    details={"criterion": criterion, "status": status},
+                )
+            assessed[criterion] = status
+        return assessed
+
     def _validate_test_evidence_list(
         self, tests: Any, *, field: str = "tests"
     ) -> list[dict[str, Any]]:
@@ -8192,6 +8219,12 @@ class AgentChatRoomService:
             raise DomainError("invalid_review_verdict", "Unsupported review verdict")
         if not criteria:
             raise DomainError("missing_review_criteria", "Review must assess acceptance criteria")
+        criteria = self._require_list_input_limit(
+            "criteria",
+            criteria,
+            limit=int(getattr(self.settings, "list_input_max_count", 100)),
+        )
+        assessed = self._review_criteria_map(criteria)
         with self.database.connect(write=True) as connection:
             reviewer = self._authenticate(
                 connection, project_id, reviewer_session_id, token
@@ -8215,10 +8248,6 @@ class AgentChatRoomService:
                     status_code=409,
                 )
             expected = json_load(task["acceptance_criteria_json"], [])
-            assessed = {
-                str(item.get("criterion", "")).strip(): str(item.get("status", "")).strip()
-                for item in criteria
-            }
             if verdict == "approved" and (
                 any(assessed.get(item) != "passed" for item in expected)
                 or any(value != "passed" for value in assessed.values())
@@ -8340,7 +8369,16 @@ class AgentChatRoomService:
                 "A successful integration requires every submitted test to pass",
                 status_code=409,
             )
-        clean_files = sorted({normalize_pattern(path) for path in (files or [])})
+        clean_files = sorted(
+            {
+                normalize_pattern(path)
+                for path in self._require_list_input_limit(
+                    "files",
+                    files or [],
+                    limit=int(getattr(self.settings, "list_input_max_count", 100)),
+                )
+            }
+        )
         with self.database.connect(write=True) as connection:
             if bool(integrator_session_id) != bool(token):
                 raise DomainError(
@@ -8882,17 +8920,7 @@ class AgentChatRoomService:
             criteria,
             limit=int(getattr(self.settings, "list_input_max_count", 100)),
         )
-        assessed = {
-            str(item.get("criterion", "")).strip(): str(item.get("status", "")).strip()
-            for item in criteria
-        }
-        if not all(assessed) or any(
-            status not in {"passed", "failed"} for status in assessed.values()
-        ):
-            raise DomainError(
-                "invalid_review_criteria",
-                "Every review criterion requires a criterion and passed/failed status",
-            )
+        assessed = self._review_criteria_map(criteria)
         if verdict == "approved" and any(
             status != "passed" for status in assessed.values()
         ):
