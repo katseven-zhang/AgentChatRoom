@@ -23,6 +23,7 @@ connect_timeout_seconds = 10.0
 
 [coordination]
 mcp_roots_timeout_seconds = 5.0
+git_scope_recheck_ttl_seconds = 30.0
 heartbeat_timeout_seconds = 45
 presence_keepalive_enabled = true
 presence_keepalive_interval_seconds = 15.0

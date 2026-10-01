@@ -45,6 +45,7 @@ CONFIG_FILE_SCHEMA: dict[str, dict[str, tuple[type, ...]]] = {
     },
     "coordination": {
         "mcp_roots_timeout_seconds": (int, float),
+        "git_scope_recheck_ttl_seconds": (int, float),
         "heartbeat_timeout_seconds": (int,),
         "presence_keepalive_enabled": (bool,),
         "presence_keepalive_interval_seconds": (int, float),
@@ -207,6 +208,7 @@ class Settings:
     presence_keepalive_enabled: bool = True
     presence_keepalive_interval_seconds: float = 15.0
     mcp_roots_timeout_seconds: float = 5.0
+    git_scope_recheck_ttl_seconds: float = 30.0
     session_token_ttl_seconds: int = 43200
     default_lease_ttl_seconds: int = 1800
     max_lease_ttl_seconds: int = 86400
@@ -334,6 +336,9 @@ def _merge_toml(path: Path) -> dict[str, Any]:
             "require_verified_task"
         ),
         "mcp_roots_timeout_seconds": raw.get("coordination", {}).get("mcp_roots_timeout_seconds"),
+        "git_scope_recheck_ttl_seconds": raw.get("coordination", {}).get(
+            "git_scope_recheck_ttl_seconds"
+        ),
         "heartbeat_timeout_seconds": raw.get("coordination", {}).get(
             "heartbeat_timeout_seconds"
         ),
@@ -616,6 +621,12 @@ def load_settings(
             file_values.get("presence_keepalive_enabled", True),
         ),
         "mcp_roots_timeout_seconds": float(os.getenv("AGENTCHATROOM_MCP_ROOTS_TIMEOUT_SECONDS", file_values.get("mcp_roots_timeout_seconds", 5.0))),
+        "git_scope_recheck_ttl_seconds": float(
+            os.getenv(
+                "AGENTCHATROOM_GIT_SCOPE_RECHECK_TTL_SECONDS",
+                file_values.get("git_scope_recheck_ttl_seconds", 30.0),
+            )
+        ),
         "presence_keepalive_interval_seconds": float(
             os.getenv(
                 "AGENTCHATROOM_PRESENCE_KEEPALIVE_INTERVAL_SECONDS",
@@ -835,6 +846,10 @@ def load_settings(
         raise ValueError("heartbeat timeout must be at least 5 seconds")
     if not 0 < values["mcp_roots_timeout_seconds"] <= 60:
         raise ValueError("mcp roots timeout must be between 0 and 60 seconds")
+    if not 0 < values["git_scope_recheck_ttl_seconds"] <= 3600:
+        raise ValueError(
+            "git scope recheck ttl must be between 0 and 3600 seconds"
+        )
     if values["presence_keepalive_interval_seconds"] <= 0:
         raise ValueError("presence keepalive interval must be positive")
     if (

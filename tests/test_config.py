@@ -481,6 +481,7 @@ def test_every_config_file_schema_key_maps_into_settings(monkeypatch, tmp_path):
         },
         "coordination": {
             "mcp_roots_timeout_seconds": 4.0,
+            "git_scope_recheck_ttl_seconds": 12.5,
             "heartbeat_timeout_seconds": 60,
             "presence_keepalive_enabled": True,
             "presence_keepalive_interval_seconds": 15.0,

@@ -44,6 +44,7 @@ connect_timeout_seconds = 10.0
 [coordination]
 # MCP roots bind timeout (seconds); 0 is invalid, max 60.
 mcp_roots_timeout_seconds = 5.0
+git_scope_recheck_ttl_seconds = 30.0
 heartbeat_timeout_seconds = 45
 # Long-running local MCP and remote Bridge processes keep joined sessions alive.
 presence_keepalive_enabled = true

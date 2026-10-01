@@ -2398,6 +2398,20 @@ class AgentChatRoomService:
                 project["project_source"] = self._peek_project_source(project)
         return projects
 
+    def git_scope_recheck_ttl_seconds(self) -> float:
+        """Configured TTL for the display-only git scope probe cache."""
+        return float(
+            getattr(
+                self.settings,
+                "git_scope_recheck_ttl_seconds",
+                GIT_SCOPE_RECHECK_TTL_SECONDS,
+            )
+        )
+
+    def invalidate_git_scope_probe(self, project_id: str) -> None:
+        """Drop a cached probe so the next read re-detects the scope."""
+        self._git_scope_probe_cache.pop(str(project_id), None)
+
     def _peek_project_source(self, project: Mapping[str, Any]) -> str:
         project_id = str(project.get("id") or "")
         root_path = str(project.get("root_path") or "").strip()
@@ -2405,12 +2419,8 @@ class AgentChatRoomService:
             return "path"
         now = time.monotonic()
         cached = self._git_scope_probe_cache.get(project_id)
-        if (
-            cached
-            and cached[1] == "path"
-            and (now - cached[0]) < GIT_SCOPE_RECHECK_TTL_SECONDS
-        ):
-            return "path"
+        if cached and (now - cached[0]) < self.git_scope_recheck_ttl_seconds():
+            return cached[1]
         source = "path"
         try:
             root = Path(root_path).expanduser().resolve()
@@ -2419,8 +2429,11 @@ class AgentChatRoomService:
                 source = _project_source_from_disk(remote, is_work_tree)
         except (OSError, DomainError):
             source = "path"
-        if source == "path":
-            self._git_scope_probe_cache[project_id] = (now, source, "")
+        # Cache every display-only probe result. Restricting the cache to "path"
+        # left a local work tree (source "git_local") re-running git subprocesses
+        # on every single read, which is exactly the cost this TTL cache exists to
+        # avoid - and the GUI polls once per second.
+        self._git_scope_probe_cache[project_id] = (now, source, "")
         return source
 
     def archive_project(self, project_id: str) -> dict[str, Any]:
@@ -2485,8 +2498,8 @@ class AgentChatRoomService:
         # Detail GET uses the same TTL cache as list for path candidates (#172):
         # avoid a git subprocess on every read when nothing has changed.
         cached = self._git_scope_probe_cache.get(project_id)
-        if cached and cached[1] == "path" and (now - cached[0]) < GIT_SCOPE_RECHECK_TTL_SECONDS:
-            return self._project_dict(project, project_source="path")
+        if cached and (now - cached[0]) < self.git_scope_recheck_ttl_seconds():
+            return self._project_dict(project, project_source=cached[1])
         try:
             root = Path(root_path).expanduser().resolve()
         except (OSError, ValueError):
@@ -2501,7 +2514,8 @@ class AgentChatRoomService:
 
         source = _project_source_from_disk(remote, is_work_tree)
         if not remote:
-            # Local work-tree or plain path: display-only, never write.
+            # Local work-tree or plain path: display-only, never write. Cached so
+            # the next read within the TTL skips the git subprocess entirely.
             self._git_scope_probe_cache[project_id] = (now, source, "")
             return self._project_dict(project, project_source=source)
 

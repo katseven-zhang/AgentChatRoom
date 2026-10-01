@@ -569,6 +569,8 @@ room_bootstrap
 
 客户端声明支持 roots 时，空列表、无效 URI、调用异常或超时都会拒绝绑定，不会回退到服务端 cwd。roots 超时由 `coordination.mcp_roots_timeout_seconds` 控制，默认 5 秒；环境变量 `AGENTCHATROOM_MCP_ROOTS_TIMEOUT_SECONDS` 优先于配置文件，取值大于 0 且不超过 60 秒。共享 HTTP 服务不会使用进程 cwd；仅对凭据包已经选定且根目录在服务端存在的 Project 使用其已登记 `root_path`。服务每次显式启动都会更换生命周期代次，即使服务停止和重启发生在两次请求之间，旧本机绑定也必须重新 bootstrap。
 
+只读展示用的 git 作用域探测（`list_projects` / `get_project` 在存量为空 remote 时判断磁盘是否为工作树）结果按 Project 缓存，缓存 **任何** 探测结果（`path` 与 `git_local` 都写、都命中），不再只缓存 `"path"`：此前一个没有 origin 的本地工作树项目每次读取都会重跑 `git` 子进程（GUI 默认 1 秒轮询两次列表，最坏每秒 4 次子进程），正好落空了这份缓存要解决的问题。TTL 由 `coordination.git_scope_recheck_ttl_seconds` 控制，默认 30 秒；环境变量 `AGENTCHATROOM_GIT_SCOPE_RECHECK_TTL_SECONDS` 优先于配置文件，必须大于 0 且不超过 3600 秒。作用域真的变化（例如后来 `git remote add`）时，写路径仍然即时更新自己的行，展示缓存最多滞后一个 TTL；管理端可用 `invalidate_git_scope_probe()` 立即失效。
+
 成功结果区分四件独立事实：软件已配置、MCP transport 已连接、当前对话创建了独立 Room Session、当前模型对话已同步。失败状态是有限集合，每种只有一个 `required_action`：
 
 | 状态 | 下一步 |
