@@ -3929,6 +3929,7 @@ class AgentChatRoomService:
             # software identity. Multiple active members sharing one client
             # (e.g. two machines both using "zcode") must not absorb each
             # other's orphan history; leave member_id NULL for explicit merge.
+            adopted_sessions: list[dict[str, Any]] = []
             shared_client_members = int(
                 connection.execute(
                     """
@@ -3943,14 +3944,52 @@ class AgentChatRoomService:
                 ).fetchone()["member_count"]
             )
             if shared_client_members == 0:
-                connection.execute(
+                # Adopting an ownerless Session assigns a durable identity to it,
+                # so its tasks and leases become reachable by the joiner. Matching
+                # on the client string alone let any same-client identity inherit
+                # another identity's orphan history; the recorded software key has
+                # to match as well, and the rewrite is audited in agent.joined.
+                orphan_rows = connection.execute(
                     """
-                    UPDATE agent_sessions SET member_id = ?, agent_key = ?
+                    SELECT id, agent_key, member_id FROM agent_sessions
                     WHERE project_id = ? AND member_id IS NULL
                       AND lower(trim(client)) = lower(trim(?))
+                      AND lower(trim(agent_key)) = lower(trim(?))
                     """,
-                    (member_id, canonical_agent_key, project_id, client),
-                )
+                    (
+                        project_id,
+                        client,
+                        self._normalize_software_key(software_key or client),
+                    ),
+                ).fetchall()
+                if orphan_rows:
+                    connection.execute(
+                        """
+                        UPDATE agent_sessions SET member_id = ?, agent_key = ?
+                        WHERE project_id = ? AND member_id IS NULL
+                          AND lower(trim(client)) = lower(trim(?))
+                          AND lower(trim(agent_key)) = lower(trim(?))
+                        """,
+                        (
+                            member_id,
+                            canonical_agent_key,
+                            project_id,
+                            client,
+                            self._normalize_software_key(software_key or client),
+                        ),
+                    )
+                adopted_sessions = [
+                    {
+                        "session_id": str(row["id"]),
+                        "previous_member_id": (
+                            None if row["member_id"] is None else str(row["member_id"])
+                        ),
+                        "member_id": member_id,
+                        "previous_agent_key": str(row["agent_key"] or ""),
+                        "agent_key": canonical_agent_key,
+                    }
+                    for row in orphan_rows
+                ]
             connection.execute(
                 """
                 INSERT INTO agent_sessions(
@@ -4057,6 +4096,7 @@ class AgentChatRoomService:
                     "model": model.strip(),
                     "role": role,
                     "member_id": member_id,
+                    "adopted_sessions": adopted_sessions,
                 },
             )
             connection.execute(
