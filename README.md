@@ -817,6 +817,8 @@ Room 中的沉淀知识以版本化 Knowledge Asset 保存，默认类型包括�
 
 项目导出（REST `/export`、CLI `project-export`）包含全部知识资产的版本与审核历史。Web 顶栏不再提供「导出」按钮（#145 起收纳）：项目设置弹窗底部提供「导出审计数据 (JSON)」，导出包含本 Project 任务与审计流水的人类可读明文 JSON，用于离线分析与复盘；它不是系统级数据库备份，也不能用于回滚。
 
+导出的每一段都必须是**全量**，不能是界面滚动窗口（`export_schema_version` 因此升为 2）。事件此前已按 `cursor` 分页取全，但 `reports` / `reviews` / `acknowledgements` 直接取自 `snapshot`，而 snapshot 的这三张表受 `coordination.snapshot_recent_limit` 限制，于是比窗口更早的 Work Report、Review 与确认记录会**静默消失**在下载的归档里。现在导出走独立的读取（`_export_room_writes`）：三段都按时间正序完整读出，`acknowledgements` 只包含 `project_seq <= cursor` 的那些（与事件区间一致），行形状与 snapshot 完全相同（`files` / `tests` / `system_evidence` / `criteria` 已展开，不暴露 `*_json` 与内部物理 id），并且返回 `counts`（各段条数），让离线一方能核对“条数=数组长度”而不是靠肉眼判断有没有被截断。snapshot 本身仍然是受限的近期窗口——那是它的用途，两者不再共用同一段读取代码。
+
 默认配置见 `config.example.toml` 的 `[knowledge]` 节：
 
 ```toml

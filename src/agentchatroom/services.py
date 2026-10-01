@@ -10042,18 +10042,12 @@ class AgentChatRoomService:
             reports, reports_older, reports_newer = _fetch_tied_page(
                 "work_reports", before=reports_before, after=reports_after
             )
-            for report in reports:
-                report["files"] = json_load(report.pop("files_json", "[]"), [])
-                report["tests"] = json_load(report.pop("tests_json", "[]"), [])
-                report["system_evidence"] = json_load(
-                    report.pop("system_evidence_json", "{}"), {}
-                )
+            reports = [self._work_report_dict(report) for report in reports]
 
             reviews, reviews_older, reviews_newer = _fetch_tied_page(
                 "reviews", before=reviews_before, after=reviews_after
             )
-            for review in reviews:
-                review["criteria"] = json_load(review.pop("criteria_json", "[]"), [])
+            reviews = [self._review_dict(review) for review in reviews]
 
             acknowledgements, acks_older, acks_newer = _fetch_ack_page(
                 before=acknowledgements_before,
@@ -10173,6 +10167,67 @@ class AgentChatRoomService:
                 },
             }
 
+    def _work_report_dict(self, row: Mapping[str, Any]) -> dict[str, Any]:
+        report = dict(row)
+        report["files"] = json_load(report.pop("files_json", "[]"), [])
+        report["tests"] = json_load(report.pop("tests_json", "[]"), [])
+        report["system_evidence"] = json_load(
+            report.pop("system_evidence_json", "{}"), {}
+        )
+        return report
+
+    def _review_dict(self, row: Mapping[str, Any]) -> dict[str, Any]:
+        review = dict(row)
+        review["criteria"] = json_load(review.pop("criteria_json", "[]"), [])
+        return review
+
+    def _acknowledgement_dict(self, row: Mapping[str, Any]) -> dict[str, Any]:
+        acknowledgement = dict(row)
+        acknowledgement.pop("physical_id", None)
+        return acknowledgement
+
+    def _export_room_writes(
+        self, project_id: str, cursor: int
+    ) -> dict[str, list[dict[str, Any]]]:
+        """Every Work Report, review, and acknowledgement for one export.
+
+        The snapshot lists these to a recency window, so an older report used to
+        vanish from the archive without a trace. Acknowledgements are capped at
+        the export cursor because that is what makes the event list complete.
+        """
+        with self.database.connect() as connection:
+            self._require_project(connection, project_id)
+            return {
+                "reports": [
+                    self._work_report_dict(row)
+                    for row in connection.execute(
+                        "SELECT * FROM work_reports WHERE project_id = ? "
+                        "ORDER BY created_at ASC, id ASC",
+                        (project_id,),
+                    ).fetchall()
+                ],
+                "reviews": [
+                    self._review_dict(row)
+                    for row in connection.execute(
+                        "SELECT * FROM reviews WHERE project_id = ? "
+                        "ORDER BY created_at ASC, id ASC",
+                        (project_id,),
+                    ).fetchall()
+                ],
+                "acknowledgements": [
+                    self._acknowledgement_dict(row)
+                    for row in connection.execute(
+                        "SELECT e.project_seq AS event_id, a.session_id, a.created_at, "
+                        "e.id AS physical_id "
+                        "FROM event_acknowledgements a "
+                        "JOIN events e ON e.id = a.event_id "
+                        "WHERE e.project_id = ? AND e.project_seq <= ? "
+                        "ORDER BY a.created_at ASC, e.project_seq ASC, a.session_id ASC",
+                        (project_id, cursor),
+                    ).fetchall()
+                ],
+            }
+
     def _export_knowledge_assets(self, project_id: str) -> list[dict[str, Any]]:
         with self.database.connect() as connection:
             self._require_project(connection, project_id)
@@ -10219,20 +10274,34 @@ class AgentChatRoomService:
                 break
             events.extend(current)
             after = current[-1]["project_seq"]
+        writes = self._export_room_writes(project_id, cursor)
+        leases = self.list_leases(project_id, include_inactive=True)
+        assets = self._export_knowledge_assets(project_id)
         return {
-            "export_schema_version": 1,
+            "export_schema_version": 2,
             "exported_at": iso_now(),
             "project": snapshot["project"],
             "members": snapshot["members"],
             "cursor": cursor,
             "agents": snapshot["agents"],
             "tasks": snapshot["tasks"],
-            "leases": self.list_leases(project_id, include_inactive=True),
-            "reports": snapshot["reports"],
-            "reviews": snapshot["reviews"],
-            "acknowledgements": snapshot["acknowledgements"],
-            "knowledge_assets": self._export_knowledge_assets(project_id),
+            "leases": leases,
+            "reports": writes["reports"],
+            "reviews": writes["reviews"],
+            "acknowledgements": writes["acknowledgements"],
+            "knowledge_assets": assets,
             "events": events,
+            "counts": {
+                "members": len(snapshot["members"]),
+                "agents": len(snapshot["agents"]),
+                "tasks": len(snapshot["tasks"]),
+                "leases": len(leases),
+                "reports": len(writes["reports"]),
+                "reviews": len(writes["reviews"]),
+                "acknowledgements": len(writes["acknowledgements"]),
+                "knowledge_assets": len(assets),
+                "events": len(events),
+            },
         }
 
     # ------------------------------------------------------------------
