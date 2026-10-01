@@ -3910,6 +3910,24 @@ class AgentChatRoomService:
                         status_code=404,
                     )
                 host_id = workspace["host_id"]
+            elif host_id:
+                # A Session worktree reference is a foreign key, so an unknown
+                # host used to reach the INSERT and surface as a raw
+                # sqlite3.IntegrityError (HTTP 500 with a traceback) instead of
+                # the 404 the workspace branch gives for the same class of typo.
+                host = connection.execute(
+                    "SELECT id FROM hosts WHERE id = ?", (host_id,)
+                ).fetchone()
+                if host is None:
+                    raise DomainError(
+                        "host_not_found",
+                        "Host does not exist; register the workspace before joining",
+                        status_code=404,
+                        details={
+                            "host_id": host_id,
+                            "required_action": "register_workspace_or_omit_host_id",
+                        },
+                    )
             if credential_id:
                 credential = connection.execute(
                     """
@@ -4036,38 +4054,51 @@ class AgentChatRoomService:
                     }
                     for row in orphan_rows
                 ]
-            connection.execute(
-                """
-                INSERT INTO agent_sessions(
-                    id, project_id, member_id, agent_key, name, client, model, role, status, branch,
-                    worktree, host_id, workspace_id, credential_id,
-                    capabilities_json, metadata_json, token_hash,
-                    token_expires_at, created_at, last_heartbeat
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'online', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    session_id,
-                    project_id,
-                    member_id,
-                    canonical_agent_key,
-                    name.strip(),
-                    client.strip(),
-                    model.strip(),
-                    role.strip() or "executor",
-                    clean_branch,
-                    clean_worktree,
-                    host_id,
-                    workspace_id,
-                    credential_id,
-                    json_dump(capabilities or {}),
-                    json_dump(metadata or {}),
-                    hashlib.sha256(token.encode()).hexdigest(),
-                    token_expires_at,
-                    now,
-                    now,
-                ),
-            )
-            # One durable software identity may have several concurrent client
+            try:
+                connection.execute(
+                    """
+                    INSERT INTO agent_sessions(
+                        id, project_id, member_id, agent_key, name, client, model, role, status, branch,
+                        worktree, host_id, workspace_id, credential_id,
+                        capabilities_json, metadata_json, token_hash,
+                        token_expires_at, created_at, last_heartbeat
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'online', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        session_id,
+                        project_id,
+                        member_id,
+                        canonical_agent_key,
+                        name.strip(),
+                        client.strip(),
+                        model.strip(),
+                        role.strip() or "executor",
+                        clean_branch,
+                        clean_worktree,
+                        host_id,
+                        workspace_id,
+                        credential_id,
+                        json_dump(capabilities or {}),
+                        json_dump(metadata or {}),
+                        hashlib.sha256(token.encode()).hexdigest(),
+                        token_expires_at,
+                        now,
+                        now,
+                    ),
+                )
+
+            except sqlite3.IntegrityError as error:
+                # Every reference has been resolved above, so a violation here
+                # is an unforeseen constraint: answer with the domain vocabulary
+                # rather than a bare traceback through the adapter.
+                raise DomainError(
+                    "invalid_join_reference",
+                    "The Session could not be created against these references",
+                    status_code=409,
+                    details={
+                        "required_action": "register_the_workspace_or_credential_first"
+                    },
+                ) from error            # One durable software identity may have several concurrent client
             # conversations. Session ownership is intentionally independent:
             # joining a new conversation must not close another connection or
             # silently move its tasks and leases.
