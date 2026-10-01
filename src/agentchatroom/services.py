@@ -1767,6 +1767,10 @@ class AgentChatRoomService:
             "last_seen": last_seen,
         }
 
+    def min_agent_token_ttl_seconds(self) -> int:
+        """Smallest Agent-token lifetime this deployment accepts."""
+        return int(getattr(self.settings, "min_agent_token_ttl_seconds", 300))
+
     def _host_dict(self, row: Mapping[str, Any]) -> dict[str, Any]:
         data = dict(row)
         data["metadata"] = json_load(data.pop("metadata_json"), {})
@@ -3206,12 +3210,14 @@ class AgentChatRoomService:
             if expires_in_seconds is None
             else expires_in_seconds
         )
-        if not 300 <= ttl <= self.settings.max_agent_token_ttl_seconds:
+        if not self.min_agent_token_ttl_seconds() <= ttl <= (
+            self.settings.max_agent_token_ttl_seconds
+        ):
             raise DomainError(
                 "invalid_agent_token_ttl",
                 "Agent token TTL is outside the configured range",
                 details={
-                    "minimum": 300,
+                    "minimum": self.min_agent_token_ttl_seconds(),
                     "maximum": self.settings.max_agent_token_ttl_seconds,
                 },
             )
@@ -3468,12 +3474,14 @@ class AgentChatRoomService:
         *,
         extend_by_seconds: int,
     ) -> dict[str, Any]:
-        if not 300 <= extend_by_seconds <= self.settings.max_agent_token_ttl_seconds:
+        if not self.min_agent_token_ttl_seconds() <= extend_by_seconds <= (
+            self.settings.max_agent_token_ttl_seconds
+        ):
             raise DomainError(
                 "invalid_agent_token_extension",
                 "Agent token extension is outside the configured range",
                 details={
-                    "minimum": 300,
+                    "minimum": self.min_agent_token_ttl_seconds(),
                     "maximum": self.settings.max_agent_token_ttl_seconds,
                 },
             )
@@ -3558,12 +3566,14 @@ class AgentChatRoomService:
             if expires_in_seconds is None
             else expires_in_seconds
         )
-        if not 300 <= ttl <= self.settings.max_agent_token_ttl_seconds:
+        if not self.min_agent_token_ttl_seconds() <= ttl <= (
+            self.settings.max_agent_token_ttl_seconds
+        ):
             raise DomainError(
                 "invalid_agent_token_ttl",
                 "Agent token TTL is outside the configured range",
                 details={
-                    "minimum": 300,
+                    "minimum": self.min_agent_token_ttl_seconds(),
                     "maximum": self.settings.max_agent_token_ttl_seconds,
                 },
             )

@@ -72,6 +72,7 @@ CONFIG_FILE_SCHEMA: dict[str, dict[str, tuple[type, ...]]] = {
     "security": {
         "agent_token_ttl_seconds": (int,),
         "max_agent_token_ttl_seconds": (int,),
+        "min_agent_token_ttl_seconds": (int,),
         "mcp_http_auth_required": (bool,),
         "management_auth_required": (bool,),
         "management_token_env": (str,),
@@ -195,6 +196,7 @@ class Settings:
     database_connect_timeout_seconds: float = 10.0
     agent_token_ttl_seconds: int = 2592000
     max_agent_token_ttl_seconds: int = 31536000
+    min_agent_token_ttl_seconds: int = 300
     mcp_http_auth_required: bool = True
     management_auth_required: bool = False
     management_token_env: str = "AGENTCHATROOM_ADMIN_TOKEN"
@@ -412,6 +414,9 @@ def _merge_toml(path: Path) -> dict[str, Any]:
         "max_agent_token_ttl_seconds": raw.get("security", {}).get(
             "max_agent_token_ttl_seconds"
         ),
+        "min_agent_token_ttl_seconds": raw.get("security", {}).get(
+            "min_agent_token_ttl_seconds"
+        ),
         "mcp_http_auth_required": raw.get("security", {}).get(
             "mcp_http_auth_required"
         ),
@@ -568,6 +573,12 @@ def load_settings(
             os.getenv(
                 "AGENTCHATROOM_MAX_AGENT_TOKEN_TTL_SECONDS",
                 file_values.get("max_agent_token_ttl_seconds", 31536000),
+            )
+        ),
+        "min_agent_token_ttl_seconds": int(
+            os.getenv(
+                "AGENTCHATROOM_MIN_AGENT_TOKEN_TTL_SECONDS",
+                file_values.get("min_agent_token_ttl_seconds", 300),
             )
         ),
         "mcp_http_auth_required": environment_bool(
@@ -862,8 +873,12 @@ def load_settings(
         )
     if values["session_token_ttl_seconds"] < values["heartbeat_timeout_seconds"]:
         raise ValueError("session token TTL must not be less than heartbeat timeout")
-    if values["agent_token_ttl_seconds"] < 300:
-        raise ValueError("Agent token TTL must be at least 300 seconds")
+    if values["min_agent_token_ttl_seconds"] < 1:
+        raise ValueError("minimum Agent token TTL must be at least 1 second")
+    if values["agent_token_ttl_seconds"] < values["min_agent_token_ttl_seconds"]:
+        raise ValueError(
+            "Agent token TTL must not be less than min_agent_token_ttl_seconds"
+        )
     if values["max_agent_token_ttl_seconds"] < values["agent_token_ttl_seconds"]:
         raise ValueError("max Agent token TTL must not be less than the default")
     if values["management_session_ttl_seconds"] < 300:

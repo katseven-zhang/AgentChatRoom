@@ -508,6 +508,7 @@ def test_every_config_file_schema_key_maps_into_settings(monkeypatch, tmp_path):
         "security": {
             "agent_token_ttl_seconds": 3600,
             "max_agent_token_ttl_seconds": 7200,
+            "min_agent_token_ttl_seconds": 60,
             "mcp_http_auth_required": False,
             "management_auth_required": False,
             "management_token_env": "ROOM_TEST_ADMIN_TOKEN",

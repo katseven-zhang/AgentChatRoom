@@ -52,6 +52,7 @@ inject_max_chars = 12000
 [security]
 agent_token_ttl_seconds = 2592000
 max_agent_token_ttl_seconds = 31536000
+min_agent_token_ttl_seconds = 300
 mcp_http_auth_required = true
 management_auth_required = true
 management_token_env = "AGENTCHATROOM_ADMIN_TOKEN"
