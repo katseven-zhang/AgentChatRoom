@@ -339,6 +339,20 @@ def _tail_text_lines(
     return lines[-limit:], truncated
 
 
+def bearer_token(authorization: str) -> str:
+    """Extract a bearer credential, accepting any spelling of the scheme.
+
+    RFC 7235 defines the scheme as case-insensitive, and the two authentication
+    entry points used to disagree about it: management required the literal
+    "Bearer " while the event stream accepted any case, so the same valid
+    lowercase header was a 401 on one path and accepted on the other.
+    """
+    text = str(authorization or "").strip()
+    if text.lower().startswith("bearer "):
+        return text[len("bearer ") :].strip()
+    return ""
+
+
 def _same_origin_browser_request(request: Request) -> bool:
     """Did the browser itself send this from the app's own page?
 
@@ -1211,10 +1225,8 @@ def create_app(
         """The credential checks that need no database access."""
         if not resolved.management_auth_required:
             return True
-        authorization = request.headers.get("authorization", "")
-        return authorization.startswith("Bearer ") and hmac.compare_digest(
-            authorization.removeprefix("Bearer "), management_token
-        )
+        token = bearer_token(request.headers.get("authorization", ""))
+        return bool(token) and hmac.compare_digest(token, management_token)
 
     def management_authenticated(request: Request) -> bool:
         """Synchronous check for the endpoints that already run off the loop."""
@@ -1291,11 +1303,7 @@ def create_app(
         ).strip()
         token = (request.headers.get("x-agentchatroom-token") or "").strip()
         authorization = request.headers.get("authorization", "")
-        bearer = (
-            authorization[7:].strip()
-            if authorization.lower().startswith("bearer ")
-            else ""
-        )
+        bearer = bearer_token(authorization)
         if session_id and not token:
             token = bearer
         if session_id and token:
