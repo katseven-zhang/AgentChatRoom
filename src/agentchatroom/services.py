@@ -4201,7 +4201,24 @@ class AgentChatRoomService:
                 effective_after = int(session_row["last_read_cursor"])
 
         placeholders = ", ".join("?" for _ in MCP_CONTEXT_EVENT_TYPES)
-        if effective_after > 0:
+        # An incremental sync must deliver from the read cursor forwards, one
+        # contiguous window at a time. Taking the newest `limit` rows and then
+        # advancing the cursor to the project head marked every older
+        # not-yet-shown message as read, so a burst of traffic bigger than the
+        # window was silently swallowed - including requires_ack messages, which
+        # the whole acknowledgement loop depends on being seen.
+        incremental = not initial_inject and effective_after > 0
+        if incremental:
+            query = f"""
+                SELECT * FROM events
+                WHERE project_id = ?
+                  AND event_type IN ({placeholders})
+                  AND project_seq > ?
+                ORDER BY project_seq ASC
+                LIMIT ?
+            """
+            params = (project_id, *MCP_CONTEXT_EVENT_TYPES, effective_after, limit)
+        elif effective_after > 0:
             query = f"""
                 SELECT * FROM events
                 WHERE project_id = ?
@@ -4222,17 +4239,41 @@ class AgentChatRoomService:
             params = (project_id, *MCP_CONTEXT_EVENT_TYPES, limit)
 
         rows = connection.execute(query, params).fetchall()
-        events = [self._event_dict(row, connection) for row in reversed(rows)]
+        events = [
+            self._event_dict(row, connection)
+            for row in (rows if incremental else reversed(rows))
+        ]
         latest = connection.execute(
             "SELECT COALESCE(MAX(project_seq), 0) AS cursor FROM events WHERE project_id = ?",
             (project_id,),
         ).fetchone()["cursor"]
-        cursor = latest if (initial_inject or effective_after <= 0) else max(after, latest)
+        if incremental:
+            delivered_through = max(
+                (int(event["project_seq"]) for event in events),
+                default=effective_after,
+            )
+            cursor = max(int(after or 0), effective_after, delivered_through)
+            # A real existence probe, not a window heuristic: the caller needs
+            # to know whether more context is still waiting behind the cursor.
+            remaining = connection.execute(
+                f"""
+                SELECT COUNT(*) AS n FROM events
+                WHERE project_id = ?
+                  AND event_type IN ({placeholders})
+                  AND project_seq > ?
+                """,
+                (project_id, *MCP_CONTEXT_EVENT_TYPES, cursor),
+            ).fetchone()["n"]
+        else:
+            cursor = latest
+            remaining = 0
         return {
             "events": events,
             "messages": events,
             "cursor": int(cursor),
             "latest_cursor": int(latest),
+            "has_more": int(remaining) > 0,
+            "next_after": int(cursor),
         }
 
     def verify_session(
