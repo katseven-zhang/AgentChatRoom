@@ -3168,13 +3168,24 @@ class AgentChatRoomService:
     ) -> dict[str, Any]:
         if not name.strip():
             raise DomainError("invalid_agent_token", "Agent token name is required")
-        selected = sorted(set(permissions or DEFAULT_AGENT_PERMISSIONS))
-        unknown = sorted(set(selected) - AGENT_PERMISSIONS)
-        if unknown:
+        if permissions is None:
+            selected = sorted(DEFAULT_AGENT_PERMISSIONS)
+            unknown: list[str] = []
+        else:
+            # An empty list is an explicit "no permissions", not an omitted
+            # field: treating it as unset silently minted a token holding every
+            # default permission, the opposite of the request, and the issue
+            # event recorded the escalated set as if it had been asked for.
+            selected = sorted(set(permissions))
+            unknown = sorted(set(selected) - AGENT_PERMISSIONS)
+        if not selected or unknown:
             raise DomainError(
                 "invalid_agent_permissions",
-                "Agent token contains unsupported permissions",
-                details={"unknown": unknown},
+                "Agent token permissions must contain only supported values",
+                details={
+                    "unknown": unknown,
+                    "required_action": "pass_supported_permissions_or_omit_the_field",
+                },
             )
         ttl = (
             self.settings.agent_token_ttl_seconds
