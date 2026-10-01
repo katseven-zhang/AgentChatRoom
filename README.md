@@ -899,6 +899,15 @@ Windows 与 Ubuntu 上依次跑 `pytest` → `node --check` → `compileall` →
   请求成本随返回行数而不是文件大小增长；`server.pid` 也改为容错读取，内容不是纯数字
   （半写入、被别的进程占位、含非 ASCII 字节）时按「未托管」处理而不再抛 UnicodeDecodeError 变成 500。
   真正的写入端轮转/上限仍未落地，属于独立事项，不并入本条已修复范围。
+- **连接等待两个后端同源**：`database.connect_timeout_seconds`（默认 10 秒）此前只作用于
+  PostgreSQL，SQLite 侧在 `sqlite3.connect(timeout=…)` 与 `PRAGMA busy_timeout` 两处各硬编一份 10；
+  现在两处都由该配置派生（SQLite 的「连接等待」就是驱动的 busy 等待，二者必须同源），
+  恢复流程里第三份硬编码 `timeout=10` 也改读同一配置。
+  另外，连接建立期的 PRAGMA 失败（例如恢复流程另一连接持 `locking_mode=EXCLUSIVE` 时
+  `journal_mode=WAL` 被拒）现在会先关闭已打开的句柄再抛结构化 `DomainError`
+  （锁竞争 → `database_write_contended` 503，其它 → `database_unavailable` 503），不再泄漏句柄、
+  也不再让裸 `sqlite3.OperationalError` 逃出适配层变成 500；`journal_mode=WAL` 在配置等待窗口内
+  带 50ms 退避重试，使 GUI 与 stdio bridge 同时冷启动时初始化不会直接失败。
 
 测试夹具必须包含 Windows 路径、内网地址或 id 形状字符串时，使用行级
 `# audit-allow:<rule>` 或模块首三行内的 `# audit-allow-file:<rules>` 显式声明豁免，

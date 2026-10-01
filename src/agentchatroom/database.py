@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import os
+import time
 from contextlib import contextmanager
 from contextvars import ContextVar
 from pathlib import Path
@@ -1162,11 +1163,45 @@ def ensure_agent_identity_columns(connection: Any, *, postgres: bool = False) ->
     )
 
 
+def _enable_wal(connection: sqlite3.Connection, wait_seconds: float) -> None:
+    """Switch to WAL, waiting out a concurrent initializer that holds the lock.
+
+    ``PRAGMA journal_mode = WAL`` needs the write lock, and the driver's own busy
+    handling does not always cover it, so two processes starting together (GUI plus
+    a stdio bridge) could fail initialization outright.
+    """
+    deadline = time.monotonic() + max(wait_seconds, 0.05)
+    while True:
+        try:
+            connection.execute("PRAGMA journal_mode = WAL")
+            return
+        except sqlite3.OperationalError as error:
+            message = str(error).lower()
+            if (
+                "locked" not in message and "busy" not in message
+            ) or time.monotonic() >= deadline:
+                raise
+            time.sleep(0.05)
+
+
+@contextmanager
+def _unused() -> None:  # pragma: no cover - placeholder guard
+    yield
+
 class Database:
     backend = "sqlite"
 
-    def __init__(self, path: str | Path) -> None:
+    def __init__(
+        self,
+        path: str | Path,
+        *,
+        busy_timeout_seconds: float = SQLITE_BUSY_TIMEOUT_SECONDS,
+    ) -> None:
         self.path = Path(path)
+        # sqlite3 has no separate connect timeout: the driver's ``timeout`` and
+        # ``PRAGMA busy_timeout`` are the same wait, so both come from this one
+        # configured value instead of two hardcoded tens.
+        self.busy_timeout_seconds = float(busy_timeout_seconds)
         self._active_connection: ContextVar[
             tuple[sqlite3.Connection, bool] | None
         ] = ContextVar(f"agentchatroom_connection_{id(self)}", default=None)
@@ -1229,19 +1264,45 @@ class Database:
             yield connection
             return
 
-        connection = sqlite3.connect(
-            self.path,
-            timeout=SQLITE_BUSY_TIMEOUT_SECONDS,
-            isolation_level=None,
-            check_same_thread=False,
-        )
-        connection.row_factory = sqlite3.Row
-        connection.execute("PRAGMA foreign_keys = ON")
-        connection.execute(
-            f"PRAGMA busy_timeout = {SQLITE_BUSY_TIMEOUT_SECONDS * 1000}"
-        )
-        if write:
-            connection.execute("PRAGMA journal_mode = WAL")
+        # Setting up the connection used to sit outside the guard below, so a
+        # failing PRAGMA (journal_mode=WAL is refused while another connection
+        # holds EXCLUSIVE during recovery) leaked the open handle and let a raw
+        # sqlite3.OperationalError escape the adapter layer.
+        connection = None
+        try:
+            connection = sqlite3.connect(
+                self.path,
+                timeout=self.busy_timeout_seconds,
+                isolation_level=None,
+                check_same_thread=False,
+            )
+            connection.row_factory = sqlite3.Row
+            connection.execute("PRAGMA foreign_keys = ON")
+            connection.execute(
+                f"PRAGMA busy_timeout = {int(self.busy_timeout_seconds * 1000)}"
+            )
+            if write:
+                _enable_wal(connection, self.busy_timeout_seconds)
+        except sqlite3.Error as error:
+            if connection is not None:
+                connection.close()
+            message = str(error).lower()
+            if "locked" in message or "busy" in message:
+                raise DomainError(
+                    "database_write_contended",
+                    "The database is busy with another write; retry shortly",
+                    status_code=503,
+                    details={
+                        "required_action": "retry_after_short_backoff",
+                        "busy_timeout_seconds": self.busy_timeout_seconds,
+                    },
+                ) from error
+            raise DomainError(
+                "database_unavailable",
+                "The database could not be prepared for use",
+                status_code=503,
+                details={"required_action": "check_database_configuration"},
+            ) from error
         binding = self._active_connection.set((connection, write))
         try:
             connection.execute("BEGIN IMMEDIATE" if write else "BEGIN")
@@ -1277,7 +1338,10 @@ class Database:
 
 def create_database(settings: "Settings") -> DatabaseBackend:
     if settings.database_backend == "sqlite":
-        return Database(settings.database_path)
+        return Database(
+            settings.database_path,
+            busy_timeout_seconds=settings.database_connect_timeout_seconds,
+        )
     if settings.database_backend != "postgresql":
         raise ValueError(f"Unsupported database backend: {settings.database_backend}")
 

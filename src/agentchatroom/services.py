@@ -10529,9 +10529,18 @@ class AgentChatRoomService:
                 # Hold process mutex + SQLite EXCLUSIVE locking from the stale
                 # check through the page copy so concurrent writers cannot land
                 # in the window that allow_data_loss=False claims is empty.
-                live_connection = sqlite3.connect(self.database.path, timeout=10.0)
+                # Same configured wait the adapter layer uses; this used to be a
+                # third copy of a hardcoded 10 seconds.
+                sqlite_wait_seconds = float(
+                    self.settings.database_connect_timeout_seconds
+                )
+                live_connection = sqlite3.connect(
+                    self.database.path, timeout=sqlite_wait_seconds
+                )
                 try:
-                    live_connection.execute("PRAGMA busy_timeout=10000")
+                    live_connection.execute(
+                        f"PRAGMA busy_timeout={int(sqlite_wait_seconds * 1000)}"
+                    )
                     live_connection.execute("PRAGMA locking_mode=EXCLUSIVE")
                     row = live_connection.execute(
                         "SELECT COALESCE(MAX(id), 0) AS latest FROM events"
