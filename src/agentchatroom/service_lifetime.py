@@ -17,6 +17,48 @@ def _lock(handle, *, release=False):
         fcntl.flock(handle, fcntl.LOCK_UN if release else fcntl.LOCK_EX | fcntl.LOCK_NB)
 
 
+def _blocking_lock(handle, *, release=False):
+    handle.seek(0)
+    if os.name == "nt":
+        import msvcrt
+        msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK if release else msvcrt.LK_LOCK, 1)
+        return
+    import fcntl
+    fcntl.flock(handle, fcntl.LOCK_UN if release else fcntl.LOCK_EX)
+
+
+@contextmanager
+def exclusive_file_lock(path):
+    """Wait for an advisory lock held on a sidecar file of ``path``.
+
+    Readers that mutate a file in place must not race with each other; the
+    sidecar keeps the lock off the file that is being replaced.
+    """
+    lock_path = path.with_name(f"{path.name}.lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+    with os.fdopen(descriptor, "r+b") as handle:
+        if handle.seek(0, 2) == 0:
+            handle.write(b"1")
+            handle.flush()
+        try:
+            _blocking_lock(handle)
+        except OSError as error:
+            raise DomainError(
+                "file_lock_contended",
+                f"Another process is still holding {lock_path.name}",
+                status_code=503,
+                details={
+                    "required_action": "retry_after_other_writer_finishes",
+                    "lock_file": str(lock_path),
+                },
+            ) from error
+        try:
+            yield
+        finally:
+            _blocking_lock(handle, release=True)
+
+
 @contextmanager
 def running_service(settings):
     settings.data_dir.mkdir(parents=True, exist_ok=True)

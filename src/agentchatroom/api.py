@@ -23,7 +23,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from starlette.datastructures import MutableHeaders
 
 from . import __version__
-from .config import Settings, load_settings
+from .config import Settings, load_settings, rewrite_config_text
 from .database import create_database
 from .desktop import DirectoryPickerUnavailable, pick_directory
 from .errors import DomainError
@@ -2143,11 +2143,11 @@ def create_app(
             if resolved.config_path
             else Path(resolved.data_dir) / "config.toml"
         )
-        existing_text = target.read_text(encoding="utf-8") if target.is_file() else ""
         applied = {key: value for key, value in updates.items() if value is not None}
-        updated_text = upsert_toml_section(existing_text, "backup", applied)
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(updated_text, encoding="utf-8")
+        rewrite_config_text(
+            target,
+            lambda current: upsert_toml_section(current, "backup", applied),
+        )
         backup_settings_override.update(applied)
         payload = _backup_settings_payload()
         # 保留份数立即生效：保存即按新上限清理现存备份，无需等下一次备份。

@@ -29,7 +29,8 @@ from .cli import (
     start_detached_server,
     stop_detached_server,
 )
-from .config import Settings, default_data_dir, load_settings
+from .config import Settings, default_data_dir, load_settings, rewrite_config_text
+from .errors import DomainError
 from .gui_autostart import GuiInstanceGuard, LoginStartup
 from .gui_event_log import RoomEventTail, format_service_line, sanitize_gui_text
 
@@ -211,29 +212,44 @@ def update_config_values(
 ) -> None:
     """Persist the chosen host/port into the local config file for later launches."""
     config_path = Path(config_path)
-    document: dict[str, dict[str, Any]] = {}
-    if config_path.exists():
-        with config_path.open("rb") as handle:
-            loaded = tomllib.load(handle)
-        document = {name: dict(values) for name, values in loaded.items()}
-    server = dict(document.get("server", {}))
-    if host is not None:
-        server["host"] = host
-    if port is not None:
-        server["port"] = port
-    rebuilt: dict[str, dict[str, Any]] = {}
-    for name, values in document.items():
-        rebuilt[name] = server if name == "server" else values
-    if "server" not in rebuilt:
-        rebuilt["server"] = server
-    lines: list[str] = []
-    for name, values in rebuilt.items():
-        lines.append(f"[{name}]")
-        for key, value in values.items():
-            lines.append(f"{key} = {_format_toml_value(value)}")
-        lines.append("")
-    config_path.parent.mkdir(parents=True, exist_ok=True)
-    config_path.write_text("\n".join(lines), encoding="utf-8")
+
+    def build(_current: str) -> str:
+        document: dict[str, dict[str, Any]] = {}
+        if config_path.exists():
+            with config_path.open("rb") as handle:
+                try:
+                    loaded = tomllib.load(handle)
+                except tomllib.TOMLDecodeError as error:
+                    raise DomainError(
+                        "config_file_unparsable",
+                        "The saved configuration cannot be read; repair or remove it first",
+                        status_code=409,
+                        details={
+                            "required_action": "restore_config_from_backup_or_delete_it",
+                            "config_path": str(config_path),
+                            "toml_error": str(error),
+                        },
+                    ) from error
+            document = {name: dict(values) for name, values in loaded.items()}
+        server = dict(document.get("server", {}))
+        if host is not None:
+            server["host"] = host
+        if port is not None:
+            server["port"] = port
+        rebuilt: dict[str, dict[str, Any]] = {}
+        for name, values in document.items():
+            rebuilt[name] = server if name == "server" else values
+        if "server" not in rebuilt:
+            rebuilt["server"] = server
+        lines: list[str] = []
+        for name, values in rebuilt.items():
+            lines.append(f"[{name}]")
+            for key, value in values.items():
+                lines.append(f"{key} = {_format_toml_value(value)}")
+            lines.append("")
+        return "\n".join(lines)
+
+    rewrite_config_text(config_path, build)
 
 
 def update_config_port(config_path: Path, port: int) -> None:

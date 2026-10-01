@@ -2,13 +2,17 @@ from __future__ import annotations
 
 import os
 import sys
+import threading
 import tomllib
+import uuid
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 from urllib.parse import urlparse
 
 from .contracts import KNOWLEDGE_DEFAULT_KINDS, KNOWLEDGE_KIND_PATTERN
+from .errors import DomainError
+from .service_lifetime import exclusive_file_lock
 
 
 CONFIG_FILE_SCHEMA: dict[str, dict[str, tuple[type, ...]]] = {
@@ -971,3 +975,58 @@ def load_settings(
     if not 1 <= values["mcp_message_limit"] <= 10:
         raise ValueError("mcp_message_limit must be between 1 and 10")
     return Settings(**values)
+
+
+_THREAD_CONFIG_LOCKS: dict[str, threading.Lock] = {}
+_THREAD_CONFIG_LOCKS_GUARD = threading.Lock()
+
+
+def _thread_lock_for(path: Path) -> threading.Lock:
+    key = str(Path(path).resolve(strict=False))
+    with _THREAD_CONFIG_LOCKS_GUARD:
+        return _THREAD_CONFIG_LOCKS.setdefault(key, threading.Lock())
+
+
+def atomic_write_text(path: Path, text: str) -> None:
+    """Replace a file in one step so an interrupt cannot leave half of it."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
+    try:
+        with temporary.open("w", encoding="utf-8", newline="\n") as handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    except BaseException:
+        temporary.unlink(missing_ok=True)
+        raise
+
+
+def rewrite_config_text(path: Path, build: Callable[[str], str]) -> str:
+    """Read-modify-write a configuration file without a torn or lost update.
+
+    ``build`` receives the current text and returns the replacement, which is
+    parsed back before it may replace the real file: a generator bug or a
+    hand-corrupted config can then never persist a file the service cannot
+    start from.
+    """
+    path = Path(path)
+    with _thread_lock_for(path), exclusive_file_lock(path):
+        current = path.read_text(encoding="utf-8") if path.is_file() else ""
+        updated = build(current)
+        try:
+            tomllib.loads(updated)
+        except tomllib.TOMLDecodeError as error:
+            raise DomainError(
+                "config_file_unparsable",
+                "Refusing to save a configuration file that cannot be read back",
+                status_code=409,
+                details={
+                    "required_action": "fix_the_config_generator_or_restore_a_backup",
+                    "config_path": str(path),
+                    "toml_error": str(error),
+                },
+            ) from error
+        atomic_write_text(path, updated)
+    return updated

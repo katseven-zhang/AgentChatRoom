@@ -284,6 +284,8 @@ Linux 或 macOS：
 
 根目录的 `config.example.toml` 是本地配置示例。复制为 `.agentchatroom/runtime/config.toml` 后再按需修改；不要把含 Secret 的实际配置复制回仓库。
 
+程序自己写 `config.toml` 只有两条路径，二者共用同一套安全写入（`rewrite_config_text`）：Web 管理端 `PUT /api/v1/admin/backup-settings` 写 `[backup]`，GUI 保存 host/port 重建 `[server]`。规则是：先按文件路径取**进程内锁 + 同目录 `config.toml.lock` 的跨进程建议锁**，在锁内读当前文本、生成新文本、把新文本再解析一遍（解析不过就返回 `config_file_unparsable` 并保持原文件不动，绝不把读不回来的内容覆盖上去），最后写临时文件、`fsync`、`os.replace` 一步替换。因此保存中途被中断（进程被杀、断电、磁盘错误）只会留下原配置和一个被清理掉的临时文件，不会出现半截 TOML 导致服务再也起不来；两个写入方也不会因为「读—改—写」互相覆盖而丢掉对方那一段。已有的 `config.toml` 若已损坏，GUI 会得到 `config_file_unparsable` 与 `required_action`，而不是一个 traceback。
+
 ## 浏览器基本使用
 
 1. 打开 Web 管理端并创建 Project。
