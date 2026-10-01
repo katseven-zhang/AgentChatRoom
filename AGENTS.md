@@ -9,6 +9,7 @@
 - Reuse the same domain service from REST, MCP, and CLI adapters.
 - Every behavior change must update `README.md` when public behavior changes and add or update tests.
 - Treat task completion and independent verification as separate states.
+- No blocking database work on the ASGI event loop: every `api.py` middleware or `async def` request path that reads or writes the database goes through `asyncio.to_thread` (precedents: #184 snapshot polling, #271 management-cookie authentication). A synchronous query there serialises SSE and MCP-over-HTTP for every client.
 - Preserve append-only event history; derived state may change, historical events may not be rewritten.
 - Keep proof from isolated upstream POCs separate from proof for the AgentChatRoom mainline.
 
