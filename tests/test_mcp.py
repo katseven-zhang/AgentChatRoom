@@ -387,6 +387,9 @@ def test_mcp_project_member_tools_share_the_domain_service(
     listed = mcp_server.member_list(project_id)
     assert listed["ok"] is True
     assert any(item["id"] == member_id for item in listed["result"])
+    # #268: member:write is a coarse default capability and is not a licence to
+    # rewrite or revoke somebody else's durable identity. The MCP tools delegate
+    # to the shared domain service, which now refuses the cross-member write.
     updated = mcp_server.member_update(
         project_id,
         member_id,
@@ -394,14 +397,21 @@ def test_mcp_project_member_tools_share_the_domain_service(
         actor_session_id=joined["agent"]["id"],
         token=joined["token"],
     )
-    assert updated["result"]["member"]["status"] == "suspended"
+    assert updated["ok"] is False
+    assert updated["error"]["code"] == "management_auth_required"
     revoked = mcp_server.member_revoke(
         project_id,
         member_id,
         actor_session_id=joined["agent"]["id"],
         token=joined["token"],
     )
-    assert revoked["result"]["member"]["status"] == "revoked"
+    assert revoked["ok"] is False
+    assert revoked["error"]["code"] == "management_auth_required"
+    still = mcp_server.member_list(project_id)
+    assert any(
+        item["id"] == member_id and item["status"] == "active"
+        for item in still["result"]
+    )
 
 
 def test_mcp_task_intake_supports_offline_targets_and_rejects_revoked(
@@ -431,7 +441,9 @@ def test_mcp_task_intake_supports_offline_targets_and_rejects_revoked(
     )
     service.leave_session(project["id"], offline["agent"]["id"], offline["token"])
     service.leave_session(project["id"], revoked["agent"]["id"], revoked["token"])
-    service.revoke_project_member(project["id"], revoked["agent"]["member_id"])
+    service.revoke_project_member(
+        project["id"], revoked["agent"]["member_id"], management_authorized=True
+    )
 
     targets = mcp_server.task_intake_targets(project["id"])
     assert targets["ok"] is True

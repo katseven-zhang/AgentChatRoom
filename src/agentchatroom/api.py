@@ -536,6 +536,10 @@ class ProjectMemberUpdate(StrictModel):
     role: str | None = None
     status: Literal["invited", "active", "suspended", "revoked"] | None = None
     metadata: dict[str, Any] | None = None
+    # An Agent maintaining its own roster entry proves its identity here;
+    # anything beyond that has to come through the management surface.
+    actor_session_id: str = ""
+    token: str = ""
 
 
 class WorkspaceRegister(StrictModel):
@@ -1768,10 +1772,18 @@ def create_app(
         member_id: str,
         body: ProjectMemberUpdate,
     ) -> dict[str, Any]:
+        _reject_credentials_in_query(request)
+        payload = body.model_dump(exclude_unset=True)
+        # Roster writes change durable software identities: either the caller
+        # proves it is that member, or it is a management request.
+        management = not str(payload.get("actor_session_id") or "").strip()
+        if management:
+            _require_management(request)
         return service.update_project_member(
             project_id,
             member_id,
-            **body.model_dump(exclude_unset=True),
+            **payload,
+            management_authorized=management,
             request_id=request.state.request_id,
         )
 
@@ -1781,9 +1793,11 @@ def create_app(
         project_id: str,
         member_id: str,
     ) -> dict[str, Any]:
+        _require_management(request)
         return service.revoke_project_member(
             project_id,
             member_id,
+            management_authorized=True,
             request_id=request.state.request_id,
         )
 

@@ -2670,11 +2670,37 @@ class AgentChatRoomService:
         metadata: dict[str, Any] | None = None,
         actor_session_id: str | None = None,
         token: str | None = None,
+        management_authorized: bool = False,
     ) -> dict[str, Any]:
         with self.database.connect(write=True) as connection:
             member = self._require_member(connection, project_id, member_id)
             if actor_session_id:
-                self._authenticate(connection, project_id, actor_session_id, token or "")
+                actor = self._authenticate(
+                    connection, project_id, actor_session_id, token or ""
+                )
+                # member:write is a coarse capability that the default Agent
+                # credential bundle carries; it is not a licence to rewrite or
+                # revoke somebody else's durable identity. An Agent may maintain
+                # its own member record, and anything beyond that has to arrive
+                # through an authenticated management request.
+                actor_member_id = (
+                    actor["member_id"] if "member_id" in actor.keys() else None
+                )
+                if actor_member_id != member_id and not management_authorized:
+                    raise DomainError(
+                        "management_auth_required",
+                        "Updating or revoking another member's durable identity "
+                        "requires an authenticated management request",
+                        status_code=403,
+                        details={
+                            "required_action": "use_management_identity",
+                            "target_member_id": member_id,
+                        },
+                    )
+            elif not management_authorized:
+                raise _management_authorization_required(
+                    "update this project member"
+                )
             if member["status"] == "revoked" and status not in {None, "revoked"}:
                 raise DomainError(
                     "project_member_revoked",
@@ -2873,6 +2899,7 @@ class AgentChatRoomService:
         *,
         actor_session_id: str | None = None,
         token: str | None = None,
+        management_authorized: bool = False,
     ) -> dict[str, Any]:
         return self.update_project_member(
             project_id,
@@ -2880,6 +2907,7 @@ class AgentChatRoomService:
             status="revoked",
             actor_session_id=actor_session_id,
             token=token,
+            management_authorized=management_authorized,
         )
 
     def issue_agent_token(

@@ -20,9 +20,11 @@ def _join(service, project_id: str, key: str):
 
 
 def _revoke(service, project_id: str, member_id: str):
-    # No actor Session means the caller is the management surface, which is what
-    # revokes a member in REST/MCP/CLI.
-    return service.revoke_project_member(project_id, member_id)
+    # Revocation is a management action: no actor Session plus the explicit
+    # management flag, which is what the authenticated REST admin surface sends.
+    return service.revoke_project_member(
+        project_id, member_id, management_authorized=True
+    )
 
 
 def _setup(service, project_dir):

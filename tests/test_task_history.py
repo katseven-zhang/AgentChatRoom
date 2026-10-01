@@ -180,7 +180,7 @@ def test_task_history_keeps_revoked_member_name_and_missing_relations(service, p
         project["id"], task["id"], joined["agent"]["id"], joined["token"]
     )
     member_id = joined["agent"]["member_id"]
-    service.revoke_project_member(project["id"], member_id)
+    service.revoke_project_member(project["id"], member_id, management_authorized=True)
     page = service.list_task_history(project["id"], task["id"], limit=20)
     claimed = next(item for item in page["items"] if item["event_type"] == "task.claimed")
     assert claimed["actor"]["name"] == "Soon Revoked"

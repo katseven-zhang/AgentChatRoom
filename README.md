@@ -516,6 +516,8 @@ room_bootstrap
 | 已取消 → 任何状态 | — | — | 已取消是终态，转移表不再提供回 `todo` 的边 | `task_is_terminal` | 需要重做时新建替代任务，不重开原任务，避免无归属的 todo↔cancelled 静默跳态 |
 | → 待认领（重派） | `task_assign` + 目标确认 | 管理端/Agent | 目标身份已接入且未吊销（可离线） | `assignment_target_not_found`、`assignment_target_revoked`、`invalid_assignment_target` | pending 指派留痕，重连后可受理 |
 | owner → 交接给另一 Session | `task_handoff` | **当前 owner 本人凭据**；无凭据的调用必须由已认证管理端发起（REST 与 release/assign/update 共用同一 `_require_management` 门禁） | 任务已有 owner 且未取消 | `management_auth_required`、`not_task_owner`、`handoff_source_missing`、`invalid_handoff_target`、`handoff_already_pending` | `requested_by_session_id` 与事件 actor 记录真实发起人；只有真正的管理端发起才写 `requested_by:"manager"`。「未带凭据」不再等于 owner 权限，因此第三方无法借他人 owner 名义制造交接，再靠目标 accept 夺走任务并释放其租约 |
+| 成员资料维护（name/kind/role/status/metadata） | `member_update` / `PATCH /projects/{id}/members/{member_id}` | **该成员本人的凭据**（actor session 的 member_id 必须等于目标），或已认证管理端 | 目标成员存在且未吊销（吊销后不可重新激活） | `management_auth_required`、`project_member_revoked`、`invalid_project_member` | 粗粒度 `member:write` 不再等于可以改写任意身份；跨成员改写必须走管理身份并在审计中留痕 |
+| 成员吊销 | `member_revoke` / `DELETE /projects/{id}/members/{member_id}` | **已认证管理端**（REST 先 `_require_management`；Agent 只能吊销自己，跨身份吊销需管理身份） | 目标成员存在 | `management_auth_required` | 同一写事务内级联收权（Token/Session/租约），详见「成员吊销」行 |
 
 租约、验证证据与任务状态分别由各自领域服务维护；上表副作用中涉及的租约清理均调用同一租约服务。
 

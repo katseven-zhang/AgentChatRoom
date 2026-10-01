@@ -182,7 +182,9 @@ def test_revoked_member_is_kept_in_history_but_removed_from_current_roster(
     )
     service.leave_session(project["id"], offline["agent"]["id"], offline["token"])
     service.leave_session(project["id"], revoked["agent"]["id"], revoked["token"])
-    service.revoke_project_member(project["id"], revoked["agent"]["member_id"])
+    service.revoke_project_member(
+        project["id"], revoked["agent"]["member_id"], management_authorized=True
+    )
 
     snapshot = service.snapshot(project["id"])
     identities = {item["member_id"]: item for item in snapshot["agent_identities"]}
@@ -264,7 +266,9 @@ def test_same_name_join_is_allowed_after_old_member_is_revoked(service, project)
         client="opencode",
         model="unknown",
     )
-    service.revoke_project_member(project["id"], first["agent"]["member_id"])
+    service.revoke_project_member(
+        project["id"], first["agent"]["member_id"], management_authorized=True
+    )
     replacement = service.join_room(
         project["id"],
         agent_key="fresh-install",
@@ -876,6 +880,7 @@ def test_project_members_are_versioned_audited_and_linked_to_tokens(
         member["id"],
         status="suspended",
         role="reviewer",
+        management_authorized=True,
     )
     assert updated["member"]["status"] == "suspended"
     assert updated["member"]["role"] == "reviewer"
@@ -887,11 +892,11 @@ def test_project_members_are_versioned_audited_and_linked_to_tokens(
         )
     assert blocked.value.code == "project_member_inactive"
 
-    revoked = service.revoke_project_member(project["id"], member["id"])
+    revoked = service.revoke_project_member(project["id"], member["id"], management_authorized=True)
     assert revoked["member"]["status"] == "revoked"
     with pytest.raises(DomainError) as reactivated:
         service.update_project_member(
-            project["id"], member["id"], status="active"
+            project["id"], member["id"], status="active", management_authorized=True
         )
     assert reactivated.value.code == "project_member_revoked"
 
@@ -1315,6 +1320,7 @@ def test_member_assignment_rejects_revoked_unknown_or_never_joined_targets(
         project["id"],
         worker["agent"]["member_id"],
         status="revoked",
+        management_authorized=True,
     )
     with pytest.raises(DomainError) as revoked:
         service.assign_task(
