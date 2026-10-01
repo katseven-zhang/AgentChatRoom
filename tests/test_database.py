@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import sqlite3
 
+import pytest
+
 from agentchatroom.database import Database, SCHEMA, SCHEMA_VERSION
 
 
@@ -566,3 +568,104 @@ def test_database_migrates_v16_to_v17_intake_and_task_number(settings):
     assert "idx_tasks_project_task_number" in indexes
     assert "idx_task_intakes_project_status" in indexes
     assert numbers == {"task_alpha": 1, "task_beta": 2, "task_gamma": 3}
+
+
+def _scalar(path, sql):
+    with sqlite3.connect(path) as connection:
+        return connection.execute(sql).fetchone()[0]
+
+
+def test_statement_splitter_keeps_literals_and_handles_one_line_scripts():
+    from agentchatroom.database import _iter_statements
+
+    statements = list(
+        _iter_statements(
+            "CREATE TABLE a(x INTEGER DEFAULT '{}'); CREATE TABLE b(y TEXT DEFAULT 'a;b');"
+        )
+    )
+    assert len(statements) == 2
+    assert statements[0].startswith("CREATE TABLE a")
+    assert "'a;b'" in statements[1]
+
+    assert list(_iter_statements("   \n -- only a comment\n")) == []
+
+
+def test_a_failing_migration_leaves_nothing_behind_and_can_be_replayed(
+    tmp_path, monkeypatch
+):
+    """#285: executescript() committed the open transaction, so each statement
+    landed on its own and a halfway failure left a permanently unopenable
+    half-migrated schema behind."""
+    import agentchatroom.database as database_module
+
+    path = tmp_path / "atomic.db"
+    Database(path).initialize()
+    monkeypatch.setitem(
+        database_module.MIGRATIONS,
+        SCHEMA_VERSION,
+        "CREATE TABLE migration_probe_a(x INTEGER); "
+        "CREATE TABLE migration_probe_a(x INTEGER);",
+    )
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            "UPDATE schema_meta SET version = ?", (SCHEMA_VERSION - 1,)
+        )
+
+    with pytest.raises(sqlite3.OperationalError):
+        Database(path).initialize()
+
+    assert _scalar(path, "SELECT version FROM schema_meta") == SCHEMA_VERSION - 1
+    with sqlite3.connect(path) as connection:
+        tables = {
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            )
+        }
+    assert "migration_probe_a" not in tables
+
+    # The same database can now replay the migration it never applied.
+    monkeypatch.setitem(
+        database_module.MIGRATIONS,
+        SCHEMA_VERSION,
+        "CREATE TABLE migration_probe_a(x INTEGER);",
+    )
+    Database(path).initialize()
+    assert _scalar(path, "SELECT version FROM schema_meta") == SCHEMA_VERSION
+    assert _scalar(path, "SELECT COUNT(*) FROM migration_probe_a") == 0
+
+
+def test_schema_meta_is_kept_a_single_row(tmp_path):
+    path = tmp_path / "meta.db"
+    Database(path).initialize()
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            "INSERT INTO schema_meta(version) VALUES (?)", (SCHEMA_VERSION,)
+        )
+    assert _scalar(path, "SELECT COUNT(*) FROM schema_meta") == 2
+
+    Database(path).initialize()
+    assert _scalar(path, "SELECT COUNT(*) FROM schema_meta") == 1
+    assert _scalar(path, "SELECT version FROM schema_meta") == SCHEMA_VERSION
+
+
+def test_initialize_is_reentrant_and_idempotent(tmp_path):
+    path = tmp_path / "reentrant.db"
+    Database(path).initialize()
+    first = _scalar(path, "SELECT COUNT(*) FROM sqlite_master")
+    Database(path).initialize()
+    assert _scalar(path, "SELECT COUNT(*) FROM sqlite_master") == first
+    assert _scalar(path, "SELECT version FROM schema_meta") == SCHEMA_VERSION
+
+
+def test_concurrent_initialization_converges(tmp_path):
+    """A GUI process and a stdio bridge can start together; the write
+    transaction now really is held, so nobody migrates the schema twice."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    path = tmp_path / "race.db"
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        list(pool.map(lambda _: Database(path).initialize(), range(6)))
+
+    assert _scalar(path, "SELECT version FROM schema_meta") == SCHEMA_VERSION
+    assert _scalar(path, "SELECT COUNT(*) FROM schema_meta") == 1

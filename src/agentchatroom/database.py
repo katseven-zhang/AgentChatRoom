@@ -29,6 +29,58 @@ class DatabaseBackend(Protocol):
 
     def close(self) -> None: ...
 
+def _strip_comments(statement: str) -> str:
+    return "\n".join(
+        line for line in statement.splitlines() if not line.strip().startswith("--")
+    ).strip()
+
+
+def _iter_statements(script: str) -> Iterator[str]:
+    """Yield complete SQL statements out of a schema or migration script.
+
+    ``executescript`` is unusable inside an open transaction because it commits
+    first; splitting with ``sqlite3.complete_statement`` keeps the driver's own
+    quoting rules (a ``;`` inside a literal or a ``DEFAULT '{}'`` never ends a
+    statement) while letting each statement run on the live transaction.
+    """
+    buffer = ""
+    for chunk in script.split(";"):
+        candidate = f"{buffer}{chunk};"
+        if not sqlite3.complete_statement(candidate):
+            # A semicolon inside a string literal or a compound statement does
+            # not end anything: keep accumulating.
+            buffer = candidate
+            continue
+        statement = candidate.strip()
+        buffer = ""
+        core = _strip_comments(statement)
+        if core and core != ";":
+            yield statement
+    trailing = buffer.strip()
+    trailing_core = _strip_comments(trailing)
+    if trailing_core and trailing_core != ";" and sqlite3.complete_statement(f"{trailing};"):
+        yield trailing
+
+
+def read_schema_version(connection: Any) -> int | None:
+    """Deterministic single value, whatever legacy duplicates contain.
+
+    ``schema_meta`` had no row constraint and was read with a bare ``LIMIT 1``,
+    so a database that had somehow gained two rows could report either version
+    depending on the plan.
+    """
+    row = connection.execute(
+        "SELECT version FROM schema_meta ORDER BY version DESC LIMIT 1"
+    ).fetchone()
+    return None if row is None else int(row[0])
+
+
+def write_schema_version(connection: Any, version: int) -> None:
+    """Keep schema_meta a one-row table by construction."""
+    connection.execute("DELETE FROM schema_meta")
+    connection.execute("INSERT INTO schema_meta(version) VALUES (?)", (version,))
+
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS schema_meta (
     version INTEGER NOT NULL
@@ -1122,7 +1174,19 @@ class Database:
     def initialize(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self.connect(write=True) as connection:
-            connection.executescript(SCHEMA)
+            # executescript() commits the transaction the driver had already
+            # opened before it runs anything, and this connection is in
+            # autocommit mode (isolation_level=None), so every schema statement,
+            # every ALTER and the schema_meta update used to be committed on its
+            # own. A crash or a single failing statement therefore left the
+            # database half migrated with the version still pointing at the old
+            # schema, and the next start replayed a non-reentrant
+            # `ALTER TABLE ... ADD COLUMN` and failed with "duplicate column
+            # name" - permanently unopenable history. Statements are applied
+            # individually now, so BEGIN IMMEDIATE survives for the whole
+            # migration unit and either all of it or none of it lands.
+            for statement in _iter_statements(SCHEMA):
+                connection.execute(statement)
             ensure_project_member_columns(connection)
             ensure_agent_identity_columns(connection)
             ensure_task_number_schema(connection)
@@ -1131,23 +1195,28 @@ class Database:
             # After the member_id / agent_key columns are backfilled, so the
             # index statements below can never reference a missing column.
             ensure_member_lookup_indexes(connection)
-            row = connection.execute("SELECT version FROM schema_meta LIMIT 1").fetchone()
-            if row is None:
-                connection.execute(
-                    "INSERT INTO schema_meta(version) VALUES (?)", (SCHEMA_VERSION,)
-                )
-            elif row["version"] > SCHEMA_VERSION:
+            version = read_schema_version(connection)
+            if version is None:
+                write_schema_version(connection, SCHEMA_VERSION)
+            elif version > SCHEMA_VERSION:
                 raise RuntimeError(
-                    f"Unsupported database schema {row['version']}; expected {SCHEMA_VERSION}"
+                    f"Unsupported database schema {version}; expected {SCHEMA_VERSION}"
                 )
+            elif version == SCHEMA_VERSION:
+                # Collapse any duplicate bookkeeping rows an older initialize
+                # could leave behind, so the single-row invariant holds from now
+                # on rather than only after a migration.
+                write_schema_version(connection, version)
             else:
-                version = int(row["version"])
                 while version < SCHEMA_VERSION:
                     target = version + 1
-                    connection.executescript(MIGRATIONS[target])
+                    for statement in _iter_statements(MIGRATIONS[target]):
+                        connection.execute(statement)
                     if target == 25:
                         migrate_knowledge_source_event_ids(connection)
-                    connection.execute("UPDATE schema_meta SET version = ?", (target,))
+                    # Same transaction as the statements above: the version may
+                    # only advance once its own migration is fully applied.
+                    write_schema_version(connection, target)
                     version = target
 
     @contextmanager

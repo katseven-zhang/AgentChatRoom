@@ -8,6 +8,8 @@ from typing import Any, Iterator
 
 from .database import (
     MIGRATIONS,
+    read_schema_version,
+    write_schema_version,
     SCHEMA,
     SCHEMA_VERSION,
     ensure_agent_identity_columns,
@@ -142,27 +144,26 @@ class PostgresDatabase:
             # Mirrors the SQLite backend: a fresh PostgreSQL install never
             # replays MIGRATIONS, so it needs the member lookup indexes too.
             ensure_member_lookup_indexes(connection)
-            row = connection.execute(
-                "SELECT version FROM schema_meta LIMIT 1"
-            ).fetchone()
-            if row is None:
-                connection.execute(
-                    "INSERT INTO schema_meta(version) VALUES (?)", (SCHEMA_VERSION,)
-                )
-            elif row["version"] > SCHEMA_VERSION:
+            row_version = read_schema_version(connection)
+            if row_version is None:
+                write_schema_version(connection, SCHEMA_VERSION)
+            elif row_version > SCHEMA_VERSION:
                 raise RuntimeError(
-                    f"Unsupported database schema {row['version']}; expected {SCHEMA_VERSION}"
+                    f"Unsupported database schema {row_version}; expected {SCHEMA_VERSION}"
                 )
             else:
-                version = int(row["version"])
+                version = int(row_version)
                 while version < SCHEMA_VERSION:
                     target = version + 1
+                    # The whole unit - statements and the version bump - shares
+                    # this transaction, exactly like the SQLite backend, so a
+                    # failure halfway leaves the old schema and a restart can
+                    # replay the same migration instead of hitting a duplicate
+                    # column.
                     connection.executescript(MIGRATIONS[target])
                     if target == 25:
                         migrate_knowledge_source_event_ids(connection)
-                    connection.execute(
-                        "UPDATE schema_meta SET version = ?", (target,)
-                    )
+                    write_schema_version(connection, target)
                     version = target
 
     @contextmanager
