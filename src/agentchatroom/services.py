@@ -5401,7 +5401,7 @@ class AgentChatRoomService:
                 )
             self._authenticate(connection, project_id, actor_session_id, token or "")
             for dependency_id in dependencies:
-                self._require_task(connection, project_id, dependency_id)
+                self._require_satisfiable_dependency(connection, project_id, dependency_id)
             task_number = self._next_task_number(connection, project_id)
             try:
                 connection.execute(
@@ -5572,6 +5572,33 @@ class AgentChatRoomService:
                 status_code=409,
                 details={"blockers": [dict(row) for row in blockers]},
             )
+
+    def _require_satisfiable_dependency(
+        self, connection: Any, project_id: str, dependency_id: str
+    ) -> None:
+        """Reject a dependency that can never be satisfied.
+
+        The gate a dependency has to clear is ``approved`` plus ``integrated``.
+        A cancelled task can never reach it again - cancelled is terminal - so
+        depending on one turned the new task into a permanent
+        ``task_dependencies_incomplete``, discovered only when someone tried to
+        claim it. Say so at the moment the dependency is wired up instead.
+        """
+        dependency = self._require_task(connection, project_id, dependency_id)
+        if dependency["execution_status"] != "cancelled":
+            return
+        raise DomainError(
+            "invalid_dependency_status",
+            f"Task #{dependency['task_number']} is cancelled and can never "
+            "satisfy a dependency",
+            status_code=422,
+            details={
+                "depends_on_task_id": dependency_id,
+                "task_number": dependency["task_number"],
+                "execution_status": dependency["execution_status"],
+                "required_action": "drop_the_cancelled_dependency_or_pick_another",
+            },
+        )
 
     @idempotent_write("task.claim")
     def claim_task(
@@ -7167,7 +7194,7 @@ class AgentChatRoomService:
                     raise DomainError(
                         "task_dependency_cycle", "A task cannot depend on itself"
                     )
-                self._require_task(connection, project_id, dependency_id)
+                self._require_satisfiable_dependency(connection, project_id, dependency_id)
                 reaches_current = connection.execute(
                     """
                     WITH RECURSIVE chain(task_id) AS (

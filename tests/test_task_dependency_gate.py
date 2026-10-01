@@ -133,3 +133,69 @@ def test_claim_still_uses_the_same_gate(service, project_dir):
             project_id, blocked["id"], worker["agent"]["id"], worker["token"]
         )
     assert refused.value.code == "task_dependencies_incomplete"
+
+
+def _cancel(service, project_id: str, task, actor):
+    # An unowned backlog task is cancelled through the management surface, which
+    # is the rule #234 introduced.
+    service.update_task(
+        project_id,
+        task["id"],
+        status="cancelled",
+        management_authorized=True,
+    )
+    return service.get_task(project_id, task["id"])
+
+
+def test_a_cancelled_task_cannot_be_wired_in_as_a_dependency(service, project_dir):
+    """#222: cancelled is terminal, so such a dependency can never satisfy the
+    approved+integrated gate - the new task would be unclaimable forever."""
+    project = service.create_project(root_path=str(project_dir))
+    project_id = project["id"]
+    coordinator = _join(service, project_id, "coordinator-a")
+    dead = _task(service, project_id, coordinator, "Cancelled upstream")
+    _cancel(service, project_id, dead, coordinator)
+
+    with pytest.raises(DomainError) as refused:
+        service.create_task(
+            project_id,
+            title="Downstream of a dead end",
+            acceptance_criteria=["Cannot depend on a cancelled task"],
+            depends_on=[dead["id"]],
+            actor_session_id=coordinator["agent"]["id"],
+            token=coordinator["token"],
+        )
+    assert refused.value.code == "invalid_dependency_status"
+    assert refused.value.details["execution_status"] == "cancelled"
+    assert refused.value.details["task_number"] == dead["task_number"]
+    assert refused.value.details["required_action"]
+
+    live = _task(service, project_id, coordinator, "Live upstream")
+    created = service.create_task(
+        project_id,
+        title="Downstream of a live task",
+        acceptance_criteria=["Ordinary dependencies still work"],
+        depends_on=[live["id"]],
+        actor_session_id=coordinator["agent"]["id"],
+        token=coordinator["token"],
+    )["task"]
+    assert created["depends_on"] == [live["id"]]
+
+
+def test_dependency_edits_reject_a_cancelled_target_too(service, project_dir):
+    project = service.create_project(root_path=str(project_dir))
+    project_id = project["id"]
+    coordinator = _join(service, project_id, "coordinator-a")
+    upstream = _task(service, project_id, coordinator, "Upstream to cancel")
+    downstream = _task(service, project_id, coordinator, "Downstream")
+    _cancel(service, project_id, upstream, coordinator)
+
+    with pytest.raises(DomainError) as refused:
+        service.update_task(
+            project_id,
+            downstream["id"],
+            depends_on=[upstream["id"]],
+            session_id=coordinator["agent"]["id"],
+            token=coordinator["token"],
+        )
+    assert refused.value.code == "invalid_dependency_status"
