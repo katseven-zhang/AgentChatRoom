@@ -49,16 +49,6 @@ REQUIRED_ACTIONS = {
     "session_expired": "call_room_bootstrap",
 }
 
-_TOKEN_KEYS = {
-    "token",
-    "agent_token",
-    "admin_token",
-    "session_token",
-    "access_token",
-    "secret",
-    "password",
-}
-
 
 @dataclass(frozen=True, slots=True)
 class RuntimeBinding:
@@ -262,26 +252,13 @@ def resolve_configured_checkout(
 
 
 def redact_runtime_value(value: Any, *, key: str = "") -> Any:
-    # Imported lazily: task_history is a leaf module (typing-only imports),
-    # while bootstrap sits above services, so a module-level import would be
-    # circular. Kept here so both redaction entry points share one policy.
-    from .task_history import redact_text
+    # The redaction policy lives in agentchatroom.redaction so that every
+    # surface — API log filter, GUI tail, task history, runtime binding dumps
+    # and the request-field guard — shares one key set, one marker and one
+    # walker. This used to be a near-copy of the task_history variant.
+    from .redaction import redact_value
 
-    if key.lower() in _TOKEN_KEYS:
-        return "[redacted]"
-    if isinstance(value, Mapping):
-        return {
-            str(item_key): redact_runtime_value(item, key=str(item_key))
-            for item_key, item in value.items()
-            if str(item_key).lower() not in _TOKEN_KEYS
-        }
-    if isinstance(value, (list, tuple)):
-        return [redact_runtime_value(item) for item in value]
-    if isinstance(value, str) and len(value) >= 24 and "token" in key.lower():
-        return "[redacted]"
-    if isinstance(value, str):
-        return redact_text(value)
-    return value
+    return redact_value(value, key=key)
 
 
 def contains_secret(value: Any, secret: str) -> bool:

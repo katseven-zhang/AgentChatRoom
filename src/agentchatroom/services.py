@@ -59,6 +59,7 @@ from .contracts import (
     task_view,
 )
 from .database import SCHEMA_VERSION, DatabaseBackend
+from .redaction import SENSITIVE_KEYS
 from .errors import DomainError
 from .project_registration import (
     detect_git_info,
@@ -135,17 +136,7 @@ CREDENTIAL_FAILURE_MESSAGES = {
     PROJECT_CREDENTIAL_INVALID: "The selected Project Token is invalid",
 }
 REQUEST_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
-SENSITIVE_REQUEST_FIELDS = {
-    "token",
-    "agent_token",
-    "admin_token",
-    "password",
-    "secret",
-    "authorization",
-    "bearer",
-    "cookie",
-    "api_key",
-}
+SENSITIVE_REQUEST_FIELDS = SENSITIVE_KEYS
 logger = logging.getLogger(__name__)
 
 _UNCLASSIFIED_TASK_VIEW_WARNED: set[str] = set()
