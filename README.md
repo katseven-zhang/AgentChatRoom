@@ -525,6 +525,8 @@ room_bootstrap
 
 - **范围写法先归一再比较**：`normalize_pattern` 折叠所有 `./` 段、重复斜杠与 `\`，因此 `././src`、`src/./a.py`、`src//`、`\\src` 与 `src`、`src/a.py` 是同一个范围，越界（含任何 `..` 段）一律 `invalid_path_pattern`。归一化后的字符串就是入库与比较的唯一依据，所以同一 Session 的重复申请能命中幂等续用，不同 Session 也无法用另一种写法绕过 exclusive 冲突或 pre-commit 检查。
 - **重叠判定按结构**：先比字面与 fnmatch，再比静态前缀的包含关系；只有当一方没有静态前缀（模式以通配符开头，如 `*.md`、`**/*.py`）时，才逐段比较是否能覆盖同一个路径。以通配符开头不再等于「与项目内一切冲突」，`**/*.md` 与 `src/app.py` 可以并存；`src/**` 与 `src/a.py`、`src/*.py` 与 `src/app.py`、`./src/a.py` 与 `src/a.py` 仍然冲突。`lease_acquire` 与 `leases/check` 走同一个 `patterns_overlap`。
+- **同一范围换模式是显式动作**：同一 Session 对同一归一化范围重复申请，模式相同即幂等续用；模式更强（`readonly < shared < exclusive`）就地升级并追加 `lease.mode_changed` 事件、按新 TTL 续期，返回体带 `mode_changed: true` 与实际生效的 `mode`；模式更弱则拒绝 `lease_mode_downgrade_requires_release`（`required_action=release_lease_then_reacquire`），绝不静默把 exclusive 降成 readonly。不再出现「申请 exclusive 却拿回 readonly 的 already_held」。
+- **同软件身份的不同 Session 视为可接管**：`leases/check` 与 `lease_acquire` 一致，把属于调用方同一 member 的 exclusive 租约判为可接管而不是冲突；第三方仍报冲突。接管释放只在申请真正被受理时发生——被冲突拒绝的申请不会先拆掉自己身份的既有覆盖。
 
 | 环节 | 语义 |
 | --- | --- |

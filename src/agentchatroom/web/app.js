@@ -492,6 +492,7 @@ function eventLabel(type) {
     "task.cancelled": "取消了任务", "lease.acquired": "占用了文件范围",
     "lease.released": "释放了文件范围", "lease.conflict": "检测到文件冲突",
     "lease.pre_commit_blocked": "提交前检查被文件占用阻断",
+    "lease.mode_changed": "调整了文件租约模式",
     "work.reported": "提交了工作证据",
     "work.commit_unverified": "工作证据提交时未核验 Commit",
     "work_report.commit_unverified": "工作证据提交时未核验 Commit",

@@ -184,6 +184,7 @@ def format_room_event(
         "lease.released": f"{name} 释放了文件租约",
         "lease.conflict": "文件租约发生冲突，相关任务需等待或协调",
         "lease.pre_commit_blocked": "提交前文件租约检查未通过",
+        "lease.mode_changed": f"{name} 调整了文件租约模式",
         "document.created": f"{name} 新增了项目文档",
         "document.updated": f"{name} 更新了项目文档",
         "document.archived": f"{name} 归档了项目文档",

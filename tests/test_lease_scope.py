@@ -190,3 +190,161 @@ def test_unrelated_leading_wildcard_scope_does_not_block_another_agent(
         token=writer["token"],
     )
     assert not checked["conflicts"]
+
+
+def _session(service, project_id: str, key: str, client: str = "pytest"):
+    return service.join_room(
+        project_id, software_key=key, name=key.title(), client=client, model="unknown"
+    )
+
+
+def test_reacquiring_a_scope_with_a_stronger_mode_upgrades_it(service, project_dir):
+    """#220: a readonly lease re-requested as exclusive used to return the old
+    mode, so the caller believed it held exclusive protection it did not have."""
+    project = service.create_project(root_path=str(project_dir))
+    project_id = project["id"]
+    owner = _session(service, project_id, "worker-a")
+    service.acquire_lease(
+        project_id,
+        session_id=owner["agent"]["id"],
+        token=owner["token"],
+        path_pattern="src/up.py",
+        mode="readonly",
+    )
+
+    upgraded = service.acquire_lease(
+        project_id,
+        session_id=owner["agent"]["id"],
+        token=owner["token"],
+        path_pattern="src/up.py",
+        mode="exclusive",
+    )
+    assert upgraded["already_held"] is True
+    assert upgraded["mode_changed"] is True
+    assert upgraded["lease"]["mode"] == "exclusive"
+
+    other = _session(service, project_id, "worker-b")
+    with pytest.raises(DomainError) as conflict:
+        service.acquire_lease(
+            project_id,
+            session_id=other["agent"]["id"],
+            token=other["token"],
+            path_pattern="src/up.py",
+            mode="exclusive",
+        )
+    assert conflict.value.code == "lease_conflict"
+    events = service.query_audit(project_id)["events"]
+    changed = next(
+        event for event in events if event["event_type"] == "lease.mode_changed"
+    )
+    assert changed["payload"]["from_mode"] == "readonly"
+    assert changed["payload"]["to_mode"] == "exclusive"
+
+
+def test_weakening_an_active_mode_requires_an_explicit_release(service, project_dir):
+    project = service.create_project(root_path=str(project_dir))
+    project_id = project["id"]
+    owner = _session(service, project_id, "worker-a")
+    service.acquire_lease(
+        project_id,
+        session_id=owner["agent"]["id"],
+        token=owner["token"],
+        path_pattern="src/down.py",
+        mode="exclusive",
+    )
+
+    with pytest.raises(DomainError) as refused:
+        service.acquire_lease(
+            project_id,
+            session_id=owner["agent"]["id"],
+            token=owner["token"],
+            path_pattern="src/down.py",
+            mode="readonly",
+        )
+    assert refused.value.code == "lease_mode_downgrade_requires_release"
+    assert refused.value.details["required_action"] == "release_lease_then_reacquire"
+    held = [
+        lease
+        for lease in service.list_leases(project_id)
+        if lease["path_pattern"] == "src/down.py" and lease.get("released_at") is None
+    ]
+    assert [lease["mode"] for lease in held] == ["exclusive"]
+
+
+def test_a_rejected_acquire_does_not_release_the_predecessor_lease(
+    service, project_dir
+):
+    """#235: the same-identity takeover ran before the conflict decision, so a
+    rejected request still tore down its own identity's coverage."""
+    project = service.create_project(root_path=str(project_dir))
+    project_id = project["id"]
+    first = _session(service, project_id, "worker-a")
+    successor = _session(service, project_id, "worker-a", client="pytest")
+    blocker = _session(service, project_id, "worker-c")
+
+    stale = service.acquire_lease(
+        project_id,
+        session_id=first["agent"]["id"],
+        token=first["token"],
+        path_pattern="src/a.py",
+        mode="exclusive",
+    )
+    service.acquire_lease(
+        project_id,
+        session_id=blocker["agent"]["id"],
+        token=blocker["token"],
+        path_pattern="src/b.py",
+        mode="exclusive",
+    )
+
+    with pytest.raises(DomainError) as conflict:
+        service.acquire_lease(
+            project_id,
+            session_id=successor["agent"]["id"],
+            token=successor["token"],
+            path_pattern="src/*.py",
+            mode="exclusive",
+        )
+    assert conflict.value.code == "lease_conflict"
+    assert {item["path_pattern"] for item in conflict.value.details["conflicts"]} == {
+        "src/b.py"
+    }
+    still_held = [
+        lease["id"]
+        for lease in service.list_leases(project_id)
+        if lease.get("released_at") is None
+    ]
+    assert stale["lease"]["id"] in still_held
+
+
+def test_check_leases_treats_ones_own_identity_as_takeable(service, project_dir):
+    """#245: check_leases reported a conflict against the caller's own software
+    identity, while acquire_lease accepts the same situation as a takeover."""
+    project = service.create_project(root_path=str(project_dir))
+    project_id = project["id"]
+    first = _session(service, project_id, "worker-a")
+    successor = _session(service, project_id, "worker-a", client="pytest")
+    stranger = _session(service, project_id, "worker-b")
+    service.acquire_lease(
+        project_id,
+        session_id=first["agent"]["id"],
+        token=first["token"],
+        path_pattern="src/adopt.py",
+        mode="exclusive",
+    )
+
+    own = service.check_leases(
+        project_id,
+        paths=["src/adopt.py"],
+        session_id=successor["agent"]["id"],
+        token=successor["token"],
+    )
+    assert not own["conflicts"]
+
+    foreign = service.check_leases(
+        project_id,
+        paths=["src/adopt.py"],
+        session_id=stranger["agent"]["id"],
+        token=stranger["token"],
+    )
+    assert foreign["conflicts"]

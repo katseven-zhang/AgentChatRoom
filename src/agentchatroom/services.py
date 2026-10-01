@@ -465,6 +465,11 @@ def lease_modes_conflict(left: str, right: str) -> bool:
     return "exclusive" in {left, right}
 
 
+# How much protection each mode buys, so re-acquiring one scope with a different
+# mode is an explicit upgrade or a refused downgrade rather than a silent no-op.
+LEASE_MODE_STRENGTH = {"readonly": 0, "shared": 1, "exclusive": 2}
+
+
 def _static_prefix(pattern: str) -> str:
     wildcard = min(
         [index for token in "*[?" if (index := pattern.find(token)) >= 0]
@@ -7264,22 +7269,6 @@ class AgentChatRoomService:
                         "expires_at": row["expires_at"],
                     }
                 )
-            for stale in superseded:
-                connection.execute(
-                    "UPDATE file_leases SET released_at = ? WHERE id = ?",
-                    (now.isoformat().replace("+00:00", "Z"), stale["id"]),
-                )
-                self._emit(
-                    connection,
-                    project_id,
-                    "lease.released",
-                    actor_session_id=session_id,
-                    payload={
-                        "lease_id": stale["id"],
-                        "path_pattern": stale["path_pattern"],
-                        "reason": "same_member_takeover",
-                    },
-                )
             if conflicts:
                 event_id = self._emit(
                     connection,
@@ -7295,6 +7284,25 @@ class AgentChatRoomService:
                     "cursor": event_id,
                 }
             else:
+                # The same-identity takeover only happens when this request is
+                # actually granted. Releasing the predecessor's leases before a
+                # rejection destroyed coverage the caller never obtained.
+                for stale in superseded:
+                    connection.execute(
+                        "UPDATE file_leases SET released_at = ? WHERE id = ?",
+                        (now.isoformat().replace("+00:00", "Z"), stale["id"]),
+                    )
+                    self._emit(
+                        connection,
+                        project_id,
+                        "lease.released",
+                        actor_session_id=session_id,
+                        payload={
+                            "lease_id": stale["id"],
+                            "path_pattern": stale["path_pattern"],
+                            "reason": "same_member_takeover",
+                        },
+                    )
                 # 幂等：同一 Session 对同一（归一化）范围的活跃租约重复申请
                 # 直接续用已有租约，不产生并行的重复占用行。
                 existing = next(
@@ -7307,6 +7315,66 @@ class AgentChatRoomService:
                     None,
                 )
                 if existing is not None:
+                    if existing["mode"] != mode:
+                        if (
+                            LEASE_MODE_STRENGTH[mode]
+                            < LEASE_MODE_STRENGTH[existing["mode"]]
+                        ):
+                            raise DomainError(
+                                "lease_mode_downgrade_requires_release",
+                                "An active lease cannot be weakened in place; "
+                                "release it and acquire the weaker mode explicitly",
+                                status_code=409,
+                                details={
+                                    "required_action": "release_lease_then_reacquire",
+                                    "lease_id": existing["id"],
+                                    "current_mode": existing["mode"],
+                                    "requested_mode": mode,
+                                },
+                            )
+                        # Raising the protection level of a scope the caller
+                        # already holds is a mode change, not a reuse of the old
+                        # mode: returning the readonly lease while the caller
+                        # believes it holds exclusive would leave check_leases
+                        # and the pre-commit policy blind to real writers.
+                        stamped = now.isoformat().replace("+00:00", "Z")
+                        connection.execute(
+                            """
+                            UPDATE file_leases
+                            SET mode = ?, expires_at = ?, renewed_at = ?, ttl_seconds = ?
+                            WHERE id = ?
+                            """,
+                            (
+                                mode,
+                                expires.isoformat().replace("+00:00", "Z"),
+                                stamped,
+                                ttl,
+                                existing["id"],
+                            ),
+                        )
+                        mode_event_id = self._emit(
+                            connection,
+                            project_id,
+                            "lease.mode_changed",
+                            actor_session_id=session_id,
+                            task_id=task_id,
+                            payload={
+                                "lease_id": existing["id"],
+                                "path_pattern": pattern,
+                                "from_mode": existing["mode"],
+                                "to_mode": mode,
+                            },
+                        )
+                        changed = connection.execute(
+                            "SELECT * FROM file_leases WHERE id = ?", (existing["id"],)
+                        ).fetchone()
+                        return {
+                            "lease": self._lease_dict(changed),
+                            "already_held": True,
+                            "mode_changed": True,
+                            "event_id": mode_event_id,
+                            "cursor": mode_event_id,
+                        }
                     return {
                         "lease": self._lease_dict(existing),
                         "already_held": True,
@@ -7394,8 +7462,14 @@ class AgentChatRoomService:
             raise DomainError("missing_paths", "At least one file path is required")
         with self.database.connect(write=True) as connection:
             project = self._require_project(connection, project_id)
+            caller_member_id: str | None = None
             if session_id:
-                self._authenticate(connection, project_id, session_id, token or "")
+                caller = self._authenticate(
+                    connection, project_id, session_id, token or ""
+                )
+                caller_member_id = (
+                    caller["member_id"] if "member_id" in caller.keys() else None
+                )
             now = iso_now()
             # Presence is display-only (#119): a silent lease owner still
             # enforces its lease until the TTL lapses or it releases, so
@@ -7403,7 +7477,8 @@ class AgentChatRoomService:
             # check_leases and acquire_lease would disagree.
             active = connection.execute(
                 """
-                SELECT l.*, a.name AS agent_name FROM file_leases l
+                SELECT l.*, a.name AS agent_name, a.member_id AS owner_member_id
+                FROM file_leases l
                 JOIN agent_sessions a ON a.id = l.session_id
                 WHERE l.project_id = ? AND l.released_at IS NULL
                   AND l.expires_at > ? AND l.mode = 'exclusive'
@@ -7422,6 +7497,15 @@ class AgentChatRoomService:
                 for path in clean_paths
                 for lease in active
                 if lease["session_id"] != session_id
+                and not (
+                    # A lease belonging to the caller's own software identity is
+                    # takeable, not a conflict: acquire_lease treats it that way,
+                    # so the check must not disagree (the invariant this function
+                    # states in its own comment).
+                    caller_member_id
+                    and lease["owner_member_id"]
+                    and lease["owner_member_id"] == caller_member_id
+                )
                 and patterns_overlap(path, lease["path_pattern"])
             ]
             settings = normalize_project_settings(
