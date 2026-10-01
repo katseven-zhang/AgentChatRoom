@@ -671,7 +671,7 @@ REST `GET /api/v1/projects/{project_id}/tasks?phase=`、MCP `task_list(phase=…
 | 结构化原因 | `reason_code`：quota_exhausted / agent_unavailable / user_requested / reassignment_needed / other + 自由文本 reason | 无需释放原因 |
 | 可执行阶段 | claimed / in_progress / blocked（含验收退回后的返修）；todo 重复释放幂等；待验收、已通过、已集成、已取消等阶段明确拒绝 | 未完成的任务 |
 | 保留内容 | 进度、步骤、任务合同、依赖、Work Report、Review、Integration 与历史 owner 全部保留；验收退回后释放保留 `changes_requested`，下一位 Agent 可从「待认领」和「需要处理」两个入口找到 | — |
-| 附带处理 | 原子释放该任务活跃文件租约、失效 pending 指派/交接并留痕 | 同样原子清理：该任务的未释放文件租约全部释放、pending 指派/交接全部取消。清理只由目标状态决定，与中间状态无关——`blocked → cancelled` 记的是 `task.cancelled`（不会被误判为 `task.unblocked` 而跳过清理），`todo/claimed/in_progress/blocked/awaiting_review/verified` 任何一条通往取消的边都留下同一个事件与同一份清理结果 |
+| 附带处理 | 原子释放该任务活跃文件租约、失效 pending 指派/交接并留痕 | 同样原子清理：该任务的未释放文件租约全部释放、pending 指派/交接全部取消，并且**逐条留痕**——每个被终结的行都追加一条 `task.assignment_cancelled(by=task_cancellation)` / `task.handoff_cancelled(by=task_cancellation)`（带 `assignment_id`/`handoff_id`、`previous_target_session_id`、`task_number`），事件集合与释放/改派路径同形，基于事件类型渲染的时间线在取消与释放下表现一致（#261）。清理只由目标状态决定，与中间状态无关——`blocked → cancelled` 记的是 `task.cancelled`（不会被误判为 `task.unblocked` 而跳过清理），`todo/claimed/in_progress/blocked/awaiting_review/verified` 任何一条通往取消的边都留下同一个事件与同一份清理结果 |
 
 当前 owner 可自助释放；owner 离线、失联或额度耗尽时，具有任务管理权限的用户/管理端（Web 与 REST 的管理身份）可代为释放。
 

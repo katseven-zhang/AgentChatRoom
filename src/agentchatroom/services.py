@@ -6201,9 +6201,14 @@ class AgentChatRoomService:
                 """,
                 (now, project_id, task_id, *released_lease_ids),
             )
+        task_number_row = connection.execute(
+            "SELECT task_number FROM tasks WHERE id = ? AND project_id = ?",
+            (task_id, project_id),
+        ).fetchone()
+        task_number = int(task_number_row["task_number"]) if task_number_row else 0
         pending_assignments = connection.execute(
             """
-            SELECT id FROM task_assignments
+            SELECT id, assigned_to_session_id FROM task_assignments
             WHERE project_id = ? AND task_id = ? AND status = 'pending'
             """,
             (project_id, task_id),
@@ -6227,9 +6232,28 @@ class AgentChatRoomService:
                     *cancelled_assignment_ids,
                 ),
             )
+            # Release and reassignment already emit one event per invalidated
+            # row; cancellation has to as well, or the event-sourced timelines
+            # show an assignment vanishing on release but not on cancellation.
+            for row in pending_assignments:
+                self._emit(
+                    connection,
+                    project_id,
+                    "task.assignment_cancelled",
+                    actor_session_id=actor_session_id,
+                    task_id=task_id,
+                    payload={
+                        "assignment_id": str(row["id"]),
+                        "by": "task_cancellation",
+                        "previous_target_session_id": str(
+                            row["assigned_to_session_id"] or ""
+                        ),
+                        "task_number": task_number,
+                    },
+                )
         pending_handoffs = connection.execute(
             """
-            SELECT id FROM task_handoffs
+            SELECT id, to_session_id FROM task_handoffs
             WHERE project_id = ? AND task_id = ? AND status = 'pending'
             """,
             (project_id, task_id),
@@ -6253,6 +6277,20 @@ class AgentChatRoomService:
                     *cancelled_handoff_ids,
                 ),
             )
+            for row in pending_handoffs:
+                self._emit(
+                    connection,
+                    project_id,
+                    "task.handoff_cancelled",
+                    actor_session_id=actor_session_id,
+                    task_id=task_id,
+                    payload={
+                        "handoff_id": str(row["id"]),
+                        "by": "task_cancellation",
+                        "previous_target_session_id": str(row["to_session_id"] or ""),
+                        "task_number": task_number,
+                    },
+                )
         return {
             "released_lease_ids": released_lease_ids,
             "cancelled_assignment_ids": cancelled_assignment_ids,
