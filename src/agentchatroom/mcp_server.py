@@ -2375,9 +2375,15 @@ def knowledge_review(
     verdict: str = "",
     criteria: list[ReviewCriterion] | None = None,
     notes: str = "",
+    expected_version_id: str = "",
     request_id: str = "",
 ) -> dict[str, Any]:
-    """Review a candidate Knowledge Asset version with an independent verdict."""
+    """Review a candidate Knowledge Asset version with an independent verdict.
+
+    Pass ``expected_version_id`` (from ``knowledge_get``) to pin the review to
+    the content that was actually read; a newer version rejects the review with
+    ``knowledge_version_stale`` instead of inheriting these criteria.
+    """
     try:
         _authorize_remote(project_id, "review:write")
     except DomainError as error:
@@ -2391,6 +2397,7 @@ def knowledge_review(
         verdict=verdict,
         criteria=criteria or [],
         notes=notes,
+        expected_version_id=expected_version_id,
         request_id=_mcp_request_id(request_id),
     )
 

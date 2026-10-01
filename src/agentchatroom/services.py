@@ -8198,6 +8198,7 @@ class AgentChatRoomService:
         verdict: str,
         criteria: list[dict[str, Any]],
         notes: str = "",
+        expected_version_id: str = "",
     ) -> dict[str, Any]:
         if verdict not in KNOWLEDGE_REVIEW_VERDICTS:
             raise DomainError(
@@ -8232,6 +8233,17 @@ class AgentChatRoomService:
                 status_code=409,
                 details={"assessed": assessed},
             )
+        if verdict == "approved" and not expected_version_id.strip():
+            # Approving is what puts unreviewed content into the Room, so the
+            # caller has to name the version it actually read. Rejecting and
+            # requesting changes cannot launder content, so they stay optional.
+            raise DomainError(
+                "knowledge_version_pin_required",
+                "Approving a candidate requires expected_version_id so the review "
+                "is bound to the content that was read",
+                status_code=422,
+                details={"required_action": "reread_and_review_current_version"},
+            )
         with self.database.connect(write=True) as connection:
             reviewer = self._authenticate(
                 connection, project_id, reviewer_session_id, token
@@ -8253,6 +8265,24 @@ class AgentChatRoomService:
                     "knowledge_version_not_found",
                     "Knowledge asset has no current version",
                     status_code=409,
+                )
+            # A review must approve the exact content the reviewer read. The
+            # current version is dereferenced here, at write time, so without a
+            # precondition a v2 submitted mid-review would silently inherit
+            # criteria the reviewer wrote against v1. Callers pin with the
+            # version_id (or content_hash) returned by get/list.
+            pinned_version = expected_version_id.strip()
+            if pinned_version and pinned_version != str(version["id"]):
+                raise DomainError(
+                    "knowledge_version_stale",
+                    "The knowledge asset moved to a new version after you read it; "
+                    "re-read the current version and review that content",
+                    status_code=409,
+                    details={
+                        "expected_version_id": pinned_version,
+                        "current_version_id": str(version["id"]),
+                        "required_action": "reread_and_review_current_version",
+                    },
                 )
             creator = connection.execute(
                 "SELECT id, member_id, agent_key FROM agent_sessions WHERE id = ?",

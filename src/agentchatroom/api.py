@@ -763,6 +763,7 @@ class KnowledgeReviewCreate(StrictModel):
     verdict: Literal["approved", "changes_requested"]
     criteria: list[dict[str, Any]]
     notes: str = ""
+    expected_version_id: str = ""
 
 
 class KnowledgeAssetAction(StrictModel):

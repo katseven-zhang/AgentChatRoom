@@ -419,6 +419,7 @@ def test_knowledge_review_supersede_archive_optimistic_locks(service, project):
             token=reviewer["token"],
             verdict="approved",
             criteria=[{"criterion": "c", "status": "passed"}],
+            expected_version_id=str(asset["current_version"]["version_id"]),
         )
     # 实际实现：状态守卫在 review 前置检查里报 knowledge_not_reviewable
     # （带并发保护时同样只会是这一族 409 错误码）。
