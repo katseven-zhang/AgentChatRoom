@@ -1740,14 +1740,15 @@ class AgentChatRoomService:
         return member
 
     def _transition_task_intake(
-        self, connection: Any, current: Mapping[str, Any], next_status: str
+        self, connection: Any, current_status: str, next_status: str
     ) -> None:
+        """The single gate every intake status write has to pass."""
         if next_status not in TASK_INTAKE_STATUSES:
             raise DomainError("invalid_task_intake_status", "Unsupported intake status")
-        if next_status not in TASK_INTAKE_TRANSITIONS[current["status"]]:
+        if next_status not in TASK_INTAKE_TRANSITIONS.get(str(current_status), set()):
             raise DomainError(
                 "invalid_task_intake_transition",
-                f"Task intake cannot move from {current['status']} to {next_status}",
+                f"Task intake cannot move from {current_status} to {next_status}",
                 status_code=409,
             )
 
@@ -5260,6 +5261,7 @@ class AgentChatRoomService:
             )
         with self.database.connect(write=True) as connection:
             intake = self._require_task_intake(connection, project_id, intake_id)
+            previous_status = str(intake["status"])
             if intake["status"] == "defined":
                 raise DomainError(
                     "task_intake_already_defined",
@@ -5270,6 +5272,7 @@ class AgentChatRoomService:
                 raise DomainError(
                     "task_intake_cancelled", "A cancelled intake cannot be reassigned", status_code=409
                 )
+            self._transition_task_intake(connection, intake["status"], "pending")
             member = self._require_intake_target(
                 connection, project_id, clean_member_id, clean_session_id
             )
@@ -5289,12 +5292,12 @@ class AgentChatRoomService:
             # An offline member remains a valid target; in that case the
             # identity is stored without a session until it reconnects.
             now = iso_now()
-            connection.execute(
+            updated_rows = connection.execute(
                 """
                 UPDATE task_intakes
                 SET target_member_id = ?, target_session_id = ?, status = 'pending',
                     note = ?, updated_at = ?
-                WHERE id = ? AND project_id = ?
+                WHERE id = ? AND project_id = ? AND status = ?
                 """,
                 (
                     member["id"],
@@ -5303,14 +5306,23 @@ class AgentChatRoomService:
                     now,
                     intake_id,
                     project_id,
+                    previous_status,
                 ),
             )
+            if updated_rows.rowcount != 1:
+                raise DomainError(
+                    "task_modified_concurrently",
+                    "Task intake was modified concurrently; reload the intake and retry",
+                    status_code=409,
+                )
             event_id = self._emit(
                 connection,
                 project_id,
                 "task.intake_reassigned",
                 payload={
                     "intake_id": intake_id,
+                    "previous_status": previous_status,
+                    "status": "pending",
                     "target_member_id": member["id"],
                     "target_session_id": clean_session_id,
                     "note": note.strip(),
@@ -5369,6 +5381,7 @@ class AgentChatRoomService:
                     status_code=409,
                 )
             next_status = response
+            self._transition_task_intake(connection, intake["status"], next_status)
             now = iso_now()
             cursor = connection.execute(
                 """
@@ -5436,6 +5449,7 @@ class AgentChatRoomService:
             # Optimistic lock BEFORE creating the task: two concurrent defines
             # must not both mint formal tasks (the loser must not leave an
             # orphan duplicate behind).
+            self._transition_task_intake(connection, intake["status"], "defining")
             claim = connection.execute(
                 """
                 UPDATE task_intakes
@@ -5462,7 +5476,8 @@ class AgentChatRoomService:
             )
             task = created["task"]
             now = iso_now()
-            connection.execute(
+            self._transition_task_intake(connection, "defining", "defined")
+            defined_rows = connection.execute(
                 """
                 UPDATE task_intakes
                 SET status = 'defined', formal_task_id = ?, note = ?, updated_at = ?
@@ -5470,6 +5485,12 @@ class AgentChatRoomService:
                 """,
                 (task["id"], note.strip(), now, intake_id, project_id),
             )
+            if defined_rows.rowcount != 1:
+                raise DomainError(
+                    "task_modified_concurrently",
+                    "Task intake was modified concurrently; the formal task was not linked",
+                    status_code=409,
+                )
             defined_event_id = self._emit(
                 connection,
                 project_id,

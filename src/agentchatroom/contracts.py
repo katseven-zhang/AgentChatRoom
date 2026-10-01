@@ -224,14 +224,23 @@ TASK_PHASE_COMMANDS = {
 TASK_INTAKE_STATUSES = {
     "pending",
     "accepted",
+    # Transaction-local claim state: define_task_from_intake moves
+    # accepted -> defining -> defined inside one write transaction so a second
+    # concurrent define loses the race instead of minting a second formal task.
+    # No reader outside that transaction can observe it.
+    "defining",
     "defined",
     "declined",
     "blocked",
     "cancelled",
 }
 TASK_INTAKE_TRANSITIONS = {
+    # Reassignment puts an intake back up for a new target. An accepted intake
+    # may be reassigned before its task is defined, which is why "pending" is a
+    # declared destination of "accepted" rather than an undeclared side effect.
     "pending": {"pending", "accepted", "declined", "blocked", "cancelled"},
-    "accepted": {"accepted", "defined", "blocked", "cancelled"},
+    "accepted": {"accepted", "pending", "defining", "blocked", "cancelled"},
+    "defining": {"defining", "defined"},
     "defined": {"defined"},
     "declined": {"declined", "pending", "cancelled"},
     "blocked": {"blocked", "pending", "cancelled"},
