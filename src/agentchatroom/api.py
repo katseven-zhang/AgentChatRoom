@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import hmac
+import inspect
 import ipaddress
 import json
 import logging
@@ -314,18 +315,22 @@ class ManagementAuthASGIMiddleware:
             and not path.startswith("/api/v1/auth/")
             and path not in self.PUBLIC_API_PATHS
         )
-        if protected and not self.authenticated(Request(scope, receive)):
-            await JSONResponse(
-                status_code=401,
-                content={
-                    "error": {
-                        "code": "management_auth_required",
-                        "message": "Management authentication is required",
-                        "details": {},
-                    }
-                },
-            )(scope, receive, send)
-            return
+        if protected:
+            authorized = self.authenticated(Request(scope, receive))
+            if inspect.isawaitable(authorized):
+                authorized = await authorized
+            if not authorized:
+                await JSONResponse(
+                    status_code=401,
+                    content={
+                        "error": {
+                            "code": "management_auth_required",
+                            "message": "Management authentication is required",
+                            "details": {},
+                        }
+                    },
+                )(scope, receive, send)
+                return
         await self.app(scope, receive, send)
 
 
@@ -1136,15 +1141,7 @@ def create_app(
     app.state.directory_picker = resolved_directory_picker
     app.state.local_mcp_configurator = resolved_local_mcp_configurator
 
-    def management_authenticated(request: Request) -> bool:
-        if not resolved.management_auth_required:
-            return True
-        authorization = request.headers.get("authorization", "")
-        if authorization.startswith("Bearer ") and hmac.compare_digest(
-            authorization.removeprefix("Bearer "), management_token
-        ):
-            return True
-        session_id = request.cookies.get(resolved.management_cookie_name, "")
+    def management_session_valid(session_id: str) -> bool:
         if not session_id:
             return False
         with service.database.connect() as connection:
@@ -1154,15 +1151,40 @@ def create_app(
             ).fetchone()
         return row is not None and float(row["expires_at"]) > time.time()
 
-    def browser_session_valid(session_id: str) -> bool:
+    def management_bearer_accepted(request: Request) -> bool:
+        """The credential checks that need no database access."""
+        if not resolved.management_auth_required:
+            return True
+        authorization = request.headers.get("authorization", "")
+        return authorization.startswith("Bearer ") and hmac.compare_digest(
+            authorization.removeprefix("Bearer "), management_token
+        )
+
+    def management_authenticated(request: Request) -> bool:
+        """Synchronous check for the endpoints that already run off the loop."""
+        if management_bearer_accepted(request):
+            return True
+        return management_session_valid(
+            request.cookies.get(resolved.management_cookie_name, "")
+        )
+
+    async def management_authenticated_async(request: Request) -> bool:
+        """Cookie authentication without a database read on the event loop.
+
+        Every request carrying a management cookie passes through this check, so
+        a synchronous query here serialises the whole ASGI application - including
+        the SSE streams - behind one round trip (#271, same rule as the #184
+        polling fix).
+        """
+        if management_bearer_accepted(request):
+            return True
+        session_id = request.cookies.get(resolved.management_cookie_name, "")
         if not session_id:
             return False
-        with service.database.connect() as connection:
-            row = connection.execute(
-                "SELECT expires_at FROM management_sessions WHERE session_hash = ?",
-                (_management_session_hash(session_id),),
-            ).fetchone()
-        return row is not None and float(row["expires_at"]) > time.time()
+        return await asyncio.to_thread(management_session_valid, session_id)
+
+    def browser_session_valid(session_id: str) -> bool:
+        return management_session_valid(session_id)
 
     def issue_browser_session() -> tuple[str, JSONResponse]:
         session_id = secrets.token_urlsafe(32)
@@ -1251,7 +1273,7 @@ def create_app(
 
     app.add_middleware(
         ManagementAuthASGIMiddleware,
-        authenticated=management_authenticated,
+        authenticated=management_authenticated_async,
     )
     app.add_middleware(RequestIdASGIMiddleware)
     install_credential_log_redaction()
