@@ -6882,17 +6882,31 @@ class AgentChatRoomService:
                 "Task handoff requires a summary and an explicit next step",
             )
 
-        def clean_items(values: list[str] | None) -> list[str]:
+        def clean_items(values: list[str] | None, field: str) -> list[str]:
+            bounded = self._require_list_input_limit(
+                field,
+                values or [],
+                limit=int(getattr(self.settings, "list_input_max_count", 100)),
+            )
             return list(
                 dict.fromkeys(
-                    str(item).strip() for item in (values or []) if str(item).strip()
+                    str(item).strip() for item in bounded if str(item).strip()
                 )
             )
 
-        clean_completed = clean_items(completed_items)
-        clean_pending = clean_items(pending_items)
-        clean_files = sorted({normalize_pattern(path) for path in (files or [])})
-        clean_risks = clean_items(risks)
+        clean_completed = clean_items(completed_items, "completed_items")
+        clean_pending = clean_items(pending_items, "pending_items")
+        clean_files = sorted(
+            {
+                normalize_pattern(path)
+                for path in self._require_list_input_limit(
+                    "files",
+                    files or [],
+                    limit=int(getattr(self.settings, "list_input_max_count", 100)),
+                )
+            }
+        )
+        clean_risks = clean_items(risks, "risks")
         with self.database.connect(write=True) as connection:
             if bool(from_session_id) != bool(token):
                 raise DomainError(
@@ -7891,6 +7905,11 @@ class AgentChatRoomService:
                 "session_id and token must be supplied together",
                 status_code=401,
             )
+        paths = self._require_list_input_limit(
+            "paths",
+            paths,
+            limit=int(getattr(self.settings, "list_input_max_count", 100)),
+        )
         clean_paths = sorted({normalize_pattern(path) for path in paths})
         if not clean_paths:
             raise DomainError("missing_paths", "At least one file path is required")
