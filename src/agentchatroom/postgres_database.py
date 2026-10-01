@@ -12,6 +12,7 @@ from .database import (
     SCHEMA_VERSION,
     ensure_agent_identity_columns,
     ensure_event_number_schema,
+    ensure_member_lookup_indexes,
     ensure_project_member_columns,
     ensure_task_assignment_member_column,
     ensure_task_number_schema,
@@ -138,6 +139,9 @@ class PostgresDatabase:
             ensure_task_number_schema(connection, postgres=True)
             ensure_task_assignment_member_column(connection, postgres=True)
             ensure_event_number_schema(connection, postgres=True)
+            # Mirrors the SQLite backend: a fresh PostgreSQL install never
+            # replays MIGRATIONS, so it needs the member lookup indexes too.
+            ensure_member_lookup_indexes(connection)
             row = connection.execute(
                 "SELECT version FROM schema_meta LIMIT 1"
             ).fetchone()

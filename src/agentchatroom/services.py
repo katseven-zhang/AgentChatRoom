@@ -559,6 +559,12 @@ class AgentChatRoomService:
         # so a backup cannot snapshot a half-restored SQLite file and restore
         # stale checks cannot race concurrent in-process backups.
         self._backup_restore_lock = threading.RLock()
+        # Retention as last applied through management, overriding the value
+        # captured in Settings at startup. Without this, saving a larger
+        # retention count would be silently undone by the next manual backup,
+        # which prunes with the stale startup number and deletes backups
+        # irreversibly.
+        self._applied_backup_max_kept: int | None = None
         # Wired by the API layer to the MCP transport state lookup: "alive",
         # "gone" (reaped transport, tombstone retained) or "unknown" for
         # sessions without an HTTP transport. Presence heartbeats are
@@ -9203,27 +9209,58 @@ class AgentChatRoomService:
             kept = self._prune_backups(max_kept)
             return {**result, "latest_event_id": latest_event_id, "pruned": kept}
 
+    def _read_backup_manifest(self, manifest_path: Path) -> dict[str, Any] | None:
+        """Read one manifest, returning None when it cannot be trusted.
+
+        A single truncated, binary or unparseable manifest must not take the
+        backup subsystem down: listing feeds the admin page *and* the auto
+        backup worker, so an exception here would return 500 and silently stop
+        automatic backups for good.
+        """
+        try:
+            raw = manifest_path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            return None
+        try:
+            parsed = json.loads(raw)
+        except ValueError:
+            return None
+        return parsed if isinstance(parsed, dict) else None
+
+    def _current_backup_max_kept(self) -> int:
+        if self._applied_backup_max_kept is not None:
+            return self._applied_backup_max_kept
+        return int(getattr(self.settings, "auto_backup_max_kept", 10))
+
     def list_backups(self) -> list[dict[str, Any]]:
         directory = self._backup_directory()
         if not directory.is_dir():
             return []
         backups: list[dict[str, Any]] = []
         for manifest_path in sorted(directory.glob("*.manifest.json")):
-            data = json_load(manifest_path.read_text(encoding="utf-8"), {})
+            data = self._read_backup_manifest(manifest_path)
             target = manifest_path.with_name(manifest_path.name[: -len(".manifest.json")])
             if not target.name.startswith("backup-"):
                 # 历史遗留快照（如迁移前 .db 备份）不属于本功能管理列表，
                 # 保留在磁盘上但不进产品列表：它们多为旧 schema，已不可回滚。
                 continue
+            try:
+                size = target.stat().st_size if target.is_file() else 0
+            except OSError:
+                size = 0
             backups.append(
                 {
                     "file": str(target),
-                    "size": target.stat().st_size if target.is_file() else 0,
-                    "created_at": data.get("created_at"),
-                    "backend": data.get("backend"),
-                    "schema_version": data.get("database_schema_version"),
-                    "latest_event_id": data.get("latest_event_id"),
-                    "source": data.get("source"),
+                    "size": size,
+                    "created_at": (data or {}).get("created_at"),
+                    "backend": (data or {}).get("backend"),
+                    "schema_version": (data or {}).get("database_schema_version"),
+                    "latest_event_id": (data or {}).get("latest_event_id"),
+                    "source": (data or {}).get("source"),
+                    # Surfaced so the operator can see the file needs attention
+                    # instead of silently treating a broken manifest as "no
+                    # cursor recorded", which reads as "stale".
+                    "manifest_readable": data is not None,
                 }
             )
         backups.sort(key=lambda item: str(item.get("created_at") or ""), reverse=True)
@@ -9231,9 +9268,7 @@ class AgentChatRoomService:
 
     def _prune_backups(self, kept_max: int | None = None) -> list[str]:
         kept_max = (
-            int(kept_max)
-            if kept_max is not None
-            else int(getattr(self.settings, "auto_backup_max_kept", 10))
+            int(kept_max) if kept_max is not None else self._current_backup_max_kept()
         )
         if kept_max < 0:
             kept_max = 0
@@ -9241,14 +9276,20 @@ class AgentChatRoomService:
         removed: list[str] = []
         for stale in backups[kept_max:]:
             target = Path(stale["file"])
-            target.unlink(missing_ok=True)
-            target.with_name(target.name + ".manifest.json").unlink(missing_ok=True)
+            try:
+                target.unlink(missing_ok=True)
+                target.with_name(target.name + ".manifest.json").unlink(missing_ok=True)
+            except OSError:
+                # A locked or vanished file must not abort the rest of the
+                # sweep, and must not be reported as removed.
+                continue
             removed.append(str(target))
         return removed
 
     def enforce_backup_retention(self, max_kept: int) -> list[str]:
         """Apply the retention policy immediately (settings save path)."""
-        return self._prune_backups(max_kept)
+        self._applied_backup_max_kept = int(max_kept)
+        return self._prune_backups(self._applied_backup_max_kept)
 
     def delete_backup(
         self,
@@ -9333,6 +9374,23 @@ class AgentChatRoomService:
             )
         target = Path(backup_path).expanduser().resolve()
         manifest_path = target.with_name(target.name + ".manifest.json")
+        # The path arrives from a management request. A restore copies this
+        # file over the live database, so an unconstrained path would let any
+        # readable file on the host be installed as the Room's database. Only
+        # managed snapshots inside the backups directory are restorable.
+        backup_root = self._backup_directory().resolve()
+        if target.parent != backup_root or not target.name.startswith("backup-"):
+            self._emit_backup_event(
+                "backup.restore_rejected",
+                payload={"file": str(target), "reason": "backup_path_outside_root"},
+                actor_session_id=actor_session_id,
+            )
+            raise DomainError(
+                "backup_path_outside_root",
+                "Only managed backups in the backups directory can be restored",
+                status_code=403,
+                details={"required_action": "select_a_listed_backup"},
+            )
         if not target.is_file() or not manifest_path.is_file():
             self._emit_backup_event(
                 "backup.restore_rejected",
@@ -9344,7 +9402,20 @@ class AgentChatRoomService:
                 f"Backup or manifest does not exist: {target}",
                 status_code=404,
             )
-        manifest = json_load(manifest_path.read_text(encoding="utf-8"), {})
+        manifest = self._read_backup_manifest(manifest_path)
+        if manifest is None:
+            self._emit_backup_event(
+                "backup.restore_rejected",
+                payload={"file": str(target), "reason": "backup_manifest_unreadable"},
+                actor_session_id=actor_session_id,
+            )
+            raise DomainError(
+                "backup_manifest_unreadable",
+                "The backup manifest cannot be parsed; refusing to restore an "
+                "unverifiable snapshot",
+                status_code=409,
+                details={"required_action": "delete_backup_and_retake"},
+            )
         current_schema = SCHEMA_VERSION
         if int(manifest.get("database_schema_version") or 0) != current_schema:
             self._emit_backup_event(
@@ -9363,7 +9434,15 @@ class AgentChatRoomService:
                 status_code=409,
                 details={"backup_schema": manifest.get("database_schema_version"), "current_schema": current_schema},
             )
-        backup_event_id = int(manifest.get("latest_event_id") or 0)
+        # A manifest with no recorded cursor is not the same as a cursor of 0.
+        # CLI-produced backups never wrote one, and reading that as 0 made
+        # every such backup look older than any non-empty database.
+        raw_cursor = manifest.get("latest_event_id")
+        backup_event_id = (
+            int(raw_cursor)
+            if isinstance(raw_cursor, int) and not isinstance(raw_cursor, bool)
+            else None
+        )
         with self._backup_restore_lock:
             if self.settings.database_backend == "sqlite":
                 # Hold process mutex + SQLite EXCLUSIVE locking from the stale
@@ -9377,20 +9456,38 @@ class AgentChatRoomService:
                         "SELECT COALESCE(MAX(id), 0) AS latest FROM events"
                     ).fetchone()
                     latest_event_id = int(row[0])
-                    stale = backup_event_id < latest_event_id
-                    if stale and not allow_data_loss:
+                    stale = (
+                        backup_event_id is not None
+                        and backup_event_id < latest_event_id
+                    )
+                    unknown_cursor = backup_event_id is None
+                    if (stale or unknown_cursor) and not allow_data_loss:
                         live_connection.close()
                         live_connection = None
+                        reason = "backup_stale" if stale else "backup_cursor_unknown"
                         self._emit_backup_event(
                             "backup.restore_rejected",
                             payload={
                                 "file": str(target),
-                                "reason": "backup_stale",
+                                "reason": reason,
                                 "backup_latest_event_id": backup_event_id,
                                 "current_latest_event_id": latest_event_id,
                             },
                             actor_session_id=actor_session_id,
                         )
+                        if unknown_cursor:
+                            raise DomainError(
+                                "backup_cursor_unknown",
+                                "The backup manifest records no event cursor, so it "
+                                "cannot be proven current; pass allow_data_loss to "
+                                "restore it anyway",
+                                status_code=409,
+                                details={
+                                    "backup_latest_event_id": None,
+                                    "current_latest_event_id": latest_event_id,
+                                    "required_action": "retake_backup_or_allow_data_loss",
+                                },
+                            )
                         raise DomainError(
                             "backup_stale",
                             "The backup is older than the current database; pass allow_data_loss "
@@ -9428,18 +9525,36 @@ class AgentChatRoomService:
                 )
             else:
                 latest_event_id = self._latest_event_id()
-                stale = backup_event_id < latest_event_id
-                if stale and not allow_data_loss:
+                stale = (
+                    backup_event_id is not None
+                    and backup_event_id < latest_event_id
+                )
+                unknown_cursor = backup_event_id is None
+                if (stale or unknown_cursor) and not allow_data_loss:
+                    reason = "backup_stale" if stale else "backup_cursor_unknown"
                     self._emit_backup_event(
                         "backup.restore_rejected",
                         payload={
                             "file": str(target),
-                            "reason": "backup_stale",
+                            "reason": reason,
                             "backup_latest_event_id": backup_event_id,
                             "current_latest_event_id": latest_event_id,
                         },
                         actor_session_id=actor_session_id,
                     )
+                    if unknown_cursor:
+                        raise DomainError(
+                            "backup_cursor_unknown",
+                            "The backup manifest records no event cursor, so it "
+                            "cannot be proven current; pass allow_data_loss to "
+                            "restore it anyway",
+                            status_code=409,
+                            details={
+                                "backup_latest_event_id": None,
+                                "current_latest_event_id": latest_event_id,
+                                "required_action": "retake_backup_or_allow_data_loss",
+                            },
+                        )
                     raise DomainError(
                         "backup_stale",
                         "The backup is older than the current database; pass allow_data_loss "
@@ -9450,13 +9565,17 @@ class AgentChatRoomService:
                             "current_latest_event_id": latest_event_id,
                         },
                     )
+                database_url = os.getenv(self.settings.database_url_env, "")
+                # pg_restore rewrites the database it targets, so an audit row
+                # written before it runs is destroyed by its own restore. The
+                # started/completed trail is emitted around the call below, the
+                # same way the SQLite branch does it.
+                restore_postgresql(database_url, target)
                 self._emit_backup_event(
                     "backup.restore_started",
                     payload={"file": str(target), "stale": stale},
                     actor_session_id=actor_session_id,
                 )
-                database_url = os.getenv(self.settings.database_url_env, "")
-                restore_postgresql(database_url, target)
         self._emit_backup_event(
             "backup.restore_completed",
             payload={"file": str(target), "restored_latest_event_id": backup_event_id},

@@ -977,6 +977,36 @@ def ensure_task_assignment_member_column(
         )
 
 
+def ensure_member_lookup_indexes(connection: Any) -> None:
+    """Create the member-scoped lookup indexes on a fresh or migrated database.
+
+    These were introduced only inside MIGRATIONS, so a brand new install — which
+    never runs them — shipped without them while a migrated database had them.
+    Member listing, credential lookup and assignment views then ran unindexed on
+    exactly the deployments that could least afford it. `CREATE INDEX IF NOT
+    EXISTS` makes this a no-op on an already migrated database.
+    """
+    for statement in (
+        """
+        CREATE INDEX IF NOT EXISTS idx_agent_credentials_member
+        ON agent_credentials(project_id, member_id, revoked_at, expires_at)
+        """,
+        """
+        CREATE INDEX IF NOT EXISTS idx_agent_sessions_member
+        ON agent_sessions(project_id, member_id, created_at)
+        """,
+        """
+        CREATE INDEX IF NOT EXISTS idx_agent_sessions_project_agent_key
+        ON agent_sessions(project_id, agent_key, last_heartbeat DESC)
+        """,
+        """
+        CREATE INDEX IF NOT EXISTS idx_task_assignments_member
+        ON task_assignments(project_id, assigned_to_member_id, status, created_at)
+        """,
+    ):
+        connection.execute(statement)
+
+
 def ensure_project_member_columns(connection: Any, *, postgres: bool = False) -> None:
     """Add v11 member links to databases whose base tables predate the model."""
     if postgres:
@@ -1098,6 +1128,9 @@ class Database:
             ensure_task_number_schema(connection)
             ensure_task_assignment_member_column(connection)
             ensure_event_number_schema(connection)
+            # After the member_id / agent_key columns are backfilled, so the
+            # index statements below can never reference a missing column.
+            ensure_member_lookup_indexes(connection)
             row = connection.execute("SELECT version FROM schema_meta LIMIT 1").fetchone()
             if row is None:
                 connection.execute(
