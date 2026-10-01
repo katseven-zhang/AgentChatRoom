@@ -711,6 +711,11 @@ Web 端采用现代科技感设计系统与零构建原生 CSS 资产交付：
 - **删除备份**：`DELETE /api/v1/admin/backups/{filename}`（管理认证）安全删除指定的数据库快照及其元数据清单（`.manifest.json`），Web 界面提供二次确认弹窗防误触。严格限制文件名必须符合 `backup-*.sqlite` 命名格式，禁止路径穿越或删除未受管快照，成功删除后写入审计事件 `backup.deleted`。
 - **自动备份**：受验证配置 `[backup]`：`auto_backup_enabled`（默认关闭）、`auto_backup_interval_seconds`（默认 3600，最小 60）、`auto_backup_max_kept`（默认 10，超出自动清理最旧备份），环境变量 `AGENTCHATROOM_AUTO_BACKUP_*` 可覆盖。项目设置对话框（项目设置重设计任务）接线同一配置，无第二套事实来源。
 
+CLI 侧的 `backup.py` 与上述管理端行为一致，且有两处额外约束：
+
+- **恢复会连同 sidecar 一起换掉**。`Connection.backup` 会把源库的 WAL 模式一并复制过来，因此只替换主库文件时，旧库遗留的 `-wal` 会在下次打开时被回放，把恢复前已经"消失"的行重新写回来——而恢复恰恰多发生在异常关机之后。`restore_sqlite` 现在在 `os.replace` 的同一步内清除 `-wal` / `-shm` / `-journal`，并把清理结果写进 manifest 与返回值（`removed_sidecars`）。
+- **PostgreSQL 凭据不进入进程参数**。`pg_dump` / `pg_restore` 原先以 `--dbname <完整 DSN>` 调用，而 DSN 通常是 `user:password@host`；argv 在同机对所有本地用户可读，密码等于公开。连接串现在先剥离密码、密码改由 0600 权限的 `PGPASSFILE` 传递，工具 stderr 也会做脱敏后再进入异常文本。dump 先写同目录临时文件再 `os.replace`，中途失败不会截断或毁掉上一份好备份；PostgreSQL 备份同样写 manifest，恢复前据此校验 schema 版本。
+
 ### 项目文档：规范注入与回执闭环
 
 每个 Project 可以维护版本化的「项目文档」，kind 分为两类：

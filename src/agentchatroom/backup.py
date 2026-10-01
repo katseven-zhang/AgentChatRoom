@@ -8,8 +8,16 @@ import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit, urlunsplit
 
 from .database import SCHEMA_VERSION
+
+# A restore swaps only the main database file. Sidecars belong to the previous
+# database and are replayed on the next open, so they must go with the swap.
+SQLITE_SIDECAR_SUFFIXES = ("-wal", "-shm", "-journal")
+# Never let a real secret reach argv, stderr or an exception message: argv is
+# world-readable through the process list on a shared machine.
+REDACTED = "***"
 
 
 class BackupError(RuntimeError):
@@ -98,6 +106,30 @@ def backup_sqlite(source: Path, target: Path) -> dict[str, Any]:
     return {"backend": "sqlite", "output": str(target), "manifest": str(manifest)}
 
 
+def clear_sqlite_sidecars(target: Path) -> list[str]:
+    """Remove the WAL/SHM/journal files sitting beside a replaced database.
+
+    ``Connection.backup`` copies the source header, so a restored file comes
+    back in WAL mode. Any leftover ``-wal`` from the previous database is then
+    replayed on the next open and resurrects pre-restore rows — exactly when a
+    restore is used, after an unclean shutdown. Removing them in the same step
+    as the swap keeps the restore atomic.
+    """
+    removed: list[str] = []
+    for suffix in SQLITE_SIDECAR_SUFFIXES:
+        sidecar = target.with_name(f"{target.name}{suffix}")
+        try:
+            sidecar.unlink()
+        except FileNotFoundError:
+            continue
+        except OSError as error:
+            raise BackupError(
+                f"Cannot remove SQLite sidecar {sidecar.name}: {error}"
+            ) from error
+        removed.append(sidecar.name)
+    return removed
+
+
 def restore_sqlite(source: Path, target: Path, *, overwrite: bool = False) -> dict[str, Any]:
     source = source.expanduser().resolve()
     target = target.expanduser().resolve()
@@ -127,15 +159,82 @@ def restore_sqlite(source: Path, target: Path, *, overwrite: bool = False) -> di
     except Exception:
         temporary.unlink(missing_ok=True)
         raise
+    removed_sidecars = clear_sqlite_sidecars(target)
     manifest = _write_manifest(
         target,
         backend="sqlite",
-        details={"restored_from": str(source), "schema_version": schema_version},
+        details={
+            "restored_from": str(source),
+            "schema_version": schema_version,
+            "removed_sidecars": removed_sidecars,
+        },
     )
-    return {"backend": "sqlite", "input": str(source), "output": str(target), "manifest": str(manifest)}
+    return {
+        "backend": "sqlite",
+        "input": str(source),
+        "output": str(target),
+        "manifest": str(manifest),
+        "removed_sidecars": removed_sidecars,
+    }
 
 
-def _run_database_tool(command: list[str], *, action: str) -> None:
+def _redact(text: str, *secrets: str) -> str:
+    for secret in secrets:
+        if secret:
+            text = text.replace(secret, REDACTED)
+    return text
+
+
+def split_conninfo_password(database_url: str) -> tuple[str, str]:
+    """Split a conninfo into a password-free URL and its password.
+
+    The password is stripped from the value handed to argv, because argv is
+    readable by every local user through the process list. It travels to the
+    tool through a 0600 PGPASSFILE instead.
+    """
+    parsed = urlsplit(database_url)
+    if not parsed.password:
+        return database_url, ""
+    hostname = parsed.hostname or ""
+    if parsed.port:
+        hostname = f"{hostname}:{parsed.port}"
+    if parsed.username:
+        hostname = f"{parsed.username}@{hostname}"
+    sanitized = urlunsplit(
+        (parsed.scheme, hostname, parsed.path, parsed.query, parsed.fragment)
+    )
+    return sanitized, parsed.password
+
+
+def _write_pgpass(database_url: str, password: str, directory: Path) -> Path | None:
+    if not password:
+        return None
+    parsed = urlsplit(database_url)
+    host = parsed.hostname or "localhost"
+    port = str(parsed.port or 5432)
+    user = parsed.username or "postgres"
+    database = parsed.path.lstrip("/") or user
+    path = directory / f".pgpass.{os.getpid()}.tmp"
+    path.write_text(f"{host}:{port}:{database}:{user}:{password}\n", encoding="utf-8")
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        # Windows has no POSIX mode; the file still never leaves this
+        # directory and is removed below.
+        pass
+    return path
+
+
+def _run_database_tool(
+    command: list[str],
+    *,
+    action: str,
+    env: dict[str, str] | None = None,
+    secrets: tuple[str, ...] = (),
+) -> None:
+    child_env = None
+    if env:
+        child_env = {**os.environ, **env}
     try:
         completed = subprocess.run(
             command,
@@ -144,6 +243,7 @@ def _run_database_tool(command: list[str], *, action: str) -> None:
             capture_output=True,
             text=True,
             stdin=subprocess.DEVNULL,
+            env=child_env,
         )
     except OSError as error:
         raise BackupError(
@@ -151,7 +251,8 @@ def _run_database_tool(command: list[str], *, action: str) -> None:
         ) from error
     if completed.returncode != 0:
         detail = (completed.stderr or completed.stdout or "command failed").strip()
-        raise BackupError(f"{action} failed: {detail[-500:]}")
+        # Tool output can echo the conninfo back; never let it reach the caller.
+        raise BackupError(f"{action} failed: {_redact(detail[-500:], *secrets)}")
 
 
 def backup_postgresql(database_url: str, target: Path) -> dict[str, Any]:
@@ -162,12 +263,49 @@ def backup_postgresql(database_url: str, target: Path) -> dict[str, Any]:
     executable = shutil.which("pg_dump")
     if not executable:
         raise BackupError("PostgreSQL backup requires pg_dump on PATH")
-    _run_database_tool(
-        [executable, "--format=custom", "--file", str(target), "--dbname", database_url],
-        action="PostgreSQL backup",
+    sanitized, password = split_conninfo_password(database_url)
+    # Dump into a sibling temporary file so an interrupted run cannot truncate
+    # or destroy the previous good backup.
+    temporary = target.with_name(f".{target.name}.{os.getpid()}.tmp")
+    passfile = _write_pgpass(database_url, password, target.parent)
+    try:
+        _run_database_tool(
+            [
+                executable,
+                "--format=custom",
+                "--file",
+                str(temporary),
+                "--dbname",
+                sanitized,
+            ],
+            action="PostgreSQL backup",
+            env={"PGPASSFILE": str(passfile)} if passfile else None,
+            secrets=(password, database_url),
+        )
+        os.replace(temporary, target)
+    except Exception:
+        temporary.unlink(missing_ok=True)
+        raise
+    finally:
+        if passfile is not None:
+            passfile.unlink(missing_ok=True)
+    manifest = _write_manifest(
+        target, backend="postgresql", details={"format": "custom"}
     )
-    manifest = _write_manifest(target, backend="postgresql", details={"format": "custom"})
     return {"backend": "postgresql", "output": str(target), "manifest": str(manifest)}
+
+
+def read_manifest(target: Path) -> dict[str, Any] | None:
+    """Return a backup's manifest, or None when it is absent or unreadable.
+
+    A corrupt manifest must not take the whole backup subsystem down with it.
+    """
+    path = _manifest_path(target)
+    try:
+        parsed = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return parsed if isinstance(parsed, dict) else None
 
 
 def restore_postgresql(database_url: str, source: Path) -> dict[str, Any]:
@@ -176,19 +314,40 @@ def restore_postgresql(database_url: str, source: Path) -> dict[str, Any]:
     source = source.expanduser().resolve()
     if not source.is_file():
         raise BackupError(f"PostgreSQL backup does not exist: {source}")
+    manifest = read_manifest(source)
+    if manifest is not None:
+        schema_version = manifest.get("database_schema_version")
+        if isinstance(schema_version, int) and schema_version > SCHEMA_VERSION:
+            raise BackupError(
+                f"PostgreSQL backup schema {schema_version} is newer than "
+                f"supported schema {SCHEMA_VERSION}"
+            )
     executable = shutil.which("pg_restore")
     if not executable:
         raise BackupError("PostgreSQL restore requires pg_restore on PATH")
-    _run_database_tool(
-        [
-            executable,
-            "--clean",
-            "--if-exists",
-            "--exit-on-error",
-            "--dbname",
-            database_url,
-            str(source),
-        ],
-        action="PostgreSQL restore",
-    )
-    return {"backend": "postgresql", "input": str(source), "restored": True}
+    sanitized, password = split_conninfo_password(database_url)
+    passfile = _write_pgpass(database_url, password, source.parent)
+    try:
+        _run_database_tool(
+            [
+                executable,
+                "--clean",
+                "--if-exists",
+                "--exit-on-error",
+                "--dbname",
+                sanitized,
+                str(source),
+            ],
+            action="PostgreSQL restore",
+            env={"PGPASSFILE": str(passfile)} if passfile else None,
+            secrets=(password, database_url),
+        )
+    finally:
+        if passfile is not None:
+            passfile.unlink(missing_ok=True)
+    return {
+        "backend": "postgresql",
+        "input": str(source),
+        "restored": True,
+        "manifest_validated": manifest is not None,
+    }
