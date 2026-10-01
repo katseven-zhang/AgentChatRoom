@@ -681,7 +681,7 @@ REST `GET /api/v1/projects/{project_id}/tasks?phase=`、MCP `task_list(phase=…
 
 Agent Session Token 校验与 `last_used_at` 更新是分开的：校验走只读连接，使用时间在后台批量写入（默认至少间隔 60 秒或累计 32 次调用），进程退出时 flush。`session_heartbeat` 只刷新连接存活，不承担 Token 校验写锁。
 
-浏览器订阅 `events/stream` 必须携带 Agent Session 凭据（请求头）或已建立的浏览器 Session Cookie；匿名订阅返回 401。公开配置提供 `max_sse_clients_per_project`（默认 64）和 `sse_per_ip_limit`（默认 16），超限返回 429。容量在响应头之前**原子预留**：并发请求中只有拿满配额的调用得到 200，落败方在 headers 前收到 429（不会出现空 200）；预留由响应包装层在 `stream_response` 结束时无条件释放，生成器 `finally` 再幂等释放一次——客户端在首字节前断开导致生成器从未迭代时也不会留下永久占用（#181），反复抖动也不会耗尽槽位。SSE 轮询里的同步 `list_events`（SQLite）经 `asyncio.to_thread` 移出事件循环（#184），多客户端慢查询不再拖住 `/health` 与普通 REST。
+浏览器订阅 `events/stream` 必须携带 Agent Session 凭据（请求头）或已建立的浏览器 Session Cookie；匿名订阅返回 401。公开配置提供 `max_sse_clients_per_project`（默认 64）和 `sse_per_ip_limit`（默认 16），超限返回 429。容量在响应头之前**原子预留**：并发请求中只有拿满配额的调用得到 200，落败方在 headers 前收到 429（不会出现空 200）；预留由响应包装层在 `stream_response` 结束时无条件释放，生成器 `finally` 再幂等释放一次——客户端在首字节前断开导致生成器从未迭代时也不会留下永久占用（#181），反复抖动也不会耗尽槽位。SSE 轮询里的同步 `list_events`（SQLite）经 `asyncio.to_thread` 移出事件循环（#184），多客户端慢查询不再拖住 `/health` 与普通 REST。`events/stream` 路由本身是同步 `def`（#273）：握手阶段的 `get_project`（可能触发 git 作用域重检/写回）与凭据校验（Session 校验或浏览器 Cookie 查库）因此跑在 Starlette 工作线程池里，重启后的重连风暴（每项目上限 `max_sse_clients_per_project`）不会把这些数据库往返压在 ASGI 事件循环上；只有流式生成器留在循环内，其轮询仍按 #184 走线程池。同一条约束也适用于管理端中间件：cookie 认证的查库通过 `asyncio.to_thread` 完成（#271），`agents.md` 已把“ASGI 协程内禁止同步访问数据库”记为工程规则。
 
 Agent 自报的 `worktree` 不会被服务盲目信任。Work Report 采集 Git 证据前必须有已登记 Workspace，路径只能是该 Workspace 的 `local_path` 或其子目录，上报的 `commit_hash` 必须能在该 worktree 内解析；否则拒绝，不会把伪造路径或伪造 commit 写成事实。
 

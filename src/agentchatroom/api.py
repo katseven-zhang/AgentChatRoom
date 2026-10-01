@@ -1832,11 +1832,16 @@ def create_app(
         return service.list_events(project_id, after=after, limit=limit)
 
     @app.get("/api/v1/projects/{project_id}/events/stream")
-    async def stream_events(
+    def stream_events(
         request: Request,
         project_id: str,
         after: int = Query(0, ge=0),
     ) -> StreamingResponse:
+        # A synchronous route runs in Starlette's worker threadpool, so the
+        # preamble below - project read, credential check - cannot put a database
+        # round trip on the event loop while 64 reconnecting EventSources arrive
+        # (#273, same rule as the #184 polling fix and #271 cookie auth).
+        # Only the streaming generator itself belongs on the loop.
         service.get_project(project_id)
         authorize_event_stream(request, project_id)
         client_ip = event_stream_client_ip(request)
