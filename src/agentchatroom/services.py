@@ -7982,6 +7982,35 @@ class AgentChatRoomService:
         clean_body = body.strip()
         clean_kind = kind.strip()
         clean_summary = summary.strip()
+        # Knowledge content was the one user-facing write with no size bound,
+        # while every sibling write (task text, project documents) has one.
+        # Reuse the existing configured limits rather than adding new ones.
+        text_limit = int(getattr(self.settings, "task_text_max_length", 32768))
+        for field_name, value in (
+            ("title", clean_title),
+            ("summary", clean_summary),
+        ):
+            if len(value) > text_limit:
+                raise DomainError(
+                    "knowledge_content_too_long",
+                    f"Knowledge {field_name} exceeds task_text_max_length ({text_limit})",
+                    status_code=422,
+                    details={
+                        "field": field_name,
+                        "limit": text_limit,
+                        "length": len(value),
+                    },
+                )
+        body_limit = int(getattr(self.settings, "project_document_max_bytes", 262144))
+        body_bytes = len(clean_body.encode("utf-8"))
+        if body_bytes > body_limit:
+            raise DomainError(
+                "knowledge_content_too_large",
+                "Knowledge body exceeds project_document_max_bytes "
+                f"({body_limit})",
+                status_code=422,
+                details={"field": "body", "limit": body_limit, "size": body_bytes},
+            )
         list_limit = int(getattr(self.settings, "list_input_max_count", 100))
         clean_tags = self._require_list_input_limit(
             "tags",
