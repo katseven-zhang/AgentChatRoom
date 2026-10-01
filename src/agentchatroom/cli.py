@@ -1452,6 +1452,29 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _read_event_cursor(settings) -> int | None:
+    """Best-effort latest event id, or None when it cannot be read.
+
+    Stamping the manifest is what lets a later restore prove the snapshot is
+    current. A backup that genuinely cannot read the cursor must report that,
+    rather than write a manifest that looks complete.
+    """
+    try:
+        from .database import create_database
+
+        backend = create_database(settings)
+        try:
+            with backend.connect() as connection:
+                row = connection.execute(
+                    "SELECT COALESCE(MAX(id), 0) AS cursor FROM events"
+                ).fetchone()
+            return int(row["cursor"])
+        finally:
+            backend.close()
+    except Exception:
+        return None
+
+
 def main(argv: list[str] | None = None) -> None:
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -1543,11 +1566,20 @@ def main(argv: list[str] | None = None) -> None:
         try:
             if args.command == "backup":
                 output = Path(args.output).expanduser().resolve()
+                # The CLI backs the database up directly, bypassing the service
+                # wrapper that normally stamps the manifest. Without the cursor
+                # the in-app restore cannot prove the snapshot is current and
+                # refuses it as backup_cursor_unknown (#295).
+                cursor = _read_event_cursor(settings)
                 if settings.database_backend == "sqlite":
-                    result = backup_sqlite(settings.database_path, output)
+                    result = backup_sqlite(
+                        settings.database_path, output, latest_event_id=cursor
+                    )
                 else:
                     database_url = os.getenv(settings.database_url_env, "").strip()
-                    result = backup_postgresql(database_url, output)
+                    result = backup_postgresql(
+                        database_url, output, latest_event_id=cursor
+                    )
             else:
                 if not args.confirm:
                     raise SystemExit("restore requires --confirm")

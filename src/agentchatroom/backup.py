@@ -32,7 +32,19 @@ def _manifest_path(target: Path) -> Path:
     return target.with_name(f"{target.name}.manifest.json")
 
 
-def _write_manifest(target: Path, *, backend: str, details: dict[str, Any]) -> Path:
+def _write_manifest(
+    target: Path,
+    *,
+    backend: str,
+    details: dict[str, Any],
+    latest_event_id: int | None = None,
+) -> Path:
+    # A manifest without an event cursor cannot be proven current, and the
+    # in-app restore then refuses it as backup_cursor_unknown (#295). Callers
+    # that can read the cursor must pass it; only a caller that genuinely has
+    # no access to the event log leaves it out.
+    if latest_event_id is not None:
+        details = {**details, "latest_event_id": int(latest_event_id)}
     manifest = {
         "backup_schema_version": 1,
         "database_schema_version": SCHEMA_VERSION,
@@ -72,7 +84,9 @@ def _validate_sqlite_backup(source: Path) -> int:
     return version
 
 
-def backup_sqlite(source: Path, target: Path) -> dict[str, Any]:
+def backup_sqlite(
+    source: Path, target: Path, *, latest_event_id: int | None = None
+) -> dict[str, Any]:
     source = source.expanduser().resolve()
     target = target.expanduser().resolve()
     if source == target:
@@ -102,6 +116,7 @@ def backup_sqlite(source: Path, target: Path) -> dict[str, Any]:
         target,
         backend="sqlite",
         details={"schema_version": schema_version},
+        latest_event_id=latest_event_id,
     )
     return {"backend": "sqlite", "output": str(target), "manifest": str(manifest)}
 
@@ -261,7 +276,9 @@ def _run_database_tool(
         raise BackupError(f"{action} failed: {_redact(detail[-500:], *secrets)}")
 
 
-def backup_postgresql(database_url: str, target: Path) -> dict[str, Any]:
+def backup_postgresql(
+    database_url: str, target: Path, *, latest_event_id: int | None = None
+) -> dict[str, Any]:
     if not database_url.strip():
         raise BackupError("PostgreSQL database URL is required for backup")
     target = target.expanduser().resolve()
@@ -296,7 +313,10 @@ def backup_postgresql(database_url: str, target: Path) -> dict[str, Any]:
         if passfile is not None:
             passfile.unlink(missing_ok=True)
     manifest = _write_manifest(
-        target, backend="postgresql", details={"format": "custom"}
+        target,
+        backend="postgresql",
+        details={"format": "custom"},
+        latest_event_id=latest_event_id,
     )
     return {"backend": "postgresql", "output": str(target), "manifest": str(manifest)}
 

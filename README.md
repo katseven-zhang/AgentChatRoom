@@ -724,12 +724,11 @@ Web 端采用现代科技感设计系统与零构建原生 CSS 资产交付：
 备份子系统的两条容错约束（CLI `backup.py` 与管理端共用）：
 
 - **单个坏 manifest 不得拖垮整个子系统。** 清单列举同时喂给管理页面和自动备份 worker，一个截断/二进制/无法解析的 manifest 若抛异常，会让列举返回 500 并让自动备份**静默永久停止**。现按条容错读取，并在列表中给出 `manifest_readable=false` 让运维看得见，而不是把「没有游标」误读成「备份很旧」。
-- **「没记录游标」不等于「游标为 0」。** CLI 生成的 manifest 从不写 `latest_event_id`，旧实现用 `int(... or 0)` 把它读成 0，于是任何此类备份相对非空库都判为 stale。现区分「未知」与「0」：未知时返回 `backup_cursor_unknown`（带 `required_action`），需显式 `allow_data_loss` 才继续，不会伪装成已证明的 stale。
+- **「没记录游标」不等于「游标为 0」。** CLI 生成的 manifest 从不写 `latest_event_id`，旧实现用 `int(... or 0)` 把它读成 0，于是任何此类备份相对非空库都判为 stale。现区分「未知」与「0」：未知时返回 `backup_cursor_unknown`（带 `required_action`），需显式 `allow_data_loss` 才继续，不会伪装成已证明的 stale。CLI `backup` 现主动读取事件游标并写入 manifest（`backup_sqlite` / `backup_postgresql` 新增可选 `latest_event_id`）；确实读不到游标的调用方会明确不写该字段，而不是让 manifest 看起来完整。
 
 CLI 侧的 `backup.py` 与上述管理端行为一致，且有两处额外约束：
 
-- **恢复会连同 sidecar 一起换掉**。`Connection.backup` 会把源库的 WAL 模式一并复制过来，因此只替换主库文件时，旧库遗留的 `-wal` 会在下次打开时被回放，把恢复前已经"消失"的行重新写回来——而恢复恰恰多发生在异常关机之后。`restore_sqlite` 现在在 `os.replace` 的同一步内清除 `-wal` / `-shm` / `-journal`，并把清理结果写进 manifest 与返回值（`removed_sidecars`）。
-- **PostgreSQL 凭据不进入进程参数**。`pg_dump` / `pg_restore` 原先以 `--dbname <完整 DSN>` 调用，而 DSN 通常是 `user:password@host`；argv 在同机对所有本地用户可读，密码等于公开。连接串现在先剥离密码、密码改由 0600 权限的 `PGPASSFILE` 传递，工具 stderr 也会做脱敏后再进入异常文本。dump 先写同目录临时文件再 `os.replace`，中途失败不会截断或毁掉上一份好备份；PostgreSQL 备份同样写 manifest，恢复前据此校验 schema 版本。
+- **恢复会连同 sidecar 一起换掉**。`Connection.backup` 会把源库的 WAL 模式一并复制过来，因此只替换主库文件时，旧库遗留的 `-wal` 会在下次打开时被回放，把恢复前已经"消失"的行重新写回来——而恢复恰恰多发生在异常关机之后。`restore_sqlite` 现在在 `os.replace` 的同一步内清除 `-wal` / `-shm` / `-journal`，并把清理结果写进 manifest 与返回值（`removed_sidecars`）。- **PostgreSQL 凭据不进入进程参数**。`pg_dump` / `pg_restore` 原先以 `--dbname <完整 DSN>` 调用，而 DSN 通常是 `user:password@host`；argv 在同机对所有本地用户可读，密码等于公开。连接串现在先剥离密码、密码改由 0600 权限的 `PGPASSFILE` 传递，工具 stderr 也会做脱敏后再进入异常文本。dump 先写同目录临时文件再 `os.replace`，中途失败不会截断或毁掉上一份好备份；PostgreSQL 备份同样写 manifest，恢复前据此校验 schema 版本。
 
 ### 项目文档：规范注入与回执闭环
 

@@ -193,6 +193,44 @@ def test_postgres_restore_audits_after_the_restore_runs(service, project, monkey
     )
 
 
+def test_cli_backup_stamps_the_event_cursor(service, project, tmp_path):
+    """#295: a backup made outside the service must not be cursor-unknown."""
+    from agentchatroom.backup import backup_sqlite
+
+    session = service.join_room(
+        project["id"], name="Worker", client="codex", model="unknown"
+    )
+    service.post_message(
+        project["id"],
+        body="before the backup",
+        session_id=session["agent"]["id"],
+        token=session["token"],
+        model_display_name="test-model",
+    )
+    cursor = service._latest_event_id()
+    assert cursor > 0
+
+    stamped = backup_sqlite(
+        service.database.path, tmp_path / "backup-cli.sqlite", latest_event_id=cursor
+    )
+    manifest = json.loads(Path(stamped["manifest"]).read_text(encoding="utf-8"))
+    assert manifest["latest_event_id"] == cursor
+
+    # A caller that genuinely cannot read the cursor still writes no cursor,
+    # and the restore refuses instead of guessing. The file must sit inside the
+    # managed directory, otherwise #240's path guard answers first.
+    managed = Path(service._backup_directory())
+    managed.mkdir(parents=True, exist_ok=True)
+    bare_target = managed / "backup-bare.sqlite"
+    bare = backup_sqlite(service.database.path, bare_target)
+    bare_manifest = json.loads(Path(bare["manifest"]).read_text(encoding="utf-8"))
+    assert "latest_event_id" not in bare_manifest
+
+    with pytest.raises(DomainError) as unknown:
+        service.restore_backup(str(bare_target), confirm="REPLACE")
+    assert unknown.value.code == "backup_cursor_unknown"
+
+
 def test_every_migrated_index_exists_in_a_fresh_install(tmp_path):
     """#296: a fresh install and a migrated database must not diverge."""
     import re
