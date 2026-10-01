@@ -565,7 +565,13 @@ def _project_scope(
 def _stored_project_scope(project: Mapping[str, Any]) -> tuple[str, str, str]:
     """The stored row's scope, from the same implementation the registration and
     bootstrap paths use, so no second copy can drift again."""
-    scope = stored_project_scope(dict(project))
+    try:
+        scope = stored_project_scope(dict(project))
+    except (OSError, ValueError):
+        # A root_path that cannot be resolved (legacy, corrupt, or deliberately
+        # malformed) owns no scope at all: it must never match a candidate and
+        # must never turn an ordinary read into a 500.
+        return ("unreadable", "", "")
     return (
         scope["kind"],
         scope["identity"],
@@ -2175,33 +2181,41 @@ class AgentChatRoomService:
                         },
                     )
             if not scope_projects and remote:
-                heal_target = None
                 norm_root = os.path.normcase(str(root.resolve()))
-                if reg_key:
-                    for p in all_projects:
-                        if str(p["project_key"]).strip() == reg_key:
-                            try:
-                                p_root = os.path.normcase(
-                                    str(Path(p["root_path"]).expanduser().resolve())
-                                )
-                                if p_root == norm_root:
-                                    heal_target = p
-                                    break
-                            except OSError:
-                                pass
-                if heal_target is None and not reg_key:
-                    matching_path_projects = [
-                        p
-                        for p in all_projects
-                        if p["archived_at"] is None
-                        and not str(p["git_remote"] or "").strip()
-                        and os.path.normcase(
-                            str(Path(p["root_path"]).expanduser().resolve())
+                # One selector for both self-heal branches. It never considers an
+                # archived Room (restoring one is an explicit management action
+                # that emits project.restored), it treats an unreadable stored
+                # root as non-matching instead of letting ValueError become a 500,
+                # and it re-checks the derived logical path so a different
+                # subproject of the same repository cannot be healed by accident.
+                heal_candidates = []
+                for candidate in all_projects:
+                    if candidate["archived_at"] is not None:
+                        continue
+                    if reg_key and str(candidate["project_key"]).strip() != reg_key:
+                        continue
+                    if not reg_key and str(candidate["git_remote"] or "").strip():
+                        continue
+                    if (
+                        str(candidate["logical_path"] or "").casefold()
+                        != logical.casefold()
+                    ):
+                        continue
+                    try:
+                        candidate_root = os.path.normcase(
+                            str(
+                                Path(str(candidate["root_path"]))
+                                .expanduser()
+                                .resolve()
+                            )
                         )
-                        == norm_root
-                    ]
-                    if len(matching_path_projects) == 1:
-                        heal_target = matching_path_projects[0]
+                    except (OSError, ValueError):
+                        continue
+                    if candidate_root == norm_root:
+                        heal_candidates.append(candidate)
+                heal_target = (
+                    heal_candidates[0] if len(heal_candidates) == 1 else None
+                )
 
                 if heal_target is not None:
                     now = iso_now()
@@ -2275,6 +2289,32 @@ class AgentChatRoomService:
                         ],
                     },
                 )
+            if reg_key:
+                # The registered Room exists but is archived, so it was excluded
+                # from the self-heal above. Report that instead of the orphaned
+                # registration error the fall-through would produce.
+                registered_row = next(
+                    (
+                        p
+                        for p in all_projects
+                        if str(p["project_key"]).strip() == reg_key
+                    ),
+                    None,
+                )
+                if (
+                    registered_row is not None
+                    and registered_row["archived_at"] is not None
+                ):
+                    raise DomainError(
+                        "project_archived",
+                        "Project is archived and must be restored explicitly before agents join",
+                        status_code=409,
+                        details={
+                            "project_id": registered_row["id"],
+                            "project_key": registered_row["project_key"],
+                            "archived_at": registered_row["archived_at"],
+                        },
+                    )
             if str(registered_project_key or "").strip():
                 raise DomainError(
                     "project_registration_orphaned",
