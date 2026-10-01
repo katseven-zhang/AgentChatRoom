@@ -1,3 +1,4 @@
+# audit-allow-file:windows_absolute_path,private_lan_address
 from __future__ import annotations
 
 import asyncio

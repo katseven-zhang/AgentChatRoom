@@ -1,3 +1,4 @@
+# audit-allow-file:windows_absolute_path
 import os
 import subprocess
 import sys

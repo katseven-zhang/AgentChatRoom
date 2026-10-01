@@ -1,3 +1,4 @@
+# audit-allow-file:windows_absolute_path,windows_user_home,private_lan_address,live_domain_id
 from __future__ import annotations
 
 import os

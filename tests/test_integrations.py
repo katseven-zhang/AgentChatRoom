@@ -1,3 +1,4 @@
+# audit-allow-file:windows_absolute_path
 from __future__ import annotations
 
 import json

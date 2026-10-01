@@ -1,3 +1,4 @@
+# audit-allow-file:live_domain_id
 from __future__ import annotations
 
 import sqlite3

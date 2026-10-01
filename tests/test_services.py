@@ -1,3 +1,4 @@
+# audit-allow-file:windows_absolute_path,unix_user_home
 from __future__ import annotations
 
 import subprocess

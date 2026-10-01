@@ -3,6 +3,11 @@ name: CI
 on:
   push:
   pull_request:
+  schedule:
+    # The reachable-history audit walks every blob, so it is a daily trunk
+    # report rather than a per-merge gate; the working-tree audit below still
+    # blocks every push and pull request.
+    - cron: "17 3 * * *"
 
 jobs:
   test:
@@ -26,3 +31,24 @@ jobs:
         run: python -m pytest
       - name: Check Web JavaScript
         run: node --check src/agentchatroom/web/app.js
+      - name: Compile source package
+        run: python -m compileall -q src/agentchatroom
+      - name: Audit public release surface
+        run: python scripts/audit_public_release.py
+      - name: Check whitespace hygiene
+        shell: bash
+        run: git diff --check
+
+  release-history:
+    name: Audit reachable Git history for private runtime data
+    runs-on: ubuntu-latest
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+      - name: Audit every reachable blob
+        run: python scripts/audit_public_release.py --history

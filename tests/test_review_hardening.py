@@ -1,3 +1,4 @@
+# audit-allow-file:private_lan_address
 from __future__ import annotations
 
 import os

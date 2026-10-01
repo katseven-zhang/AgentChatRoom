@@ -1,3 +1,4 @@
+# audit-allow-file:windows_absolute_path
 """Regression coverage for services-cluster review batch (#175-#200)."""
 
 from __future__ import annotations

@@ -858,6 +858,31 @@ node --check src\agentchatroom\web\app.js
 git diff --check
 ```
 
+上述每一条都在流水线里真实执行，不是只写在文档里：`ci.yml` 的 `test` job 在
+Windows 与 Ubuntu 上依次跑 `pytest` → `node --check` → `compileall` →
+`audit_public_release.py` → `git diff --check`（Whitespace hygiene），任一失败即
+红灯；`package-windows.yml` 的 “Validate source before packaging” 同样跑齐这五条并
+逐项 `throw`，所以审计不过时根本不会产出 EXE artifact。可达历史审计在
+`ci.yml` 的 `release-history` job（每日定时 + 手动 `workflow_dispatch`）里执行，
+不在每次合并时阻塞。
+
+发布审计的口径与本机日志的口径是两件事，不要混为一谈：
+
+- **Git 与发布产物是公开面**：`audit_public_release.py` 除自身以外对所有路径做内容
+  检查（含 `evidence/`、`packaging/`、`tests/`、根目录 `.cmd`、`*.spec`、
+  `pyproject.toml`），`evidence/` 已进入 `.gitignore` 与禁用前缀；二进制不再因
+  `\x00` 被整体跳过（`.xml/.png/.zip/.dump/.har/.jsonl` 等走字节级检测）；新增
+  `windows_user_home`、`developer_hostname`（只认序列化形态，不误判 Python 变量赋值）
+  与按运行机器实时推导的 `this_machine_hostname` / `this_user_home_path` 规则——后两条
+  不写入仓库字面量，任何 `audit-allow` 指令都无法屏蔽。
+- **本机日志与 GUI 诊断保持可读**：这是本地单人工具，`server.log`、GUI 面板和排错
+  输出刻意不做全量脱敏，以免信息缺失无法定位问题；日志侧只对凭据值做定点处理。
+  隐私约束的位置是版本控制与发布面，不是日志。
+
+测试夹具必须包含 Windows 路径、内网地址或 id 形状字符串时，使用行级
+`# audit-allow:<rule>` 或模块首三行内的 `# audit-allow-file:<rules>` 显式声明豁免，
+豁免范围按规则而非按目录，且对上面两条按机器实时推导的规则无效。
+
 本机验收脚本产生的临时数据库、日志和协议结果统一写入
 `.agentchatroom/verification/`，不会散落到仓库源码目录或进入 Git。
 PostgreSQL 验收脚本在未安装可选数据库依赖时仍可查看 `--help`；实际执行
