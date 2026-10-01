@@ -5539,6 +5539,40 @@ class AgentChatRoomService:
             task = self._require_task_by_number(connection, project_id, task_number)
             return self._task_with_dependencies(connection, task)
 
+    def _unfinished_dependencies(self, connection: Any, task_id: str) -> list[Any]:
+        return connection.execute(
+            """
+            SELECT t.id, t.title, t.status, t.execution_status,
+                   t.verification_status, t.integration_status
+            FROM task_dependencies d
+            JOIN tasks t ON t.id = d.depends_on_task_id
+            WHERE d.task_id = ?
+              AND NOT (
+                  t.verification_status = 'approved'
+                  AND t.integration_status = 'done'
+              )
+            """,
+            (task_id,),
+        ).fetchall()
+
+    def _require_finished_dependencies(self, connection: Any, task_id: str) -> None:
+        """Gate entry into work, whatever door is used.
+
+        Claim, assignment acceptance and handoff acceptance all move a task into
+        ``claimed``. The dependency rule lived only in ``claim_task``, so
+        assigning a blocked task and having the target accept it stepped straight
+        past the gate, and the task then read as claimed and could be reported
+        and reviewed with its dependencies unfinished.
+        """
+        blockers = self._unfinished_dependencies(connection, task_id)
+        if blockers:
+            raise DomainError(
+                "task_dependencies_incomplete",
+                "Task has unfinished dependencies",
+                status_code=409,
+                details={"blockers": [dict(row) for row in blockers]},
+            )
+
     @idempotent_write("task.claim")
     def claim_task(
         self,
@@ -5709,27 +5743,7 @@ class AgentChatRoomService:
                         "status": task["status"],
                     },
                 )
-            blockers = connection.execute(
-                """
-                SELECT t.id, t.title, t.status, t.execution_status,
-                       t.verification_status, t.integration_status
-                FROM task_dependencies d
-                JOIN tasks t ON t.id = d.depends_on_task_id
-                WHERE d.task_id = ?
-                  AND NOT (
-                      t.verification_status = 'approved'
-                      AND t.integration_status = 'done'
-                  )
-                """,
-                (task_id,),
-            ).fetchall()
-            if blockers:
-                raise DomainError(
-                    "task_dependencies_incomplete",
-                    "Task has unfinished dependencies",
-                    status_code=409,
-                    details={"blockers": [dict(row) for row in blockers]},
-                )
+            self._require_finished_dependencies(connection, task_id)
             now = iso_now()
             updated = connection.execute(
                 """
@@ -6528,6 +6542,7 @@ class AgentChatRoomService:
                 else:
                     owner_clause = "owner_session_id = ?"
                     owner_params = (task["owner_session_id"],)
+                self._require_finished_dependencies(connection, task_id)
                 updated_task = connection.execute(
                     f"""
                     UPDATE tasks
@@ -6856,6 +6871,7 @@ class AgentChatRoomService:
                         "Cancelled tasks cannot accept a handoff",
                         status_code=409,
                     )
+                self._require_finished_dependencies(connection, task_id)
                 if task["execution_status"] == "completed" and (
                     task["verification_status"] != "approved"
                     or task["integration_status"] != "pending"
