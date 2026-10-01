@@ -6400,6 +6400,7 @@ class AgentChatRoomService:
         next_step: str,
         from_session_id: str | None = None,
         token: str | None = None,
+        management_authorized: bool = False,
         completed_items: list[str] | None = None,
         pending_items: list[str] | None = None,
         files: list[str] | None = None,
@@ -6439,18 +6440,36 @@ class AgentChatRoomService:
                     token or "",
                 )
             task = self._require_task(connection, project_id, task_id)
-            source_session_id = from_session_id or task["owner_session_id"]
+            # "No credentials presented" is not owner authority. A handoff moves
+            # ownership once the target accepts, and accepting releases the
+            # source's active leases, so the caller must either prove it is the
+            # current owner or arrive through an authenticated management
+            # request. The unauthenticated path used to borrow the owner's own
+            # session id, which made the ownership check below compare a value
+            # with itself and never fail, and the audit then recorded another
+            # Agent's intrusion as requested_by "manager".
+            if not from_session_id and not management_authorized:
+                raise _management_authorization_required(
+                    "hand this task off using the owner's credentials"
+                )
+            if from_session_id:
+                if task["owner_session_id"] != from_session_id:
+                    raise DomainError(
+                        "not_task_owner",
+                        "Only the current task owner can hand off this task",
+                        status_code=403,
+                        details={
+                            "required_action": "handoff_requires_current_owner_credentials"
+                        },
+                    )
+                source_session_id = from_session_id
+            else:
+                source_session_id = task["owner_session_id"]
             if not source_session_id:
                 raise DomainError(
                     "handoff_source_missing",
                     "Task must have an owner before it can be handed off",
                     status_code=409,
-                )
-            if task["owner_session_id"] != source_session_id:
-                raise DomainError(
-                    "not_task_owner",
-                    "Only the current task owner can hand off this task",
-                    status_code=403,
                 )
             if task["execution_status"] == "cancelled":
                 raise DomainError(

@@ -1493,12 +1493,25 @@ def test_manager_can_request_handoff_without_impersonating_owner(
         project["id"], task["id"], owner["agent"]["id"], owner["token"]
     )
 
+    # An uncredentialed call is not owner authority either: a handoff has to be
+    # declared as a management request (#334).
+    with pytest.raises(DomainError) as anonymous:
+        service.handoff_task(
+            project["id"],
+            task["id"],
+            to_session_id=successor["agent"]["id"],
+            summary="Manager is coordinating a shift change",
+            next_step="Review the current branch",
+        )
+    assert anonymous.value.code == "management_auth_required"
+
     requested = service.handoff_task(
         project["id"],
         task["id"],
         to_session_id=successor["agent"]["id"],
         summary="Manager is coordinating a shift change",
         next_step="Review the current branch",
+        management_authorized=True,
     )
 
     assert requested["handoff"]["from_session_id"] == owner["agent"]["id"]

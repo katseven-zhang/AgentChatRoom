@@ -2336,10 +2336,19 @@ def create_app(
         task_id: str,
         body: TaskHandoffCreate,
     ) -> dict[str, Any]:
+        _reject_credentials_in_query(request)
+        payload = body.model_dump()
+        # Missing Session credentials are not management authority, and they are
+        # certainly not the task owner either: handoff must pass the same gate
+        # its sibling writes (release/assign/update) pass.
+        management = not str(payload.get("from_session_id") or "").strip()
+        if management:
+            _require_management(request)
         return service.handoff_task(
             project_id,
             task_id,
-            **body.model_dump(),
+            **payload,
+            management_authorized=management,
             request_id=request.state.request_id,
         )
 
