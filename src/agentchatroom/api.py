@@ -480,7 +480,6 @@ class ProjectUpdate(StrictModel):
 
 class AgentJoin(StrictModel):
     agent_key: str = ""
-    software_key: str = ""
     name: str
     client: str
     model: str
@@ -1872,8 +1871,17 @@ def create_app(
         )
 
     @app.post("/api/v1/projects/{project_id}/agents/join", status_code=201)
-    def join_agent(project_id: str, body: AgentJoin) -> dict[str, Any]:
-        return service.join_room(project_id, **body.model_dump())
+    def join_agent(request: Request, project_id: str, body: AgentJoin) -> dict[str, Any]:
+        # Creating a Session is how a software identity enters the Room, so
+        # this endpoint is management-only. The durable software key is not
+        # accepted from the body: without a credential-bound key, any
+        # unauthenticated caller could name somebody else's identity by
+        # choosing a matching `client`. Remote Agents do not use this route;
+        # they present a management-issued credential through MCP instead.
+        _require_management(request)
+        return service.join_room(
+            project_id, manage_member_reference=True, **body.model_dump()
+        )
 
     @app.get("/api/v1/projects/{project_id}/agent-tokens")
     def list_agent_tokens(project_id: str) -> dict[str, Any]:

@@ -297,6 +297,8 @@ Linux 或 macOS：
 
 一个本机 Agent 软件安装在一个 Project 中只对应一个持久软件身份。本机 stdio MCP 配置通过 `AGENTCHATROOM_SOFTWARE_KEY`、`AGENTCHATROOM_SOFTWARE_NAME` 和 `AGENTCHATROOM_SOFTWARE_CLIENT` 注入身份。用户级/多工作区共用配置应移除 `AGENTCHATROOM_PROJECT_PATH`，每个连接使用客户端 roots 或自身 cwd；未登记工作区会失败。身份配置完整、服务已显式启动且 checkout 已登记后，客户端通过 `room_bootstrap` 建立 Presence；进程启动本身不会加入或替换会话。缺少配置时不会猜测身份或创建 Room。模型不得按任务、角色、审核或运行检查临时改名。数据库 `agent_key`/`member_id` 由后端生成；同一软件可在同一或不同 Project 保持多个并行 Session，每个 Session 独立持有任务与租约。
 
+身份是接入配置而不是调用参数，因此接入面不提供任何身份字段：`room_join` 没有 `member_id`/`agent_key`/`agent_name`/`client`/`software_key`；本机取上述三个环境变量，远程 Bridge 取 `AGENTCHATROOM_AGENT_TOKEN` 所关联的成员，未关联时取它转发的 `X-AgentChatRoom-Software-Key/Name/Client` 请求头。领域层要求任何 `member_id` 都必须可被证明：要么是管理签发且已关联该成员的凭据，要么是与该成员固定软件身份一致的 software key，否则返回 `software_identity_mismatch`（403，带 `required_action`）。指定成员名不等于拥有该身份，这条规则挡住了以他人身份「独立验收」、接管租约和对他人任务 reclaim 的路径。`POST /api/v1/projects/{id}/agents/join` 只用于引用已受管理的成员或凭据，不接受软件身份字段，并且要求管理鉴权。
+
 Project 的创建、归档、永久删除和 Agent 接入使用不同语义：代码项目作用域还
 没有 Room 时，第一个 Agent 的 `room_join` 可以请求后端创建它，Web 管理端、REST 和
 CLI 也可以显式创建；作用域已经存在活动 Room 后，其他 Agent只能加入，不能

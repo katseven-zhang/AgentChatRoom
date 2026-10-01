@@ -134,6 +134,7 @@ def test_reclaim_uses_transport_state_not_the_presence_window(quiet_service):
         client="opencode",
         model="unknown",
         member_id=member["id"],
+        manage_member_reference=True,
     )
     task = service.create_task(
         project["id"], title="Crash recovery", acceptance_criteria=["reclaim fast"],
@@ -148,6 +149,7 @@ def test_reclaim_uses_transport_state_not_the_presence_window(quiet_service):
         client="opencode",
         model="unknown",
         member_id=member["id"],
+        manage_member_reference=True,
     )
     other = service.join_room(
         project["id"], name="Other", client="qoder", model="unknown"

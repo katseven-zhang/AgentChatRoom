@@ -151,6 +151,7 @@ async def test_submit_requires_explicit_takeover_for_live_same_identity_owner(
     owner = app.state.service.join_room(
         project["id"], name="OpenCode owner", client="opencode", model="unknown",
         member_id=member["id"],
+        manage_member_reference=True,
     )
     task = app.state.service.create_task(
         project["id"],

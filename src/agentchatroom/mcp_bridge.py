@@ -21,6 +21,17 @@ from mcp.server.lowlevel import NotificationOptions, Server
 from mcp.server.stdio import stdio_server
 
 from . import __version__
+from .bootstrap import (
+    SOFTWARE_CLIENT_ENV,
+    SOFTWARE_KEY_ENV,
+    SOFTWARE_NAME_ENV,
+)
+from .integrations import (
+    SOFTWARE_CLIENT_HEADER,
+    SOFTWARE_KEY_HEADER,
+    SOFTWARE_NAME_HEADER,
+    encode_http_identity_value,
+)
 from .mcp_http_recovery import (
     DIRECT_CLIENT_RECONNECT_HINT,
     MCP_SESSION_EXPIRED_CODE,
@@ -37,6 +48,9 @@ BRIDGE_INSTANCE_ID = uuid.uuid4().hex
 class BridgeSettings:
     server_url: str
     agent_token: str = ""
+    software_key: str = ""
+    software_name: str = ""
+    software_client: str = ""
     ca_file: Path | None = None
     timeout_seconds: float = 30.0
     retry_attempts: int = 3
@@ -153,6 +167,9 @@ def parse_bridge_settings(argv: list[str] | None = None) -> BridgeSettings:
     return BridgeSettings(
         server_url=url,
         agent_token=os.getenv("AGENTCHATROOM_AGENT_TOKEN", "").strip(),
+        software_key=os.getenv(SOFTWARE_KEY_ENV, "").strip(),
+        software_name=os.getenv(SOFTWARE_NAME_ENV, "").strip(),
+        software_client=os.getenv(SOFTWARE_CLIENT_ENV, "").strip(),
         ca_file=ca_file,
         timeout_seconds=args.timeout,
         retry_attempts=args.retry_attempts,
@@ -458,6 +475,17 @@ async def run_bridge(settings: BridgeSettings) -> None:
     headers = {}
     if settings.agent_token:
         headers["Authorization"] = f"Bearer {settings.agent_token}"
+    # The center resolves the durable software identity from these headers when
+    # the credential is not already linked to a member. Forwarding them keeps a
+    # single identity across reconnects instead of letting the center guess one
+    # from whatever the request happens to look like.
+    for header, value in (
+        (SOFTWARE_KEY_HEADER, settings.software_key),
+        (SOFTWARE_NAME_HEADER, settings.software_name),
+        (SOFTWARE_CLIENT_HEADER, settings.software_client),
+    ):
+        if value.strip():
+            headers[header] = encode_http_identity_value(value.strip())
     verify: bool | str = str(settings.ca_file) if settings.ca_file else True
     upstream = ReconnectingUpstream(settings, headers=headers, verify=verify)
     presence = BridgePresenceManager(upstream, settings)

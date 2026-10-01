@@ -460,6 +460,7 @@ def test_intake_define_concurrent_lock_prevents_duplicate_tasks(service, project
         client="opencode",
         model="unknown",
         member_id=member["id"],
+        manage_member_reference=True,
     )
     service.acknowledge_task_intake(
         project["id"],

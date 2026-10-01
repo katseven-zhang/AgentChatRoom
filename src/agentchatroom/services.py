@@ -1331,6 +1331,49 @@ class AgentChatRoomService:
         ).fetchone()
         return member, True
 
+    def _require_joinable_member_identity(
+        self,
+        member: Mapping[str, Any],
+        *,
+        software_key: str,
+        management_reference: bool,
+    ) -> None:
+        """Refuse a member reference the caller cannot prove it owns.
+
+        A software-managed member is only joinable by presenting the same
+        durable software key that the member was registered with. A member
+        that carries no software identity of its own is only reachable through
+        an authenticated management reference, because nothing in a plain
+        join request can distinguish "operator asked for this offline
+        identity" from "caller guessed the member id".
+        """
+        data = dict(member)
+        metadata = json_load(data.get("metadata_json"), {})
+        pinned_key = str(metadata.get("software_key") or "").strip()
+        member_key = str(data.get("member_key") or "").strip()
+        if not pinned_key and member_key.startswith(SOFTWARE_MEMBER_PREFIX):
+            pinned_key = member_key[len(SOFTWARE_MEMBER_PREFIX) :]
+        requested = str(software_key or "").strip()
+        if pinned_key:
+            if requested and self._normalize_software_key(
+                pinned_key
+            ) == self._normalize_software_key(requested):
+                return
+        elif management_reference:
+            return
+        raise DomainError(
+            "software_identity_mismatch",
+            "Joining as this project member requires proving the same software "
+            "identity. Restore the original identity configuration, or issue a "
+            "management credential linked to that member.",
+            status_code=403,
+            details={
+                "required_action": (
+                    "restore_configured_software_identity_or_use_management_credential"
+                ),
+            },
+        )
+
     @staticmethod
     def _same_agent_identity(
         first: Mapping[str, Any] | None,
@@ -3188,6 +3231,7 @@ class AgentChatRoomService:
         workspace_id: str | None = None,
         credential_id: str | None = None,
         member_id: str | None = None,
+        manage_member_reference: bool = False,
     ) -> dict[str, Any]:
         if not name.strip() or not client.strip():
             raise DomainError("invalid_agent", "Agent name and client are required")
@@ -3249,6 +3293,21 @@ class AgentChatRoomService:
                         "project_member_inactive",
                         "Agent session can only join as an active project member",
                         status_code=409,
+                    )
+                # Naming a member is not proof of being that member. A caller
+                # may join as a member only when it can actually prove that
+                # identity: a management-issued credential already linked to
+                # that member (resolved above), or a software key equal to the
+                # member's pinned key. Management may additionally reference a
+                # member that carries no software identity of its own. Without
+                # one of these proofs any caller could mint a Session as
+                # another software identity and inherit its independence,
+                # lease takeovers and append-only history.
+                if not credential_id:
+                    self._require_joinable_member_identity(
+                        member,
+                        software_key=software_key,
+                        management_reference=manage_member_reference,
                     )
                 member_created = False
             else:
@@ -3523,10 +3582,11 @@ class AgentChatRoomService:
         host_key: str,
         host_name: str,
         workspace_path: str,
-        agent_key: str,
-        name: str,
-        client: str,
         model: str,
+        software_key: str = "",
+        agent_key: str = "",
+        name: str = "",
+        client: str = "",
         role: str = "executor",
         branch: str = "",
         worktree: str = "",
@@ -3549,9 +3609,28 @@ class AgentChatRoomService:
             worktree=worktree,
             git_remote=git_remote,
         )
+        # The credential is the trust boundary for a remote join: a member it
+        # is linked to pins the durable identity, and its display fields are
+        # derived from that member. An unlinked credential falls back to the
+        # software identity the adapter already validated against the request
+        # credentials and headers. Caller-supplied display fields never select
+        # which software identity the Session runs as.
+        credential_member_id = str(credential.get("member_id") or "")
+        if credential_member_id:
+            with self.database.connect() as connection:
+                linked_member = self._require_member(
+                    connection, project_id, credential_member_id
+                )
+            linked_metadata = json_load(linked_member["metadata_json"], {})
+            name = str(name or "").strip() or str(linked_member["name"] or "").strip()
+            client = (
+                str(client or "").strip()
+                or str(linked_metadata.get("client") or "").strip()
+            )
         joined = self.join_room(
             project_id,
             agent_key=agent_key,
+            software_key=software_key,
             name=name,
             client=client,
             model=model,
@@ -3563,7 +3642,7 @@ class AgentChatRoomService:
             host_id=registered["host"]["id"],
             workspace_id=registered["workspace"]["id"],
             credential_id=credential["id"],
-            member_id=credential.get("member_id"),
+            member_id=credential_member_id or None,
         )
         return {"credential": credential, **registered, **joined}
 

@@ -211,7 +211,14 @@ class ServiceBoundToolManager(CompatibleToolManager):
                     http_identity_token = _bootstrap_http_identity.set(
                         _software_identity_from_http(context)
                     )
-            elif name != "room_join":
+            elif name == "room_join" and self.service_provider is not None:
+                # A remote join resolves identity from the same validated
+                # credential/header source as bootstrap, so identity is never a
+                # tool argument and can never be chosen by the caller.
+                http_identity_token = _bootstrap_http_identity.set(
+                    _software_identity_from_http(context)
+                )
+            else:
                 tool = self.get_tool(name)
                 if tool is not None:
                     forwarded = bind_runtime_arguments(
@@ -1232,12 +1239,13 @@ def room_join(
     host_key: str = "",
     host_name: str = "",
     git_remote: str = "",
-    member_id: str = "",
-    agent_key: str = "",
-    agent_name: str = "",
-    client: str = "",
 ) -> dict[str, Any]:
-    """Join as this MCP process's configured software identity."""
+    """Join as this MCP process's configured software identity.
+
+    Identity is never a parameter: the local process takes it from validated
+    client configuration, and a remote join takes it from the presented
+    credential. There is deliberately no way to name another project member.
+    """
     try:
         room_service = get_service()
         access = get_access_token()
@@ -1257,15 +1265,22 @@ def room_join(
                     "remote_host_required",
                     "Remote room_join requires host_key and host_name",
                 )
+            remote_identity = _bootstrap_http_identity.get()
+            if remote_identity is None:
+                raise DomainError(
+                    "software_identity_not_configured",
+                    "Remote room_join requires a configured software identity on "
+                    "the credential or the software identity headers",
+                )
             joined = room_service.join_remote_room(
                 project_id,
                 agent_token=agent_token,
                 host_key=host_key,
                 host_name=host_name,
                 workspace_path=worktree or project_path,
-                agent_key=agent_key,
-                name=agent_name,
-                client=client,
+                software_key=remote_identity[0],
+                name=remote_identity[1],
+                client=remote_identity[2],
                 model=model,
                 role=role,
                 branch=branch,
@@ -1308,7 +1323,6 @@ def room_join(
         )
         joined = room_service.join_room(
             project["id"],
-            agent_key=agent_key,
             software_key=effective_software_key,
             name=effective_name,
             client=effective_client,
@@ -1317,7 +1331,6 @@ def room_join(
             branch=branch,
             worktree=worktree or workspace_path,
             capabilities=capabilities or {"mcp": True},
-            member_id=member_id or None,
             host_id=registered["host"]["id"],
             workspace_id=registered["workspace"]["id"],
         )

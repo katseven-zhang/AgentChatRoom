@@ -568,12 +568,10 @@ def test_local_mcp_join_creates_then_joins_one_room(monkeypatch, service, projec
     )
 
     first = mcp_server.room_join(
-        project_path=str(project_dir), model="unknown", agent_key="first-main",
-        agent_name="First Agent", client="generic-client"
+        project_path=str(project_dir), model="unknown"
     )
     second = mcp_server.room_join(
-        project_path=str(project_dir), model="unknown", agent_key="second-main",
-        agent_name="Second Agent", client="generic-client"
+        project_path=str(project_dir), model="unknown"
     )
 
     assert first["ok"] is True
@@ -613,16 +611,13 @@ def test_local_mcp_join_derives_monorepo_subproject_from_project_path(
     )
 
     root_join = mcp_server.room_join(
-        project_path=str(repository), model="unknown", agent_key="root-main",
-        agent_name="Root Agent", client="generic-client"
+        project_path=str(repository), model="unknown"
     )
     api_join = mcp_server.room_join(
-        project_path=str(api_dir), model="unknown", agent_key="api-main",
-        agent_name="API Agent", client="generic-client"
+        project_path=str(api_dir), model="unknown"
     )
     api_repeat = mcp_server.room_join(
-        project_path=str(api_dir), model="unknown", agent_key="api-review",
-        agent_name="API Reviewer", client="generic-client"
+        project_path=str(api_dir), model="unknown"
     )
 
     expected = "packages/api"
@@ -644,8 +639,7 @@ def test_orphaned_checkout_registration_does_not_recreate_deleted_project(
     service.delete_project(project["id"])
 
     response = mcp_server.room_join(
-        project_path=str(project_dir), model="unknown", agent_key="trae-main",
-        agent_name="Trae", client="trae"
+        project_path=str(project_dir), model="unknown"
     )
 
     assert response["ok"] is False
@@ -667,8 +661,7 @@ def test_backend_refreshes_registration_after_project_key_migration(
     path.write_text(json.dumps(document), encoding="utf-8")
 
     joined = mcp_server.room_join(
-        project_path=str(project_dir), model="unknown", agent_key="codex-main",
-        agent_name="Codex", client="codex"
+        project_path=str(project_dir), model="unknown"
     )
 
     assert joined["ok"] is True

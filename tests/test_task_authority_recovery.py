@@ -52,6 +52,7 @@ def _two_sessions(service, project_id: str):
         client="workbuddy",
         model="unknown",
         member_id=member["id"],
+        manage_member_reference=True,
     )
     second = service.join_room(
         project_id,
@@ -59,6 +60,7 @@ def _two_sessions(service, project_id: str):
         client="workbuddy",
         model="unknown",
         member_id=member["id"],
+        manage_member_reference=True,
     )
     foreign_member = service.create_project_member(
         project_id, member_key="qoder", name="Qoder"
@@ -69,6 +71,7 @@ def _two_sessions(service, project_id: str):
         client="qoder",
         model="unknown",
         member_id=foreign_member["id"],
+        manage_member_reference=True,
     )
     return first, second, foreign
 
@@ -358,6 +361,7 @@ def test_concurrent_explicit_takeovers_keep_one_owner_and_one_lease_holder(
         client="workbuddy",
         model="unknown",
         member_id=owner["agent"]["member_id"],
+        manage_member_reference=True,
     )
     task = _claimed_task(service, project["id"], owner)
     lease = service.acquire_lease(
@@ -412,7 +416,6 @@ def test_explicit_takeover_rejects_task_awaiting_independent_review(
     owner, _reviewer = joined_agents
     sibling = service.join_room(
         project["id"], name="Builder sibling", client="codex", model="unknown",
-        member_id=owner["agent"]["member_id"],
         workspace_id=owner["agent"]["workspace_id"],
         host_id=owner["agent"]["host_id"],
         worktree=project["root_path"],

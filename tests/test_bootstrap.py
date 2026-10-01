@@ -490,6 +490,7 @@ def test_mcp_task_update_cannot_change_another_sessions_task(
         member_id=service.create_project_member(
             project["id"], member_key="codex", name="Codex"
         )["member"]["id"],
+        manage_member_reference=True,
     )
     intruder = service.join_room(
         project["id"],
@@ -499,6 +500,7 @@ def test_mcp_task_update_cannot_change_another_sessions_task(
         member_id=service.create_project_member(
             project["id"], member_key="grok-build", name="Grok Build"
         )["member"]["id"],
+        manage_member_reference=True,
     )
     task = service.create_task(
         project["id"],

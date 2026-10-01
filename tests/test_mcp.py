@@ -17,6 +17,7 @@ from agentchatroom import mcp_bridge, mcp_server
 from agentchatroom.api import create_app
 from agentchatroom.config import Settings
 from agentchatroom.database import Database
+from agentchatroom.errors import DomainError
 from agentchatroom.mcp_bridge import (
     BridgeSettings,
     ReconnectingUpstream,
@@ -219,6 +220,143 @@ def test_mcp_room_join_requires_project_path_and_model_only():
     assert "agent_key" not in bootstrap.parameters.get("properties", {})
 
 
+def test_mcp_room_join_exposes_no_identity_parameters():
+    """#267: identity is configuration, never a tool argument.
+
+    A join schema that accepts a member or software identity would let any
+    Agent mint a Session as another software identity, which breaks the
+    independent-verification baseline that reviewer_not_independent enforces.
+    """
+    room_join = mcp_server.mcp._tool_manager.get_tool("room_join")
+
+    properties = room_join.parameters.get("properties", {})
+    for forbidden in ("member_id", "agent_key", "agent_name", "client", "software_key"):
+        assert forbidden not in properties, forbidden
+        assert forbidden not in room_join.parameters.get("required", [])
+
+
+def test_join_room_refuses_another_members_identity(monkeypatch, service, project_dir):
+    """#267: naming a member is not proof of being that member.
+
+    A local MCP process configured as one software identity must not be able to
+    open a Session that belongs to a different one, even when it knows the id.
+    """
+    monkeypatch.setattr(mcp_server, "service", service)
+    _configure_local_software(
+        monkeypatch, key="intruder", name="Intruder", client="intruder"
+    )
+    project = service.create_project(root_path=str(project_dir))
+    victim = service.join_room(
+        project["id"],
+        software_key="victim",
+        name="Victim",
+        client="victim-client",
+        model="unknown",
+    )
+    victim_member_id = victim["agent"]["member_id"]
+
+    with pytest.raises(DomainError) as forged:
+        service.join_room(
+            project["id"],
+            software_key="intruder",
+            name="Intruder",
+            client="intruder-client",
+            model="unknown",
+            member_id=victim_member_id,
+        )
+
+    assert forged.value.code == "software_identity_mismatch"
+    assert forged.value.status_code == 403
+    assert forged.value.details["required_action"] == (
+        "restore_configured_software_identity_or_use_management_credential"
+    )
+    # The forged attempt must not have produced a Session for the victim.
+    sessions = service.snapshot(project["id"])["agents"]
+    assert [item["id"] for item in sessions] == [victim["agent"]["id"]]
+    assert sessions[0]["client"] == "victim-client"
+    identities = service.snapshot(project["id"])["agent_identities"]
+    assert {item["id"] for item in identities} == {victim_member_id}
+
+
+def test_join_room_accepts_the_same_software_identity(monkeypatch, service, project_dir):
+    """#267: proving the same software key still allows a second conversation."""
+    monkeypatch.setattr(mcp_server, "service", service)
+    _configure_local_software(
+        monkeypatch, key="builder", name="Builder", client="codex"
+    )
+    project = service.create_project(root_path=str(project_dir))
+
+    first = mcp_server.room_join(
+        project_path=str(project_dir), model="unknown", role="executor"
+    )["result"]
+    second = service.join_room(
+        project["id"],
+        software_key="builder",
+        name="Builder",
+        client="codex",
+        model="unknown",
+        member_id=first["agent"]["member_id"],
+    )
+
+    assert second["agent"]["member_id"] == first["agent"]["member_id"]
+
+
+def test_join_room_allows_management_to_reference_an_managed_member(
+    service, project_dir
+):
+    """#267: management may address a member that has no software identity."""
+    project = service.create_project(root_path=str(project_dir))
+    managed = service.create_project_member(
+        project["id"], member_key="offline-worker", name="Offline Worker"
+    )["member"]
+
+    with pytest.raises(DomainError) as refused:
+        service.join_room(
+            project["id"],
+            name="Offline Worker",
+            client="generic",
+            model="unknown",
+            member_id=managed["id"],
+        )
+    assert refused.value.code == "software_identity_mismatch"
+
+    joined = service.join_room(
+        project["id"],
+        name="Offline Worker",
+        client="generic",
+        model="unknown",
+        member_id=managed["id"],
+        manage_member_reference=True,
+    )
+    assert joined["agent"]["member_id"] == managed["id"]
+
+
+def test_api_agent_join_refuses_a_software_key_in_the_body(
+    settings, project_dir
+):
+    """#267: REST cannot be used to name a durable software identity."""
+    from fastapi.testclient import TestClient
+
+    from agentchatroom.api import create_app
+
+    with TestClient(create_app(settings)) as client:
+        project = client.post(
+            "/api/v1/projects",
+            json={"root_path": str(project_dir), "name": "Join surface"},
+        ).json()
+        response = client.post(
+            f"/api/v1/projects/{project['id']}/agents/join",
+            json={
+                "name": "Impostor",
+                "client": "codex",
+                "model": "unknown",
+                "software_key": "victim",
+            },
+        )
+
+    assert response.status_code == 422
+
+
 def test_mcp_project_member_tools_share_the_domain_service(
     monkeypatch, service, project_dir
 ):
@@ -233,9 +371,6 @@ def test_mcp_project_member_tools_share_the_domain_service(
     joined = mcp_server.room_join(
         project_path=str(project_dir),
         model="unknown",
-        agent_key="member-admin-main",
-        agent_name="Member Admin",
-        client="codex",
         role="coordinator",
     )["result"]
     project_id = joined["project"]["id"]
@@ -561,9 +696,6 @@ def test_mcp_request_id_replays_and_session_can_leave(
     joined = mcp_server.room_join(
         project_path=str(project_dir),
         model="test-model",
-        agent_key="reliable-mcp-main",
-        agent_name="Reliable MCP",
-        client="grok-build",
         role="executor",
     )["result"]
     project_id = joined["project"]["id"]
@@ -652,8 +784,7 @@ def test_mcp_handoff_and_integration_share_the_domain_service(
         client="codex",
     )
     executor = mcp_server.room_join(
-        project_path=str(project_dir), model="unknown", agent_key="executor-main",
-        agent_name="Executor", client="codex", role="executor"
+        project_path=str(project_dir), model="unknown", role="executor"
     )["result"]
     _configure_local_software(
         monkeypatch,
@@ -664,9 +795,6 @@ def test_mcp_handoff_and_integration_share_the_domain_service(
     successor = mcp_server.room_join(
         project_path=str(project_dir),
         model="test-model",
-        agent_key="successor-main",
-        agent_name="Successor",
-        client="grok-build",
         role="executor",
     )["result"]
     _configure_local_software(
@@ -676,8 +804,7 @@ def test_mcp_handoff_and_integration_share_the_domain_service(
         client="trae",
     )
     reviewer = mcp_server.room_join(
-        project_path=str(project_dir), model="unknown", agent_key="reviewer-main",
-        agent_name="Reviewer", client="trae", role="reviewer"
+        project_path=str(project_dir), model="unknown", role="reviewer"
     )["result"]
     project_id = executor["project"]["id"]
     created = mcp_server.task_create(
@@ -802,9 +929,6 @@ def test_mcp_room_join_generates_the_database_identity(monkeypatch, service, pro
     response = mcp_server.room_join(
         project_path=str(project_dir),
         model="local-model",
-        agent_key="fourth-agent-main",
-        agent_name="Fourth Agent",
-        client="custom-client",
         role="specialist",
         capabilities={"mcp": True, "notifications": False},
     )
@@ -976,16 +1100,10 @@ def test_mcp_configured_software_identity_ignores_task_aliases(
     first = mcp_server.room_join(
         project_path=str(project_dir),
         model="unknown",
-        agent_key="runtime-check-main",
-        agent_name="Runtime Check",
-        client="validation",
     )["result"]
     second = mcp_server.room_join(
         project_path=str(project_dir),
         model="unknown",
-        agent_key="codex-review-main",
-        agent_name="Codex Review",
-        client="reviewer",
         role="reviewer",
     )["result"]
 
@@ -1009,9 +1127,6 @@ def test_mcp_room_join_uses_unique_existing_room_without_project_key(
     response = mcp_server.room_join(
         project_path=str(project_dir),
         model="unknown",
-        agent_key="trae-main",
-        agent_name="Trae",
-        client="trae",
     )
 
     assert response["ok"] is True
@@ -1039,9 +1154,6 @@ def test_mcp_room_join_returns_document_manifest(
     response = mcp_server.room_join(
         project_path=str(project_dir),
         model="unknown",
-        agent_key="trae-main",
-        agent_name="Trae",
-        client="trae",
     )
 
     assert response["ok"] is True
@@ -1066,9 +1178,6 @@ async def test_mcp_compatibility_is_schema_directed(monkeypatch, service, projec
         "room_join",
         {
             "project_path": str(project_dir),
-            "agent_key": "string-wrapped-main",
-            "agent_name": "String Wrapped Agent",
-            "client": "grok-build",
             "model": "test-model",
             "capabilities": '{"mcp":true,"python":true}',
         },
@@ -1364,9 +1473,6 @@ async def test_mcp_stdio_round_trip(tmp_path, project_dir, request, mcp_stdio_co
                     "name": "room_join",
                     "arguments": {
                         "project_path": str(project_dir),
-                        "agent_key": "protocol-agent-main",
-                        "agent_name": "Protocol Agent",
-                        "client": "generic-mcp-client",
                         "model": "unknown",
                         "role": "specialist",
                     },
@@ -1395,6 +1501,11 @@ def test_streamable_http_mcp_uses_fastapi_domain_service(settings, project_dir):
         "content-type": "application/json",
         "host": f"127.0.0.1:{settings.port}",
         "authorization": f"Bearer {credential['token']}",
+        # Identity is never a tool argument: an unlinked credential resolves
+        # the durable software identity from these validated headers.
+        mcp_server.SOFTWARE_KEY_HEADER: "streamable-http-test",
+        mcp_server.SOFTWARE_NAME_HEADER: "Remote MCP Agent",
+        mcp_server.SOFTWARE_CLIENT_HEADER: "streamable-http-test",
     }
 
     def rpc_payload(response):
@@ -1466,9 +1577,6 @@ def test_streamable_http_mcp_uses_fastapi_domain_service(settings, project_dir):
                     "name": "room_join",
                     "arguments": {
                         "project_path": str(project_dir),
-                        "agent_key": "remote-mcp-main",
-                        "agent_name": "Remote MCP Agent",
-                        "client": "streamable-http-test",
                         "model": "unknown",
                         "host_key": "http-test-host",
                         "host_name": "HTTP Test Host",
@@ -1507,6 +1615,9 @@ async def test_stdio_bridge_forwards_to_central_http_mcp(settings, project_dir):
 
     environment = os.environ.copy()
     environment["AGENTCHATROOM_AGENT_TOKEN"] = credential["token"]
+    environment["AGENTCHATROOM_SOFTWARE_KEY"] = "stdio-bridge-test"
+    environment["AGENTCHATROOM_SOFTWARE_NAME"] = "Bridge Agent"
+    environment["AGENTCHATROOM_SOFTWARE_CLIENT"] = "stdio-bridge-test"
     process = await asyncio.create_subprocess_exec(
         sys.executable,
         "-m",
@@ -1568,9 +1679,6 @@ async def test_stdio_bridge_forwards_to_central_http_mcp(settings, project_dir):
                     "name": "room_join",
                     "arguments": {
                         "project_path": str(project_dir),
-                        "agent_key": "bridge-agent-main",
-                        "agent_name": "Bridge Agent",
-                        "client": "stdio-bridge-test",
                         "model": "unknown",
                         "host_key": "bridge-test-host",
                         "host_name": "Bridge Test Host",
@@ -1637,6 +1745,9 @@ async def test_stdio_bridge_reconnects_after_center_restart_without_duplicate_wr
 
     environment = os.environ.copy()
     environment["AGENTCHATROOM_AGENT_TOKEN"] = credential["token"]
+    environment["AGENTCHATROOM_SOFTWARE_KEY"] = "stdio-bridge-restart-test"
+    environment["AGENTCHATROOM_SOFTWARE_NAME"] = "Restart Bridge Agent"
+    environment["AGENTCHATROOM_SOFTWARE_CLIENT"] = "stdio-bridge-restart-test"
     process = await asyncio.create_subprocess_exec(
         sys.executable,
             "-m",
@@ -1703,9 +1814,6 @@ async def test_stdio_bridge_reconnects_after_center_restart_without_duplicate_wr
                     "name": "room_join",
                     "arguments": {
                         "project_path": str(project_dir),
-                        "agent_key": "restart-bridge-main",
-                        "agent_name": "Restart Bridge Agent",
-                        "client": "stdio-bridge-restart-test",
                         "model": "unknown",
                         "host_key": "restart-bridge-host",
                         "host_name": "Restart Bridge Host",

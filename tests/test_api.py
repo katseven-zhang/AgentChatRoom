@@ -1874,7 +1874,6 @@ def test_task_claim_reclaim_passes_through_rest_api(settings, project_dir):
         joined_a = _join_agent(
             client,
             project,
-            software_key="codex",
             name="Codex",
             client="codex",
             model="unknown",
@@ -1902,7 +1901,6 @@ def test_task_claim_reclaim_passes_through_rest_api(settings, project_dir):
         joined_b = _join_agent(
             client,
             project,
-            software_key="codex",
             name="Codex",
             client="codex",
             model="unknown",
@@ -1950,11 +1948,11 @@ def test_task_claim_explicit_live_takeover_passes_through_rest_api(
         assert created.status_code == 201
         project = created.json()
         owner = _join_agent(
-            client, project, software_key="codex", name="Codex",
+            client, project, name="Codex",
             client="codex", model="unknown", role="executor",
         )
         sibling = _join_agent(
-            client, project, software_key="codex", name="Codex",
+            client, project, name="Codex",
             client="codex", model="unknown", role="executor",
         )
         task = client.post(
@@ -2042,7 +2040,6 @@ def test_task_update_over_rest_requires_owner_credentials_or_management(
         owner = _join_agent(
             admin,
             project,
-            software_key="codex",
             name="Codex",
             client="codex",
             model="unknown",
@@ -2051,7 +2048,6 @@ def test_task_update_over_rest_requires_owner_credentials_or_management(
         intruder = _join_agent(
             admin,
             project,
-            software_key="grok-build",
             name="Grok Build",
             client="grok-build",
             model="unknown",
