@@ -72,6 +72,14 @@ AUTO_IDEMPOTENCY_TOOL_NAMES = frozenset(
         "task_handoff",
         "task_handoff_acknowledge",
         "task_update",
+        "task_intake_submit",
+        "task_intake_acknowledge",
+        "task_intake_reassign",
+        "task_define_from_intake",
+        "project_document_upsert",
+        "member_create",
+        "member_update",
+        "member_revoke",
         "lease_acquire",
         "lease_release",
         "work_report",
@@ -83,6 +91,10 @@ AUTO_IDEMPOTENCY_TOOL_NAMES = frozenset(
         "knowledge_archive",
     }
 )
+# Every other tool that advertises request_id is covered above. Presence is the
+# one deliberate exception: a replayed heartbeat must not be answered from the
+# idempotency cache, or the connection would stop looking alive.
+AUTO_IDEMPOTENCY_EXCLUDED_TOOL_NAMES = frozenset({"session_heartbeat"})
 ResultT = TypeVar("ResultT")
 RETRYABLE_HTTP_STATUS_CODES = frozenset({408, 425, 429, 500, 502, 503, 504})
 # An expired upstream MCP session may be re-initialised automatically, but only

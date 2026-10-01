@@ -1540,6 +1540,7 @@ def project_document_upsert(
     kind: str = "binding",
     title: str = "",
     content: str = "",
+    request_id: str = "",
 ) -> dict[str, Any]:
     """Create a new immutable version of a project document (binding or reference)."""
     try:
@@ -1554,6 +1555,7 @@ def project_document_upsert(
         title=title,
         content=content,
         actor="agent",
+        request_id=_mcp_request_id(request_id),
     )
 
 

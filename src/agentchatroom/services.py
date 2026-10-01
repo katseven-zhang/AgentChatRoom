@@ -10816,6 +10816,7 @@ class AgentChatRoomService:
                 }
             }
 
+    @idempotent_write("project.document.upsert")
     def upsert_project_document(
         self,
         project_id: str,
