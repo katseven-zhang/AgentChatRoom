@@ -295,6 +295,18 @@ class RequestIdASGIMiddleware:
         await self.app(scope, receive, send_with_request_id)
 
 
+def _same_origin_browser_request(request: Request) -> bool:
+    """Did the browser itself send this from the app's own page?
+
+    ``Sec-Fetch-Site`` is attached by the browser to every subresource request and
+    a cross-site document cannot forge it, so it is the cheapest way to keep the
+    local Web UI's event stream working without minting a session row. Missing or
+    unknown values are refused.
+    """
+    site = str(request.headers.get("sec-fetch-site", "")).strip().lower()
+    return site in {"same-origin", "none"}
+
+
 class ManagementAuthASGIMiddleware:
     """Protect management APIs without buffering streaming MCP responses."""
 
@@ -1252,6 +1264,15 @@ def create_app(
                 required_permission="room:read",
             )
             return
+        if not resolved.management_auth_required and _same_origin_browser_request(
+            request
+        ):
+            # A local deployment is already trusted by the management middleware,
+            # so an in-app browser stream needs no session row. The same-origin
+            # check replaces the cookie that GET /auth/status used to mint (#281):
+            # a cross-site page driving the user's browser still cannot open a
+            # stream, and no anonymous GET can grow management_sessions.
+            return
         cookie = request.cookies.get(resolved.management_cookie_name, "")
         if browser_session_valid(cookie):
             return
@@ -1343,29 +1364,15 @@ def create_app(
 
     @app.get("/api/v1/auth/status")
     def management_auth_status(request: Request) -> JSONResponse:
-        cookie = request.cookies.get(resolved.management_cookie_name, "")
-        authenticated = management_authenticated(request)
-        response = JSONResponse(
+        # Read-only: a GET must not hand out management sessions. Issuance lives
+        # in the login flow, so an anonymous or cross-origin simple request can
+        # no longer insert 12h management_sessions rows without bound (#281).
+        return JSONResponse(
             {
                 "required": resolved.management_auth_required,
-                "authenticated": authenticated,
+                "authenticated": management_authenticated(request),
             }
         )
-        if (
-            not resolved.management_auth_required
-            and authenticated
-            and not browser_session_valid(cookie)
-        ):
-            session_id, _issued = issue_browser_session()
-            response = JSONResponse(
-                {
-                    "required": False,
-                    "authenticated": True,
-                    "expires_in_seconds": resolved.management_session_ttl_seconds,
-                }
-            )
-            attach_browser_cookie(response, session_id)
-        return response
 
     @app.post("/api/v1/auth/login")
     def management_login(request: Request, body: AdminLogin) -> JSONResponse:
