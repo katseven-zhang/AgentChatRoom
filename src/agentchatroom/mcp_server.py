@@ -234,7 +234,11 @@ class ServiceBoundToolManager(CompatibleToolManager):
                 convert_result=convert_result,
             )
             if name == "room_bootstrap":
-                persist_runtime_binding(session_key, _runtime_binding.get())
+                # Read the binding back from the shared registry rather than the
+                # ContextVar: a synchronous tool runs in a worker thread, so a
+                # binding it stored is visible here but its ContextVar write is
+                # not. Re-persisting the stale local value would clear it.
+                persist_runtime_binding(session_key, get_runtime_binding(session_key))
             elif name == "session_leave":
                 persist_runtime_binding(session_key, None)
                 clear_bindings_for_agent_session(str(forwarded.get("session_id") or ""))

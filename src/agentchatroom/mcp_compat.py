@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import json
+from functools import partial
 from typing import Any
 
+import anyio
 from mcp.server.fastmcp.exceptions import ToolError
 from mcp.server.fastmcp.tools import ToolManager
 
@@ -175,8 +177,43 @@ class CompatibleToolManager(ToolManager):
         if tool is None:
             raise ToolError(f"Unknown tool: {name}")
         normalized = normalize_mcp_arguments(arguments, tool.parameters)
-        return await tool.run(
-            normalized,
-            context=context,
-            convert_result=convert_result,
-        )
+        if tool.is_async or not _can_offload(tool):
+            return await tool.run(
+                normalized,
+                context=context,
+                convert_result=convert_result,
+            )
+        # The SDK invokes a synchronous tool function inline, which parks the
+        # whole event loop for the tool's duration: REST, SSE and every other
+        # MCP client stall behind one work_report's git subprocesses. The
+        # domain call is unchanged; only where it runs differs.
+        return await _run_sync_tool_off_loop(tool, normalized, context, convert_result)
+
+
+def _can_offload(tool: Any) -> bool:
+    metadata = getattr(tool, "fn_metadata", None)
+    return (
+        metadata is not None
+        and callable(getattr(tool, "fn", None))
+        and hasattr(metadata, "pre_parse_json")
+        and hasattr(metadata, "arg_model")
+    )
+
+
+async def _run_sync_tool_off_loop(
+    tool: Any, normalized: dict[str, Any], context: Any, convert_result: bool
+) -> Any:
+    """Run a synchronous MCP tool in a worker thread.
+
+    Argument validation and result conversion deliberately reuse the SDK's own
+    implementation so the offloaded path cannot drift from the inline one.
+    """
+    metadata = tool.fn_metadata
+    parsed = metadata.arg_model.model_validate(metadata.pre_parse_json(normalized))
+    kwargs = parsed.model_dump_one_level()
+    if getattr(tool, "context_kwarg", None) is not None:
+        kwargs[tool.context_kwarg] = context
+    result = await anyio.to_thread.run_sync(partial(tool.fn, **kwargs))
+    if convert_result:
+        result = metadata.convert_result(result)
+    return result

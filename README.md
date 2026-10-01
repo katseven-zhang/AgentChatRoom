@@ -661,6 +661,12 @@ Agent Session Token 校验与 `last_used_at` 更新是分开的：校验走只�
 
 Agent 自报的 `worktree` 不会被服务盲目信任。Work Report 采集 Git 证据前必须有已登记 Workspace，路径只能是该 Workspace 的 `local_path` 或其子目录，上报的 `commit_hash` 必须能在该 worktree 内解析；否则拒绝，不会把伪造路径或伪造 commit 写成事实。
 
+写事务的范围只包含数据库本身，不包含磁盘与子进程。带 `request_id` 的幂等写入先用一个短事务查重并写入「处理中」占位记录并提交，再在**不持有写锁**的情况下执行领域动作（领域动作自己开自己的事务），最后再用另一个短事务写回响应。因此一次 `work_report` 在采集 Git 证据期间不会阻塞任何其他写路径。动作失败时占位记录会被清除，修正后的重试不会被永久钉在 `idempotency_in_progress`；进程在动作提交后、响应写回前硬崩溃属于已知取舍，此时该 `request_id` 仍会显示处理中。
+
+写锁竞争是正常且可重试的结果，不再是内部错误：SQLite 忙等待超时后统一返回 `database_write_contended`（503，`required_action=retry_after_short_backoff`），REST / MCP / CLI 由此得到同一套可恢复语义，而不是裸 `sqlite3.OperationalError` 变成 500。
+
+MCP 的同步工具函数不再内联占用事件循环。SDK 默认直接调用同步函数，导致一次 `work_report` 的 Git 子进程期间，同进程的 REST、SSE 和其他 MCP 客户端全部停摆；现在同步工具经 `anyio.to_thread` 在工作线程执行，领域调用本身不变。`room_bootstrap` 的绑定因此从共享注册表回读，而不是从只在线程内可见的 ContextVar 回读，避免线程边界把刚建立的绑定覆盖成空。
+
 后台 stdio/Bridge 进程与共享 HTTP transport Session 只负责连接 Presence。HTTP 服务按实际 MCP transport 绑定后台保活，多个并行 Session 分别刷新；transport 结束后停止保活并关闭对应 Room Session。部分客户端断开时不会发送 MCP `DELETE`，服务端因此对无任何 HTTP 请求的 stateful transport 做有界回收，默认 300 秒，可通过 `[server].mcp_http_session_idle_timeout_seconds` 或 `AGENTCHATROOM_MCP_HTTP_SESSION_IDLE_TIMEOUT_SECONDS` 配置。被回收 transport 的后台心跳与 Room Session 会一起停止，旧任务所有者不会被永久误判为在线；之后使用该连接须重新 bootstrap，并按任务实际状态显式 reclaim。`session_heartbeat` 只刷新连接存活，
 不再依赖 Agent 主动提交 `working`、`idle` 或 `blocked`。左侧显示已连接/未连接、
 当前任务阶段和最后活动；任务认领、Work Report、独立 Review 与 Integration 才是

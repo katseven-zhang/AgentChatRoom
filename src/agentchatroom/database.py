@@ -8,11 +8,16 @@ from contextvars import ContextVar
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, ContextManager, Iterator, Protocol
 
+from .errors import DomainError
+
 if TYPE_CHECKING:
     from .config import Settings
 
 
 SCHEMA_VERSION = 25
+# One source for both the connect timeout and the busy timeout: a writer that
+# loses the race waits this long before the contention is reported.
+SQLITE_BUSY_TIMEOUT_SECONDS = 10
 
 
 class DatabaseBackend(Protocol):
@@ -1124,13 +1129,15 @@ class Database:
 
         connection = sqlite3.connect(
             self.path,
-            timeout=10,
+            timeout=SQLITE_BUSY_TIMEOUT_SECONDS,
             isolation_level=None,
             check_same_thread=False,
         )
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys = ON")
-        connection.execute("PRAGMA busy_timeout = 10000")
+        connection.execute(
+            f"PRAGMA busy_timeout = {SQLITE_BUSY_TIMEOUT_SECONDS * 1000}"
+        )
         if write:
             connection.execute("PRAGMA journal_mode = WAL")
         binding = self._active_connection.set((connection, write))
@@ -1138,6 +1145,23 @@ class Database:
             connection.execute("BEGIN IMMEDIATE" if write else "BEGIN")
             yield connection
             connection.commit()
+        except sqlite3.OperationalError as error:
+            connection.rollback()
+            # Lock contention is a normal, retryable outcome of a busy
+            # database, not an internal failure. Surfacing it as a structured
+            # DomainError keeps REST/MCP/CLI answering with the same vocabulary
+            # instead of an opaque 500.
+            if "locked" not in str(error).lower() and "busy" not in str(error).lower():
+                raise
+            raise DomainError(
+                "database_write_contended",
+                "The database is busy with another write; retry shortly",
+                status_code=503,
+                details={
+                    "required_action": "retry_after_short_backoff",
+                    "busy_timeout_seconds": SQLITE_BUSY_TIMEOUT_SECONDS,
+                },
+            ) from error
         except Exception:
             connection.rollback()
             raise

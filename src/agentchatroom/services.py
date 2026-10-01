@@ -726,6 +726,10 @@ class AgentChatRoomService:
         )
         request_hash = hashlib.sha256(canonical_request.encode()).hexdigest()
         scope = f"project:{project_id}"
+        # The reservation is deliberately its own short transaction. The action
+        # can run git subprocesses and touch disk, so holding the database write
+        # lock across it stalls every other writer — and freezes the
+        # Streamable-HTTP event loop — for as long as that work takes.
         with self.database.connect(write=True) as connection:
             self._require_project(connection, project_id)
             existing = connection.execute(
@@ -771,9 +775,20 @@ class AgentChatRoomService:
                 """,
                 (scope, clean_request_id, operation, request_hash, now),
             )
+
+        try:
             result = action()
             if not isinstance(result, dict):
                 raise RuntimeError("Idempotent write results must be objects")
+        except BaseException:
+            # The action commits on its own now, so its failure can no longer
+            # roll the reservation back. Drop the unfinished record instead:
+            # leaving it behind would pin the request id to "in progress"
+            # forever and block every corrected retry.
+            self._release_idempotency_reservation(scope, clean_request_id)
+            raise
+
+        with self.database.connect(write=True) as connection:
             connection.execute(
                 """
                 UPDATE idempotency_records
@@ -782,11 +797,25 @@ class AgentChatRoomService:
                 """,
                 (json_dump(result), iso_now(), scope, clean_request_id),
             )
-            return {
-                **result,
-                "request_id": clean_request_id,
-                "idempotent_replay": False,
-            }
+        return {
+            **result,
+            "request_id": clean_request_id,
+            "idempotent_replay": False,
+        }
+
+    def _release_idempotency_reservation(self, scope: str, request_id: str) -> None:
+        try:
+            with self.database.connect(write=True) as connection:
+                connection.execute(
+                    """
+                    DELETE FROM idempotency_records
+                    WHERE scope = ? AND request_id = ? AND response_json IS NULL
+                    """,
+                    (scope, request_id),
+                )
+        except Exception:
+            # Cleanup must never mask the failure that triggered it.
+            pass
 
     def _require_project(self, connection: Any, project_id: str) -> Mapping[str, Any]:
         row = connection.execute(
