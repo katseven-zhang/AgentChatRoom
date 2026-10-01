@@ -1650,16 +1650,10 @@ def create_app(
         permanent: bool = Query(False),
     ) -> dict[str, Any]:
         if permanent:
-            snapshot = service.snapshot(project_id)
-            project = snapshot["project"]
-            checkout_paths = {
-                str(project["root_path"]),
-                *(
-                    str(agent.get("worktree", "")).strip()
-                    for agent in snapshot["agents"]
-                    if str(agent.get("worktree", "")).strip()
-                ),
-            }
+            # Which checkouts this Project may own is a domain decision; Session
+            # worktrees are caller-reported strings and must not widen the set.
+            cleanup_scope = service.checkout_cleanup_scope(project_id)
+            checkout_paths = list(cleanup_scope["paths"])
             deleted = service.delete_project(project_id)
             removed = 0
             instructions_removed = 0
@@ -1670,8 +1664,8 @@ def create_app(
                     removed += int(
                         remove_checkout_project_registration(
                             checkout_path,
-                            project_key=str(project["project_key"]),
-                            logical_path=str(project.get("logical_path", "") or ""),
+                            project_key=str(cleanup_scope["project_key"]),
+                            logical_path=str(cleanup_scope["logical_path"]),
                         )
                     )
                 except DomainError as error:

@@ -3584,6 +3584,17 @@ class AgentChatRoomService:
                 "invalid_agent_model",
                 "Agent model code is required; use unknown only when unavailable",
             )
+        # A Session worktree is later used as a filesystem root (git evidence
+        # capture, permanent Project cleanup), so it follows the same guard the
+        # sibling workspace registration applies.
+        clean_worktree = (
+            self._validate_workspace_path("worktree", worktree)
+            if str(worktree or "").strip()
+            else ""
+        )
+        clean_branch = str(branch or "").strip()
+        if any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in clean_branch):
+            raise DomainError("invalid_agent", "branch contains control characters")
         token = secrets.token_urlsafe(32)
         session_id = new_id("agent")
         now = iso_now()
@@ -3714,8 +3725,8 @@ class AgentChatRoomService:
                     client.strip(),
                     model.strip(),
                     role.strip() or "executor",
-                    branch.strip(),
-                    worktree.strip(),
+                    clean_branch,
+                    clean_worktree,
                     host_id,
                     workspace_id,
                     credential_id,
@@ -7875,8 +7886,8 @@ class AgentChatRoomService:
                     status_code=409,
                 )
             worktree = self._trusted_worktree(connection, project, agent)
-        system_evidence = self._collect_git_evidence(
-            project, agent, commit_hash, worktree=worktree
+        system_evidence = self._collect_git_evidence_from_worktree(
+            worktree, commit_hash
         )
         stored_commit = str(system_evidence.get("commit_hash") or "")
         if commit_hash.strip() and (
@@ -9177,9 +9188,17 @@ class AgentChatRoomService:
             )
         root = Path(str(workspace["local_path"])).expanduser().resolve(strict=False)
         reported_raw = str(agent_data.get("worktree") or "").strip()
-        reported = (
-            Path(reported_raw).expanduser().resolve(strict=False) if reported_raw else root
-        )
+        if not reported_raw:
+            reported = root
+        else:
+            # A legacy row may hold a relative value. Resolving it against the
+            # process CWD would make the containment verdict depend on where the
+            # server was started; anchoring it at the registered workspace root is
+            # the only reading that keeps `relative_to(root)` meaningful.
+            reported_candidate = Path(reported_raw).expanduser()
+            if not reported_candidate.is_absolute():
+                reported_candidate = root / reported_candidate
+            reported = reported_candidate.resolve(strict=False)
         try:
             reported.relative_to(root)
         except ValueError as error:
@@ -9194,16 +9213,37 @@ class AgentChatRoomService:
     def _collect_git_status(self, worktree: Path) -> dict[str, Any]:
         return self._collect_git_evidence_from_worktree(worktree, "")
 
-    def _collect_git_evidence(
-        self,
-        project: Mapping[str, Any],
-        agent: Mapping[str, Any],
-        commit_hash: str,
-        *,
-        worktree: Path | None = None,
-    ) -> dict[str, Any]:
-        resolved = worktree or Path(agent["worktree"] or project["root_path"])
-        return self._collect_git_evidence_from_worktree(resolved, commit_hash)
+    def checkout_cleanup_scope(self, project_id: str) -> dict[str, Any]:
+        """The checkouts a permanent Project delete may clean up, plus its identity.
+
+        Session worktrees are caller-supplied strings and legacy rows were stored
+        unvalidated, so the cleanup set is filtered to absolute local paths inside
+        the Project root. An unrelated or remote directory a Session happened to
+        report must never be stat/unlinked by deleting a Room.
+        """
+        with self.database.connect() as connection:
+            project = self._require_project(connection, project_id)
+            rows = connection.execute(
+                "SELECT worktree FROM agent_sessions WHERE project_id = ?",
+                (project_id,),
+            ).fetchall()
+        root = Path(str(project["root_path"])).expanduser().resolve(strict=False)
+        paths = {str(project["root_path"])}
+        for row in rows:
+            candidate = str(row["worktree"] or "").strip()
+            if not candidate:
+                continue
+            try:
+                validated = self._validate_workspace_path("worktree", candidate)
+                Path(validated).expanduser().resolve(strict=False).relative_to(root)
+            except (DomainError, OSError, ValueError):
+                continue
+            paths.add(validated)
+        return {
+            "project_key": str(project["project_key"]),
+            "logical_path": str(project["logical_path"] or ""),
+            "paths": sorted(paths),
+        }
 
     def _collect_git_evidence_from_worktree(
         self,
