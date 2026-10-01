@@ -523,6 +523,9 @@ room_bootstrap
 
 文件租约是 Agent 对文件或 glob 范围的限时编辑意图声明，只保护文件范围，不等于任务所有权、任务三维状态或 Agent 在线状态。REST、MCP、CLI、Web 复用同一领域服务，事件追加留痕：
 
+- **范围写法先归一再比较**：`normalize_pattern` 折叠所有 `./` 段、重复斜杠与 `\`，因此 `././src`、`src/./a.py`、`src//`、`\\src` 与 `src`、`src/a.py` 是同一个范围，越界（含任何 `..` 段）一律 `invalid_path_pattern`。归一化后的字符串就是入库与比较的唯一依据，所以同一 Session 的重复申请能命中幂等续用，不同 Session 也无法用另一种写法绕过 exclusive 冲突或 pre-commit 检查。
+- **重叠判定按结构**：先比字面与 fnmatch，再比静态前缀的包含关系；只有当一方没有静态前缀（模式以通配符开头，如 `*.md`、`**/*.py`）时，才逐段比较是否能覆盖同一个路径。以通配符开头不再等于「与项目内一切冲突」，`**/*.md` 与 `src/app.py` 可以并存；`src/**` 与 `src/a.py`、`src/*.py` 与 `src/app.py`、`./src/a.py` 与 `src/a.py` 仍然冲突。`lease_acquire` 与 `leases/check` 走同一个 `patterns_overlap`。
+
 | 环节 | 语义 |
 | --- | --- |
 | 申请 | `lease_acquire` 声明 `path_pattern` + 模式（readonly/shared/exclusive）+ TTL（省略用默认 1800s，上限可配；显式 0/负值与超上限拒绝 `invalid_lease_ttl`，仅 `None`/缺省回落默认）；同一 Session 对同一归一化范围的重复申请幂等续用已有租约，不产生重复占用 |

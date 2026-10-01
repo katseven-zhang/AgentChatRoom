@@ -441,12 +441,22 @@ def normalize_remote(remote: str) -> str:
 
 
 def normalize_pattern(pattern: str) -> str:
+    """Fold every spelling of one scope onto the one stored pattern.
+
+    A leading ``./`` was stripped only once and inner ``.`` segments survived, so
+    ``././src`` and ``src``, or ``src/./a.py`` and ``src/a.py``, were different
+    strings: two Agents could then hold exclusive leases on the same file with no
+    conflict event, the pre-commit check saw a different scope than the one the
+    other lease actually covered, and the owning Session's idempotent fast path
+    created a second row instead of renewing the first.
+    """
     value = pattern.strip().replace("\\", "/")
-    value = re.sub(r"^\./", "", value)
-    value = re.sub(r"/+", "/", value).strip("/")
-    if not value or value.startswith("../") or "/../" in f"/{value}/":
-        raise DomainError("invalid_path_pattern", "Path pattern must stay inside the project")
-    return value
+    segments = [segment for segment in value.split("/") if segment not in ("", ".")]
+    if not segments or any(segment == ".." for segment in segments):
+        raise DomainError(
+            "invalid_path_pattern", "Path pattern must stay inside the project"
+        )
+    return "/".join(segments)
 
 
 def lease_modes_conflict(left: str, right: str) -> bool:
@@ -463,6 +473,27 @@ def _static_prefix(pattern: str) -> str:
     return pattern[:wildcard].rstrip("/")
 
 
+def _patterns_can_cover_same_path(left: str, right: str) -> bool:
+    """Compare two scopes segment by segment instead of giving up.
+
+    A pattern that begins with a wildcard has no static prefix, and the old code
+    read that as "overlaps everything": one Agent holding ``*.md`` then blocked an
+    unrelated ``src/app.py``, including under the pre-commit policy. Walking the
+    segments answers the real question instead - can one path satisfy both.
+    """
+    for left_segment, right_segment in zip(left.split("/"), right.split("/")):
+        if left_segment == "**" or right_segment == "**":
+            continue
+        if (
+            left_segment == right_segment
+            or fnmatch.fnmatchcase(left_segment, right_segment)
+            or fnmatch.fnmatchcase(right_segment, left_segment)
+        ):
+            continue
+        return False
+    return True
+
+
 def patterns_overlap(left: str, right: str) -> bool:
     left = normalize_pattern(left)
     right = normalize_pattern(right)
@@ -471,7 +502,9 @@ def patterns_overlap(left: str, right: str) -> bool:
     left_prefix = _static_prefix(left)
     right_prefix = _static_prefix(right)
     if not left_prefix or not right_prefix:
-        return True
+        # No static prefix only means the pattern starts with a wildcard; it does
+        # not make it overlap every other scope in the project.
+        return _patterns_can_cover_same_path(left, right)
     return (
         left_prefix == right_prefix
         or left_prefix.startswith(f"{right_prefix}/")
