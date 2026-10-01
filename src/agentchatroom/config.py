@@ -68,6 +68,7 @@ CONFIG_FILE_SCHEMA: dict[str, dict[str, tuple[type, ...]]] = {
         "project_document_max_bytes": (int,),
         "snapshot_recent_limit": (int,),
         "idempotency_retention_days": (int,),
+        "retention_sweep_interval_seconds": (int, float),
     },
     "security": {
         "agent_token_ttl_seconds": (int,),
@@ -244,6 +245,7 @@ class Settings:
     project_document_max_bytes: int = 262144
     snapshot_recent_limit: int = 200
     idempotency_retention_days: int = 30
+    retention_sweep_interval_seconds: float = 3600.0
 
     @property
     def mcp_message_context_limit(self) -> int:
@@ -396,6 +398,9 @@ def _merge_toml(path: Path) -> dict[str, Any]:
         ),
         "idempotency_retention_days": raw.get("coordination", {}).get(
             "idempotency_retention_days"
+        ),
+        "retention_sweep_interval_seconds": raw.get("coordination", {}).get(
+            "retention_sweep_interval_seconds"
         ),
         "mcp_message_limit": (
             raw.get("coordination", {}).get("mcp_message_limit")
@@ -792,6 +797,12 @@ def load_settings(
                 file_values.get("idempotency_retention_days", 30),
             )
         ),
+        "retention_sweep_interval_seconds": float(
+            os.getenv(
+                "AGENTCHATROOM_RETENTION_SWEEP_INTERVAL_SECONDS",
+                file_values.get("retention_sweep_interval_seconds", 3600.0),
+            )
+        ),
     }
     if values["message_max_body_length"] <= 0:
         raise ValueError("message_max_body_length must be positive")
@@ -807,6 +818,8 @@ def load_settings(
         raise ValueError("snapshot_recent_limit must be positive")
     if values["idempotency_retention_days"] < 0:
         raise ValueError("idempotency_retention_days must be >= 0")
+    if values["retention_sweep_interval_seconds"] < 1:
+        raise ValueError("retention sweep interval must be at least 1 second")
     if not 1 <= values["port"] <= 65535:
         raise ValueError("port must be between 1 and 65535")
     if not str(values["host"]).strip():

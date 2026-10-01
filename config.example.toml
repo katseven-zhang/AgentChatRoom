@@ -77,6 +77,7 @@ project_document_max_bytes = 262144
 snapshot_recent_limit = 200
 # Idempotency record retention in days; 0 = keep forever (#200).
 idempotency_retention_days = 30
+retention_sweep_interval_seconds = 3600.0
 
 [knowledge]
 # Knowledge Asset kinds enabled for this deployment. Each kind must match

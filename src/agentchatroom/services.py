@@ -674,7 +674,10 @@ class AgentChatRoomService:
     def __init__(self, database: DatabaseBackend, settings: Settings) -> None:
         self.database = database
         self.settings = settings
-        self._retention_last_run: dict[str, float] = {}
+        # Monotonic deadlines, not wall-clock timestamps: an NTP correction or a
+        # resumed VM can move time backwards and stall retention for the whole
+        # process lifetime.
+        self._retention_next_run: dict[str, float] = {}
         # Serializes create_backup / restore_backup (including auto_backup_worker)
         # so a backup cannot snapshot a half-restored SQLite file and restore
         # stale checks cannot race concurrent in-process backups.
@@ -735,10 +738,12 @@ class AgentChatRoomService:
         retention_days = int(getattr(self.settings, "idempotency_retention_days", 30))
         if retention_days <= 0:
             return {"deleted": 0, "retention_days": 0}
-        now = time.time()
-        if not force and now - self._retention_last_run.get("idempotency", 0.0) < 3600:
+        now = time.monotonic()
+        if not force and now < self._retention_next_run.get("idempotency", 0.0):
             return {"deleted": 0, "retention_days": retention_days, "skipped": True}
-        self._retention_last_run["idempotency"] = now
+        self._retention_next_run["idempotency"] = (
+            now + self.retention_sweep_interval_seconds()
+        )
         cutoff = (utc_now() - timedelta(days=retention_days)).isoformat().replace(
             "+00:00", "Z"
         )
@@ -1766,6 +1771,12 @@ class AgentChatRoomService:
             "transport_state": transport_state,
             "last_seen": last_seen,
         }
+
+    def retention_sweep_interval_seconds(self) -> float:
+        """Minimum gap between two automatic retention sweeps, in monotonic seconds."""
+        return float(
+            getattr(self.settings, "retention_sweep_interval_seconds", 3600.0)
+        )
 
     def min_agent_token_ttl_seconds(self) -> int:
         """Smallest Agent-token lifetime this deployment accepts."""
@@ -11121,11 +11132,12 @@ class AgentChatRoomService:
 
     def enforce_audit_retention_throttled(self, project_id: str) -> dict[str, Any]:
         """Retention sweep for read paths: at most once per hour per project."""
-        now = time.time()
-        last = self._retention_last_run.get(project_id, 0.0)
-        if now - last < 3600:
+        now = time.monotonic()
+        if now < self._retention_next_run.get(project_id, 0.0):
             return {"purged": 0, "retention_days": None, "skipped": True}
-        self._retention_last_run[project_id] = now
+        self._retention_next_run[project_id] = (
+            now + self.retention_sweep_interval_seconds()
+        )
         result = self.enforce_audit_retention(project_id)
         result["idempotency"] = self.enforce_idempotency_retention()
         return result

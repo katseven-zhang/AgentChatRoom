@@ -503,6 +503,7 @@ def test_every_config_file_schema_key_maps_into_settings(monkeypatch, tmp_path):
             "project_document_max_bytes": 4096,
             "snapshot_recent_limit": 50,
             "idempotency_retention_days": 7,
+            "retention_sweep_interval_seconds": 45.0,
             # mcp_message_context_limit is an alias; covered in a dedicated load below.
         },
         "security": {
