@@ -435,6 +435,15 @@ HTTP 同一路径匹配多个项目或多个 roots 中混有无法解析的路�
 
 Agent Session Token 与 access token 只能放在 JSON 请求体、`Authorization: Bearer` 头，或客户端本地安全配置 / 环境变量中。不得把这些凭据放进 URL 路径、查询参数、Referer、access log、代理日志、消息正文、项目规则或 Git。`release_lease` 等敏感操作必须走请求体或请求头，不能把 `session_id` 或 `token` 拼进查询字符串。服务端 access log 会对 `token=`、`Bearer`、`Authorization` 和 Cookie 值脱敏；脱敏不能替代正确的传输方式。未来使用的远程 Token 同样只允许放在客户端安全配置或环境变量中。
 
+**脱敏只有一套策略。** `agentchatroom.redaction` 是唯一来源：敏感键名并集、唯一替换标记 `[REDACTED]`、文本模式与结构遍历器都在这里。此前 API 日志过滤、GUI 日志尾窗、任务历史投影、运行时绑定转储、请求字段守卫与 PostgreSQL 工具包装各有一套，键名互不包含（9 / 10 / 7 条，无一为超集）且替换标记大小写不一，同一个秘密在不同入口渲染成 `[redacted]` 与 `[REDACTED]`，无法统一断言或过滤。现 `services.SENSITIVE_REQUEST_FIELDS` 别名共享键集，`bootstrap` 与 `task_history` 共用同一遍历器。
+
+**两种文本强度是刻意保留的，不要合并**：
+
+- `redaction.redact_text` 只替换凭据**值**，保留上下文——它跑在消息正文、备注与证据上。
+- 日志行策略额外吞掉整行剩余——日志行不是产品可见内容。
+
+若把日志策略套到正文，一条含 `token: x` 的消息会从该处被截断成空白，**直接损坏用户可见的任务时间线**。`tests/test_redaction_policy.py` 固定了这一差异。
+
 ### 管理登录失败限速
 
 `POST /api/v1/auth/login`（管理认证开启时）对失败尝试做进程内限速，按**来源 IP** 与**全局**双键计数（反代场景经 `trusted_proxy_headers` / `trusted_proxy_ips` 取真实 IP）。窗口内失败达到阈值后进入冷却：超限请求返回 **429** `management_login_rate_limited`，响应头与 `error.details.retry_after` 给出需等待的秒数；冷却期内**正确凭据同样被拒绝**。一次成功登录会复位该 IP 与全局计数；成功路径本身不受默认阈值影响。失败只记脱敏日志（不含 Token），不写入请求体内容。
@@ -728,7 +737,9 @@ Web 端采用现代科技感设计系统与零构建原生 CSS 资产交付：
 
 CLI 侧的 `backup.py` 与上述管理端行为一致，且有两处额外约束：
 
-- **恢复会连同 sidecar 一起换掉**。`Connection.backup` 会把源库的 WAL 模式一并复制过来，因此只替换主库文件时，旧库遗留的 `-wal` 会在下次打开时被回放，把恢复前已经"消失"的行重新写回来——而恢复恰恰多发生在异常关机之后。`restore_sqlite` 现在在 `os.replace` 的同一步内清除 `-wal` / `-shm` / `-journal`，并把清理结果写进 manifest 与返回值（`removed_sidecars`）。- **PostgreSQL 凭据不进入进程参数**。`pg_dump` / `pg_restore` 原先以 `--dbname <完整 DSN>` 调用，而 DSN 通常是 `user:password@host`；argv 在同机对所有本地用户可读，密码等于公开。连接串现在先剥离密码、密码改由 0600 权限的 `PGPASSFILE` 传递，工具 stderr 也会做脱敏后再进入异常文本。dump 先写同目录临时文件再 `os.replace`，中途失败不会截断或毁掉上一份好备份；PostgreSQL 备份同样写 manifest，恢复前据此校验 schema 版本。
+- **恢复会连同 sidecar 一起换掉**。`Connection.backup` 会把源库的 WAL 模式一并复制过来，因此只替换主库文件时，旧库遗留的 `-wal` 会在下次打开时被回放，把恢复前已经"消失"的行重新写回来——而恢复恰恰多发生在异常关机之后。`restore_sqlite` 现在在 `os.replace` 的同一步内清除 `-wal` / `-shm` / `-journal`，并把清理结果写进 manifest 与返回值（`removed_sidecars`）。
+- **PostgreSQL 凭据不进入进程参数**。`pg_dump` / `pg_restore` 原先以 `--dbname <完整 DSN>` 调用，而 DSN 通常是 `user:password@host`；argv 在同机对所有本地用户可读，密码等于公开。连接串现在先剥离密码、密码改由 0600 权限的 `PGPASSFILE` 传递，工具 stderr 也会做脱敏后再进入异常文本。dump 先写同目录临时文件再 `os.replace`，中途失败不会截断或毁掉上一份好备份；PostgreSQL 备份同样写 manifest，恢复前据此校验 schema 版本。
+- **CLI 备份带事件游标**。CLI 直接调 `backup.py` 备份，绕过了会写 `latest_event_id` 的服务封装，这类 manifest 无法证明是当前的，而恢复把缺失字段读成 0，导致任何 CLI 备份相对非空库都判为 stale。现 `backup_sqlite` / `backup_postgresql` 接受可选 `latest_event_id` 并写入 manifest，CLI `backup` 主动读取游标后传入；确实读不到游标的调用方明确不写该字段，恢复返回 `backup_cursor_unknown` 而不是猜。
 
 ### 项目文档：规范注入与回执闭环
 
