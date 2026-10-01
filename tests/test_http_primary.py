@@ -708,7 +708,12 @@ async def test_bundle_rejects_tokens_from_different_software_identities(
             name=f"Software {index}",
             kind="software_agent",
             role="executor",
-            metadata={"software_key": software_key, "client": software_key},
+            metadata={
+                "managed_identity": True,
+                "software_key": software_key,
+                "client": software_key,
+            },
+            management_authorized=True,
         )["member"]
         issued = service.issue_agent_token(
             project["id"], name=f"Identity {index}", member_id=member["id"]
@@ -737,7 +742,12 @@ async def test_bundle_uses_its_single_linked_identity_for_unlinked_project_token
         name="Shared Software",
         kind="software_agent",
         role="executor",
-        metadata={"software_key": "shared-software", "client": "shared-client"},
+        metadata={
+            "managed_identity": True,
+            "software_key": "shared-software",
+            "client": "shared-client",
+        },
+        management_authorized=True,
     )["member"]
     linked = service.issue_agent_token(
         linked_project["id"], name="Linked", member_id=member["id"]

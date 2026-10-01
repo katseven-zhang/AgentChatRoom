@@ -1753,9 +1753,15 @@ def create_app(
         project_id: str,
         body: ProjectMemberCreate,
     ) -> dict[str, Any]:
+        _reject_credentials_in_query(request)
+        # The roster carries durable identities and this model can carry no
+        # Session credentials, so an unauthenticated caller would otherwise be
+        # able to mint a member - including one in the reserved namespace.
+        _require_management(request)
         return service.create_project_member(
             project_id,
             **body.model_dump(),
+            management_authorized=True,
             request_id=request.state.request_id,
         )
 

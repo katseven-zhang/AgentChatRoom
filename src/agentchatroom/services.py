@@ -1448,6 +1448,74 @@ class AgentChatRoomService:
             )
         return clean
 
+    @staticmethod
+    def _reject_reserved_member_key(
+        value: str,
+        *,
+        kind: str,
+        metadata: Mapping[str, Any] | None,
+        management_authorized: bool,
+    ) -> str:
+        """Keep the durable identity namespace writable only by the backend.
+
+        A row under the ``software:`` prefix is adopted as a permanent software
+        identity the next time the matching client joins, so pre-staking one hands
+        the writer somebody else's identity (display name, member_id, and
+        therefore same-identity task reclaim).
+        """
+        clean = value.strip()
+        if not clean.casefold().startswith(SOFTWARE_MEMBER_PREFIX):
+            return clean
+        if not management_authorized:
+            raise DomainError(
+                "reserved_member_key",
+                "Member keys in the reserved software identity namespace are issued "
+                "by the backend when that identity first joins, or by an "
+                "authenticated management request",
+                status_code=409,
+                details={
+                    "reserved_prefix": SOFTWARE_MEMBER_PREFIX,
+                    "required_action": "use_management_identity",
+                },
+            )
+        values = metadata or {}
+        if (
+            kind != "software_agent"
+            or not values.get("managed_identity")
+            or not str(values.get("software_key") or "").strip()
+            or not str(values.get("client") or "").strip()
+        ):
+            raise DomainError(
+                "software_identity_unmanaged",
+                "A member in the reserved namespace must be issued as a managed "
+                "software identity with a software key and client binding",
+                status_code=409,
+                details={
+                    "required_action": "set_kind_software_agent_and_metadata_"
+                    "managed_identity_software_key_client"
+                },
+            )
+        return clean
+
+    @staticmethod
+    def _software_name_conflict(
+        connection: Any,
+        project_id: str,
+        name: str,
+        *,
+        exclude_member_key: str,
+    ) -> Mapping[str, Any] | None:
+        """Return the active software identity already using ``name``, if any."""
+        return connection.execute(
+            """
+            SELECT id, member_key FROM project_members
+            WHERE project_id = ? AND kind = 'software_agent' AND status = 'active'
+              AND lower(trim(name)) = lower(trim(?)) AND member_key != ?
+            LIMIT 1
+            """,
+            (project_id, name, exclude_member_key),
+        ).fetchone()
+
     def _ensure_software_member(
         self,
         connection: Any,
@@ -1471,8 +1539,35 @@ class AgentChatRoomService:
                     status_code=409,
                 )
             metadata = json_load(member["metadata_json"], {})
+            if (
+                str(member["kind"] or "") != "software_agent"
+                or not metadata.get("managed_identity")
+            ):
+                # Roster writes are blocked from this namespace, but rows can
+                # predate that rule. Only a row the backend issued may become a
+                # durable identity, never a pre-staked one.
+                raise DomainError(
+                    "software_identity_unmanaged",
+                    "This member key is reserved but was never issued as a managed "
+                    "software identity",
+                    status_code=409,
+                    details={
+                        "member_id": str(member["id"]),
+                        "required_action": "recreate_the_row_through_the_management_api_or_use_another_key",
+                    },
+                )
             expected_client = str(metadata.get("client") or "").strip().casefold()
-            if expected_client and expected_client != client.strip().casefold():
+            if not expected_client:
+                raise DomainError(
+                    "software_identity_client_unbound",
+                    "The managed software identity has no client binding to verify",
+                    status_code=409,
+                    details={
+                        "member_id": str(member["id"]),
+                        "required_action": "set_metadata_client_through_management",
+                    },
+                )
+            if expected_client != client.strip().casefold():
                 raise DomainError(
                     "software_identity_client_mismatch",
                     "The software identity is already bound to another client",
@@ -1480,15 +1575,9 @@ class AgentChatRoomService:
                 )
             return member, False
 
-        name_conflict = connection.execute(
-            """
-            SELECT id, member_key FROM project_members
-            WHERE project_id = ? AND kind = 'software_agent' AND status = 'active'
-              AND lower(trim(name)) = lower(trim(?)) AND member_key != ?
-            LIMIT 1
-            """,
-            (project_id, name, member_key),
-        ).fetchone()
+        name_conflict = self._software_name_conflict(
+            connection, project_id, name, exclude_member_key=member_key
+        )
         if name_conflict is not None:
             # 拒绝静默创建第二个同名 active 成员（#139）：同名不同 key 的
             # 接入必须走既有成员合并或由调用方改名，否则成员列表会出现
@@ -2537,12 +2626,18 @@ class AgentChatRoomService:
         metadata: dict[str, Any] | None = None,
         actor_session_id: str | None = None,
         token: str | None = None,
+        management_authorized: bool = False,
     ) -> dict[str, Any]:
-        clean_key = member_key.strip()
         clean_name = name.strip()
         clean_kind = kind.strip()
         clean_role = role.strip()
         clean_status = self._validate_member_status(status)
+        clean_key = self._reject_reserved_member_key(
+            member_key,
+            kind=clean_kind,
+            metadata=metadata,
+            management_authorized=management_authorized,
+        )
         if not clean_key or not clean_name or not clean_kind:
             raise DomainError(
                 "invalid_project_member",
@@ -2723,6 +2818,31 @@ class AgentChatRoomService:
                     "invalid_project_member",
                     "Member name and kind cannot be empty",
                 )
+            # The duplicate-name guard that joins already honour has to cover
+            # renames too, or renaming any member onto an existing software
+            # identity name makes the roster ambiguous for projection (#139).
+            if (
+                clean_kind == "software_agent"
+                and clean_status == "active"
+                and (clean_name != member["name"] or clean_kind != member["kind"])
+            ):
+                name_conflict = self._software_name_conflict(
+                    connection,
+                    project_id,
+                    clean_name,
+                    exclude_member_key=str(member["member_key"]),
+                )
+                if name_conflict is not None:
+                    raise DomainError(
+                        "software_identity_name_conflict",
+                        "Another active software identity already uses this name "
+                        "in the Project",
+                        status_code=409,
+                        details={
+                            "conflicting_member_id": str(name_conflict["id"]),
+                            "required_action": "pick_a_distinct_identity_name",
+                        },
+                    )
             clean_metadata = (
                 json_load(member["metadata_json"], {})
                 if metadata is None

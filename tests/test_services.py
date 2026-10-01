@@ -1329,12 +1329,25 @@ def test_member_assignment_rejects_revoked_unknown_or_never_joined_targets(
         )
     assert revoked.value.code == "assignment_target_revoked"
 
-    never_joined = service.create_project_member(
-        project["id"],
-        member_key="software:ghost",
-        name="Ghost",
-    )
-    ghost_member_id = never_joined["member"]["id"]
+    # A reserved-namespace row that never joined. #344 closed create_project_member
+    # to that prefix, so the legacy shape can only arrive through the database.
+    with service.database.connect(write=True) as connection:
+        connection.execute(
+            """
+            INSERT INTO project_members(
+                id, project_id, member_key, name, kind, role, status,
+                metadata_json, created_at, updated_at, revoked_at
+            ) VALUES (?, ?, 'software:ghost', 'Ghost', 'agent', '', 'active',
+                      '{}', ?, ?, NULL)
+            """,
+            (
+                "member_ghost_never_joined",
+                project["id"],
+                "2026-01-01T00:00:00Z",
+                "2026-01-01T00:00:00Z",
+            ),
+        )
+    ghost_member_id = "member_ghost_never_joined"
     with pytest.raises(DomainError) as no_session:
         service.assign_task(
             project["id"], task["id"], assigned_to_member_id=ghost_member_id,
