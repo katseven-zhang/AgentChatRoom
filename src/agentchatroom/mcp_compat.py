@@ -8,6 +8,8 @@ import anyio
 from mcp.server.fastmcp.exceptions import ToolError
 from mcp.server.fastmcp.tools import ToolManager
 
+from .services import is_strict_int
+
 
 def _single_schema_type(schema: dict[str, Any]) -> str | None:
     direct = schema.get("type")
@@ -101,7 +103,7 @@ def coerce_schema_value(
             converted = normalized == "true"
         elif expected == "integer":
             converted = _parse_json_string(value, field=field, expected="integer")
-            if isinstance(converted, bool) or not isinstance(converted, int):
+            if not is_strict_int(converted):
                 raise ToolError(f"MCP argument {field!r} must be an integer")
         elif expected == "number":
             converted = _parse_json_string(value, field=field, expected="number")

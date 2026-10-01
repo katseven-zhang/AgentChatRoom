@@ -109,7 +109,11 @@ def _fake_tool(monkeypatch, *, returncode: int, stderr: str, write: bytes | None
         captured["env"] = kwargs.get("env")
         if write is not None and "--file" in command:
             Path(command[command.index("--file") + 1]).write_bytes(write)
-        return subprocess.CompletedProcess(command, returncode, "", stderr)
+        # No text=True: a real subprocess hands back raw bytes, which is what
+        # the caller decodes explicitly.
+        return subprocess.CompletedProcess(
+            command, returncode, b"", stderr.encode("utf-8")
+        )
 
     monkeypatch.setattr(backup_module.shutil, "which", lambda name: f"/usr/bin/{name}")
     monkeypatch.setattr(backup_module.subprocess, "run", fake_run)

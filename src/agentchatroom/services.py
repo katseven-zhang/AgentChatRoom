@@ -522,6 +522,69 @@ def _stored_project_scope(project: Mapping[str, Any]) -> tuple[str, str, str]:
     return ("path", os.path.normcase(str(root_path)), logical_path.casefold())
 
 
+def run_git_capture(
+    command: list[str], *, timeout_seconds: float = 5
+) -> tuple[int, str, str]:
+    """Run a git command and return ``(returncode, stdout, stderr)`` as text.
+
+    ``text=True`` decodes with the process locale, which on Windows is the
+    console code page — not the UTF-8 that git actually writes. A branch or
+    path with non-ASCII characters then becomes mojibake, and because
+    UnicodeDecodeError is a ValueError it slips past the ``OSError`` /
+    ``SubprocessError`` handling, surfacing as a 500 or as corrupted bytes
+    written into append-only evidence. Decoding explicitly keeps the result
+    readable and the failure total.
+    """
+    try:
+        completed = subprocess.run(
+            command,
+            check=False,
+            capture_output=True,
+            timeout=timeout_seconds,
+            stdin=subprocess.DEVNULL,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return 1, "", ""
+    return (
+        completed.returncode,
+        completed.stdout.decode("utf-8", "replace").strip(),
+        completed.stderr.decode("utf-8", "replace").strip(),
+    )
+
+
+def is_strict_int(value: Any) -> bool:
+    """True only for a genuine integer.
+
+    ``bool`` is a subclass of ``int`` in Python, so a JSON ``false`` passes an
+    ``isinstance(value, int)`` check and is then stored as exit code 0 — turning
+    a failed check into a recorded pass inside append-only evidence that can
+    never be rewritten. Adapters share this one predicate so REST, MCP and CLI
+    cannot disagree about what an integer is.
+    """
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def require_int_field(value: Any, field: str) -> Any:
+    """Pass an integer-typed input through, refusing booleans.
+
+    REST bodies arrive as untyped dictionaries, so ``priority: true`` reaches
+    the domain as a bool and still satisfies a range check such as
+    ``0 <= True <= 4``. Every integer-typed entry point routes through this so
+    REST, MCP and CLI cannot disagree about what an integer is.
+    """
+    if value is None:
+        return None
+    if not is_strict_int(value):
+        raise DomainError(
+            f"invalid_{field}",
+            f"{field.replace('_', ' ')} must be an integer",
+            status_code=422,
+            details={"field": field},
+        )
+    return int(value)
+
+
 def credential_state_error(reason: str) -> DomainError:
     """Map a credential failure onto the shared Project-credential vocabulary.
 
@@ -675,8 +738,8 @@ class AgentChatRoomService:
                     status_code=422,
                     details={"field": field, "unexpected_keys": unexpected},
                 )
-            if not str(test.get("command", "")).strip() or not isinstance(
-                test.get("exit_code"), int
+            if not str(test.get("command", "")).strip() or not is_strict_int(
+                test.get("exit_code")
             ):
                 raise DomainError(
                     "invalid_test_evidence",
@@ -5071,6 +5134,7 @@ class AgentChatRoomService:
                     f"Task {field_name} exceeds task_text_max_length ({text_limit})",
                     details={"field": field_name, "limit": text_limit},
                 )
+        priority = require_int_field(priority, "priority")
         if priority is not None and not 0 <= priority <= 4:
             raise DomainError("invalid_priority", "Priority must be between 0 and 4")
         list_limit = int(getattr(self.settings, "list_input_max_count", 100))
@@ -6761,6 +6825,8 @@ class AgentChatRoomService:
                 next_status,
                 previous_verification=task["verification_status"],
             )
+            priority = require_int_field(priority, "priority")
+            progress_percent = require_int_field(progress_percent, "progress_percent")
             if priority is not None and not 0 <= priority <= 4:
                 raise DomainError("invalid_priority", "Priority must be between 0 and 4")
             if progress_percent is not None and not 0 <= progress_percent <= 100:
@@ -8598,19 +8664,10 @@ class AgentChatRoomService:
         commit_hash: str,
     ) -> dict[str, Any]:
         def git(*arguments: str) -> tuple[int, str]:
-            try:
-                completed = subprocess.run(
-                    ["git", "-C", str(worktree), *arguments],
-                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-                    check=False,
-                    capture_output=True,
-                    text=True,
-                    timeout=5,
-                    stdin=subprocess.DEVNULL,
-                )
-                return completed.returncode, completed.stdout.strip()
-            except (OSError, subprocess.SubprocessError):
-                return 1, ""
+            returncode, stdout, _stderr = run_git_capture(
+                ["git", "-C", str(worktree), *arguments]
+            )
+            return returncode, stdout
 
         inside_code, inside = git("rev-parse", "--is-inside-work-tree")
         if inside_code != 0 or inside != "true":

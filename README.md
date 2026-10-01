@@ -585,6 +585,8 @@ HTTP MCP 会话过期与恢复：服务端按 `server.mcp_http_session_idle_time
 
 MCP 的 `work_report` 和 `integration_submit` 接收 `tests[].exit_code` 为 JSON 整数；若客户端把这个嵌套字段送成 JSON 字符串中的整数字面量（例如 `"0"`、`"-1"`），MCP 适配层按工具 schema 转成整数后再进入领域服务，事件与数据库仍保存 JSON 数字。`"0.0"`、`"1e0"`、非数字字符串及缺失测试证据不会被当作整数。REST、CLI 和领域服务的整数契约不变；升级服务端后，客户端重连 MCP 才会使用新的适配层。
 
+**JSON 布尔不再是整数。** Python 里 `bool` 是 `int` 的子类，因此 `exit_code: false` 会通过 `isinstance(value, int)` 再被 `int(False)` 写成 `0`——一次失败的检查在**不可重写的追加式证据**里变成"测试通过"。领域层与 MCP 适配层现共用同一判据 `is_strict_int()`，布尔一律拒绝（`invalid_test_evidence`）。同样的守卫用于整型入参（`priority` / `progress_percent` 等），避免 `priority: true` 通过 `0 <= True <= 4` 的范围检查后落库为 1。Web 端那个把 `Number("")` 判为通过的 `parseTestLines` 死代码已删除。
+
 知识 `source_event_ids` 采用显式编号空间信封（`{"v":1,"space":"project_seq","ids":[…]}`）：新写入一律 `project_seq`。schema 25 迁移对历史裸列表 fail-closed：仅在「只命中 project_seq」或「只命中全局 id」或「两命中同一事件」时才解析；同一数字同时命中不同事件（schema24 已写 project_seq 与更早全局 id 碰撞）时标记 `space=ambiguous` 并保留 `raw`/候选映射供审计，绝不静默改指；完全无法解析的标 `space=unresolved`。读取侧暴露 `source_event_ids` / `source_event_ids_space` / `source_event_ids_ambiguous` / `source_event_ids_unresolved`。`idempotency_records` 按 `idempotency_retention_days`（默认 30，0=永久）清理。
 
 ### MCP 生命周期与启动归属
@@ -660,6 +662,8 @@ Agent Session Token 校验与 `last_used_at` 更新是分开的：校验走只�
 浏览器订阅 `events/stream` 必须携带 Agent Session 凭据（请求头）或已建立的浏览器 Session Cookie；匿名订阅返回 401。公开配置提供 `max_sse_clients_per_project`（默认 64）和 `sse_per_ip_limit`（默认 16），超限返回 429。容量在响应头之前**原子预留**：并发请求中只有拿满配额的调用得到 200，落败方在 headers 前收到 429（不会出现空 200）；预留由响应包装层在 `stream_response` 结束时无条件释放，生成器 `finally` 再幂等释放一次——客户端在首字节前断开导致生成器从未迭代时也不会留下永久占用（#181），反复抖动也不会耗尽槽位。SSE 轮询里的同步 `list_events`（SQLite）经 `asyncio.to_thread` 移出事件循环（#184），多客户端慢查询不再拖住 `/health` 与普通 REST。
 
 Agent 自报的 `worktree` 不会被服务盲目信任。Work Report 采集 Git 证据前必须有已登记 Workspace，路径只能是该 Workspace 的 `local_path` 或其子目录，上报的 `commit_hash` 必须能在该 worktree 内解析；否则拒绝，不会把伪造路径或伪造 commit 写成事实。
+
+采集 Git 证据时不使用 `text=True`。`text=True` 按**进程 locale** 解码，而 Windows 上那是控制台 ANSI 码页、并非 git 实际写出的 UTF-8：非 ASCII 分支名或路径会变成乱码写进不可改事件，而 `UnicodeDecodeError` 属于 `ValueError`，会绕过只捕获 `OSError`/`SubprocessError` 的处理，表现为 500。证据采集与 PostgreSQL 工具调用现统一经 `run_git_capture()` / 显式 `decode("utf-8", "replace")` 处理，git 失败降级为 `captured: false` 而不是中断报告。
 
 写事务的范围只包含数据库本身，不包含磁盘与子进程。带 `request_id` 的幂等写入先用一个短事务查重并写入「处理中」占位记录并提交，再在**不持有写锁**的情况下执行领域动作（领域动作自己开自己的事务），最后再用另一个短事务写回响应。因此一次 `work_report` 在采集 Git 证据期间不会阻塞任何其他写路径。动作失败时占位记录会被清除，修正后的重试不会被永久钉在 `idempotency_in_progress`；进程在动作提交后、响应写回前硬崩溃属于已知取舍，此时该 `request_id` 仍会显示处理中。
 

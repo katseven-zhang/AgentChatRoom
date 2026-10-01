@@ -241,16 +241,22 @@ def _run_database_tool(
             check=False,
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
             capture_output=True,
-            text=True,
             stdin=subprocess.DEVNULL,
             env=child_env,
         )
-    except OSError as error:
+    except (OSError, subprocess.SubprocessError, ValueError) as error:
         raise BackupError(
             f"{action} requires the PostgreSQL client tools (pg_dump/pg_restore)"
         ) from error
     if completed.returncode != 0:
-        detail = (completed.stderr or completed.stdout or "command failed").strip()
+        # Decode as UTF-8 rather than the process locale: pg_* writes UTF-8,
+        # and a locale decode both mangles the message and can raise
+        # UnicodeDecodeError, which would replace a clean failure with a 500.
+        detail = (
+            completed.stderr.decode("utf-8", "replace").strip()
+            or completed.stdout.decode("utf-8", "replace").strip()
+            or "command failed"
+        )
         # Tool output can echo the conninfo back; never let it reach the caller.
         raise BackupError(f"{action} failed: {_redact(detail[-500:], *secrets)}")
 

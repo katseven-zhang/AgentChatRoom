@@ -470,16 +470,6 @@ function textLines(value) {
   return String(value || "").split("\n").map((item) => item.trim()).filter(Boolean);
 }
 
-function parseTestLines(value) {
-  return textLines(value).map((line) => {
-    const separator = line.lastIndexOf("::");
-    if (separator < 1) throw new Error(`无效测试记录：${line}`);
-    const exitCode = Number(line.slice(separator + 2));
-    if (!Number.isInteger(exitCode)) throw new Error(`无效测试退出码：${line}`);
-    return { command: line.slice(0, separator).trim(), exit_code: exitCode };
-  });
-}
-
 function eventLabel(type) {
   const labels = {
     "project.created": "项目已创建", "project.updated": "更新了项目设置",
