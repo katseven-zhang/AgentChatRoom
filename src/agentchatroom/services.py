@@ -65,6 +65,7 @@ from .project_registration import (
     detect_git_info,
     derive_logical_path,
     load_checkout_registration,
+    stored_project_scope,
 )
 from .task_history import (
     TASK_HISTORY_LIMIT_MAX,
@@ -562,12 +563,14 @@ def _project_scope(
 
 
 def _stored_project_scope(project: Mapping[str, Any]) -> tuple[str, str, str]:
-    logical_path = str(project["logical_path"] or "")
-    remote = str(project["git_remote"] or "")
-    if remote:
-        return ("git", normalize_remote(remote), logical_path.casefold())
-    root_path = Path(str(project["root_path"])).expanduser().resolve()
-    return ("path", os.path.normcase(str(root_path)), logical_path.casefold())
+    """The stored row's scope, from the same implementation the registration and
+    bootstrap paths use, so no second copy can drift again."""
+    scope = stored_project_scope(dict(project))
+    return (
+        scope["kind"],
+        scope["identity"],
+        scope["logical_path"].casefold(),
+    )
 
 
 def run_git_capture(

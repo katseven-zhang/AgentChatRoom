@@ -325,8 +325,11 @@ REST、CLI 或 Web 自定义。Agent 只提供实际 `project_path`；后端自�
 改写 Project 身份。
 
 一个规范化代码项目作用域对应一个活动 Project/Room。同一 Git remote 与
-`logical_path`，或同一本地规范化路径与 `logical_path`，不能创建第二个活动
-Room。`room_join` 会从忽略的 `.agentchatroom/project.json` 读取后端登记并自动
+`logical_path`，或同一 Git 根目录（无 Git 时为所选目录本身）与 `logical_path`，
+不能创建第二个活动 Room。本地路径作用域两侧同源：数据库行的 `root_path` 记录的是
+用户选择的子目录，比较时按 `logical_path` 回溯出仓库根目录，因此没有配置 remote 的
+monorepo 子项目重入时能认出属于自己的 Room，不会每次 bootstrap 都另建一个 Project。
+`room_join` 会从忽略的 `.agentchatroom/project.json` 读取后端登记并自动
 加入该作用域唯一的活动 Room；如果登记仍指向已永久删除的 Project，只返回失效
 登记错误，不会用旧 key 复活。只有本地登记和数据库作用域都为空时才创建新 Room。
 

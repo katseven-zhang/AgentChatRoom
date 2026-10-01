@@ -344,6 +344,29 @@ def checkout_scope(
     }
 
 
+def repository_root_from_logical(root: Path, logical: str) -> Path:
+    """Undo ``repository root / logical_path`` for a row that kept only the join.
+
+    A path-scoped Project is identified by its repository root plus the
+    repository-relative logical path, because that is what the candidate side can
+    compute from a checkout. The stored ``root_path`` is the directory the operator
+    selected, so recovering the root is the only way the two sides can meet -
+    without it a monorepo subproject without an origin never recognised its own
+    Room and every bootstrap created another Project.
+    """
+    parts = [
+        part
+        for part in Path(str(logical).replace("\\", "/")).parts
+        if part not in ("", ".")
+    ]
+    if not parts:
+        return root
+    repo_root = root
+    for _ in parts:
+        repo_root = repo_root.parent
+    return repo_root
+
+
 def stored_project_scope(project: Mapping[str, Any]) -> dict[str, str]:
     logical = normalize_logical_path(str(project.get("logical_path", "") or ""))
     remote = str(project.get("git_remote", "") or "").strip()
@@ -356,7 +379,9 @@ def stored_project_scope(project: Mapping[str, Any]) -> dict[str, str]:
     root = Path(str(project.get("root_path", ""))).expanduser().resolve()
     return {
         "kind": "path",
-        "identity": os.path.normcase(str(root)),
+        "identity": os.path.normcase(
+            str(repository_root_from_logical(root, logical))
+        ),
         "logical_path": logical,
     }
 
@@ -448,8 +473,16 @@ def _is_path_to_git_upgrade(
             registered_identity = os.path.normcase(
                 str(Path(str(registered_scope.get("identity", ""))).expanduser().resolve())
             )
+            # A path-scope identity is the repository root, not the selected
+            # subdirectory, so the upgrade check has to walk the same number of
+            # logical segments back from the checkout.
             current_identity = os.path.normcase(
-                str(Path(root_path).expanduser().resolve())
+                str(
+                    repository_root_from_logical(
+                        Path(root_path).expanduser().resolve(),
+                        str(requested_scope.get("logical_path", "") or ""),
+                    )
+                )
             )
             return registered_identity == current_identity
         except (OSError, ValueError):
