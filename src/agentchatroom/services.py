@@ -7796,6 +7796,7 @@ class AgentChatRoomService:
         commit_hash: str = "",
         integrator_session_id: str | None = None,
         token: str | None = None,
+        management_authorized: bool = False,
     ) -> dict[str, Any]:
         if result not in INTEGRATION_RESULTS:
             raise DomainError(
@@ -7830,6 +7831,13 @@ class AgentChatRoomService:
                     integrator_session_id,
                     token or "",
                 )
+            elif not management_authorized:
+                # Same gate as handoff/assign/release/update. An integration
+                # without credentials used to be honoured as a management write
+                # simply because nobody had authenticated it, which let any
+                # caller stamp the terminal integration state with no actor at
+                # all.
+                raise _management_authorization_required("record this integration")
             task = self._require_task(connection, project_id, task_id)
             if (
                 task["execution_status"] != "completed"
@@ -7846,6 +7854,26 @@ class AgentChatRoomService:
                     "Task integration is already complete",
                     status_code=409,
                 )
+            # A commit hash carried by an integration is only as trustworthy as
+            # the commit the approved Work Report already proved against the
+            # trusted worktree. Re-running git here would put subprocess work
+            # back inside the write transaction (#337), so anything that does
+            # not match that proven commit is recorded honestly as
+            # self-reported instead of being rendered as captured evidence.
+            clean_commit = commit_hash.strip()
+            reported_commit = ""
+            for report_row in connection.execute(
+                """
+                SELECT payload_json FROM events
+                WHERE project_id = ? AND task_id = ? AND event_type = 'work.report'
+                ORDER BY id DESC LIMIT 1
+                """,
+                (project_id, task_id),
+            ).fetchall():
+                reported_commit = str(
+                    json_load(report_row["payload_json"], {}).get("commit_hash") or ""
+                ).strip()
+            commit_verified = bool(clean_commit) and clean_commit == reported_commit
             integration_id = new_id("integration")
             now = iso_now()
             connection.execute(
@@ -7863,7 +7891,7 @@ class AgentChatRoomService:
                     result,
                     clean_summary,
                     json_dump(clean_files),
-                    commit_hash.strip(),
+                    clean_commit,
                     json_dump(tests),
                     now,
                 ),
@@ -7900,7 +7928,11 @@ class AgentChatRoomService:
                     "result": result,
                     "summary": clean_summary,
                     "files": clean_files,
-                    "commit_hash": commit_hash.strip(),
+                    "commit_hash": clean_commit,
+                    "commit_verified": commit_verified,
+                    "commit_self_reported": (
+                        bool(clean_commit) and not commit_verified
+                    ),
                     "tests": tests,
                     "integrated_by": (
                         "agent" if integrator_session_id else "manager"

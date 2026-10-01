@@ -2463,10 +2463,18 @@ def create_app(
         task_id: str,
         body: IntegrationCreate,
     ) -> dict[str, Any]:
+        _reject_credentials_in_query(request)
+        payload = body.model_dump()
+        # No integrator credentials is not the same thing as management
+        # authority: the terminal integration state must say who wrote it.
+        management = not str(payload.get("integrator_session_id") or "").strip()
+        if management:
+            _require_management(request)
         return service.submit_integration(
             project_id,
             task_id,
-            **body.model_dump(),
+            **payload,
+            management_authorized=management,
             request_id=request.state.request_id,
         )
 

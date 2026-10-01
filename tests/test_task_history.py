@@ -296,7 +296,12 @@ def test_task_history_shows_integration_commit_hash(service, project, joined_age
     assert git_sections, "integration history must carry a Git evidence section"
     entry = git_sections[0]["items"][0]
     assert entry["head"] == "abc123def4567890"
-    assert entry["captured"] is True
+    # #335: this commit was never proved by the approved Work Report (that
+    # report carried no commit), so the history must show the hash without
+    # dressing it up as captured system evidence.
+    assert entry["captured"] is False
+    assert entry["self_reported"] is True
+    assert "自报" in entry["reason"]
 
 
 def test_task_history_redacts_credentials_embedded_in_text():

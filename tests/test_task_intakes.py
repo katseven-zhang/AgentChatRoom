@@ -274,6 +274,7 @@ def test_task_number_is_immutable_across_lifecycle_changes(service, project, joi
         result="done",
         summary="Merged",
         tests=[{"command": "pytest", "exit_code": 0}],
+        management_authorized=True,
     )
     fetched = service.get_task_by_number(project["id"], 1)
     assert fetched["id"] == task["id"]

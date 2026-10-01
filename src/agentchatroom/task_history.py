@@ -202,6 +202,13 @@ def evidence_sections(
         commit_hash = str(
             integration.get("commit_hash") or payload.get("commit_hash") or ""
         ).strip()
+        # An integration's commit is only system-proven when it matches the
+        # commit the approved Work Report verified against the trusted worktree;
+        # anything else must not be rendered as captured evidence (#335).
+        verified_flag = payload.get("commit_verified")
+        commit_captured = (
+            bool(commit_hash) if verified_flag is None else bool(verified_flag)
+        )
         sections.append(
             {
                 "kind": "git",
@@ -210,8 +217,17 @@ def evidence_sections(
                     {
                         "branch": "",
                         "head": commit_hash,
-                        "captured": bool(commit_hash),
-                        "reason": "" if commit_hash else "未采集",
+                        "captured": commit_captured,
+                        "self_reported": bool(payload.get("commit_self_reported")),
+                        "reason": (
+                            ""
+                            if commit_captured
+                            else (
+                                "未经 Work Report 校验（调用方自报）"
+                                if commit_hash
+                                else "未采集"
+                            )
+                        ),
                     }
                 ],
             }

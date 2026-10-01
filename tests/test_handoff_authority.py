@@ -160,3 +160,95 @@ def test_rest_handoff_requires_management_like_its_siblings(
         )
     assert response.status_code == 401
     assert response.json()["error"]["code"] == "management_auth_required"
+
+
+def _approved_for_integration(service, project_id: str, task_id: str, reported_commit: str = ""):
+    """Park a task in the state integration accepts, and record the commit the
+    Work Report proved, so only the integration-side rule under test is
+    exercised."""
+    with service.database.connect(write=True) as connection:
+        if reported_commit:
+            service._emit(
+                connection,
+                project_id,
+                "work.report",
+                task_id=task_id,
+                payload={"commit_hash": reported_commit},
+            )
+        connection.execute(
+            """
+            UPDATE tasks
+            SET status = 'verified', execution_status = 'completed',
+                verification_status = 'approved'
+            WHERE id = ? AND project_id = ?
+            """,
+            (task_id, project_id),
+        )
+
+
+def _integration_event(service, project_id: str, task_id: str):
+    return next(
+        event
+        for event in service.query_audit(project_id, task_id=task_id)["events"]
+        if event["event_type"] == "task.integration_completed"
+    )
+
+
+def test_anonymous_integration_is_refused_without_management_authority(
+    service, project_dir
+):
+    project = service.create_project(root_path=str(project_dir))
+    project_id = project["id"]
+    owner = _join(service, project_id, "worker-a")
+    task = _owned_task(service, project_id, owner)
+
+    with pytest.raises(DomainError) as refused:
+        service.submit_integration(
+            project_id,
+            task["id"],
+            result="done",
+            summary="stamp a terminal state as nobody",
+            tests=[{"command": "pytest", "exit_code": 0}],
+        )
+    assert refused.value.code == "management_auth_required"
+    live = service.get_task(project_id, task["id"])
+    assert live["integration_status"] == "pending"
+
+
+def test_integration_commit_is_only_system_evidence_when_the_report_proved_it(
+    service, project_dir
+):
+    project = service.create_project(root_path=str(project_dir))
+    project_id = project["id"]
+    owner = _join(service, project_id, "worker-a")
+
+    forged = _owned_task(service, project_id, owner)
+    _approved_for_integration(service, project_id, forged["id"], "a" * 12)
+    service.submit_integration(
+        project_id,
+        forged["id"],
+        result="done",
+        summary="integrating a commit nobody proved",
+        tests=[{"command": "pytest", "exit_code": 0}],
+        commit_hash="deadbeefcafe",
+        management_authorized=True,
+    )
+    forged_event = _integration_event(service, project_id, forged["id"])
+    assert forged_event["payload"]["commit_verified"] is False
+    assert forged_event["payload"]["commit_self_reported"] is True
+
+    proven = _owned_task(service, project_id, owner)
+    _approved_for_integration(service, project_id, proven["id"], "b" * 12)
+    service.submit_integration(
+        project_id,
+        proven["id"],
+        result="done",
+        summary="integrating the approved commit",
+        tests=[{"command": "pytest", "exit_code": 0}],
+        commit_hash="b" * 12,
+        management_authorized=True,
+    )
+    proven_event = _integration_event(service, project_id, proven["id"])
+    assert proven_event["payload"]["commit_verified"] is True
+    assert proven_event["payload"]["commit_self_reported"] is False
+    assert proven_event["payload"]["integrated_by"] == "manager"
