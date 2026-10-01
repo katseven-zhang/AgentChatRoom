@@ -34,6 +34,7 @@ from .http_identity import decode_http_identity_value
 from .mcp_compat import CompatibleToolManager
 from .presence import LocalPresenceManager
 from .service_lifetime import require_running_service
+from .services import credential_state_error
 from .bootstrap import (
     RuntimeBinding,
     bind_runtime_arguments,
@@ -893,25 +894,14 @@ def _bundle_project_for_name(access: AccessToken, project_name: str) -> str:
     unavailable_item = unavailable.get(requested)
     if isinstance(unavailable_item, dict):
         reason = str(unavailable_item.get("reason") or "agent_token_invalid")
-        if reason == "agent_token_expired":
-            code = "project_credential_expired"
-            action = "renew_project_token"
-            message = "The selected Project Token has expired"
-        elif reason == "agent_token_revoked":
-            code = "project_credential_revoked"
-            action = "issue_new_project_token_and_update_bundle"
-            message = "The selected Project Token has been revoked"
-        else:
-            code = "project_credential_invalid"
-            action = "replace_project_token_in_bundle"
-            message = "The selected Project Token is invalid"
+        failure = credential_state_error(reason)
         raise DomainError(
-            code,
-            message,
+            failure.code,
+            failure.message,
             status_code=403,
             details={
                 "project_name": requested,
-                "required_action": action,
+                "required_action": failure.details["required_action"],
                 "available_project_names": available_names,
                 "configured_project_names": configured_names,
             },
@@ -987,25 +977,14 @@ def _authorize_remote(
                 touch=True,
             )
         except DomainError as error:
-            if error.code == "agent_token_expired":
-                code = "project_credential_expired"
-                action = "renew_project_token"
-                message = "The selected Project Token has expired"
-            elif error.code == "agent_token_revoked":
-                code = "project_credential_revoked"
-                action = "issue_new_project_token_and_update_bundle"
-                message = "The selected Project Token has been revoked"
-            else:
-                code = "project_credential_invalid"
-                action = "replace_project_token_in_bundle"
-                message = "The selected Project Token is invalid"
+            failure = credential_state_error(error.code)
             raise DomainError(
-                code,
-                message,
+                failure.code,
+                failure.message,
                 status_code=403,
                 details={
                     "project_name": profile_name,
-                    "required_action": action,
+                    "required_action": failure.details["required_action"],
                 },
             ) from error
         if str(credential.get("project_id") or "") != project_id:

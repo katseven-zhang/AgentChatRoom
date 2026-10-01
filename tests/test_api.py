@@ -1610,6 +1610,86 @@ def test_agent_join_generates_identity_key_and_requires_model(
         assert accepted.json()["agent"]["member_id"] == generated.json()["agent"]["member_id"]
 
 
+def test_join_refuses_a_revoked_credential(settings, project_dir):
+    """#333: revocation must block a new Session, not only authenticated calls."""
+    with TestClient(create_app(settings)) as client:
+        project = client.post(
+            "/api/v1/projects",
+            json={"root_path": str(project_dir), "name": "Revoked Join"},
+        ).json()
+        issued = client.post(
+            f"/api/v1/projects/{project['id']}/agent-tokens",
+            json={"name": "Revoked token"},
+        ).json()
+        credential_id = issued["credential"]["id"]
+        registered = _register_workspace(client, project)
+        revoked = client.delete(
+            f"/api/v1/projects/{project['id']}/agent-tokens/{credential_id}"
+        )
+        assert revoked.status_code == 200
+
+        response = client.post(
+            f"/api/v1/projects/{project['id']}/agents/join",
+            json={
+                "name": "Revoked Agent",
+                "client": "revoked-client",
+                "model": "unknown",
+                "credential_id": credential_id,
+                "host_id": registered["host"]["id"],
+                "workspace_id": registered["workspace"]["id"],
+            },
+        )
+
+        assert response.status_code == 401
+        error = response.json()["error"]
+        assert error["code"] == "project_credential_revoked"
+        assert error["details"]["required_action"] == (
+            "issue_new_project_token_and_update_bundle"
+        )
+        assert client.get(f"/api/v1/projects/{project['id']}/snapshot").json()["agents"] == []
+
+
+def test_join_refuses_an_expired_credential(service, project_dir):
+    """#333: an expired credential must not open a new Session either."""
+    project = service.create_project(root_path=str(project_dir))
+    issued = service.issue_agent_token(project["id"], name="Expiring token")
+    credential_id = issued["credential"]["id"]
+    with service.database.connect(write=True) as connection:
+        connection.execute(
+            "UPDATE agent_credentials SET expires_at = ? WHERE id = ?",
+            ("2000-01-01T00:00:00Z", credential_id),
+        )
+
+    with pytest.raises(DomainError) as expired:
+        service.join_room(
+            project["id"],
+            name="Late Agent",
+            client="late-client",
+            model="unknown",
+            credential_id=credential_id,
+        )
+
+    assert expired.value.code == "project_credential_expired"
+    assert expired.value.status_code == 401
+    assert expired.value.details["required_action"] == "renew_project_token"
+    assert service.snapshot(project["id"])["agents"] == []
+
+
+def test_agent_token_listing_requires_management(monkeypatch, settings, project_dir):
+    """#333: the credential inventory is a manifest, not public metadata."""
+    guarded = replace(settings, management_auth_required=True)
+    monkeypatch.setenv(guarded.management_token_env, "t" * 32)
+    with TestClient(create_app(guarded)) as client:
+        anonymous = client.get("/api/v1/projects/any-project/agent-tokens")
+        authorized = client.get(
+            "/api/v1/projects/any-project/agent-tokens",
+            headers={"authorization": f"Bearer {'t' * 32}"},
+        )
+
+    assert anonymous.status_code in (401, 403)
+    assert authorized.status_code == 404
+
+
 def test_redact_log_line_covers_token_bearer_authorization_and_cookies():
     query_line = (
         '127.0.0.1:1 - "DELETE /api/v1/projects/p/leases/l'

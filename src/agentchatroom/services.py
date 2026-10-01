@@ -113,6 +113,27 @@ PROJECT_SETTINGS_DEFAULTS: dict[str, Any] = {
     "mcp_message_context_limit": 5,
 }
 SOFTWARE_MEMBER_PREFIX = "software:"
+# One vocabulary for "this Project credential can no longer open a Session", so
+# REST, MCP and CLI report the same failure instead of three different ones.
+# The internal agent_token_* codes stay for token management operations.
+PROJECT_CREDENTIAL_REVOKED = "project_credential_revoked"
+PROJECT_CREDENTIAL_EXPIRED = "project_credential_expired"
+PROJECT_CREDENTIAL_INVALID = "project_credential_invalid"
+CREDENTIAL_FAILURE_CODES = {
+    "agent_token_revoked": PROJECT_CREDENTIAL_REVOKED,
+    "agent_token_expired": PROJECT_CREDENTIAL_EXPIRED,
+    "agent_token_invalid": PROJECT_CREDENTIAL_INVALID,
+}
+CREDENTIAL_FAILURE_ACTIONS = {
+    PROJECT_CREDENTIAL_REVOKED: "issue_new_project_token_and_update_bundle",
+    PROJECT_CREDENTIAL_EXPIRED: "renew_project_token",
+    PROJECT_CREDENTIAL_INVALID: "replace_project_token_in_bundle",
+}
+CREDENTIAL_FAILURE_MESSAGES = {
+    PROJECT_CREDENTIAL_REVOKED: "The selected Project Token has been revoked",
+    PROJECT_CREDENTIAL_EXPIRED: "The selected Project Token has expired",
+    PROJECT_CREDENTIAL_INVALID: "The selected Project Token is invalid",
+}
 REQUEST_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 SENSITIVE_REQUEST_FIELDS = {
     "token",
@@ -499,6 +520,34 @@ def _stored_project_scope(project: Mapping[str, Any]) -> tuple[str, str, str]:
         return ("git", normalize_remote(remote), logical_path.casefold())
     root_path = Path(str(project["root_path"])).expanduser().resolve()
     return ("path", os.path.normcase(str(root_path)), logical_path.casefold())
+
+
+def credential_state_error(reason: str) -> DomainError:
+    """Map a credential failure onto the shared Project-credential vocabulary.
+
+    Adapters raise the internal ``agent_token_*`` codes from the domain; every
+    caller that wants to tell an Agent what to do next uses this instead, so
+    REST, MCP and CLI all return the same code, message and required_action.
+    """
+    code = CREDENTIAL_FAILURE_CODES.get(reason, PROJECT_CREDENTIAL_INVALID)
+    return DomainError(
+        code,
+        CREDENTIAL_FAILURE_MESSAGES[code],
+        status_code=401,
+        details={"required_action": CREDENTIAL_FAILURE_ACTIONS[code]},
+    )
+
+
+def _require_live_credential(row: Mapping[str, Any]) -> None:
+    """Refuse a credential that was revoked or has already expired.
+
+    Opening a Session is exactly as privileged as using the credential, so the
+    same liveness rule that guards an authenticated call must guard a join.
+    """
+    if row["revoked_at"] is not None:
+        raise credential_state_error("agent_token_revoked")
+    if parse_time(row["expires_at"]) <= utc_now():
+        raise credential_state_error("agent_token_expired")
 
 
 class AgentChatRoomService:
@@ -3268,7 +3317,8 @@ class AgentChatRoomService:
             if credential_id:
                 credential = connection.execute(
                     """
-                    SELECT id, member_id, name FROM agent_credentials
+                    SELECT id, member_id, name, revoked_at, expires_at
+                    FROM agent_credentials
                     WHERE id = ? AND project_id = ?
                     """,
                     (credential_id, project_id),
@@ -3279,6 +3329,10 @@ class AgentChatRoomService:
                         "Agent credential does not belong to this Project",
                         status_code=404,
                     )
+                # A revoked or expired credential must not be able to mint a new
+                # 12h Session; previously only the existence of the row was
+                # checked, so a revoked Token kept full write authority.
+                _require_live_credential(credential)
                 if member_id and credential["member_id"] not in {None, member_id}:
                     raise DomainError(
                         "project_member_mismatch",

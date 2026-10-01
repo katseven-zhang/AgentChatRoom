@@ -1884,7 +1884,11 @@ def create_app(
         )
 
     @app.get("/api/v1/projects/{project_id}/agent-tokens")
-    def list_agent_tokens(project_id: str) -> dict[str, Any]:
+    def list_agent_tokens(request: Request, project_id: str) -> dict[str, Any]:
+        # The listing is a credential inventory: it names every Token in the
+        # Project and who it belongs to. Metadata is a manifest too, so it is
+        # not readable anonymously.
+        _require_management(request)
         return {"credentials": service.list_agent_tokens(project_id)}
 
     @app.post("/api/v1/projects/{project_id}/agent-tokens", status_code=201)
