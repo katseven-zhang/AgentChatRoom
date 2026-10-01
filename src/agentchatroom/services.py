@@ -3936,7 +3936,29 @@ class AgentChatRoomService:
             "SELECT COALESCE(MAX(project_seq), 0) AS cursor FROM events WHERE project_id = ?",
             (project_id,),
         ).fetchone()["cursor"]
-        return {"events": events, "cursor": int(cursor), "latest_cursor": int(latest)}
+        # A retention purge can leave a hole between the caller's cursor and
+        # the oldest retained event. Reporting the highest purged project_seq
+        # lets a client holding an old cursor tell "there is a gap here" apart
+        # from "you are already at the start".
+        purged_before = 0
+        for receipt in connection.execute(
+            """
+            SELECT payload_json FROM events
+            WHERE project_id = ? AND event_type = 'audit.purged'
+            ORDER BY project_seq DESC
+            """,
+            (project_id,),
+        ).fetchall():
+            value = json_load(receipt["payload_json"], {}).get("purged_before")
+            if isinstance(value, int) and not isinstance(value, bool):
+                purged_before = max(purged_before, value)
+        return {
+            "events": events,
+            "cursor": int(cursor),
+            "latest_cursor": int(latest),
+            "purged_before": purged_before or None,
+            "cursor_is_purged": bool(purged_before) and after < purged_before,
+        }
 
     def get_project_mcp_message_limit(
         self, project_id: str, *, connection: Any | None = None
@@ -10021,26 +10043,100 @@ class AgentChatRoomService:
             )
         )
 
+    def _audit_retention_protected_ids(
+        self, connection: Any, project_id: str
+    ) -> set[int]:
+        """Event ids a retention purge must not remove.
+
+        Three things still point at events. An acknowledgement cascades away
+        with its event, erasing "who confirmed what, when" while a later
+        message.acknowledged event keeps citing the now-missing number. Each
+        task's spec_receipt is derived by scanning the newest task.claimed that
+        carries the project-document snapshot, so purging that event silently
+        degrades the receipt to {} — a permanent false "this task had no bound
+        documents". And the audit.purged receipt records the purge, so deleting
+        it would leave no surviving evidence that the cleanup ever happened.
+        """
+        protected: set[int] = set()
+        for row in connection.execute(
+            """
+            SELECT a.event_id AS event_id
+            FROM event_acknowledgements a
+            JOIN events e ON e.id = a.event_id
+            WHERE e.project_id = ?
+            """,
+            (project_id,),
+        ).fetchall():
+            protected.add(int(row["event_id"]))
+        for row in connection.execute(
+            """
+            SELECT id FROM events
+            WHERE project_id = ? AND event_type = 'audit.purged'
+            """,
+            (project_id,),
+        ).fetchall():
+            protected.add(int(row["id"]))
+        for row in connection.execute(
+            """
+            SELECT id FROM events
+            WHERE project_id = ?
+              AND event_type = 'task.claimed'
+              AND payload_json LIKE '%"project_documents"%'
+              AND id = (
+                  SELECT MAX(inner_e.id) FROM events inner_e
+                  WHERE inner_e.project_id = events.project_id
+                    AND inner_e.task_id = events.task_id
+                    AND inner_e.event_type = 'task.claimed'
+                    AND inner_e.payload_json LIKE '%"project_documents"%'
+              )
+            """,
+            (project_id,),
+        ).fetchall():
+            protected.add(int(row["id"]))
+        return protected
+
     def enforce_audit_retention(self, project_id: str) -> dict[str, Any]:
         """Delete audit events older than the project retention policy.
 
         Only whole expired events are removed by created_at; retained events
-        are never rewritten or reordered. The purge itself is audited after
-        the deletion so the cleanup leaves a surviving trace.
+        are never rewritten or reordered. The purge is audited after the
+        deletion so the cleanup leaves a surviving trace, and that trace is
+        itself excluded from later purges — otherwise the receipt would be
+        destroyed by the very statement that records it. Events still
+        referenced by an acknowledgement or by a task's spec receipt are
+        deferred rather than cascading into a dangling reference.
         """
         with self.database.connect(write=True) as connection:
             row = self._require_project(connection, project_id)
             retention_days = self._project_retention_days(row)
             if retention_days <= 0:
-                return {"purged": 0, "retention_days": 0}
+                return {"purged": 0, "retention_days": 0, "purged_before": None}
             cutoff = (utc_now() - timedelta(days=retention_days)).isoformat().replace(
                 "+00:00", "Z"
             )
+            protected = sorted(self._audit_retention_protected_ids(connection, project_id))
+            base_scope = (
+                "project_id = ? AND created_at < ? AND event_type != 'audit.purged'"
+            )
+            if protected:
+                # NOT IN (NULL) is never true, so the clause can only be added
+                # when there is at least one protected id.
+                placeholders = ",".join("?" for _ in protected)
+                scope = f"{base_scope} AND id NOT IN ({placeholders})"
+                params = (project_id, cutoff, *protected)
+            else:
+                scope = base_scope
+                params = (project_id, cutoff)
+            bounds = connection.execute(
+                f"SELECT MIN(id) AS first_id, MAX(id) AS last_id FROM events WHERE {scope}",
+                params,
+            ).fetchone()
             cursor = connection.execute(
-                "DELETE FROM events WHERE project_id = ? AND created_at < ?",
-                (project_id, cutoff),
+                f"DELETE FROM events WHERE {scope}",
+                params,
             )
             purged = max(0, int(cursor.rowcount))
+            purged_before = int(bounds["last_id"] or 0) if purged else None
             if purged:
                 self._emit(
                     connection,
@@ -10050,9 +10146,17 @@ class AgentChatRoomService:
                         "retention_days": retention_days,
                         "cutoff": cutoff,
                         "deleted_events": purged,
+                        "purged_from": int(bounds["first_id"] or 0),
+                        "purged_before": purged_before,
+                        "deferred_referenced": len(protected),
                     },
                 )
-            return {"purged": purged, "retention_days": retention_days}
+            return {
+                "purged": purged,
+                "retention_days": retention_days,
+                "purged_before": purged_before,
+                "deferred_referenced": len(protected),
+            }
 
     def enforce_audit_retention_throttled(self, project_id: str) -> dict[str, Any]:
         """Retention sweep for read paths: at most once per hour per project."""

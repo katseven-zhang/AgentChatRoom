@@ -669,6 +669,12 @@ Agent 自报的 `worktree` 不会被服务盲目信任。Work Report 采集 Git 
 
 写锁竞争是正常且可重试的结果，不再是内部错误：SQLite 忙等待超时后统一返回 `database_write_contended`（503，`required_action=retry_after_short_backoff`），REST / MCP / CLI 由此得到同一套可恢复语义，而不是裸 `sqlite3.OperationalError` 变成 500。
 
+审计保留期清理只移除整个过期事件，不改写或重排留存事件，并且不会销毁自己留下的凭证：
+
+- **`audit.purged` 不再被清理**。它记录"发生过清理"，若被下一次保留窗口按同一条语句删掉，历史就默变了且无法证明。台账 payload 记录 `purged_from` / `purged_before`（被清掉的首尾 `project_seq`）、`deleted_events` 与 `deferred_referenced`。
+- **仍被引用的事件延后删除**。`event_acknowledgements.event_id` 对 `events(id)` 是 `ON DELETE CASCADE`，直接删会把"谁何时确认了哪条消息"一并抹掉，而更晚的 `message.acknowledged` 仍引用已不存在的编号；每个任务的 `spec_receipt` 由**最新一条带 `project_documents` 快照的 `task.claimed`** 推导，该事件被清掉会让回执静默退化成 `{}`，永远误判该任务未绑定文档。这两类事件本轮一律延后。
+- **读路径给出 `purged_before`**。`list_events` / `room_sync` 返回 `purged_before` 与 `cursor_is_purged`，让持有旧游标的一方能区分"中间有空洞"和"你已经在起点"，而不是把空洞当成没有新事件。
+
 MCP 的同步工具函数不再内联占用事件循环。SDK 默认直接调用同步函数，导致一次 `work_report` 的 Git 子进程期间，同进程的 REST、SSE 和其他 MCP 客户端全部停摆；现在同步工具经 `anyio.to_thread` 在工作线程执行，领域调用本身不变。`room_bootstrap` 的绑定因此从共享注册表回读，而不是从只在线程内可见的 ContextVar 回读，避免线程边界把刚建立的绑定覆盖成空。
 
 后台 stdio/Bridge 进程与共享 HTTP transport Session 只负责连接 Presence。HTTP 服务按实际 MCP transport 绑定后台保活，多个并行 Session 分别刷新；transport 结束后停止保活并关闭对应 Room Session。部分客户端断开时不会发送 MCP `DELETE`，服务端因此对无任何 HTTP 请求的 stateful transport 做有界回收，默认 300 秒，可通过 `[server].mcp_http_session_idle_timeout_seconds` 或 `AGENTCHATROOM_MCP_HTTP_SESSION_IDLE_TIMEOUT_SECONDS` 配置。被回收 transport 的后台心跳与 Room Session 会一起停止，旧任务所有者不会被永久误判为在线；之后使用该连接须重新 bootstrap，并按任务实际状态显式 reclaim。`session_heartbeat` 只刷新连接存活，
