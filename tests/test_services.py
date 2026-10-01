@@ -3111,7 +3111,10 @@ def test_silent_owner_lease_stays_enforced_until_ttl_or_same_member_takeover(
         project["id"],
         session_id=successor["agent"]["id"],
         token=successor["token"],
-        path_pattern="src/reclaimable/file.py",
+        # The successor takes over the same scope it replaces. Acquiring a
+        # narrower scope must NOT retire the identity's broader lease (#235);
+        # that direction is covered in tests/test_lease_scope.py.
+        path_pattern="src/reclaimable/**",
     )
     assert acquired["lease"]["active"] is True
 

@@ -465,6 +465,25 @@ def lease_modes_conflict(left: str, right: str) -> bool:
     return "exclusive" in {left, right}
 
 
+def _pattern_covers(broad: str, narrow: str) -> bool:
+    """True when every path inside ``narrow`` is also inside ``broad``.
+
+    A same-identity takeover must only retire leases the new scope actually
+    replaces. Releasing a broader lease because it merely *overlaps* a narrower
+    request silently shrank the caller's own protection.
+    """
+    broad = normalize_pattern(broad)
+    narrow = normalize_pattern(narrow)
+    if broad == narrow:
+        return True
+    if fnmatch.fnmatchcase(narrow, broad):
+        return True
+    prefix = _static_prefix(broad)
+    return bool(prefix) and (
+        narrow == prefix or narrow.startswith(f"{prefix}/") or narrow.startswith(prefix)
+    )
+
+
 # How much protection each mode buys, so re-acquiring one scope with a different
 # mode is an explicit upgrade or a refused downgrade rather than a silent no-op.
 LEASE_MODE_STRENGTH = {"readonly": 0, "shared": 1, "exclusive": 2}
@@ -7256,8 +7275,10 @@ class AgentChatRoomService:
                 ):
                     # Same software identity, new session: the successor
                     # transparently takes over the stale lease of its own
-                    # identity (a reaped transport cannot release it itself).
-                    superseded.append(dict(row))
+                    # identity (a reaped transport cannot release it itself) -
+                    # but only where the new scope actually replaces the old one.
+                    if _pattern_covers(pattern, row["path_pattern"]):
+                        superseded.append(dict(row))
                     continue
                 conflicts.append(
                     {

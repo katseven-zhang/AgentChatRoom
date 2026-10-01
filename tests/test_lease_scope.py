@@ -315,6 +315,85 @@ def test_a_rejected_acquire_does_not_release_the_predecessor_lease(
         if lease.get("released_at") is None
     ]
     assert stale["lease"]["id"] in still_held
+    released_events = [
+        event
+        for event in service.query_audit(project_id)["events"]
+        if event["event_type"] == "lease.released"
+    ]
+    assert released_events == []
+
+
+def test_a_narrow_takeover_keeps_the_broader_lease_of_its_own_identity(
+    service, project_dir
+):
+    """#235: the takeover used to fire on mere overlap, so acquiring a single
+    file quietly retired the same identity's directory-wide lease."""
+    project = service.create_project(root_path=str(project_dir))
+    project_id = project["id"]
+    first = _session(service, project_id, "worker-a")
+    successor = _session(service, project_id, "worker-a")
+    broad = service.acquire_lease(
+        project_id,
+        session_id=first["agent"]["id"],
+        token=first["token"],
+        path_pattern="src/**",
+        mode="exclusive",
+    )
+
+    result = service.acquire_lease(
+        project_id,
+        session_id=successor["agent"]["id"],
+        token=successor["token"],
+        path_pattern="src/a.py",
+        mode="exclusive",
+    )
+    assert result["lease"]["path_pattern"] == "src/a.py"
+    active = {
+        lease["path_pattern"]
+        for lease in service.list_leases(project_id)
+        if lease.get("released_at") is None
+    }
+    assert {"src/**", "src/a.py"} <= active
+    assert broad["lease"]["id"] in [
+        lease["id"]
+        for lease in service.list_leases(project_id)
+        if lease.get("released_at") is None
+    ]
+
+
+def test_a_replacing_takeover_does_retire_the_covered_lease(service, project_dir):
+    project = service.create_project(root_path=str(project_dir))
+    project_id = project["id"]
+    first = _session(service, project_id, "worker-a")
+    successor = _session(service, project_id, "worker-a")
+    narrow = service.acquire_lease(
+        project_id,
+        session_id=first["agent"]["id"],
+        token=first["token"],
+        path_pattern="src/a.py",
+        mode="exclusive",
+    )
+
+    service.acquire_lease(
+        project_id,
+        session_id=successor["agent"]["id"],
+        token=successor["token"],
+        path_pattern="src/**",
+        mode="exclusive",
+    )
+    active = {
+        lease["id"]
+        for lease in service.list_leases(project_id)
+        if lease.get("released_at") is None
+    }
+    assert narrow["lease"]["id"] not in active
+    takeover = [
+        event
+        for event in service.query_audit(project_id)["events"]
+        if event["event_type"] == "lease.released"
+        and event["payload"].get("reason") == "same_member_takeover"
+    ]
+    assert [event["payload"]["lease_id"] for event in takeover] == [narrow["lease"]["id"]]
 
 
 def test_check_leases_treats_ones_own_identity_as_takeable(service, project_dir):
