@@ -368,11 +368,20 @@ def task_state_for_legacy_status(
     status: str,
     *,
     previous_verification: str = "not_required",
+    previous_integration: str = "pending",
 ) -> tuple[str, str, str]:
+    # An integration verdict is a fact about the last integration attempt, not a
+    # by-product of the execution status: a field edit (next_step, priority) must
+    # not wash `failed` back to `pending` and delete the reason the task is stuck.
+    # Only a new integration_submit replaces it, or a status that carries its own
+    # integration verdict (done below).
+    preserved_integration = (
+        previous_integration if previous_integration == "failed" else "pending"
+    )
     if status == "awaiting_review":
-        return "completed", "pending", "pending"
+        return "completed", "pending", preserved_integration
     if status == "verified":
-        return "completed", "approved", "pending"
+        return "completed", "approved", preserved_integration
     if status == "done":
         return "completed", "approved", "done"
     if status == "cancelled":
@@ -382,7 +391,7 @@ def task_state_for_legacy_status(
         if previous_verification in {"changes_requested", "approved"}
         else "not_required"
     )
-    return status, verification, "pending"
+    return status, verification, preserved_integration
 
 
 def task_contract(

@@ -7119,6 +7119,7 @@ class AgentChatRoomService:
             ) = task_state_for_legacy_status(
                 next_status,
                 previous_verification=task["verification_status"],
+                previous_integration=task["integration_status"],
             )
             priority = require_int_field(priority, "priority")
             progress_percent = require_int_field(progress_percent, "progress_percent")
