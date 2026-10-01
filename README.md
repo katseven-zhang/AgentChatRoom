@@ -701,6 +701,8 @@ Agent 自报的 `worktree` 不会被服务盲目信任。Work Report 采集 Git 
 
 MCP 的同步工具函数不再内联占用事件循环。SDK 默认直接调用同步函数，导致一次 `work_report` 的 Git 子进程期间，同进程的 REST、SSE 和其他 MCP 客户端全部停摆；现在同步工具经 `anyio.to_thread` 在工作线程执行，领域调用本身不变。`room_bootstrap` 的绑定因此从共享注册表回读，而不是从只在线程内可见的 ContextVar 回读，避免线程边界把刚建立的绑定覆盖成空。
 
+MCP 参数归一化按 schema 生效，不把客户端清空可选值当成格式错误。部分客户端会将被选的标量参数（`task_create.priority`、`task_update.progress_percent`、`lease_acquire.ttl_seconds`、`audit_query.limit`、`message_post.requires_ack` 等）发成空串而不是省略；空串对整数/布尔/数值/对象没有合法字面量含义，因此非必填且可空或带默认值的参数在归一化时直接丢弃，等价于不传，工具自身的默认值继续生效。数组沿用既有语义（空串→`[]`），字符串沿用空串本身（空文本是合法取值）。必填且不接受 null 的标量被清空则返回结构化错误 `invalid_mcp_argument`，`details.required_action` 说明应传该类型的 JSON 字面量或省略该可选参数，而不是抛出无法处置的裸 ToolError；同一机制也作用于嵌套数组/对象里的字段。
+
 后台 stdio/Bridge 进程与共享 HTTP transport Session 只负责连接 Presence。HTTP 服务按实际 MCP transport 绑定后台保活，多个并行 Session 分别刷新；transport 结束后停止保活并关闭对应 Room Session。部分客户端断开时不会发送 MCP `DELETE`，服务端因此对无任何 HTTP 请求的 stateful transport 做有界回收，默认 300 秒，可通过 `[server].mcp_http_session_idle_timeout_seconds` 或 `AGENTCHATROOM_MCP_HTTP_SESSION_IDLE_TIMEOUT_SECONDS` 配置。被回收 transport 的后台心跳与 Room Session 会一起停止，旧任务所有者不会被永久误判为在线；之后使用该连接须重新 bootstrap，并按任务实际状态显式 reclaim。`session_heartbeat` 只刷新连接存活，
 不再依赖 Agent 主动提交 `working`、`idle` 或 `blocked`。左侧显示已连接/未连接、
 当前任务阶段和最后活动；任务认领、Work Report、独立 Review 与 Integration 才是
