@@ -130,6 +130,26 @@ async function pageStale(loader) {
 
 await pageStale(loadOlderAuditEvents);
 await pageStale(loadNewerAuditEvents);
+
+// --- #319: a burst larger than one page must not claim the tail -----------
+state.projectId = 'project-a';
+state.selectGeneration += 1;
+state.auditFilter = '';
+state.auditEvents = [{project_seq: 20}, {project_seq: 21}];
+state.auditHasNewer = false; // we were looking at the live tail
+state.auditHasOlder = false;
+const burst = refreshManagement();
+releaseAll(); // the stub answers has_newer: true — more events past this window
+await burst;
+assert.equal(
+  state.auditHasNewer,
+  true,
+  'the server said newer events exist past this window, so paging must stay open',
+);
+assert.ok(
+  state.auditEvents.some((event) => event.project_seq === 5),
+  'the fresh events are still merged into the window',
+);
 """
 
 

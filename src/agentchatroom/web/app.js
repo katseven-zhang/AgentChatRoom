@@ -2316,7 +2316,11 @@ async function refreshManagement() {
       const overflow = Math.max(0, merged.length - AUDIT_PAGE_SIZE);
       state.auditEvents = overflow ? merged.slice(overflow) : merged;
       if (overflow) state.auditHasOlder = true;
-      state.auditHasNewer = false;
+      // The server already answered for this exact window. A burst bigger than
+      // one page leaves newer events past the right edge, so the merged view
+      // must not claim the tail: that disables 「下一页」 and hides the rest of
+      // the burst until a later refresh (#319).
+      state.auditHasNewer = Boolean(audit.has_newer);
       state.auditPage = 1;
     } else {
       // mid-history view: new events exist beyond the preserved window; do not jump pages
