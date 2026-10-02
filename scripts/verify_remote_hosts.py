@@ -22,7 +22,12 @@ def parse_args() -> argparse.Namespace:
         description="Verify two isolated remote AgentChatRoom Hosts through MCP Bridges."
     )
     parser.add_argument("--url", required=True, help="Center MCP URL, for example http://127.0.0.1:8765/mcp")
-    parser.add_argument("--token", required=True, help="Project Agent Token")
+    parser.add_argument(
+        "--token",
+        default=os.getenv("AGENTCHATROOM_AGENT_TOKEN", ""),
+        help="Project Agent Token; defaults to AGENTCHATROOM_AGENT_TOKEN. Passing a "
+        "live token here exposes it in this machine's process arguments.",
+    )
     parser.add_argument("--project-id", required=True)
     parser.add_argument("--workspace-a", required=True)
     parser.add_argument("--workspace-b", required=True)

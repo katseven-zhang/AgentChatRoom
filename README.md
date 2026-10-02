@@ -942,6 +942,8 @@ Windows 与 Ubuntu 上依次跑 `pytest` → `node --check` → `compileall` →
 `# audit-allow:<rule>` 或模块首三行内的 `# audit-allow-file:<rules>` 显式声明豁免，
 豁免范围按规则而非按目录，且对上面两条按机器实时推导的规则无效。
 
+验收脚本的 Agent Token 一律优先用环境变量而不是命令行参数：`scripts/verify_live_server.py` 与 `scripts/verify_remote_hosts.py` 的 `--token` 都默认取 `AGENTCHATROOM_AGENT_TOKEN`，命令行传令牌会把它暴露给同机任何能列进程的调用者，因此不再是必填项（显式传入仍可用）。发布审计新增 `agentchatroom_credential` 规则，按 `redaction.py` 里同一个 `acr.<id>.<secret>` 模式扫描脚本、部署文件与日志等发布面文本，使凭据既不能留在日志里、也不能逃过发布检查；测试夹具里的假凭据按路径豁免，其余密钥规则在测试目录照常生效。
+
 本机验收脚本产生的临时数据库、日志和协议结果统一写入
 `.agentchatroom/verification/`，不会散落到仓库源码目录或进入 Git。
 PostgreSQL 验收脚本在未安装可选数据库依赖时仍可查看 `--help`；实际执行

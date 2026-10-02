@@ -74,6 +74,8 @@ PLACEHOLDER_MARKERS = (
     "<",
 )
 
+from agentchatroom.redaction import AGENTCHATROOM_CREDENTIAL_PATTERN
+
 SECRET_PATTERNS = (    (
         "github_token",
         re.compile(r"(?i)(?:github_pat_[A-Za-z0-9_]{20,}|gh[pousr]_[A-Za-z0-9_]{30,})"),
@@ -84,6 +86,10 @@ SECRET_PATTERNS = (    (
             r"(?i)\b(?:sk-(?:proj-|svcacct-)?[A-Za-z0-9_-]{20,}|"
             r"xai-[A-Za-z0-9_-]{20,}|sk-ant-[A-Za-z0-9_-]{20,})\b"
         ),
+    ),
+    (
+        "agentchatroom_credential",
+        AGENTCHATROOM_CREDENTIAL_PATTERN,
     ),
     ("google_api_key", re.compile(r"\bAIza[0-9A-Za-z_-]{35}\b")),
     ("aws_access_key", re.compile(r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b")),
@@ -289,6 +295,11 @@ def _path_findings(path: str, source: str) -> list[Finding]:
     return findings
 
 
+def _is_test_fixture(path: str) -> bool:
+    """True for repository test sources, which carry fake credentials by design."""
+    return path.startswith("tests/") or "/tests/" in path
+
+
 def scan_text(text: str, *, path: str, source: str) -> list[Finding]:
     findings: list[Finding] = []
     public_surface = _is_public_surface(path)
@@ -300,6 +311,11 @@ def scan_text(text: str, *, path: str, source: str) -> list[Finding]:
                 findings.append(Finding(source, path, line_number, rule))
         high_confidence_secret = False
         for rule, pattern in SECRET_PATTERNS:
+            if rule == "agentchatroom_credential" and _is_test_fixture(path):
+                # Test suites carry fake acr.<id>.<secret> values on purpose; the
+                # credential rule exists for shipped text (scripts, deploy files,
+                # logs) and would otherwise be noise the moment a test is added.
+                continue
             if pattern.search(line):
                 findings.append(Finding(source, path, line_number, rule))
                 high_confidence_secret = True

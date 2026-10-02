@@ -58,6 +58,11 @@ _TOKENISH = "token"
 
 _CREDENTIAL_VALUE = r"[^\s,;}\]&\"']+"
 
+# AgentChatRoom's own credential shape: acr.<id>.<secret>. The release audit
+# reports this same pattern, so a live credential can neither survive a log nor
+# stay invisible to the publish check.
+AGENTCHATROOM_CREDENTIAL_PATTERN = re.compile(r"\bacr\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b")
+
 # Value-pattern redaction: credentials embedded in free-form text must not leak
 # even under a benign key such as "body" or "summary" (review #44, criterion 12).
 _REDACT_TEXT_PATTERNS = (
@@ -70,8 +75,7 @@ _REDACT_TEXT_PATTERNS = (
     re.compile(r"\bsk-(?:proj-|svcacct-)?[A-Za-z0-9_-]{8,}\b"),
     re.compile(r"\b(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{20,}\b"),
     re.compile(r"\bxox[baprs]-[A-Za-z0-9-]{10,}\b"),
-    # AgentChatRoom's own credential shape: acr.<id>.<secret>
-    re.compile(r"\bacr\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b"),
+    AGENTCHATROOM_CREDENTIAL_PATTERN,
 )
 
 
