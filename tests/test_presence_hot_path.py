@@ -200,6 +200,50 @@ def test_presence_falls_back_when_the_binding_is_another_session(
     assert manager.registrations == [{"session_id": joined["agent"]["id"], "agent_key": ""}]
 
 
+def test_explicit_leave_unregisters_the_manager_bound_to_the_transport(
+    service, project, monkeypatch
+):
+    """#283: HTTP 形态下保活注册表是按 transport 绑定的，全局那个根本不存在。"""
+    joined = _join(service, project)
+    bound = LocalPresenceManager(service, enabled=True, interval_seconds=60)
+    bound.register(
+        project["id"],
+        joined["agent"]["id"],
+        joined["token"],
+        agent_key=joined["agent"]["agent_key"],
+    )
+    monkeypatch.setattr(mcp_server, "presence_manager", None)
+    monkeypatch.setattr(mcp_server, "get_service", lambda: service)
+    presence_token = mcp_server._bound_presence_manager.set(bound)
+    try:
+        assert mcp_server.session_leave(
+            project["id"], joined["agent"]["id"], joined["token"]
+        )["ok"] is True
+    finally:
+        mcp_server._bound_presence_manager.reset(presence_token)
+
+    assert joined["agent"]["id"] not in bound._sessions
+
+
+def test_explicit_leave_unregisters_the_stdio_manager(service, project, monkeypatch):
+    joined = _join(service, project)
+    manager = LocalPresenceManager(service, enabled=True, interval_seconds=60)
+    manager.register(
+        project["id"],
+        joined["agent"]["id"],
+        joined["token"],
+        agent_key=joined["agent"]["agent_key"],
+    )
+    monkeypatch.setattr(mcp_server, "presence_manager", manager)
+    monkeypatch.setattr(mcp_server, "get_service", lambda: service)
+
+    assert mcp_server.session_leave(
+        project["id"], joined["agent"]["id"], joined["token"]
+    )["ok"] is True
+
+    assert joined["agent"]["id"] not in manager._sessions
+
+
 def test_repeated_heartbeat_keeps_the_session_alive_without_room_reads(
     service, project, monkeypatch
 ):

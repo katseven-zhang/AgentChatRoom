@@ -857,8 +857,21 @@ def _mcp_request_id(request_id: str) -> str:
     return request_id.strip() or new_id("request")
 
 
+def _active_presence_manager() -> LocalPresenceManager | None:
+    """The keepalive registry for this call.
+
+    The HTTP/Bridge adapters bind a per-transport manager before running a tool;
+    stdio has one process-wide manager. Every presence touchpoint must resolve
+    through here or the two shapes diverge: an explicit leave under HTTP would
+    close the Room Session in the domain while the manager that still holds the
+    registration -- and, in that form, is the only manager there is -- never learns,
+    so the keepalive keeps refreshing a closed Session until a heartbeat fails.
+    """
+    return _bound_presence_manager.get() or presence_manager
+
+
 def _register_local_presence(payload: dict[str, Any]) -> None:
-    manager = _bound_presence_manager.get() or presence_manager
+    manager = _active_presence_manager()
     if manager is None:
         return
     project = payload.get("project") or {}
@@ -883,7 +896,7 @@ def _ensure_local_presence(project_id: str, session_id: str, token: str) -> None
     tool call proves this process still owns the session, so use it to resume
     the background heartbeat keepalive automatically.
     """
-    manager = _bound_presence_manager.get() or presence_manager
+    manager = _active_presence_manager()
     if manager is None:
         return
     binding = get_runtime_binding()
@@ -1454,8 +1467,9 @@ def session_leave(
         # caller keeps its binding, presence keeps heartbeating, and the leases
         # stay held until a leave that the domain actually accepts.
         return result
-    if presence_manager is not None:
-        presence_manager.unregister(session_id)
+    manager = _active_presence_manager()
+    if manager is not None:
+        manager.unregister(session_id)
     binding = get_runtime_binding()
     if binding is not None and binding.session_id == session_id:
         clear_bindings_for_agent_session(session_id)
