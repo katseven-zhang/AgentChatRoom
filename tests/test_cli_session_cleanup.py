@@ -53,7 +53,7 @@ async def test_a_failing_report_still_leaves_the_session(settings, project_dir, 
 @pytest.mark.asyncio
 async def test_keep_session_still_keeps_the_session_open(settings, project_dir, capsys):
     app = create_app(settings)
-    project, _member, credential = _prepared_project(app, project_dir)
+    project, member, credential = _prepared_project(app, project_dir)
 
     server, server_task, url = await _serve(app)
     try:
@@ -73,15 +73,15 @@ async def test_keep_session_still_keeps_the_session_open(settings, project_dir, 
                 url,
             )
 
-        kinds = [
-            event["event_type"]
-            for event in app.state.service.list_events(project["id"], after=0)["events"]
-        ]
+        events = app.state.service.list_events(project["id"], after=0)["events"]
+        kinds = [event["event_type"] for event in events]
         agents = app.state.service.snapshot(project["id"])["agents"]
+        joined = next(event for event in events if event["event_type"] == "agent.joined")
 
         assert "agent.joined" in kinds
         assert "agent.left" not in kinds
-        assert [agent["name"] for agent in agents] == ["OpenCode"]
+        assert [agent["name"] for agent in agents] == ["CLI submit"]
+        assert joined["payload"]["member_id"] == member["id"]
         assert agents[0]["left_at"] is None
         assert "kept because --keep-session" in capsys.readouterr().err
     finally:
