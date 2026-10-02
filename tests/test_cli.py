@@ -488,6 +488,47 @@ def test_work_report_cli_allows_explicit_no_code_reason(monkeypatch, capsys):
     assert '"ok": true' in capsys.readouterr().out
 
 
+def test_http_commands_use_the_configured_port_without_an_explicit_url(
+    monkeypatch, tmp_path, capsys
+):
+    """#300: room-sync and task-* follow Settings, not a hardcoded port."""
+    config_path = tmp_path / "room.toml"
+    config_path.write_text(
+        '[server]\nhost = "0.0.0.0"\nport = 9000\n\n'
+        "[security]\nmanagement_auth_required = true\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("AGENTCHATROOM_CONFIG", str(config_path))
+    monkeypatch.delenv("AGENTCHATROOM_URL", raising=False)
+    monkeypatch.delenv("AGENTCHATROOM_PORT", raising=False)
+    monkeypatch.delenv("AGENTCHATROOM_HOST", raising=False)
+    monkeypatch.delenv("AGENTCHATROOM_EXTERNAL_BASE_URL", raising=False)
+    seen: list[str] = []
+
+    def fake_request_json(base, method, path, body=None, *, request_id=None):
+        seen.append(base)
+        if path.endswith("/sync"):
+            return {"events": [], "cursor": 0}
+        return {"tasks": []}
+
+    monkeypatch.setattr(cli, "request_json", fake_request_json)
+    main(["room-sync", "project_example"])
+    main(["task-list", "project_example"])
+    assert seen == ["http://127.0.0.1:9000", "http://127.0.0.1:9000"]
+
+    config_path.write_text(
+        '[server]\nhost = "0.0.0.0"\nport = 9000\n'
+        'external_base_url = "https://room.example.test"\n\n'
+        "[security]\nmanagement_auth_required = true\n",
+        encoding="utf-8",
+    )
+    main(["task-get", "project_example", "task_example"])
+    assert seen[-1] == "https://room.example.test"
+    main(["--url", "http://127.0.0.1:9100", "task-list", "project_example"])
+    assert seen[-1] == "http://127.0.0.1:9100"
+    assert "8765" not in capsys.readouterr().out
+
+
 def test_task_get_cli_uses_exact_task_endpoint(monkeypatch, capsys):
     captured = {}
 

@@ -5,6 +5,10 @@ deployment_profile = "local"
 [server]
 host = "127.0.0.1"
 port = 8765
+# There is no url key. CLI commands derive the service URL from host, port,
+# and external_base_url (a wildcard host 0.0.0.0 or :: is addressed as
+# 127.0.0.1). Pass --url only to override that derivation.
+# AGENTCHATROOM_URL is not a configuration key.
 mcp_http_enabled = true
 mcp_http_path = "/mcp"
 mcp_http_stateless = false

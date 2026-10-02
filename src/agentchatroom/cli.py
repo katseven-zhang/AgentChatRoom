@@ -89,6 +89,19 @@ def service_url(host: str, port: int) -> str:
     return f"http://{browser_host}:{port}"
 
 
+def configured_service_url(settings) -> str:
+    """Derive the service URL from validated settings.
+
+    ``external_base_url`` wins. Otherwise map a wildcard bind address to the
+    loopback address a client on this machine can open, using the configured
+    port. There is no separate ``url`` setting and no ``AGENTCHATROOM_URL``.
+    """
+    external = str(getattr(settings, "external_base_url", "") or "").strip()
+    if external:
+        return external.rstrip("/")
+    return service_url(str(settings.host), int(settings.port))
+
+
 def print_server_log(settings, *, lines: int = 80, follow: bool = False) -> None:
     log_path = settings.data_dir / "server.log"
     pid_path = settings.data_dir / "server.pid"
@@ -881,8 +894,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="agentchatroom")
     parser.add_argument(
         "--url",
-        default=os.getenv("AGENTCHATROOM_URL", "http://127.0.0.1:8765"),
-        help="AgentChatRoom service URL",
+        default=None,
+        help=(
+            "Explicit AgentChatRoom service URL. When omitted, the URL is "
+            "derived from the configured host, port, and external_base_url."
+        ),
     )
     parser.add_argument("--json", action="store_true", help="Print compact JSON")
     parser.add_argument(
@@ -1660,7 +1676,10 @@ def main(argv: list[str] | None = None) -> None:
         print_result(result, args.json)
         return
 
-    base = args.url
+    if args.url:
+        base = str(args.url).rstrip("/")
+    else:
+        base = configured_service_url(load_settings(getattr(args, "config", None)))
 
     def call_api(
         method: str,
