@@ -2534,7 +2534,11 @@ def test_web_management_audit_refresh_queries_past_right_edge():
     assert "before: state.auditEvents[state.auditEvents.length - 1].id + 1" not in body
     assert "after: latestId" in body
     assert "before:" not in body
-    assert "fetchAuditTail(state.projectId, eventType)" in body
+    # #317: the tail fetch stays bound to the project this request was made
+    # for, which is now captured before the await instead of read after it.
+    assert "fetchAuditTail(projectId, eventType)" in body
+    assert "const projectId = anchor.projectId;" in body
+    assert "if (!withinRequestScope(anchor)) return;" in body
     assert "viewingLiveTail" in body
     assert "state.auditEvents = overflow ? merged.slice(overflow) : merged" in body
     assert "state.auditHasNewer = fresh.length > 0 || state.auditHasNewer" in body

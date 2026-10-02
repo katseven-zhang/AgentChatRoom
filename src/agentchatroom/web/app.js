@@ -1041,10 +1041,12 @@ async function resetAuditPages(projectId, eventType) {
 async function loadOlderAuditEvents() {
   if (!state.projectId || !state.auditHasOlder || !state.auditEvents.length) return;
   const eventType = elements["audit-event-filter"].value;
-  const page = await api(auditQueryUrl(state.projectId, {
+  const anchor = requestAnchor();
+  const page = await api(auditQueryUrl(anchor.projectId, {
     before: state.auditEvents[0].project_seq,
     eventType,
   }));
+  if (!withinRequestScope(anchor)) return;
   if (!page.events.length) {
     state.auditHasOlder = false;
     renderAudit();
@@ -1060,10 +1062,12 @@ async function loadOlderAuditEvents() {
 async function loadNewerAuditEvents() {
   if (!state.projectId || !state.auditHasNewer || !state.auditEvents.length) return;
   const eventType = elements["audit-event-filter"].value;
-  const page = await api(auditQueryUrl(state.projectId, {
+  const anchor = requestAnchor();
+  const page = await api(auditQueryUrl(anchor.projectId, {
     after: state.auditEvents[state.auditEvents.length - 1].project_seq,
     eventType,
   }));
+  if (!withinRequestScope(anchor)) return;
   if (!page.events.length) {
     state.auditHasNewer = false;
     renderAudit();
@@ -2250,8 +2254,22 @@ function renderAudit() {
     + auditPager();
 }
 
+// 异步响应落地时用户可能已经切走项目：这些回调写的是全局 state，缺项目/代次
+// 校验就会把上一个项目的成员、Token、Workspace 与审计窗口盖到新项目上（#317）。
+function requestAnchor() {
+  return { projectId: state.projectId, generation: state.selectGeneration };
+}
+
+function withinRequestScope(anchor) {
+  return (
+    anchor.projectId === state.projectId && anchor.generation === state.selectGeneration
+  );
+}
+
 async function refreshManagement() {
   if (!state.projectId) return;
+  const anchor = requestAnchor();
+  const projectId = anchor.projectId;
   const eventType = elements["audit-event-filter"].value;
   // #196: keep the window open to the right — do not clamp after/before to the
   // already-rendered set. Same filter + data: probe for events newer than the
@@ -2262,19 +2280,20 @@ async function refreshManagement() {
     : 0;
   const viewingLiveTail = !state.auditHasNewer;
   const auditRefresh = hasLoadedWindow
-    ? api(auditQueryUrl(state.projectId, {
+    ? api(auditQueryUrl(projectId, {
         after: latestId,
         eventType,
       }))
-    : fetchAuditTail(state.projectId, eventType);
+    : fetchAuditTail(projectId, eventType);
   const [members, credentials, workspaces, audit, runtime, backups] = await Promise.all([
-    api(`/api/v1/projects/${state.projectId}/members`),
-    api(`/api/v1/projects/${state.projectId}/agent-tokens`),
-    api(`/api/v1/projects/${state.projectId}/workspaces`),
+    api(`/api/v1/projects/${projectId}/members`),
+    api(`/api/v1/projects/${projectId}/agent-tokens`),
+    api(`/api/v1/projects/${projectId}/workspaces`),
     auditRefresh,
     api("/api/v1/admin/runtime?lines=80"),
     api("/api/v1/admin/backups"),
   ]);
+  if (!withinRequestScope(anchor)) return;
   state.members = members.members;
   state.credentials = credentials.credentials;
   state.workspaces = workspaces.workspaces;
