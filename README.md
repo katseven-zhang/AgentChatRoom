@@ -712,6 +712,8 @@ MCP 的同步工具函数不再内联占用事件循环。SDK 默认直接调用
 
 MCP 参数归一化按 schema 生效，不把客户端清空可选值当成格式错误。部分客户端会将被选的标量参数（`task_create.priority`、`task_update.progress_percent`、`lease_acquire.ttl_seconds`、`audit_query.limit`、`message_post.requires_ack` 等）发成空串而不是省略；空串对整数/布尔/数值/对象没有合法字面量含义，因此非必填且可空或带默认值的参数在归一化时直接丢弃，等价于不传，工具自身的默认值继续生效。数组沿用既有语义（空串→`[]`），字符串沿用空串本身（空文本是合法取值）。必填且不接受 null 的标量被清空则返回结构化错误 `invalid_mcp_argument`，`details.required_action` 说明应传该类型的 JSON 字面量或省略该可选参数，而不是抛出无法处置的裸 ToolError；同一机制也作用于嵌套数组/对象里的字段。
 
+GUI 的在线/离线巡检走 `list_session_presence(project_id)`，只返回 `id` / `name` / `status` / `left_at` 四个字段。此前这条每 10 秒、每个项目一次的后台巡检调用 `snapshot()`——那是整个 Room 投影（事件分页、带关联的任务、Work Report、Review、确认记录、租约、知识资产，外加每个 Session 的未读计数），只为读四个字段；项目数一多，后台线程就把数据库压在无用功上。在线/离线的判定仍由同一个 `_agent_dict` 计算（心跳与真实活动取较新者，超过 `heartbeat_timeout_seconds` 才算离线），所以巡检视图与快照视图不可能对同一个 Session 给出不同结论；`unread_count` 等字段不再由这条路径计算。提醒语义不变：只有真正发生「在线 → 离线」且该 Session 没有 `left_at` 时才写一行超时提示，主动离开不产生该提示（两条分别有用例锁定）。
+
 后台 stdio/Bridge 进程与共享 HTTP transport Session 只负责连接 Presence。HTTP 服务按实际 MCP transport 绑定后台保活，多个并行 Session 分别刷新；transport 结束后停止保活并关闭对应 Room Session。部分客户端断开时不会发送 MCP `DELETE`，服务端因此对无任何 HTTP 请求的 stateful transport 做有界回收，默认 300 秒，可通过 `[server].mcp_http_session_idle_timeout_seconds` 或 `AGENTCHATROOM_MCP_HTTP_SESSION_IDLE_TIMEOUT_SECONDS` 配置。被回收 transport 的后台心跳与 Room Session 会一起停止，旧任务所有者不会被永久误判为在线；之后使用该连接须重新 bootstrap，并按任务实际状态显式 reclaim。`session_heartbeat` 只刷新连接存活，
 不再依赖 Agent 主动提交 `working`、`idle` 或 `blocked`。左侧显示已连接/未连接、
 当前任务阶段和最后活动；任务认领、Work Report、独立 Review 与 Integration 才是

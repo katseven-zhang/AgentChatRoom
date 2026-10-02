@@ -262,8 +262,8 @@ class RoomEventTail(threading.Thread):
         """Report a derived timeout only after a real online-to-offline transition."""
         for project in self.service.list_projects():
             project_id = str(project["id"])
-            agents = self.service.snapshot(project_id).get("agents", [])
-            current = {str(a["id"]): str(a.get("status") or "") for a in agents}
+            agents = self.service.list_session_presence(project_id)
+            current = {agent["id"]: agent["status"] for agent in agents}
             previous = self.presence.get(project_id)
             if previous is not None:
                 for agent in agents:

@@ -9882,6 +9882,42 @@ class AgentChatRoomService:
             )
         return parts
 
+    def list_session_presence(self, project_id: str) -> list[dict[str, Any]]:
+        """Presence fields for one project's Sessions, without the Room projection.
+
+        The GUI polls this every few seconds per project and only ever reads
+        ``id``/``name``/``status``/``left_at``. `snapshot()` additionally pages
+        events, tasks with relations, reports, reviews, acknowledgements,
+        leases and knowledge assets, and computes an unread counter per Session,
+        so a presence check cost a full Room rebuild each time. Status still comes
+        from `_agent_dict`, so the two surfaces cannot disagree about who is online.
+        """
+        with self.database.connect() as connection:
+            self._require_project(connection, project_id)
+            rows = connection.execute(
+                """
+                SELECT a.*, (
+                    SELECT MAX(e.created_at)
+                    FROM events e
+                    WHERE e.project_id = a.project_id
+                      AND e.actor_session_id = a.id
+                ) AS last_activity_at
+                FROM agent_sessions a
+                WHERE a.project_id = ?
+                ORDER BY a.created_at
+                """,
+                (project_id,),
+            ).fetchall()
+        return [
+            {
+                "id": str(agent["id"]),
+                "name": str(agent.get("name") or ""),
+                "status": str(agent.get("status") or ""),
+                "left_at": agent.get("left_at"),
+            }
+            for agent in (self._agent_dict(row) for row in rows)
+        ]
+
     def _snapshot(
         self,
         connection: Any,

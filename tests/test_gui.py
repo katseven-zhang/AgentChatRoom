@@ -1189,9 +1189,9 @@ def test_room_presence_timeout_is_not_reported_as_active_leave() -> None:
         def list_projects(self):
             return [{"id": "p", "name": "测试项目"}]
 
-        def snapshot(self, _project):
-            return {"agents": [{"id": "s", "name": "MiniMax", "status": self.state,
-                                "left_at": None}]}
+        def list_session_presence(self, _project):
+            return [{"id": "s", "name": "MiniMax", "status": self.state,
+                     "left_at": None}]
 
     service = Service()
     sink = Queue()
