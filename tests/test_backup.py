@@ -68,6 +68,23 @@ def test_cli_backup_and_restore_use_the_configured_sqlite_database(monkeypatch, 
     assert "cli-backup.sqlite" in restore_output
 
 
+def test_failed_backup_is_a_domain_error_with_an_audit_event(service, project, monkeypatch):
+    from agentchatroom.errors import DomainError
+    from agentchatroom import services as services_module
+
+    def boom(*_args, **_kwargs):
+        raise BackupError("disk full")
+
+    monkeypatch.setattr(services_module, "backup_sqlite", boom)
+    with pytest.raises(DomainError) as caught:
+        service.create_backup(source="management")
+    assert caught.value.code == "backup_failed"
+    assert caught.value.details["required_action"] == "inspect_the_database_and_retry_the_backup"
+    failure = service.latest_backup_failure()
+    assert failure["payload"]["reason"] == "BackupError"
+    assert failure["payload"]["source"] == "management"
+
+
 def test_service_create_backup_audits_and_prunes(service, project, tmp_path, monkeypatch):
     import json as json_module
     from pathlib import Path

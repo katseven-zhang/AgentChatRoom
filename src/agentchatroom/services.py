@@ -6389,7 +6389,7 @@ class AgentChatRoomService:
                 f"""
                 UPDATE task_assignments
                 SET status = 'cancelled', responded_by_session_id = ?,
-                    response_note = 'cancelled by task cancellation', responded_at = ?
+                    response_note = 'task_cancellation', responded_at = ?
                 WHERE project_id = ? AND task_id = ?
                   AND status = 'pending' AND id IN ({placeholders})
                 """,
@@ -6434,7 +6434,7 @@ class AgentChatRoomService:
                 f"""
                 UPDATE task_handoffs
                 SET status = 'cancelled', responded_by_session_id = ?,
-                    response_note = 'cancelled by task cancellation', responded_at = ?
+                    response_note = 'task_cancellation', responded_at = ?
                 WHERE project_id = ? AND task_id = ?
                   AND status = 'pending' AND id IN ({placeholders})
                 """,
@@ -6573,7 +6573,7 @@ class AgentChatRoomService:
                 """,
                 (
                     actor_session_id,
-                    f"cancelled by task release ({clean_reason_code})",
+                    f"task_release:{clean_reason_code}",
                     now,
                     project_id,
                     task["id"],
@@ -6601,7 +6601,7 @@ class AgentChatRoomService:
                 """,
                 (
                     actor_session_id,
-                    f"cancelled by task release ({clean_reason_code})",
+                    f"task_release:{clean_reason_code}",
                     now,
                     project_id,
                     task["id"],
@@ -6937,7 +6937,7 @@ class AgentChatRoomService:
                     """
                     UPDATE task_assignments
                     SET status = 'cancelled', responded_by_session_id = ?,
-                        response_note = 'superseded by reassignment', responded_at = ?
+                        response_note = 'reassignment', responded_at = ?
                     WHERE id = ?
                     """,
                     (assigned_by_session_id, now_reassign, row["id"]),
@@ -10479,6 +10479,22 @@ class AgentChatRoomService:
         ).fetchall()
         return [str(row["id"]) for row in rows]
 
+    def latest_backup_failure(self) -> dict[str, Any] | None:
+        with self.database.connect() as connection:
+            row = connection.execute(
+                """
+                SELECT payload_json, created_at FROM events
+                WHERE event_type = 'backup.failed'
+                ORDER BY id DESC LIMIT 1
+                """
+            ).fetchone()
+        if row is None:
+            return None
+        return {
+            "created_at": row["created_at"],
+            "payload": json_load(row["payload_json"], {}),
+        }
+
     def _emit_backup_event(
         self,
         event_type: str,
@@ -10523,27 +10539,46 @@ class AgentChatRoomService:
                 actor_session_id=actor_session_id,
             )
             latest_event_id = self._latest_event_id()
-            if backend == "sqlite":
-                result = backup_sqlite(
-                    self.database.path,
-                    target,
-                    latest_event_id=latest_event_id,
-                    source_label=source,
+            try:
+                if backend == "sqlite":
+                    result = backup_sqlite(
+                        self.database.path,
+                        target,
+                        latest_event_id=latest_event_id,
+                        source_label=source,
+                    )
+                elif backend == "postgresql":
+                    database_url = os.getenv(self.settings.database_url_env, "")
+                    result = backup_postgresql(
+                        database_url,
+                        target,
+                        latest_event_id=latest_event_id,
+                        source_label=source,
+                    )
+                else:
+                    raise DomainError(
+                        "backup_backend_unsupported",
+                        f"Backups are not supported for backend {backend}",
+                        status_code=422,
+                    )
+            except BackupError as error:
+                self._emit_backup_event(
+                    "backup.failed",
+                    payload={
+                        "source": source,
+                        "output": str(target),
+                        "reason": error.__class__.__name__,
+                    },
+                    actor_session_id=actor_session_id,
                 )
-            elif backend == "postgresql":
-                database_url = os.getenv(self.settings.database_url_env, "")
-                result = backup_postgresql(
-                    database_url,
-                    target,
-                    latest_event_id=latest_event_id,
-                    source_label=source,
-                )
-            else:
                 raise DomainError(
-                    "backup_backend_unsupported",
-                    f"Backups are not supported for backend {backend}",
-                    status_code=422,
-                )
+                    "backup_failed",
+                    "The database backup did not complete",
+                    status_code=409,
+                    details={
+                        "required_action": "inspect_the_database_and_retry_the_backup",
+                    },
+                ) from error
             kept = self._prune_backups(max_kept)
             return {**result, "latest_event_id": latest_event_id, "pruned": kept}
 

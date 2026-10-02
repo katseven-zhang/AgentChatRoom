@@ -323,7 +323,10 @@ def remove_project_coordination_instructions(root_path: str | Path) -> bool:
                 "project_instructions_write_failed",
                 "Generated project AGENTS.md could not be removed",
                 status_code=500,
-                details={"path": str(path)},
+                details={
+                    "path": str(path),
+                    "required_action": "retry_checkout_cleanup_or_remove_the_generated_instructions",
+                },
             ) from error
     return True
 
@@ -677,6 +680,9 @@ def remove_checkout_project_registration(
                 "project_registration_write_failed",
                 "Checkout Project registration could not be removed",
                 status_code=500,
-                details={"path": str(path)},
+                details={
+                    "path": str(path),
+                    "required_action": "retry_checkout_cleanup_or_remove_the_registration_file",
+                },
             ) from error
     return True

@@ -57,7 +57,7 @@ session_token_ttl_seconds = 43200
 default_lease_ttl_seconds = 1800
 max_lease_ttl_seconds = 86400
 sse_poll_interval_seconds = 0.5
-presence_refresh_interval_seconds = 1.0
+presence_refresh_interval_seconds = 5.0
 # SSE occupancy caps; over-limit streams return 429 sse_limit_exceeded.
 max_sse_clients_per_project = 64
 sse_per_ip_limit = 16

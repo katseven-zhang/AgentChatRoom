@@ -559,6 +559,46 @@ def test_checkout_registration_supports_derived_logical_subprojects_and_removal(
     assert load_checkout_registration(web_dir, logical_path=web_logical) is not None
 
 
+def test_failed_registration_removal_names_a_required_action(service, tmp_path, monkeypatch):
+    root = tmp_path / "checkout"
+    root.mkdir()
+    project = service.create_project(root_path=str(root), name="cleanup-target")
+    register_checkout_project(root, project)
+
+    def locked(self, missing_ok=False):
+        raise OSError("locked")
+
+    monkeypatch.setattr(Path, "unlink", locked)
+    with pytest.raises(DomainError) as caught:
+        remove_checkout_project_registration(
+            root,
+            project_key=project["project_key"],
+            logical_path="",
+        )
+    assert caught.value.code == "project_registration_write_failed"
+    assert caught.value.details["required_action"] == (
+        "retry_checkout_cleanup_or_remove_the_registration_file"
+    )
+
+
+def test_cleanup_failure_fills_required_action_when_the_domain_error_omits_it():
+    from agentchatroom.api import _cleanup_failure
+
+    payload = _cleanup_failure(
+        DomainError(
+            "project_registration_write_failed",
+            "Checkout Project registration could not be written",
+            status_code=500,
+            details={"path": "registration.json"},
+        )
+    )
+    assert payload["code"] == "project_registration_write_failed"
+    assert payload["details"]["path"] == "registration.json"
+    assert payload["details"]["required_action"] == (
+        "retry_checkout_cleanup_or_remove_the_generated_files"
+    )
+
+
 def test_local_mcp_join_creates_then_joins_one_room(monkeypatch, service, project_dir):
     monkeypatch.setattr(mcp_server, "service", service)
     _configure_local_software(

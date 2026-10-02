@@ -220,7 +220,7 @@ class Settings:
     default_lease_ttl_seconds: int = 1800
     max_lease_ttl_seconds: int = 86400
     sse_poll_interval_seconds: float = 0.5
-    presence_refresh_interval_seconds: float = 1.0
+    presence_refresh_interval_seconds: float = 5.0
     max_sse_clients_per_project: int = 64
     sse_per_ip_limit: int = 16
     audit_window_size: int = 100
@@ -680,7 +680,7 @@ def load_settings(
         "presence_refresh_interval_seconds": float(
             os.getenv(
                 "AGENTCHATROOM_PRESENCE_REFRESH_INTERVAL_SECONDS",
-                file_values.get("presence_refresh_interval_seconds", 1.0),
+                file_values.get("presence_refresh_interval_seconds", 5.0),
             )
         ),
         "max_sse_clients_per_project": int(

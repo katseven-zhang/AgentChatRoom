@@ -289,12 +289,12 @@
       </aside>
     </div>
 
-    <dialog id="project-dialog">
+    <dialog id="project-dialog" aria-labelledby="project-dialog-title" aria-modal="true">
       <form method="dialog" class="dialog-form" id="project-form">
         <div class="dialog-header">
           <div>
             <p class="context-label">项目 Room</p>
-            <h2>添加本地项目</h2>
+            <h2 id="project-dialog-title">添加本地项目</h2>
           </div>
           <button type="button" class="icon-button dialog-close" title="关闭" aria-label="关闭">×</button>
         </div>
@@ -314,12 +314,12 @@
       </form>
     </dialog>
 
-    <dialog id="task-dialog">
+    <dialog id="task-dialog" aria-labelledby="task-dialog-title" aria-modal="true">
       <form method="dialog" class="dialog-form" id="task-form">
         <div class="dialog-header">
           <div>
             <p class="context-label">交给 Agent 处理</p>
-            <h2>新建任务</h2>
+            <h2 id="task-dialog-title">新建任务</h2>
           </div>
           <button type="button" class="icon-button dialog-close" title="关闭" aria-label="关闭">×</button>
         </div>
@@ -338,7 +338,7 @@
       </form>
     </dialog>
 
-    <dialog id="task-edit-dialog" class="task-detail-dialog">
+    <dialog id="task-edit-dialog" class="task-detail-dialog" aria-labelledby="task-detail-heading" aria-modal="true">
       <div class="dialog-form" id="task-detail-view">
         <div class="dialog-header">
           <div>
@@ -389,7 +389,7 @@
       </div>
     </dialog>
 
-    <dialog id="task-assign-dialog">
+    <dialog id="task-assign-dialog" aria-labelledby="task-assign-title" aria-modal="true">
       <form method="dialog" class="dialog-form" id="task-assign-form">
         <div class="dialog-header">
           <div>
@@ -412,7 +412,7 @@
       </form>
     </dialog>
 
-    <dialog id="task-release-dialog">
+    <dialog id="task-release-dialog" aria-labelledby="task-release-title" aria-modal="true">
       <form method="dialog" class="dialog-form" id="task-release-form">
         <div class="dialog-header">
           <div>
@@ -440,12 +440,12 @@
       </form>
     </dialog>
 
-    <dialog id="settings-dialog">
+    <dialog id="settings-dialog" aria-labelledby="settings-dialog-title" aria-modal="true">
       <form method="dialog" class="dialog-form" id="settings-form">
         <div class="dialog-header">
           <div>
             <p class="context-label">Room 配置</p>
-            <h2>项目设置</h2>
+            <h2 id="settings-dialog-title">项目设置</h2>
           </div>
           <button type="button" class="icon-button dialog-close" title="关闭" aria-label="关闭">×</button>
         </div>
@@ -500,12 +500,12 @@
       </form>
     </dialog>
 
-    <dialog id="system-settings-dialog" class="wide-dialog">
+    <dialog id="system-settings-dialog" class="wide-dialog" aria-labelledby="system-settings-dialog-title" aria-modal="true">
       <div class="dialog-form">
         <div class="dialog-header">
           <div>
             <p class="context-label">全局配置（所有 Project 共用）</p>
-            <h2>系统设置</h2>
+            <h2 id="system-settings-dialog-title">系统设置</h2>
           </div>
           <button type="button" class="icon-button dialog-close" title="关闭" aria-label="关闭">×</button>
         </div>
@@ -563,12 +563,12 @@
       </div>
     </dialog>
 
-    <dialog id="archive-dialog">
+    <dialog id="archive-dialog" aria-labelledby="archive-dialog-title" aria-modal="true">
       <form method="dialog" class="dialog-form" id="archive-form">
         <div class="dialog-header">
           <div>
             <p class="context-label">项目管理</p>
-            <h2>归档项目</h2>
+            <h2 id="archive-dialog-title">归档项目</h2>
           </div>
           <button type="button" class="icon-button dialog-close" title="关闭" aria-label="关闭">×</button>
         </div>
@@ -583,12 +583,12 @@
       </form>
     </dialog>
 
-    <dialog id="integration-dialog" class="wide-dialog">
+    <dialog id="integration-dialog" class="wide-dialog" aria-labelledby="integration-dialog-title" aria-modal="true">
       <div class="dialog-form">
         <div class="dialog-header">
           <div>
             <p class="context-label">当前项目</p>
-            <h2>接入 Agent</h2>
+            <h2 id="integration-dialog-title">接入 Agent</h2>
           </div>
           <button type="button" class="icon-button dialog-close" title="关闭" aria-label="关闭">×</button>
         </div>
@@ -604,7 +604,7 @@
           </div>
           <div>
             <p class="integration-choice-label">连接方式</p>
-            <div class="segmented-control integration-transport-tabs" id="integration-transport-tabs" aria-label="连接方式（仅 HTTP）">
+            <div class="segmented-control integration-transport-tabs" id="integration-transport-tabs" role="group" aria-label="连接方式（仅 HTTP）">
               <button type="button" class="is-active" data-integration-transport="http">HTTP 直连</button>
             </div>
           </div>
@@ -711,12 +711,12 @@
       </div>
     </dialog>
 
-    <dialog id="login-dialog" class="auth-dialog">
+    <dialog id="login-dialog" class="auth-dialog" aria-labelledby="login-dialog-title" aria-modal="true">
       <form method="dialog" class="dialog-form" id="login-form">
         <div class="dialog-header">
           <div>
             <p class="context-label">管理认证</p>
-            <h2>登录 AgentChatRoom</h2>
+            <h2 id="login-dialog-title">登录 AgentChatRoom</h2>
           </div>
         </div>
         <label>管理员 Secret <input id="login-token" type="password" autocomplete="current-password" required></label>
@@ -727,7 +727,7 @@
       </form>
     </dialog>
 
-    <dialog id="token-dialog">
+    <dialog id="token-dialog" aria-labelledby="token-dialog-title" aria-modal="true">
       <form method="dialog" class="dialog-form" id="token-form">
         <div class="dialog-header">
           <div>
@@ -762,7 +762,7 @@
       </form>
     </dialog>
 
-    <dialog id="token-permissions-dialog">
+    <dialog id="token-permissions-dialog" aria-labelledby="token-permissions-title" aria-modal="true">
       <form method="dialog" class="dialog-form" id="token-permissions-form">
         <div class="dialog-header">
           <div>
@@ -783,7 +783,7 @@
       </form>
     </dialog>
 
-    <dialog id="token-extend-dialog">
+    <dialog id="token-extend-dialog" aria-labelledby="token-extend-title" aria-modal="true">
       <form method="dialog" class="dialog-form" id="token-extend-form">
         <div class="dialog-header">
           <div>
@@ -804,7 +804,7 @@
       </form>
     </dialog>
 
-    <dialog id="token-secret-dialog">
+    <dialog id="token-secret-dialog" aria-labelledby="token-secret-title" aria-modal="true">
       <div class="dialog-form">
         <div class="dialog-header">
           <div>

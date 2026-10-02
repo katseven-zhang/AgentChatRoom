@@ -17,6 +17,7 @@
   --red: #b91c1c;
   --danger: #b91c1c;
   --red-soft: #fef2f2;
+  --danger-soft: #fef2f2;
   --red-border: #fecaca;
   --primary-border: #b6d7f8;
   --focus-ring: rgba(0, 113, 227, 0.25);
@@ -242,7 +243,7 @@ select:focus-visible,
   cursor: col-resize;
   touch-action: none;
   background: var(--surface-muted);
-  z-index: 3;
+  z-index: var(--z-sticky);
 }
 
 .panel-resizer::before {
@@ -295,7 +296,7 @@ body.is-resizing-panels {
   -webkit-backdrop-filter: blur(16px);
   border-bottom: 1px solid var(--border);
   box-shadow: var(--shadow-sm);
-  z-index: 10;
+  z-index: var(--z-sticky);
 }
 
 .brand-block,
@@ -669,6 +670,14 @@ body.is-resizing-panels {
   font-size: var(--fs-xs);
 }
 
+.check-row {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  min-height: 38px;
+  line-height: var(--lh-body);
+}
+
 .agent-item {
   position: relative;
   min-height: 64px;
@@ -686,7 +695,6 @@ body.is-resizing-panels {
   background: var(--surface);
   border-color: var(--border);
   box-shadow: var(--shadow-sm);
-  transform: translateY(-1px);
 }
 
 .agent-item.is-disconnected {
@@ -744,7 +752,7 @@ body.is-resizing-panels {
 .agent-item small {
   color: var(--text-muted);
   font-size: var(--fs-xs);
-  line-height: 1.4;
+  line-height: var(--lh-body);
 }
 
 .agent-copy {
@@ -925,19 +933,6 @@ body.is-resizing-panels {
 
 .tab-label {
   line-height: var(--lh-body);
-}
-
-.tab-status {
-  min-height: 14px;
-  padding: 1px 5px;
-  border: 1px solid color-mix(in srgb, var(--amber) 28%, var(--border));
-  border-radius: 4px;
-  background: var(--amber-soft);
-  color: var(--amber);
-  font-size: var(--fs-xs);
-  font-weight: 750;
-  line-height: 1.1;
-  white-space: nowrap;
 }
 
 .tab:hover:not(.is-active) {
@@ -1193,12 +1188,12 @@ body.is-resizing-panels {
   align-items: center;
   justify-content: space-between;
   gap: 8px;
-  line-height: 1.3;
+  line-height: var(--lh-tight);
 }
 
 #recent-event-list .compact-body {
   margin-top: 4px;
-  line-height: 1.3;
+  line-height: var(--lh-body);
 }
 
 #recent-event-list .compact-body .msg-line,
@@ -1688,7 +1683,7 @@ body.is-resizing-panels {
   color: var(--blue);
   font-size: var(--fs-xs);
   font-weight: 700;
-  line-height: 1.35;
+  line-height: var(--lh-tight);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -1708,10 +1703,6 @@ body.is-resizing-panels {
 
 .compact-item.kind-decision {
   border-left: 3px solid var(--amber);
-}
-
-.compact-item.merged-activity {
-  border-left: 3px solid var(--border-strong, rgba(125, 140, 150, 0.55));
 }
 
 .compact-item.kind-blocker {
@@ -2323,7 +2314,7 @@ button.event-id {
 
 #panel-reviews .section-heading h3 {
   font-size: var(--fs-md);
-  line-height: 1.3;
+  line-height: var(--lh-tight);
 }
 
 #panel-reviews .section-heading .secondary-text {
@@ -2434,7 +2425,7 @@ button.event-id {
   font-size: var(--fs-xs);
   font-weight: 700;
   box-shadow: var(--shadow);
-  z-index: 2;
+  z-index: var(--z-sticky);
 }
 
 .new-message-notice:hover {
@@ -2833,20 +2824,6 @@ dialog::backdrop {
   font-weight: 650;
 }
 
-.dependency-options {
-  max-height: 132px;
-  overflow-y: auto;
-  display: grid;
-  gap: 4px;
-}
-
-.dependency-options .check-control {
-  min-height: 30px;
-  padding: 3px 5px;
-  color: var(--text);
-  white-space: normal;
-}
-
 .archive-project-name {
   padding: 10px 12px;
   border-left: 3px solid var(--red);
@@ -2866,12 +2843,6 @@ dialog::backdrop {
 
 .dialog-form textarea {
   resize: vertical;
-}
-
-.form-grid {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 0 12px;
 }
 
 .dialog-actions {
@@ -3090,13 +3061,13 @@ dialog::backdrop {
   margin-top: 3px;
 }
 
-.integration-tabs {
+.integration-transport-tabs {
   width: 100%;
   min-width: 0;
   box-sizing: border-box;
 }
 
-.integration-tabs button {
+.integration-transport-tabs button {
   min-width: 0;
   flex: 1 1 0;
 }
@@ -3185,7 +3156,7 @@ dialog::backdrop {
   position: fixed;
   right: 16px;
   bottom: 16px;
-  z-index: 10;
+  z-index: var(--z-toast);
   display: grid;
   gap: 8px;
 }
@@ -3220,6 +3191,10 @@ dialog::backdrop {
 /* 对话框顶层 Toast（#167）：当二级模态弹窗处于打开状态时，Toast 提示直接呈现在活跃弹窗
    内部顶层，处于浏览器的 Top Layer 渲染上下文中，彻底避免被 dialog::backdrop 遮罩模糊虚化。
    采用顶部居中、高对比度阴影的浮层展示，避免遮挡弹窗底部的确认/取消操作栏。 */
+dialog {
+  z-index: var(--z-dialog);
+}
+
 dialog > .toast-region,
 .dialog-toast-region {
   position: fixed;
@@ -3228,7 +3203,7 @@ dialog > .toast-region,
   transform: translateX(-50%);
   right: auto;
   bottom: auto;
-  z-index: 1000;
+  z-index: var(--z-toast);
   pointer-events: none;
   width: max-content;
   max-width: calc(100% - 32px);
@@ -3409,10 +3384,6 @@ dialog > .toast-region .toast.error {
     grid-template-columns: 1fr;
   }
 
-  .form-grid {
-    grid-template-columns: 1fr;
-  }
-
   .integration-heading {
     align-items: flex-start;
   }
@@ -3425,13 +3396,13 @@ dialog > .toast-region .toast.error {
     min-width: 0;
   }
 
-  .integration-tabs {
+  .integration-transport-tabs {
     display: grid;
     grid-template-columns: repeat(2, minmax(0, 1fr));
     overflow: visible;
   }
 
-  .integration-tabs button {
+  .integration-transport-tabs button {
     width: 100%;
     height: auto;
     min-height: 38px;
@@ -3439,7 +3410,7 @@ dialog > .toast-region .toast.error {
     white-space: normal;
   }
 
-  .integration-tabs button:last-child {
+  .integration-transport-tabs button:last-child {
     grid-column: 1 / -1;
   }
 
@@ -3450,6 +3421,13 @@ dialog > .toast-region .toast.error {
   .management-item,
   .audit-list .management-item {
     grid-template-columns: 1fr;
+  }
+
+  .audit-list .management-item {
+    height: auto;
+    max-height: none;
+    overflow: visible;
+    align-items: start;
   }
 
   .runtime-grid {

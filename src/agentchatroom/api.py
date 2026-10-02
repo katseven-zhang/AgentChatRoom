@@ -490,6 +490,18 @@ def _management_session_hash(session_id: str) -> str:
     return hashlib.sha256(session_id.encode("utf-8")).hexdigest()
 
 
+def _cleanup_failure(error: DomainError) -> dict[str, Any]:
+    """Surface a checkout-cleanup failure with a required next step."""
+    payload = dict(error.as_dict()["error"])
+    details = dict(payload.get("details") or {})
+    details.setdefault(
+        "required_action",
+        "retry_checkout_cleanup_or_remove_the_generated_files",
+    )
+    payload["details"] = details
+    return payload
+
+
 class ProjectCreate(StrictModel):
     root_path: str
     name: str | None = None
@@ -1664,6 +1676,7 @@ def create_app(
         effective = effective_backup_settings(resolved, backup_settings_override)
         return {
             "backups": service.list_backups(),
+            "last_failure": service.latest_backup_failure(),
             "auto_backup": {
                 "enabled": effective["auto_backup_enabled"],
                 "interval_seconds": effective["auto_backup_interval_seconds"],
@@ -1758,13 +1771,13 @@ def create_app(
                         )
                     )
                 except DomainError as error:
-                    registration_cleanup_errors.append(error.as_dict()["error"])
+                    registration_cleanup_errors.append(_cleanup_failure(error))
                 try:
                     instructions_removed += int(
                         remove_project_coordination_instructions(checkout_path)
                     )
                 except DomainError as error:
-                    instruction_cleanup_errors.append(error.as_dict()["error"])
+                    instruction_cleanup_errors.append(_cleanup_failure(error))
             deleted["project_registration"] = {
                 "removed": removed,
                 "cleanup_errors": registration_cleanup_errors,

@@ -55,6 +55,7 @@ const elements = {
   'token-config-projects': {textContent: 'x'},
   'token-config-section': {hidden: false},
   'token-dialog': {addEventListener() {}},
+  'login-dialog': dialogElement(),
 };
 let toasts = [];
 function showToast(message) {

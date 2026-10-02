@@ -208,18 +208,21 @@ def test_web_token_dialog_shows_inline_validation_errors():
     javascript = (WEB_DIR / "app.js").read_text(encoding="utf-8")
 
     # 内联横幅位于 token-dialog 内部并带 alert 角色。
-    dialog_start = markup.index('<dialog id="token-dialog">')
+    dialog_start = markup.index('<dialog id="token-dialog"')
     dialog_end = markup.index("</dialog>", dialog_start)
     dialog_markup = markup[dialog_start:dialog_end]
     assert '<p class="form-error" id="token-form-error" role="alert" hidden></p>' in dialog_markup
     assert ".form-error {" in (WEB_DIR / "app.css").read_text(encoding="utf-8")
 
-    # 提交处理器内所有校验失败与 API 失败都写内联横幅，不再调用 toast。
+    # 弹窗仍打开时，校验失败与 API 失败写内联横幅。签发已经关掉弹窗之后
+    # 的失败（例如刷新管理数据失败）改走全局 toast，避免写进没人看得见的横幅（#321）。
     start = javascript.index('elements["token-form"].addEventListener("submit"')
     end = javascript.index('elements["task-assign-form"].addEventListener', start)
     handler = javascript[start:end]
+    closed_at = handler.index('if (!elements["token-dialog"].open)')
     assert handler.count("setTokenFormError(") >= 6
-    assert "showToast(" not in handler
+    assert "showToast(" not in handler[:closed_at]
+    assert "showToast(" in handler[closed_at:]
     assert "handleError(" not in handler
     # 弹窗关闭与下次提交都会先清空横幅，避免残留误导。
     assert 'setTokenFormError("")' in javascript
@@ -488,7 +491,7 @@ def test_web_project_export_lives_in_settings_as_audit_export():
 
     assert 'id="export-project-button"' not in markup
     assert "export-project-button" not in javascript
-    dialog_start = markup.index('<dialog id="settings-dialog">')
+    dialog_start = markup.index('<dialog id="settings-dialog"')
     dialog_end = markup.index("</dialog>", dialog_start)
     dialog_markup = markup[dialog_start:dialog_end]
     assert 'id="export-audit-data-button"' in dialog_markup
@@ -523,7 +526,7 @@ def test_web_system_settings_decoupled_from_project_settings():
     assert 'id="runtime-log"' in system_dialog
     assert 'id="backup-list"' in system_dialog
     # 项目设置弹窗不再有全局自动备份字段。
-    settings_start = markup.index('<dialog id="settings-dialog">')
+    settings_start = markup.index('<dialog id="settings-dialog"')
     settings_end = markup.index("</dialog>", settings_start)
     project_dialog = markup[settings_start:settings_end]
     assert 'id="settings-auto-backup"' not in project_dialog
@@ -887,7 +890,7 @@ def test_web_local_mcp_assistant_separates_write_reload_and_presence_states():
 
     assert 'id="integration-local-assistant"' in markup
     assert '>接入 Agent</button>' in markup
-    assert '<h2>接入 Agent</h2>' in markup
+    assert '<h2 id="integration-dialog-title">接入 Agent</h2>' in markup
     assert 'data-integration-transport="http"' in markup
     assert 'data-integration-transport="local"' not in markup
     assert 'data-integration-transport="remote"' not in markup
@@ -954,7 +957,7 @@ def test_web_sse_and_project_switch_guard_stale_snapshots():
     markup = (WEB_DIR / "index.html").read_text(encoding="utf-8")
     stylesheet = (WEB_DIR / "app.css").read_text(encoding="utf-8")
 
-    assert "function refreshSnapshot(projectId)" in javascript
+    assert "function refreshSnapshot(projectId, options" in javascript
     assert "JSON.parse(message.data)" in javascript
     assert "Ignored malformed room event" in javascript
     assert "applySnapshotIfCurrent" in javascript
@@ -1571,11 +1574,11 @@ def test_web_assignment_labels_distinguish_release_from_reassignment(tmp_path):
 const outcomes = {};
 outcomes.releaseInvalidated = assignmentStatus({
   status: 'cancelled',
-  response_note: 'cancelled by task release (other)',
+  response_note: 'task_release:other',
 }) === '因任务释放失效';
 outcomes.reassignInvalidated = assignmentStatus({
   status: 'cancelled',
-  response_note: 'superseded by reassignment',
+  response_note: 'reassignment',
 }) === '因改派失效';
 outcomes.plainCancelStillWorks = assignmentStatus({
   status: 'cancelled',
@@ -1835,7 +1838,7 @@ def test_web_task_events_synchronize_navigation_and_table_counts(tmp_path):
 
     start_cfg = javascript.index("function taskViewConfig()")
     end_table = javascript.index("function intakeTargetName(intake)")
-    start_snap = javascript.index("function fetchSnapshotDirect(projectId)")
+    start_snap = javascript.index("function fetchSnapshotDirect(")
     end_snap = javascript.index("async function api(path, options = {})")
     start_pres = javascript.index("async function refreshPresence()")
     end_apply = javascript.index("function connectEvents(after)")
@@ -1958,7 +1961,7 @@ function getNavCounts() {
   });
 
   const event1 = { id: 10, event_type: 'task.created', task_id: 't_1' };
-  let snap1 = await refreshSnapshot(state.projectId, event1.id);
+  let snap1 = await refreshSnapshot(state.projectId, { minCursor: event1.id });
   applySnapshotIfCurrent(state.projectId, snap1);
   renderForEvent(event1);
 
@@ -1992,7 +1995,7 @@ function getNavCounts() {
   });
 
   const event2 = { id: 20, event_type: 'task.created', task_id: 't_2' };
-  const eventPromise = refreshSnapshot(state.projectId, event2.id);
+  const eventPromise = refreshSnapshot(state.projectId, { minCursor: event2.id });
 
   // Resolve the in-flight snapshot with OLD data (cursor 10)
   state.snapshotInFlight = null;
@@ -2019,7 +2022,7 @@ function getNavCounts() {
   mockServerSnapshot.tasks[0].execution_status = 'claimed';
   mockServerSnapshot.tasks[0].state_view = { phase: 'claimed', group: 'active', needs_attention: false };
   const eventClaim = { id: 21, event_type: 'task.claimed', task_id: 't_1' };
-  let snapClaim = await refreshSnapshot(state.projectId, eventClaim.id);
+  let snapClaim = await refreshSnapshot(state.projectId, { minCursor: eventClaim.id });
   applySnapshotIfCurrent(state.projectId, snapClaim);
   renderForEvent(eventClaim);
 
@@ -2033,7 +2036,7 @@ function getNavCounts() {
   mockServerSnapshot.tasks[0].execution_status = 'todo';
   mockServerSnapshot.tasks[0].state_view = { phase: 'todo', group: 'claimable', needs_attention: false };
   const eventRelease = { id: 22, event_type: 'task.released', task_id: 't_1' };
-  let snapRelease = await refreshSnapshot(state.projectId, eventRelease.id);
+  let snapRelease = await refreshSnapshot(state.projectId, { minCursor: eventRelease.id });
   applySnapshotIfCurrent(state.projectId, snapRelease);
   renderForEvent(eventRelease);
 
@@ -2047,7 +2050,7 @@ function getNavCounts() {
   mockServerSnapshot.tasks[1].execution_status = 'cancelled';
   mockServerSnapshot.tasks[1].state_view = { phase: 'cancelled', group: 'cancelled', needs_attention: false };
   const eventCancel = { id: 23, event_type: 'task.cancelled', task_id: 't_2' };
-  let snapCancel = await refreshSnapshot(state.projectId, eventCancel.id);
+  let snapCancel = await refreshSnapshot(state.projectId, { minCursor: eventCancel.id });
   applySnapshotIfCurrent(state.projectId, snapCancel);
   renderForEvent(eventCancel);
 
@@ -2062,7 +2065,7 @@ function getNavCounts() {
   mockServerSnapshot.tasks[0].execution_status = 'claimed';
   mockServerSnapshot.tasks[0].state_view = { phase: 'claimed', group: 'active', needs_attention: false };
   const eventClaim2 = { id: 24, event_type: 'task.claimed', task_id: 't_1' };
-  applySnapshotIfCurrent(state.projectId, await refreshSnapshot(state.projectId, eventClaim2.id));
+  applySnapshotIfCurrent(state.projectId, await refreshSnapshot(state.projectId, { minCursor: eventClaim2.id }));
   renderForEvent(eventClaim2);
   counts = getNavCounts();
   if (counts['claimable'] !== 0 || counts['active'] !== 1) {
@@ -2074,7 +2077,7 @@ function getNavCounts() {
   mockServerSnapshot.tasks[0].execution_status = 'blocked';
   mockServerSnapshot.tasks[0].state_view = { phase: 'blocked', group: 'active', needs_attention: true };
   const eventBlocked = { id: 25, event_type: 'task.blocked', task_id: 't_1' };
-  applySnapshotIfCurrent(state.projectId, await refreshSnapshot(state.projectId, eventBlocked.id));
+  applySnapshotIfCurrent(state.projectId, await refreshSnapshot(state.projectId, { minCursor: eventBlocked.id }));
   renderForEvent(eventBlocked);
   counts = getNavCounts();
   if (counts['attention'] !== 1 || counts['active'] !== 1) {
@@ -2086,7 +2089,7 @@ function getNavCounts() {
   mockServerSnapshot.tasks[0].execution_status = 'in_progress';
   mockServerSnapshot.tasks[0].state_view = { phase: 'in_progress', group: 'active', needs_attention: false };
   const eventUnblocked = { id: 26, event_type: 'task.unblocked', task_id: 't_1' };
-  applySnapshotIfCurrent(state.projectId, await refreshSnapshot(state.projectId, eventUnblocked.id));
+  applySnapshotIfCurrent(state.projectId, await refreshSnapshot(state.projectId, { minCursor: eventUnblocked.id }));
   renderForEvent(eventUnblocked);
   counts = getNavCounts();
   if (counts['attention'] !== 0 || counts['active'] !== 1) {
@@ -2098,7 +2101,7 @@ function getNavCounts() {
   mockServerSnapshot.tasks[0].execution_status = 'awaiting_review';
   mockServerSnapshot.tasks[0].state_view = { phase: 'awaiting_review', group: 'review', needs_attention: false };
   const eventReported = { id: 27, event_type: 'task.reported', task_id: 't_1' };
-  applySnapshotIfCurrent(state.projectId, await refreshSnapshot(state.projectId, eventReported.id));
+  applySnapshotIfCurrent(state.projectId, await refreshSnapshot(state.projectId, { minCursor: eventReported.id }));
   renderForEvent(eventReported);
   counts = getNavCounts();
   if (counts['review'] !== 1 || counts['active'] !== 0) {
@@ -2110,7 +2113,7 @@ function getNavCounts() {
   mockServerSnapshot.tasks[0].execution_status = 'changes_requested';
   mockServerSnapshot.tasks[0].state_view = { phase: 'changes_requested', group: 'active', needs_attention: true };
   const eventChanges = { id: 28, event_type: 'task.review_submitted', task_id: 't_1' };
-  applySnapshotIfCurrent(state.projectId, await refreshSnapshot(state.projectId, eventChanges.id));
+  applySnapshotIfCurrent(state.projectId, await refreshSnapshot(state.projectId, { minCursor: eventChanges.id }));
   renderForEvent(eventChanges);
   counts = getNavCounts();
   if (counts['attention'] !== 1 || counts['review'] !== 0 || counts['active'] !== 1) {
@@ -2122,7 +2125,7 @@ function getNavCounts() {
   mockServerSnapshot.tasks[0].execution_status = 'awaiting_review';
   mockServerSnapshot.tasks[0].state_view = { phase: 'awaiting_review', group: 'review', needs_attention: false };
   const eventReported2 = { id: 29, event_type: 'task.reported', task_id: 't_1' };
-  applySnapshotIfCurrent(state.projectId, await refreshSnapshot(state.projectId, eventReported2.id));
+  applySnapshotIfCurrent(state.projectId, await refreshSnapshot(state.projectId, { minCursor: eventReported2.id }));
   renderForEvent(eventReported2);
   counts = getNavCounts();
   if (counts['attention'] !== 0 || counts['review'] !== 1 || counts['active'] !== 0) {
@@ -2134,7 +2137,7 @@ function getNavCounts() {
   mockServerSnapshot.tasks[0].execution_status = 'pending_integration';
   mockServerSnapshot.tasks[0].state_view = { phase: 'pending_integration', group: 'integration', needs_attention: false };
   const eventApproved = { id: 30, event_type: 'task.review_submitted', task_id: 't_1' };
-  applySnapshotIfCurrent(state.projectId, await refreshSnapshot(state.projectId, eventApproved.id));
+  applySnapshotIfCurrent(state.projectId, await refreshSnapshot(state.projectId, { minCursor: eventApproved.id }));
   renderForEvent(eventApproved);
   counts = getNavCounts();
   if (counts['review'] !== 0 || counts['integration'] !== 1) {
@@ -2146,7 +2149,7 @@ function getNavCounts() {
   mockServerSnapshot.tasks[0].execution_status = 'done';
   mockServerSnapshot.tasks[0].state_view = { phase: 'done', group: 'done', needs_attention: false };
   const eventIntegrated = { id: 31, event_type: 'task.integrated', task_id: 't_1' };
-  applySnapshotIfCurrent(state.projectId, await refreshSnapshot(state.projectId, eventIntegrated.id));
+  applySnapshotIfCurrent(state.projectId, await refreshSnapshot(state.projectId, { minCursor: eventIntegrated.id }));
   renderForEvent(eventIntegrated);
   counts = getNavCounts();
   if (counts['integration'] !== 0 || counts['done'] !== 1) {
@@ -2167,7 +2170,7 @@ function getNavCounts() {
     state_view: { phase: 'todo', group: 'claimable', needs_attention: false },
   });
   const eventIntake = { id: 32, event_type: 'task.intake_defined', task_id: 't_3' };
-  let snapIntake = await refreshSnapshot(state.projectId, eventIntake.id);
+  let snapIntake = await refreshSnapshot(state.projectId, { minCursor: eventIntake.id });
   applySnapshotIfCurrent(state.projectId, snapIntake);
   renderForEvent(eventIntake);
 
@@ -2262,7 +2265,7 @@ def test_web_intake_refresh_never_overwrites_snapshot_state(tmp_path):
 
     start_intake = javascript.index("let taskIntakeRefreshSequence = 0;")
     end_intake = javascript.index("function sessionName(sessionId)")
-    start_snap = javascript.index("function fetchSnapshotDirect(projectId)")
+    start_snap = javascript.index("function fetchSnapshotDirect(")
     end_snap = javascript.index("async function api(path, options = {})")
     start_apply = javascript.index("function applySnapshotIfCurrent(projectId, snapshot)")
     end_apply = javascript.index("function renderForEvent(event)")
@@ -2959,7 +2962,7 @@ def test_web_intake_refresh_never_overwrites_snapshot_state(tmp_path):
 
     start_intake = javascript.index("let taskIntakeRefreshSequence = 0;")
     end_intake = javascript.index("function sessionName(sessionId)")
-    start_snap = javascript.index("function fetchSnapshotDirect(projectId)")
+    start_snap = javascript.index("function fetchSnapshotDirect(")
     end_snap = javascript.index("async function api(path, options = {})")
     start_apply = javascript.index("function applySnapshotIfCurrent(projectId, snapshot)")
     end_apply = javascript.index("function renderForEvent(event)")

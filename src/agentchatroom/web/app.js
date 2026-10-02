@@ -452,12 +452,11 @@ function assignmentStatus(assignment) {
   if (typeof assignment === "string") {
     return { pending: "待确认", accepted: "已接受", declined: "已拒绝", blocked: "受阻", cancelled: "已取消" }[assignment] || assignment;
   }
-  // 指派生命周期与任务生命周期分离：cancelled 需要区分
-  // 「因释放/改派失效」与「目标明确取消受理」，不能都显示成已取消。
-  const note = String(assignment.response_note || "");
+  // 失效原因是稳定代码（task_release / reassignment），不是后端说明文案。
+  const reason = String(assignment.cancellation_reason || assignment.response_note || "");
   if (assignment.status === "cancelled") {
-    if (note.includes("task release")) return "因任务释放失效";
-    if (note.includes("superseded by reassignment")) return "因改派失效";
+    if (reason === "task_release" || reason.startsWith("task_release:")) return "因任务释放失效";
+    if (reason === "reassignment") return "因改派失效";
   }
   return assignmentStatus(assignment.status);
 }
@@ -831,12 +830,14 @@ function clearDialogDrafts(dialog) {
   if (dialog.id === "task-edit-dialog") state.editingTaskId = null;
 }
 
-function fetchSnapshotDirect(projectId) {
-  const minCursor = Number(arguments[1] || 0);
+function fetchSnapshotDirect(projectId, options = {}) {
+  const minCursor = Number(options.minCursor || 0);
   if (!projectId) return Promise.resolve(null);
-  const request = { projectId, promise: null };
+  const request = { projectId, promise: null, minCursor };
   const cacheBuster = `_=${Date.now()}`;
-  const query = minCursor ? `?min_cursor=${minCursor}&${cacheBuster}` : `?${cacheBuster}`;
+  // The snapshot endpoint has no min_cursor query. A caller that already holds
+  // a new enough cursor skips the request in refreshSnapshot (#329).
+  const query = `?${cacheBuster}`;
   request.promise = api(`/api/v1/projects/${projectId}/snapshot${query}`, {
     cache: "no-store",
     headers: { "Cache-Control": "no-cache, no-store" },
@@ -847,24 +848,24 @@ function fetchSnapshotDirect(projectId) {
   return request.promise;
 }
 
-function refreshSnapshot(projectId) {
-  const minCursor = Number(arguments[1] || 0);
+function refreshSnapshot(projectId, options = {}) {
+  const minCursor = Number(options.minCursor || 0);
   if (!projectId) return Promise.resolve(null);
   if (minCursor > 0 && state.snapshot && Number(state.snapshot.cursor || 0) >= minCursor) {
     return Promise.resolve(state.snapshot);
   }
   if (state.snapshotInFlight && state.snapshotInFlight.projectId === projectId) {
-    if (!minCursor) {
+    if (!minCursor || Number(state.snapshotInFlight.minCursor || 0) >= minCursor) {
       return state.snapshotInFlight.promise;
     }
     return state.snapshotInFlight.promise.then((snapshot) => {
       if (snapshot && Number(snapshot.cursor || 0) >= minCursor) {
         return snapshot;
       }
-      return refreshSnapshot(projectId, minCursor);
+      return refreshSnapshot(projectId, { minCursor });
     });
   }
-  return fetchSnapshotDirect(projectId, minCursor);
+  return fetchSnapshotDirect(projectId, { minCursor });
 }
 
 async function api(path, options = {}) {
@@ -900,6 +901,7 @@ function showLoginDialog(notice) {
 // 失效 Cookie 打出 401 死循环），改为主动探测鉴权状态后决定重连方式。
 let streamRetryTimer = null;
 let streamRetryDelayMs = 1000;
+let streamOnline = false;
 
 function scheduleStreamRetry(projectId, after) {
   if (streamRetryTimer) clearTimeout(streamRetryTimer);
@@ -1139,11 +1141,11 @@ async function selectProject(projectId) {
     state.runtime = runtime;
     state.managedBackups = backups.backups || [];
     state.autoBackupInfo = backups.auto_backup || null;
+    state.lastBackupFailure = backups.last_failure || null;
     mergeEvents(eventPage.events);
     renderProjects();
     renderAll();
     connectEvents(eventPage.cursor);
-    startPresenceRefresh();
   } catch (error) {
     if (generation !== state.selectGeneration) return;
     if (previousId && previousId !== projectId) {
@@ -1179,6 +1181,7 @@ function mergeEvents(events) {
 }
 
 function closeEventSource() {
+  streamOnline = false;
   if (state.eventSource) state.eventSource.close();
   state.eventSource = null;
   if (streamRetryTimer) {
@@ -1194,7 +1197,10 @@ function stopPresenceRefresh() {
 
 function startPresenceRefresh() {
   stopPresenceRefresh();
-  const interval = Math.max(250, Number(state.config?.presence_refresh_interval_seconds || 1) * 1000);
+  if (streamOnline) return;
+  if (typeof document !== "undefined" && document.hidden) return;
+  const configured = Number(state.config?.presence_refresh_interval_seconds || 5);
+  const interval = Math.max(5000, (Number.isFinite(configured) ? configured : 5) * 1000);
   state.presenceTimer = setInterval(refreshPresence, interval);
 }
 
@@ -1328,6 +1334,8 @@ function connectEvents(after) {
   state.eventSource = source;
   source.onopen = () => {
     streamRetryDelayMs = 1000;
+    streamOnline = true;
+    stopPresenceRefresh();
     setConnection("online", "浏览器已连接");
     if (state.streamHadError) {
       state.streamHadError = false;
@@ -1344,6 +1352,8 @@ function connectEvents(after) {
   };
   source.onerror = () => {
     state.streamHadError = true;
+    streamOnline = false;
+    startPresenceRefresh();
     setConnection("offline", "浏览器正在重连");
     source.close();
     if (state.eventSource === source) state.eventSource = null;
@@ -1365,7 +1375,7 @@ function connectEvents(after) {
     mergeEvents([event]);
     try {
       const minCursor = Number(event?.id || 0);
-      const snapshot = await refreshSnapshot(capturedProjectId, minCursor);
+      const snapshot = await refreshSnapshot(capturedProjectId, { minCursor });
       if (!applySnapshotIfCurrent(capturedProjectId, snapshot)) return;
       renderForEvent(event);
     } catch (error) {
@@ -1946,11 +1956,15 @@ function memberStatusClass(status) {
 
 function renderTokenMemberOptions(selected = "") {
   const activeMembers = state.members.filter((member) => member.status === "active");
+  const selectedMissing = Boolean(selected) && !activeMembers.some((member) => member.id === selected);
   elements["token-member"].innerHTML = [
     '<option value="">不关联；首次连接时按下面填写的显示名称自动创建成员</option>',
+    ...(selectedMissing
+      ? [`<option value="${escapeHtml(selected)}">先前选择的成员已不在有效列表中，请重新选择</option>`]
+      : []),
     ...activeMembers.map((member) => `<option value="${escapeHtml(member.id)}">${escapeHtml(member.name)} · ${escapeHtml(member.member_key)}</option>`),
   ].join("");
-  if (activeMembers.some((member) => member.id === selected)) {
+  if (selectedMissing || activeMembers.some((member) => member.id === selected)) {
     elements["token-member"].value = selected;
   }
 }
@@ -1984,8 +1998,12 @@ const BACKUP_PAGE_SIZE = 5;
 
 function renderBackups() {
   const autoBackup = state.autoBackupInfo;
+  const failure = state.lastBackupFailure;
+  const failureNote = failure
+    ? `最近一次自动或手动备份失败（${escapeHtml(failure.payload?.reason || "backup_failed")}），请查看服务日志后重试。`
+    : "";
   const autoSummary = autoBackup
-    ? `自动备份：${autoBackup.enabled ? `已开启 · 每 ${Math.round(autoBackup.interval_seconds / 60)} 分钟 · 保留 ${autoBackup.max_kept} 份` : "未开启（可在系统设置或配置 [backup] 开启）"}`
+    ? `自动备份：${autoBackup.enabled ? `已开启 · 每 ${Math.round(autoBackup.interval_seconds / 60)} 分钟 · 保留 ${autoBackup.max_kept} 份` : "未开启（可在系统设置或配置 [backup] 开启）"}${failureNote ? `。${failureNote}` : ""}`
     : "";
   const total = state.managedBackups.length;
   const pages = Math.max(1, Math.ceil(total / BACKUP_PAGE_SIZE));
@@ -2442,6 +2460,7 @@ async function refreshManagement() {
   state.runtime = runtime;
   state.managedBackups = backups.backups || [];
   state.autoBackupInfo = backups.auto_backup || null;
+  state.lastBackupFailure = backups.last_failure || null;
   renderManagement();
 }
 
@@ -2550,10 +2569,11 @@ elements["project-folder-picker-button"].addEventListener("click", async () => {
     button.disabled = !state.config?.capabilities?.local_folder_picker;
   }
 });
-document.getElementById("create-task-button").addEventListener("click", async () => {
+document.getElementById("create-task-button").addEventListener("click", () => {
   if (!state.projectId) return;
-  await refreshTaskIntakeTargets();
-  elements["task-dialog"].showModal();
+  refreshTaskIntakeTargets()
+    .then(() => elements["task-dialog"].showModal())
+    .catch(handleError);
 });
 document.getElementById("archive-project-button").addEventListener("click", () => {
   if (!state.snapshot) return;
@@ -2579,10 +2599,20 @@ document.getElementById("project-settings-button").addEventListener("click", () 
   );
   elements["settings-dialog"].showModal();
 });
+
+function parseKeptCount(value) {
+  const text = String(value ?? "").trim();
+  if (!/^[1-9]\d*$/.test(text)) return null;
+  const number = Number(text);
+  return Number.isSafeInteger(number) && number >= 1 ? number : null;
+}
+
+let backupSettingsRequest = 0;
 elements["system-settings-button"].addEventListener("click", () => {
-  // #146：全局运维（自动备份策略、运行状态、全库备份）收拢在系统设置弹窗。
   elements["system-settings-dialog"].showModal();
+  const requestId = ++backupSettingsRequest;
   api("/api/v1/admin/backup-settings").then((settings) => {
+    if (requestId !== backupSettingsRequest) return;
     elements["settings-auto-backup"].checked = !!settings.auto_backup_enabled;
     elements["settings-backup-max-kept"].value = settings.auto_backup_max_kept ?? 10;
     elements["settings-backup-hint"].textContent = `${settings.effective || ""} · 配置文件：${settings.config_path || "-"}`;
@@ -2590,17 +2620,31 @@ elements["system-settings-button"].addEventListener("click", () => {
   if (state.projectId) refreshManagement().catch(handleError);
 });
 elements["save-backup-policy-button"].addEventListener("click", async () => {
+  const maxKept = parseKeptCount(elements["settings-backup-max-kept"].value);
+  if (maxKept == null) {
+    showToast("保留份数必须是大于等于 1 的整数", "error");
+    return;
+  }
+  const button = elements["save-backup-policy-button"];
+  button.disabled = true;
   try {
-    await api("/api/v1/admin/backup-settings", {
+    const saved = await api("/api/v1/admin/backup-settings", {
       method: "PUT",
       body: JSON.stringify({
         auto_backup_enabled: elements["settings-auto-backup"].checked,
-        auto_backup_max_kept: Number(elements["settings-backup-max-kept"].value),
+        auto_backup_max_kept: maxKept,
       }),
     });
+    state.autoBackupInfo = {
+      enabled: !!saved.auto_backup_enabled,
+      interval_seconds: saved.auto_backup_interval_seconds,
+      max_kept: saved.auto_backup_max_kept,
+    };
     showToast("备份策略已保存");
   } catch (error) {
     handleError(error);
+  } finally {
+    button.disabled = false;
   }
 });
 elements["export-audit-data-button"].addEventListener("click", () => downloadProjectExport().catch(handleError));
@@ -2737,6 +2781,10 @@ elements["token-secret-close"].addEventListener("click", () => {
 elements["token-secret-dialog"].addEventListener("cancel", (event) => {
   event.preventDefault();
   showToast("这个 Secret 只显示一次，请按「我已保存」确认后再关闭");
+});
+
+elements["login-dialog"].addEventListener("cancel", (event) => {
+  event.preventDefault();
 });
 
 elements["token-secret-dialog"].addEventListener("close", () => {
@@ -3222,6 +3270,8 @@ elements["event-hide-system"].addEventListener("change", () => {
 
 async function submitProjectForm() {
   setProjectFormError("");
+  const submit = elements["project-form"].querySelector("[type=submit]");
+  if (submit) submit.disabled = true;
   try {
     const project = await withBusy(() => api("/api/v1/projects", {
       method: "POST",
@@ -3239,7 +3289,12 @@ async function submitProjectForm() {
   } catch (error) {
     // #163：失败时保持弹窗打开、输入原样保留，错误写进弹窗内横幅；
     // 底层页面 toast 会被 dialog::backdrop 模糊遮住（与 #142 同机制）。
-    setProjectFormError(error.message || "项目添加失败");
+    // 弹窗若已经关闭，内联横幅没人能看见，改走全局 toast（#321）。
+    const message = error.message || "项目添加失败";
+    if (!elements["project-dialog"].open) showToast(message, "error");
+    else setProjectFormError(message);
+  } finally {
+    if (submit) submit.disabled = false;
   }
 }
 
@@ -3256,6 +3311,8 @@ elements["project-dialog"].addEventListener("close", () => setProjectFormError("
 elements["settings-form"].addEventListener("submit", async (event) => {
   event.preventDefault();
   if (!state.snapshot) return;
+  const submit = event.submitter || elements["settings-form"].querySelector("[type=submit]");
+  if (submit) submit.disabled = true;
   try {
     await api(`/api/v1/projects/${state.projectId}`, {
       method: "PATCH",
@@ -3276,6 +3333,8 @@ elements["settings-form"].addEventListener("submit", async (event) => {
     await refreshSnapshot(state.projectId);
   } catch (error) {
     handleError(error);
+  } finally {
+    if (submit) submit.disabled = false;
   }
 });
 
@@ -3309,18 +3368,40 @@ elements["archive-form"].addEventListener("submit", async (event) => {
   event.preventDefault();
   if (!state.projectId) return;
   const permanent = elements["permanent-delete-input"].checked;
+  const confirmDelete = typeof window !== "undefined" && typeof window.confirm === "function"
+    ? window.confirm.bind(window)
+    : null;
+  if (permanent && confirmDelete && !confirmDelete("永久删除会移除这个项目的 Room 数据，而且不能恢复。确定继续？")) {
+    return;
+  }
+  const submit = elements["remove-project-submit"];
+  if (submit) submit.disabled = true;
   try {
-    await api(`/api/v1/projects/${state.projectId}${permanent ? "?permanent=true" : ""}`, { method: "DELETE" });
-    // 只有确认项目已归档/删除之后才允许断流：先关流会让失败的请求留下一个
-    // 还在显示、却再也不更新事件的页面（#328）。
+    const result = await api(`/api/v1/projects/${state.projectId}${permanent ? "?permanent=true" : ""}`, { method: "DELETE" });
+    // 只有确认项目已归档/删除之后才允许断流：失败时事件流保持在线（#328）。
     closeEventSource();
     elements["archive-dialog"].close();
     localStorage.removeItem("agentchatroom.projectId");
     state.projectId = null;
     await loadProjects();
-    showToast(permanent ? "项目数据已永久删除" : "项目已归档");
+    const cleanupErrors = [
+      ...(result?.project_registration?.cleanup_errors || []),
+      ...(result?.project_instructions?.cleanup_errors || []),
+    ];
+    if (cleanupErrors.length) {
+      const first = cleanupErrors[0];
+      const action = first.details && first.details.required_action;
+      showToast(
+        `项目已删除，但有 ${cleanupErrors.length} 项清理没有完成：${first.message || first.code || "未知错误"}${action ? `。下一步：${action}` : ""}`,
+        "error",
+      );
+    } else {
+      showToast(permanent ? "项目数据已永久删除" : "项目已归档");
+    }
   } catch (error) {
     handleError(error);
+  } finally {
+    if (submit) submit.disabled = false;
   }
 });
 
@@ -3359,6 +3440,8 @@ elements["message-form"].addEventListener("submit", async (event) => {
 
 elements["login-form"].addEventListener("submit", async (event) => {
   event.preventDefault();
+  const submit = event.submitter || elements["login-form"].querySelector("[type=submit]");
+  if (submit) submit.disabled = true;
   elements["login-error"].textContent = "";
   try {
     await withBusy(() => api("/api/v1/auth/login", {
@@ -3371,7 +3454,11 @@ elements["login-form"].addEventListener("submit", async (event) => {
     elements["logout-button"].classList.remove("is-hidden");
     await loadAuthenticatedApp();
   } catch (error) {
-    elements["login-error"].textContent = error.message || "登录失败";
+    const message = error.message || "登录失败";
+    elements["login-error"].textContent = message;
+    if (!elements["login-dialog"].open) showToast(message, "error");
+  } finally {
+    if (submit) submit.disabled = false;
   }
 });
 
@@ -3393,7 +3480,14 @@ function deriveTokenCredentialName(member) {
 
 elements["token-form"].addEventListener("submit", async (event) => {
   event.preventDefault();
-  if (!state.projectId) return;
+  if (!state.projectId || state.tokenSubmitInFlight) return;
+  state.tokenSubmitInFlight = true;
+  const submit = event.submitter || elements["token-form"].querySelector("[type=submit]");
+  if (submit) submit.disabled = true;
+  const releaseTokenSubmit = () => {
+    state.tokenSubmitInFlight = false;
+    if (submit) submit.disabled = false;
+  };
   setTokenFormError("");
   const projectId = state.projectId;
   const setup = state.pendingHttpSetup;
@@ -3403,6 +3497,11 @@ elements["token-form"].addEventListener("submit", async (event) => {
   }
   const memberId = elements["token-member"].value;
   const member = state.members.find((item) => item.id === memberId);
+  if (memberId && (!member || member.status !== "active")) {
+    setTokenFormError("所选成员已不在有效列表中。请改选有效成员，或改为不关联并填写 Agent 显示名称。不会签发不关联凭据。");
+    releaseTokenSubmit();
+    return;
+  }
   let softwareIdentity = null;
   if (setup?.projectId === projectId) {
     let selectedIdentity;
@@ -3410,6 +3509,7 @@ elements["token-form"].addEventListener("submit", async (event) => {
       selectedIdentity = softwareIdentityForMember(member);
     } catch (error) {
       setTokenFormError(error.message || "所选项目成员的软件身份不完整");
+      releaseTokenSubmit();
       return;
     }
     if (selectedIdentity) {
@@ -3417,6 +3517,7 @@ elements["token-form"].addEventListener("submit", async (event) => {
       softwareIdentity = selectedIdentity;
     } else if (member) {
       setTokenFormError("所选项目成员的软件身份不完整，请改选成员，或改为不关联并填写 Agent 显示名称");
+      releaseTokenSubmit();
       return;
     } else if (setup.mode === "add_project") {
       // 已配置软件增量加入 Project：客户端原身份由 Agent 在本地保留，
@@ -3431,6 +3532,7 @@ elements["token-form"].addEventListener("submit", async (event) => {
         );
       } catch (error) {
         setTokenFormError(error.message || "Agent 显示名称无效，请填写实际接入端名称");
+        releaseTokenSubmit();
         return;
       }
       const typedName = elements["token-agent-name"].value.trim().toLocaleLowerCase();
@@ -3442,6 +3544,7 @@ elements["token-form"].addEventListener("submit", async (event) => {
         setTokenFormError(
           `项目中已有同名成员「${nameOwner.name}」（软件身份 ${nameOwner.metadata?.software_key || "未知"}）。请在成员下拉中选择该项以沿用现有身份合并接入，或为本次接入换一个显示名称。`,
         );
+        releaseTokenSubmit();
         return;
       }
     }
@@ -3450,6 +3553,7 @@ elements["token-form"].addEventListener("submit", async (event) => {
     .map((input) => input.value);
   if (!permissions.length) {
     setTokenFormError("至少选择一项权限");
+    releaseTokenSubmit();
     return;
   }
   try {
@@ -3480,7 +3584,14 @@ elements["token-form"].addEventListener("submit", async (event) => {
     }
     await refreshManagement();
   } catch (error) {
-    setTokenFormError(error.message || "签发失败，请稍后重试");
+    const message = error.message || "签发失败，请稍后重试";
+    if (!elements["token-dialog"].open) {
+      showToast(message, "error");
+    } else {
+      setTokenFormError(message);
+    }
+  } finally {
+    releaseTokenSubmit();
   }
 });
 
@@ -4726,6 +4837,14 @@ async function loadAuthenticatedApp() {
 window.addEventListener("beforeunload", () => {
   closeEventSource();
   stopPresenceRefresh();
+});
+
+document.addEventListener("visibilitychange", () => {
+  if (document.hidden) {
+    stopPresenceRefresh();
+    return;
+  }
+  if (state.projectId && !streamOnline) startPresenceRefresh();
 });
 
 async function bootstrap() {
