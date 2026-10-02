@@ -1148,3 +1148,109 @@ def test_task_claim_cli_passes_reclaim_flag(monkeypatch, capsys):
     assert captured[2]["body"]["reclaim"] is False
     assert captured[2]["body"]["takeover"] is False
     assert capsys.readouterr().out.count('"ok": true') == 3
+
+
+def test_cli_knowledge_review_pins_the_version_the_reviewer_read(
+    monkeypatch, settings, project_dir, capsys
+):
+    """#368: the CLI review call pins the version it read, and a newer one is stale."""
+    from fastapi.testclient import TestClient
+
+    from agentchatroom.api import create_app
+
+    app = create_app(settings)
+    service = app.state.service
+    project = service.create_project(root_path=str(project_dir), name="Knowledge CLI")
+    author = service.join_room(
+        project["id"], name="Author", client="author-cli", model="unknown"
+    )
+    reviewer = service.join_room(
+        project["id"], name="Reviewer", client="reviewer-cli", model="unknown"
+    )
+    created = service.submit_knowledge_candidate(
+        project["id"],
+        session_id=author["agent"]["id"],
+        token=author["token"],
+        title="Pin the reviewed version",
+        body="Version one.",
+        kind="decision",
+        summary="first",
+        tags=["cli"],
+        source_type="manual",
+    )
+    asset_id = created["asset"]["id"]
+    read_version_id = service.get_knowledge_asset(project["id"], asset_id)[
+        "current_version"
+    ]["version_id"]
+    service.submit_knowledge_candidate(
+        project["id"],
+        session_id=author["agent"]["id"],
+        token=author["token"],
+        asset_id=asset_id,
+        title="Pin the reviewed version",
+        body="Version two.",
+        kind="decision",
+        summary="second",
+        tags=["cli"],
+        source_type="manual",
+    )
+
+    with TestClient(app) as client:
+        def forward(base, method, path, payload=None, *, request_id=None):
+            response = client.request(method, path, json=payload)
+            if response.status_code >= 400:
+                raise SystemExit(response.text)
+            return response.json()
+
+        monkeypatch.setattr(cli, "request_json", forward)
+        with pytest.raises(SystemExit) as stale:
+            main(
+                [
+                    "--url",
+                    "http://cli.test",
+                    "knowledge-review",
+                    project["id"],
+                    asset_id,
+                    "--session-id",
+                    reviewer["agent"]["id"],
+                    "--token",
+                    reviewer["token"],
+                    "--verdict",
+                    "approved",
+                    "--criterion",
+                    "Content is accurate::passed",
+                    "--expected-version-id",
+                    read_version_id,
+                ]
+            )
+        assert json.loads(str(stale.value))["error"]["code"] == "knowledge_version_stale"
+        assert (
+            service.get_knowledge_asset(project["id"], asset_id)["status"] == "candidate"
+        )
+
+        current_version_id = service.get_knowledge_asset(project["id"], asset_id)[
+            "current_version"
+        ]["version_id"]
+        main(
+            [
+                "--url",
+                "http://cli.test",
+                "knowledge-review",
+                project["id"],
+                asset_id,
+                "--session-id",
+                reviewer["agent"]["id"],
+                "--token",
+                reviewer["token"],
+                "--verdict",
+                "approved",
+                "--criterion",
+                "Content is accurate::passed",
+                "--expected-version-id",
+                current_version_id,
+            ]
+        )
+
+    approved = json.loads(capsys.readouterr().out)
+    assert approved["status"] == "approved"
+    assert approved["review"]["version_id"] == current_version_id

@@ -1503,6 +1503,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="CRITERION::passed or CRITERION::failed (defaults to passed)",
     )
     knowledge_review.add_argument("--notes", default="")
+    knowledge_review.add_argument(
+        "--expected-version-id",
+        default="",
+        help=(
+            "Version id from knowledge-get. Required for --verdict approved "
+            "so the review stays pinned to the version that was read."
+        ),
+    )
 
     knowledge_supersede = commands.add_parser(
         "knowledge-supersede", help="Supersede an approved Knowledge Asset"
@@ -2235,6 +2243,7 @@ def main(argv: list[str] | None = None) -> None:
                 "verdict": args.verdict,
                 "criteria": parse_knowledge_criteria(args.criterion),
                 "notes": args.notes,
+                "expected_version_id": args.expected_version_id,
             },
         )
     elif args.command == "knowledge-supersede":

@@ -835,7 +835,7 @@ Room 中的沉淀知识以版本化 Knowledge Asset 保存，默认类型包括�
 - MCP：`knowledge_candidate_submit`、`knowledge_review`、`knowledge_supersede`、`knowledge_archive`、`knowledge_get`、`knowledge_list`。
 - **评审绑定到被读的那个版本**。`knowledge_review` 接受 `expected_version_id`（`knowledge_get` / `knowledge_list` 返回的 `current_version.version_id` 与 `content_hash` 即可 pin）。当前版本在写入时才解引用，因此评审期间若有人提交了 v2，旧评审的逐条证据原本会直接落到 v2 上——「已批准」的知识可能从未被任何身份读过。现在版本不一致返回 `knowledge_version_stale`（409，带 `required_action=reread_and_review_current_version`），资产保持 `candidate`。`verdict=approved` **必须**提供 `expected_version_id`，否则返回 `knowledge_version_pin_required`（422）：批准是把内容放进 Room 的动作，必须说清批的是哪一版；`changes_requested` 不会让未经评审的内容生效，因此不强制 pin。
 - **知识内容也受配置上限约束**。`title` / `summary` 复用 `task_text_max_length`（超限 `knowledge_content_too_long`），`body` 复用 `project_document_max_bytes`（超限 `knowledge_content_too_large`，均 422 并带 `limit` / `size`）。此前这是唯一没有大小约束的用户可写路径，而任务文本与项目文档都有。
-- CLI：`agentchatroom knowledge-submit | knowledge-review | knowledge-supersede | knowledge-archive | knowledge-list | knowledge-get`。CLI 审核通过 `--criterion "描述::passed"` 或 `--criterion "描述::failed"` 表达每项判定（省略后缀默认 passed）。
+- CLI：`agentchatroom knowledge-submit | knowledge-review | knowledge-supersede | knowledge-archive | knowledge-list | knowledge-get`。CLI 审核通过 `--criterion "描述::passed"` 或 `--criterion "描述::failed"` 表达每项判定（省略后缀默认 passed）。`knowledge-review` 用 `--expected-version-id` 传入 `knowledge-get` 读到的 `current_version.version_id`，与 REST/MCP 进入同一个领域守卫：批准必须带这个 pin，评审期间若已有新版本则返回 `knowledge_version_stale`，资产保持 `candidate`。
 
 项目导出（REST `/export`、CLI `project-export`）包含全部知识资产的版本与审核历史。Web 顶栏不再提供「导出」按钮（#145 起收纳）：项目设置弹窗底部提供「导出审计数据 (JSON)」，导出包含本 Project 任务与审计流水的人类可读明文 JSON，用于离线分析与复盘；它不是系统级数据库备份，也不能用于回滚。
 
