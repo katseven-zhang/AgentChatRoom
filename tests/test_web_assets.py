@@ -2538,10 +2538,13 @@ def test_web_management_audit_refresh_queries_past_right_edge():
     # for, which is now captured before the await instead of read after it.
     assert "fetchAuditTail(projectId, eventType)" in body
     assert "const projectId = anchor.projectId;" in body
-    assert "if (!withinRequestScope(anchor)) return;" in body
+    assert "withinRequestScope(anchor)" in body
     assert "viewingLiveTail" in body
     assert "state.auditEvents = overflow ? merged.slice(overflow) : merged" in body
-    assert "state.auditHasNewer = fresh.length > 0 || state.auditHasNewer" in body
+    # #319: the mid-history view must honour the server's answer instead of
+    # counting rows (an empty refresh used to mean "we are at the end").
+    assert "state.auditHasNewer = Boolean(audit.has_newer)" in body
+    assert "state.auditHasNewer = fresh.length > 0 || state.auditHasNewer" not in body
 
 
 def test_web_audit_refresh_merge_surfaces_new_events_after_emit(tmp_path):

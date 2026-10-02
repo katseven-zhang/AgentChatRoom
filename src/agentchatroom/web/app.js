@@ -1040,13 +1040,15 @@ async function resetAuditPages(projectId, eventType) {
 
 async function loadOlderAuditEvents() {
   if (!state.projectId || !state.auditHasOlder || !state.auditEvents.length) return;
-  const eventType = elements["audit-event-filter"].value;
-  const anchor = requestAnchor();
+  const anchor = auditAnchor();
+  const eventType = anchor.eventType;
   const page = await api(auditQueryUrl(anchor.projectId, {
     before: state.auditEvents[0].project_seq,
     eventType,
   }));
-  if (!withinRequestScope(anchor)) return;
+  if (!withinRequestScope(anchor) || anchor.eventType !== elements["audit-event-filter"].value) {
+    return;
+  }
   if (!page.events.length) {
     state.auditHasOlder = false;
     renderAudit();
@@ -1054,20 +1056,25 @@ async function loadOlderAuditEvents() {
   }
   state.auditEvents = page.events;
   state.auditHasOlder = page.has_older;
-  state.auditHasNewer = true;
+  // Both edges belong to the window the server just returned: inventing
+  // "there is newer stuff" here re-opens the page we came from even when this
+  // page already is the newest one (#317).
+  state.auditHasNewer = Boolean(page.has_newer);
   state.auditPage += 1;
   renderAudit();
 }
 
 async function loadNewerAuditEvents() {
   if (!state.projectId || !state.auditHasNewer || !state.auditEvents.length) return;
-  const eventType = elements["audit-event-filter"].value;
-  const anchor = requestAnchor();
+  const anchor = auditAnchor();
+  const eventType = anchor.eventType;
   const page = await api(auditQueryUrl(anchor.projectId, {
     after: state.auditEvents[state.auditEvents.length - 1].project_seq,
     eventType,
   }));
-  if (!withinRequestScope(anchor)) return;
+  if (!withinRequestScope(anchor) || anchor.eventType !== elements["audit-event-filter"].value) {
+    return;
+  }
   if (!page.events.length) {
     state.auditHasNewer = false;
     renderAudit();
@@ -1075,7 +1082,7 @@ async function loadNewerAuditEvents() {
   }
   state.auditEvents = page.events;
   state.auditHasNewer = page.has_newer;
-  state.auditHasOlder = true;
+  state.auditHasOlder = Boolean(page.has_older);
   state.auditPage = Math.max(1, state.auditPage - 1);
   renderAudit();
 }
@@ -2281,11 +2288,18 @@ function withinRequestScope(anchor) {
   );
 }
 
+// Audit paging carries the filter too: a page fetched for one event type must
+// not land in a view the user has since re-filtered (#317).
+function auditAnchor() {
+  return { ...requestAnchor(), eventType: elements["audit-event-filter"].value };
+}
+
 async function refreshManagement() {
   if (!state.projectId) return;
   const anchor = requestAnchor();
   const projectId = anchor.projectId;
   const eventType = elements["audit-event-filter"].value;
+  anchor.eventType = eventType;
   // #196: keep the window open to the right — do not clamp after/before to the
   // already-rendered set. Same filter + data: probe for events newer than the
   // current right edge. Filter change or empty list: reset to the live tail.
@@ -2308,7 +2322,9 @@ async function refreshManagement() {
     api("/api/v1/admin/runtime?lines=80"),
     api("/api/v1/admin/backups"),
   ]);
-  if (!withinRequestScope(anchor)) return;
+  if (!withinRequestScope(anchor) || anchor.eventType !== elements["audit-event-filter"].value) {
+    return;
+  }
   state.members = members.members;
   state.credentials = credentials.credentials;
   state.workspaces = workspaces.workspaces;
@@ -2336,10 +2352,12 @@ async function refreshManagement() {
       // must not claim the tail: that disables 「下一页」 and hides the rest of
       // the burst until a later refresh (#319).
       state.auditHasNewer = Boolean(audit.has_newer);
-      state.auditPage = 1;
+      if (!state.auditHasNewer) state.auditPage = 1;
     } else {
-      // mid-history view: new events exist beyond the preserved window; do not jump pages
-      state.auditHasNewer = fresh.length > 0 || state.auditHasNewer;
+      // Mid-history view: the same server answer applies. Counting the fresh
+      // rows instead would report "at the end" whenever this refresh happened
+      // to return nothing, even though the tail is still to the right (#319).
+      state.auditHasNewer = Boolean(audit.has_newer);
     }
   }
   state.runtime = runtime;

@@ -200,8 +200,9 @@ def test_every_late_writing_loader_is_scoped():
         "async function loadNewerAuditEvents()",
     ):
         body = javascript[javascript.index(name) : javascript.index("\n}\n", javascript.index(name)) + 3]
-        assert "requestAnchor()" in body, name
+        assert "requestAnchor()" in body or "auditAnchor()" in body, name
         assert "withinRequestScope(anchor)" in body, name
+        assert "const projectId = anchor.projectId;" in body or "anchor.eventType" in body, name
 
 
 INTAKE_PREAMBLE = """
