@@ -846,10 +846,19 @@ def _ensure_local_presence(project_id: str, session_id: str, token: str) -> None
     manager = _bound_presence_manager.get() or presence_manager
     if manager is None:
         return
+    binding = get_runtime_binding()
+    agent_key = ""
+    if (
+        binding is not None
+        and binding.session_id == session_id
+        and binding.project_id == project_id
+    ):
+        agent_key = binding.agent_key
     manager.ensure_registered(
         project_id,
         session_id,
         token,
+        agent_key=agent_key,
         transport_key=_active_binding_key.get() or "",
     )
 

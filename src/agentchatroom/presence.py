@@ -111,18 +111,22 @@ class LocalPresenceManager:
         if not self.enabled:
             return False
         resolved_agent_key = agent_key.strip()
+        with self._lock:
+            if session_id in self._sessions:
+                return False
+        # Cold path only: the registry is process-local memory, so the first call
+        # after an MCP process restart has to look the identity up. Resolve it
+        # from the one Session row rather than rebuilding the Room board, which
+        # every already-registered session used to pay for on each hot call.
         if not resolved_agent_key:
             try:
-                sessions = self.room_service.snapshot(project_id)["agents"]
+                resolved_agent_key = self.room_service.session_agent_key(
+                    project_id, session_id
+                )
             except DomainError:
                 return False
-            session = next(
-                (item for item in sessions if str(item["id"]) == session_id),
-                None,
-            )
-            if session is None:
+            if resolved_agent_key is None:
                 return False
-            resolved_agent_key = str(session.get("agent_key") or session_id)
         with self._lock:
             if session_id in self._sessions:
                 return False

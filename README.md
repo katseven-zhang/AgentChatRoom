@@ -716,6 +716,8 @@ MCP 参数归一化按 schema 生效，不把客户端清空可选值当成格�
 
 GUI 的在线/离线巡检走 `list_session_presence(project_id)`，只返回 `id` / `name` / `status` / `left_at` 四个字段。此前这条每 10 秒、每个项目一次的后台巡检调用 `snapshot()`——那是整个 Room 投影（事件分页、带关联的任务、Work Report、Review、确认记录、租约、知识资产，外加每个 Session 的未读计数），只为读四个字段；项目数一多，后台线程就把数据库压在无用功上。在线/离线的判定仍由同一个 `_agent_dict` 计算（心跳与真实活动取较新者，超过 `heartbeat_timeout_seconds` 才算离线），所以巡检视图与快照视图不可能对同一个 Session 给出不同结论；`unread_count` 等字段不再由这条路径计算。提醒语义不变：只有真正发生「在线 → 离线」且该 Session 没有 `left_at` 时才写一行超时提示，主动离开不产生该提示（两条分别有用例锁定）。
 
+MCP 保活注册表先查内存再决定是否查库。`room_sync`、`session_heartbeat`、`message_post` 每次成功后都会调用一次 `ensure_registered`，用来在 MCP 进程重启后自动恢复后台心跳；这条路径原先在判定「该 Session 是否已在注册表里」之前，就为了补一个 `agent_key` 而重建整块 Room 看板，所以每个热调用都付一次全量投影，且投影成本随项目内 Session 数量增长。现在已注册的 Session 在内存判定处直接返回，零数据库访问；确实需要补身份时走 `session_agent_key(project_id, session_id)`，只读那一行（仍按 Project 限定，别的 Project 或已不存在的 Session 依旧不会被登记，行为不变）；而 `bootstrap`/`room_join` 已知的 `agent_key` 由当前 Runtime 绑定直接带入调用，正常路径连这一次读也省掉。实测（30 个 Session 的项目、200 次已注册热调用）：修复前 2800 条 SQL（14 条/次）、516.4ms；修复后 0 条 SQL、0.1ms。把项目扩到 120 个 Session 时修复前单次耗时从 2.289ms 涨到 3.910ms 而 SQL 条数不变（看板投影随规模变贵），修复后仍为 0 条 / 平坦。
+
 后台 stdio/Bridge 进程与共享 HTTP transport Session 只负责连接 Presence。HTTP 服务按实际 MCP transport 绑定后台保活，多个并行 Session 分别刷新；transport 结束后停止保活并关闭对应 Room Session。部分客户端断开时不会发送 MCP `DELETE`，服务端因此对无任何 HTTP 请求的 stateful transport 做有界回收，默认 300 秒，可通过 `[server].mcp_http_session_idle_timeout_seconds` 或 `AGENTCHATROOM_MCP_HTTP_SESSION_IDLE_TIMEOUT_SECONDS` 配置。被回收 transport 的后台心跳与 Room Session 会一起停止，旧任务所有者不会被永久误判为在线；之后使用该连接须重新 bootstrap，并按任务实际状态显式 reclaim。`session_heartbeat` 只刷新连接存活，
 不再依赖 Agent 主动提交 `working`、`idle` 或 `blocked`。左侧显示已连接/未连接、
 当前任务阶段和最后活动；任务认领、Work Report、独立 Review 与 Integration 才是

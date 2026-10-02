@@ -9935,6 +9935,29 @@ class AgentChatRoomService:
             for agent in (self._agent_dict(row) for row in rows)
         ]
 
+    def session_agent_key(self, project_id: str, session_id: str) -> str | None:
+        """Stored identity of one Session, or None when it is not in this Project.
+
+        Presence keepalive only needs the ``agent_key`` of a Session it is about
+        to register. Reading it through `snapshot()` rebuilt the whole Room board
+        (events, tasks with relations, reports, reviews, leases, knowledge) for
+        one label, so every hot MCP call paid for a full projection. This is the
+        single indexed row, and it still scopes by Project so a Session from
+        another Project is not adopted here.
+        """
+        with self.database.connect() as connection:
+            row = connection.execute(
+                """
+                SELECT agent_key FROM agent_sessions
+                WHERE id = ? AND project_id = ?
+                """,
+                (session_id, project_id),
+            ).fetchone()
+        if row is None:
+            return None
+        stored = str(dict(row).get("agent_key") or "").strip()
+        return stored or str(session_id)
+
     def _snapshot(
         self,
         connection: Any,
