@@ -743,7 +743,10 @@ def test_room_bootstrap_cli_uses_shared_service_and_hides_token(
     monkeypatch.setenv(SOFTWARE_NAME_ENV, "CLI Boot")
     monkeypatch.setenv(SOFTWARE_CLIENT_ENV, "codex")
 
-    main(["room-bootstrap", "--cwd", str(project_dir), "--model", "unknown"])
+    from agentchatroom.service_lifetime import running_service
+
+    with running_service(settings):
+        main(["room-bootstrap", "--cwd", str(project_dir), "--model", "unknown"])
     ready = json.loads(capsys.readouterr().out)
     assert ready["status"] == "ready"
     assert ready["project"]["id"] == project["id"]
@@ -755,7 +758,84 @@ def test_room_bootstrap_cli_uses_shared_service_and_hides_token(
     online = [agent for agent in snapshot["agents"] if agent["status"] == "online"]
     assert len(online) == 1
     assert online[0]["id"] == ready["session"]["id"]
+    assert ready["connection"]["process_connected"] is True
+    assert len(ready["connection"]["service_generation"]) == 32
     assert "token" not in encoded
+
+
+def test_room_bootstrap_stops_before_any_write_when_the_service_is_down(
+    monkeypatch, tmp_path, capsys
+):
+    """#287: a stopped service is service_unavailable and does not touch the checkout."""
+    from agentchatroom.bootstrap import (
+        SOFTWARE_CLIENT_ENV,
+        SOFTWARE_KEY_ENV,
+        SOFTWARE_NAME_ENV,
+    )
+    from agentchatroom.config import load_settings
+
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    agents = checkout / "AGENTS.md"
+    agents.write_text("user rules\n", encoding="utf-8")
+    config_path = tmp_path / "room.toml"
+    config_path.write_text(
+        '[server]\nhost = "127.0.0.1"\nport = 9000\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("AGENTCHATROOM_DATA_DIR", str(data_dir))
+    monkeypatch.setenv("AGENTCHATROOM_CONFIG", str(config_path))
+    monkeypatch.setenv(SOFTWARE_KEY_ENV, "cli-boot")
+    monkeypatch.setenv(SOFTWARE_NAME_ENV, "CLI Boot")
+    monkeypatch.setenv(SOFTWARE_CLIENT_ENV, "codex")
+    settings = load_settings(config_path, data_dir=data_dir)
+
+    with pytest.raises(SystemExit) as excinfo:
+        main(["room-bootstrap", "--cwd", str(checkout), "--config", str(config_path)])
+
+    assert excinfo.value.code == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["status"] == "service_unavailable"
+    assert payload["required_action"] == "start_configured_service"
+    assert payload["connection"]["process_connected"] is False
+    assert not settings.database_path.exists()
+    assert agents.read_text(encoding="utf-8") == "user rules\n"
+    assert not (checkout / ".agentchatroom").exists()
+
+
+def test_room_bootstrap_rejects_postgresql_without_a_url_before_opening_a_database(
+    monkeypatch, tmp_path, capsys
+):
+    from agentchatroom.bootstrap import (
+        SOFTWARE_CLIENT_ENV,
+        SOFTWARE_KEY_ENV,
+        SOFTWARE_NAME_ENV,
+    )
+    from agentchatroom.config import load_settings
+
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    config_path = tmp_path / "room.toml"
+    config_path.write_text(
+        '[server]\nhost = "127.0.0.1"\nport = 9000\n\n'
+        '[database]\nbackend = "postgresql"\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("AGENTCHATROOM_DATA_DIR", str(data_dir))
+    monkeypatch.delenv("AGENTCHATROOM_DATABASE_URL", raising=False)
+    monkeypatch.setenv(SOFTWARE_KEY_ENV, "cli-boot")
+    monkeypatch.setenv(SOFTWARE_NAME_ENV, "CLI Boot")
+    monkeypatch.setenv(SOFTWARE_CLIENT_ENV, "codex")
+    settings = load_settings(config_path, data_dir=data_dir)
+
+    with pytest.raises(SystemExit) as excinfo:
+        main(["room-bootstrap", "--cwd", str(tmp_path), "--config", str(config_path)])
+
+    assert "AGENTCHATROOM_DATABASE_URL" in str(excinfo.value)
+    assert not settings.database_path.exists()
+    assert capsys.readouterr().out == ""
 
 
 def test_room_join_cli_forwards_stable_agent_key_and_model(monkeypatch, capsys):

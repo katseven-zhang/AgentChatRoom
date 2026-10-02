@@ -362,6 +362,7 @@ def _ready_outcome(
     cursor: int,
     notices: list[dict[str, Any]],
     room_session: str,
+    process_connected: bool = True,
 ) -> BootstrapOutcome:
     """Build the ready payload plus the in-memory binding for one Session.
 
@@ -375,7 +376,7 @@ def _ready_outcome(
     public["conversation_synced"] = True
     public["connection"] = {
         "software_configured": True,
-        "process_connected": True,
+        "process_connected": process_connected,
         "room_session": room_session,
         "conversation_synced": True,
     }
@@ -423,6 +424,7 @@ def restore_runtime_binding(
     software_key: str,
     software_name: str,
     client: str,
+    process_connected: bool = True,
 ) -> BootstrapOutcome | None:
     """Reuse the Session this runtime already holds instead of creating a new one.
 
@@ -472,6 +474,7 @@ def restore_runtime_binding(
             }
         ],
         room_session="restored",
+        process_connected=process_connected,
     )
 
 
@@ -491,7 +494,9 @@ def bootstrap_local_room(
     database_first: bool = False,
     selected_project_id: str | None = None,
     credential_id: str | None = None,
-    restore_binding: RuntimeBinding | None = None,) -> BootstrapOutcome:
+    restore_binding: RuntimeBinding | None = None,
+    process_connected: bool = True,
+) -> BootstrapOutcome:
     current_identity = (software_key, software_name, client)
     if loaded_identity is not None and loaded_identity != current_identity:
         return BootstrapOutcome(bootstrap_status_payload("mcp_restart_required"))
@@ -694,6 +699,7 @@ def bootstrap_local_room(
                 software_key=software_key,
                 software_name=software_name,
                 client=client,
+                process_connected=process_connected,
             )
             if restored_outcome is not None:
                 if credential_id and restored_outcome.binding is not None:
@@ -837,6 +843,7 @@ def bootstrap_local_room(
         cursor=cursor,
         notices=notices,
         room_session="created",
+        process_connected=process_connected,
     )
 
 

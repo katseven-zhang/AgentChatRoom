@@ -1787,8 +1787,8 @@ def main(argv: list[str] | None = None) -> None:
         )
     elif args.command == "room-bootstrap":
         from .bootstrap import bootstrap_local_room, configured_software_identity
-        from .database import create_database
-        from .services import AgentChatRoomService
+        from .errors import DomainError
+        from .service_lifetime import require_running_service
 
         identity = configured_software_identity()
         if identity is None:
@@ -1797,8 +1797,38 @@ def main(argv: list[str] | None = None) -> None:
             result = bootstrap_status_payload("identity_not_configured")
         else:
             from .bootstrap import PROJECT_PATH_ENV
+            from .database import create_database
+            from .services import AgentChatRoomService
 
             settings = load_settings(args.config)
+            # Deployment checks and the live service lock both happen before
+            # any database or checkout write. A stopped service must not open
+            # a second writer or report itself as connected.
+            validate_runtime_settings(settings)
+            try:
+                generation = require_running_service(settings)
+            except DomainError as error:
+                required_action = str((error.details or {}).get("required_action") or "")
+                print_result(
+                    {
+                        "ok": False,
+                        "status": error.code,
+                        "required_action": required_action,
+                        "connection": {
+                            "software_configured": True,
+                            "process_connected": False,
+                            "room_session": "absent",
+                            "conversation_synced": False,
+                        },
+                        "error": {
+                            "code": error.code,
+                            "message": error.message,
+                            "required_action": required_action,
+                        },
+                    },
+                    args.json,
+                )
+                raise SystemExit(1) from error
             room_service = AgentChatRoomService(create_database(settings), settings)
             room_service.initialize()
             outcome = bootstrap_local_room(
@@ -1809,8 +1839,13 @@ def main(argv: list[str] | None = None) -> None:
                 model=args.model,
                 cwd=args.cwd or os.getcwd(),
                 explicit_project_path=os.getenv(PROJECT_PATH_ENV, "").strip() or None,
+                process_connected=bool(generation),
             )
             result = outcome.public
+            connection = result.get("connection")
+            if isinstance(connection, dict):
+                connection["process_connected"] = bool(generation)
+                connection["service_generation"] = generation
             if outcome.binding is not None and outcome.binding.token in json.dumps(
                 result, ensure_ascii=False, default=str
             ):
