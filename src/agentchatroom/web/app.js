@@ -3205,8 +3205,10 @@ elements["archive-form"].addEventListener("submit", async (event) => {
   if (!state.projectId) return;
   const permanent = elements["permanent-delete-input"].checked;
   try {
-    closeEventSource();
     await api(`/api/v1/projects/${state.projectId}${permanent ? "?permanent=true" : ""}`, { method: "DELETE" });
+    // 只有确认项目已归档/删除之后才允许断流：先关流会让失败的请求留下一个
+    // 还在显示、却再也不更新事件的页面（#328）。
+    closeEventSource();
     elements["archive-dialog"].close();
     localStorage.removeItem("agentchatroom.projectId");
     state.projectId = null;
