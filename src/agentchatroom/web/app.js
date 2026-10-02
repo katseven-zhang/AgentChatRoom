@@ -3817,7 +3817,12 @@ async function loadTaskEvents(projectId, taskId) {
 
 async function refreshTaskIntakeTargets() {
   if (!state.projectId) return;
-  const result = await api(`/api/v1/projects/${state.projectId}/task-intakes/targets`);
+  const anchor = requestAnchor();
+  const result = await api(`/api/v1/projects/${anchor.projectId}/task-intakes/targets`);
+  // A target list belongs to the project it was queried for: writing it after a
+  // project switch would offer another project's Agents as reassign targets and
+  // enable submit for them (#329).
+  if (!withinRequestScope(anchor)) return false;
   state.taskIntakeTargets = result.targets || [];
   const options = state.taskIntakeTargets
     .map((target) => {

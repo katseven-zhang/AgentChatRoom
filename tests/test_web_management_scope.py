@@ -18,6 +18,8 @@ from __future__ import annotations
 import subprocess
 from pathlib import Path
 
+import pytest
+
 WEB_DIR = Path(__file__).resolve().parent.parent / "src" / "agentchatroom" / "web"
 
 PREAMBLE = """
@@ -200,3 +202,89 @@ def test_every_late_writing_loader_is_scoped():
         body = javascript[javascript.index(name) : javascript.index("\n}\n", javascript.index(name)) + 3]
         assert "requestAnchor()" in body, name
         assert "withinRequestScope(anchor)" in body, name
+
+
+INTAKE_PREAMBLE = """
+const assert = require('node:assert/strict');
+
+const state = {
+  projectId: 'project-a',
+  selectGeneration: 0,
+  taskIntakeTargets: [{member_id: 'previous', name: 'previous'}],
+};
+
+function escapeHtml(value) {
+  return String(value).replace(/[&<>"']/g, (c) => ({'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'}[c]));
+}
+
+const elements = {
+  'task-target-agent-input': {innerHTML: 'KEEP', disabled: true},
+  'task-target-agent-empty': {textContent: 'KEEP', classList: {toggle() {}}},
+  'intake-target-select': {innerHTML: 'KEEP'},
+  'task-intake-submit': {disabled: true},
+};
+
+let waiter = null;
+async function api(url) {
+  return new Promise((resolve) => {
+    waiter = () =>
+      resolve({
+        targets: [
+          {member_id: 'member-x', name: 'Agent X', client: 'client', software_key: 'sk', connection_status: 'connected'},
+        ],
+      });
+  });
+}
+"""
+
+INTAKE_BODY = r"""
+const applied = refreshTaskIntakeTargets();
+await Promise.resolve();
+state.projectId = 'project-b';
+state.selectGeneration += 1;
+const targetsBefore = state.taskIntakeTargets;
+waiter();
+const ok = await applied;
+assert.equal(ok, false, 'a stale target list reports no usable targets');
+assert.equal(state.taskIntakeTargets, targetsBefore, "another project's targets are not stored");
+assert.equal(elements['task-target-agent-input'].innerHTML, 'KEEP', 'the select is not repainted');
+assert.equal(elements['task-intake-submit'].disabled, true, 'submit stays disabled');
+
+const current = refreshTaskIntakeTargets();
+await Promise.resolve();
+waiter();
+assert.equal(await current, true, 'a current response is still applied');
+assert.equal(state.taskIntakeTargets.length, 1);
+assert.equal(elements['task-intake-submit'].disabled, false);
+"""
+
+
+def _intake_harness(tmp_path: Path) -> Path:
+    javascript = (WEB_DIR / "app.js").read_text(encoding="utf-8")
+    helpers_start = javascript.index("function requestAnchor() {")
+    start = javascript.index("async function refreshTaskIntakeTargets() {")
+    end = javascript.index("async function refreshTaskIntakeData(", start)
+    anchor = javascript[
+        helpers_start : javascript.index("async function refreshManagement()")
+    ]
+    harness = tmp_path / "intake_targets.js"
+    harness.write_text(
+        INTAKE_PREAMBLE
+        + "\n"
+        + anchor
+        + "\n"
+        + javascript[start:end]
+        + "\n(async () => {"
+        + INTAKE_BODY
+        + "})();\n",
+        encoding="utf-8",
+    )
+    return harness
+
+
+def test_intake_target_refresh_does_not_cross_projects(tmp_path):
+    harness = _intake_harness(tmp_path)
+    if "function requestAnchor() {" not in harness.read_text(encoding="utf-8"):
+        pytest.fail("no scope helper in this tree")
+    run = subprocess.run(["node", str(harness)], capture_output=True, text=True, encoding="utf-8")
+    assert run.returncode == 0, f"{run.stdout}\n{run.stderr}"
