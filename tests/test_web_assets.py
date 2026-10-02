@@ -789,7 +789,9 @@ def test_web_supports_human_reading_and_guided_interactions():
     # Deep links and Agent-visible numbers use project_seq, not the physical global id.
     assert 'data-open-event="${seq}"' in javascript
     assert "function eventFromCaches(eventSeq)" in javascript
-    assert "location.hash = `event-${seq}`" in javascript
+    assert "history.replaceState" in javascript
+    assert "next.hash = `event-${seq}`" in javascript
+    assert "location.hash = `event-${seq}`" not in javascript
     assert "Number(event.project_seq) === seq" in javascript
     # Navigation labels describe user destinations, not internal release status.
     assert 'class="tab-status"' not in markup
@@ -997,7 +999,7 @@ def test_web_task_view_harness_covers_state_triple_samples(tmp_path):
     start_b = javascript.index("function taskNavigationEntries(tasks)")
     end_b = javascript.index("function renderTaskNavigation(tasks)")
     # Expert filter rendering (exact-state options must carry counts).
-    start_c = javascript.index("function renderTaskExpertFilters(tasks)")
+    start_c = javascript.index("function taskExpertFilterSignature(")
     end_c = javascript.index("function renderTasks(tasks)")
 
     config = {
@@ -1075,7 +1077,7 @@ def test_web_task_view_harness_covers_state_triple_samples(tmp_path):
         "function escapeHtml(value) { return String(value ?? ''); }\n"
         "function shortId(value) { return String(value); }\n"
         "const captured = { expert: '' };\n"
-        "const document = { getElementById: (id) => ({ set innerHTML(value) { captured[id === 'task-expert-filters' ? 'expert' : id] = value; }, get innerHTML() { return captured[id] || ''; } }) };\n"
+        "const document = { getElementById: (id) => ({ dataset: {}, querySelector: () => null, set innerHTML(value) { captured[id === 'task-expert-filters' ? 'expert' : id] = value; }, get innerHTML() { return captured[id] || ''; } }) };\n"
         + javascript[start_a:end_a]
         + "\n"
         + javascript[start_b:end_b]
@@ -1875,11 +1877,11 @@ const elements = {
 
 const dom = {
   'task-navigation': { innerHTML: '' },
-  'task-expert-filters': { innerHTML: '' },
+  'task-expert-filters': { innerHTML: '', dataset: {}, querySelector: () => null },
 };
 
 const document = {
-  getElementById: (id) => dom[id] || elements[id] || { innerHTML: '', addEventListener: () => {} },
+  getElementById: (id) => dom[id] || elements[id] || { innerHTML: '', dataset: {}, querySelector: () => null, addEventListener: () => {} },
   querySelectorAll: (selector) => [],
 };
 
