@@ -524,6 +524,10 @@ class AgentJoin(StrictModel):
     host_id: str | None = None
     workspace_id: str | None = None
     credential_id: str | None = None
+    # Presented project credential (acr.*). When set, the server authenticates
+    # it and that credential's member is the identity. Body member_id and
+    # credential_id are ignored on this path.
+    token: str = ""
 
 
 class AgentHeartbeat(StrictModel):
@@ -1977,15 +1981,26 @@ def create_app(
 
     @app.post("/api/v1/projects/{project_id}/agents/join", status_code=201)
     def join_agent(request: Request, project_id: str, body: AgentJoin) -> dict[str, Any]:
-        # Creating a Session is how a software identity enters the Room, so
-        # this endpoint is management-only. The durable software key is not
-        # accepted from the body: without a credential-bound key, any
-        # unauthenticated caller could name somebody else's identity by
-        # choosing a matching `client`. Remote Agents do not use this route;
-        # they present a management-issued credential through MCP instead.
+        # Creating a Session is how a software identity enters the Room.
+        # Without a credential, this stays management-only: an unauthenticated
+        # caller must not name somebody else's identity by choosing `client`
+        # or `member_id`. A presented project credential is authenticated
+        # here, and that credential — not the body — decides the member.
+        payload = body.model_dump()
+        presented = str(payload.pop("token", "") or "").strip()
+        if presented:
+            credential = service.authenticate_agent_token(
+                presented, project_id=project_id
+            )
+            payload["credential_id"] = str(credential["id"])
+            linked_member = str(credential.get("member_id") or "").strip()
+            payload["member_id"] = linked_member or None
+            return service.join_room(
+                project_id, manage_member_reference=False, **payload
+            )
         _require_management(request)
         return service.join_room(
-            project_id, manage_member_reference=True, **body.model_dump()
+            project_id, manage_member_reference=True, **payload
         )
 
     @app.get("/api/v1/projects/{project_id}/agent-tokens")

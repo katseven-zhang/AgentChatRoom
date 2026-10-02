@@ -5,7 +5,6 @@ import base64
 import json
 import os
 import platform
-import re
 import signal
 import subprocess
 import sys
@@ -47,10 +46,13 @@ def request_json(
     payload: dict[str, Any] | None = None,
     *,
     request_id: str | None = None,
+    authorization: str | None = None,
 ) -> Any:
     normalized_method = method.upper()
     effective_request_id = request_id
     headers = {"Content-Type": "application/json"}
+    if authorization:
+        headers["Authorization"] = authorization
     if normalized_method in MUTATING_HTTP_METHODS:
         effective_request_id = request_id or f"cli_{uuid.uuid4().hex}"
         headers["Idempotency-Key"] = effective_request_id
@@ -133,6 +135,7 @@ def _leave_session(
     token: str,
     *,
     quiet: bool = False,
+    authorization: str | None = None,
 ) -> bool:
     """Close a Session this command opened.
 
@@ -145,6 +148,7 @@ def _leave_session(
             "POST",
             f"/api/v1/projects/{project_id}/agents/{session_id}/leave",
             {"token": token},
+            authorization=authorization,
         )
         return True
     except BaseException as error:
@@ -233,6 +237,64 @@ def _parse_test_specs(specs: list[str]) -> list[dict[str, Any]]:
     return parsed
 
 
+_SUBMIT_CREDENTIAL_CODES = frozenset({
+    "invalid_agent_token",
+    "agent_token_revoked",
+    "agent_token_expired",
+    "agent_token_not_found",
+    "agent_token_project_forbidden",
+})
+
+
+def _submit_error_from_http(error: SystemExit) -> SubmitError | None:
+    """Map a service error into a submit failure when the code is one we own."""
+    try:
+        detail = json.loads(str(error))
+    except json.JSONDecodeError:
+        return None
+    error_body = detail.get("error") or {}
+    code = str(error_body.get("code") or "")
+    message = str(error_body.get("message") or code)
+    details = error_body.get("details") or {}
+    required_action = str(details.get("required_action") or "")
+    if code in _SUBMIT_CREDENTIAL_CODES:
+        return SubmitError(
+            "submit_credential_invalid",
+            message or "The presented project credential is unknown, revoked, or expired",
+            required_action or "issue_new_project_token_and_update_bundle",
+        )
+    if code == "management_auth_required":
+        return SubmitError(
+            "management_auth_required",
+            message or "Management authentication is required for this endpoint",
+            required_action or "provide_management_token",
+        )
+    return None
+
+
+def _submit_request(
+    base_url: str,
+    method: str,
+    path: str,
+    payload: dict[str, Any] | None = None,
+    *,
+    authorization: str | None = None,
+) -> Any:
+    try:
+        return request_json(
+            base_url,
+            method,
+            path,
+            payload,
+            authorization=authorization,
+        )
+    except SystemExit as error:
+        mapped = _submit_error_from_http(error)
+        if mapped is not None:
+            raise mapped from error
+        raise
+
+
 def run_submit(args: argparse.Namespace, base_url: str) -> dict[str, Any]:
     """One-shot REST submission fallback for when the MCP transport is down.
 
@@ -259,7 +321,12 @@ def run_submit(args: argparse.Namespace, base_url: str) -> dict[str, Any]:
         )
     parsed_tests = _parse_test_specs(args.test)
 
-    projects = request_json(base_url, "GET", "/api/v1/projects")["projects"]
+    management_token = str(getattr(args, "management_token", "") or "").strip()
+    authorization = f"Bearer {management_token}" if management_token else None
+
+    projects = _submit_request(
+        base_url, "GET", "/api/v1/projects", authorization=authorization
+    )["projects"]
     wanted = str(args.project).strip()
     # Names stay non-unique. A duplicate display name must fail closed here
     # instead of adding a UNIQUE constraint that existing Rooms may already
@@ -310,25 +377,11 @@ def run_submit(args: argparse.Namespace, base_url: str) -> dict[str, Any]:
             )
         token = entry["token"]
 
-    match = re.match(r"acr\.credential_([0-9a-f]+)\.", token)
-    if match is None:
+    if not token.startswith("acr."):
         raise SubmitError("submit_token_invalid", "The project credential is malformed")
-    credential_id = f"credential_{match.group(1)}"
-    credentials = request_json(
-        base_url, "GET", f"/api/v1/projects/{project_id}/agent-tokens"
-    )["credentials"]
-    credential = next(
-        (item for item in credentials if item.get("id") == credential_id), None
-    )
-    if credential is None or not credential.get("active"):
-        raise SubmitError(
-            "submit_credential_invalid",
-            "The presented project credential is unknown, revoked, or expired",
-            "issue_new_project_token_and_update_bundle",
-        )
 
     local_path = str(Path(args.cwd or os.getcwd()).resolve())
-    registered = request_json(
+    registered = _submit_request(
         base_url,
         "POST",
         f"/api/v1/projects/{project_id}/workspaces",
@@ -337,22 +390,17 @@ def run_submit(args: argparse.Namespace, base_url: str) -> dict[str, Any]:
             "host_name": platform.node(),
             "local_path": local_path,
         },
+        authorization=authorization,
     )
     workspace_id = str(registered.get("workspace", {}).get("id") or "")
     host_id = str(registered.get("host", {}).get("id") or "")
 
-    member_id = credential.get("member_id")
-    members = request_json(
-        base_url, "GET", f"/api/v1/projects/{project_id}/members"
-    ).get("members", [])
-    member = next(
-        (item for item in members if item.get("id") == member_id), None
-    ) if member_id else None
-    member_key = str((member or {}).get("member_key") or "").strip()
-    name = str(args.name or (member or {}).get("name") or "CLI submit").strip()
-    client = str(args.client or member_key.removeprefix("software:") or "cli-submit").strip()
+    # Display labels only. The server derives member_id and credential_id
+    # from the presented secret, so this command cannot name another member.
+    name = str(args.name or "CLI submit").strip()
+    client = str(args.client or "cli-submit").strip()
 
-    joined = request_json(
+    joined = _submit_request(
         base_url,
         "POST",
         f"/api/v1/projects/{project_id}/agents/join",
@@ -360,14 +408,15 @@ def run_submit(args: argparse.Namespace, base_url: str) -> dict[str, Any]:
             "name": name,
             "client": client,
             "model": str(args.model or "unknown"),
-            "credential_id": credential_id,
-            "member_id": member_id,
+            "token": token,
             "workspace_id": workspace_id,
             "host_id": host_id,
         },
+        authorization=authorization,
     )
     session_id = str(joined["agent"]["id"])
     session_token = str(joined.get("token") or joined.get("session_token") or "")
+    member_id = str((joined.get("identity") or {}).get("id") or "")
     result: dict[str, Any] = {
         "ok": True,
         "project": {"id": project_id, "name": project_name},
@@ -377,7 +426,7 @@ def run_submit(args: argparse.Namespace, base_url: str) -> dict[str, Any]:
 
     try:
         if has_message:
-            posted = request_json(
+            posted = _submit_request(
                 base_url,
                 "POST",
                 f"/api/v1/projects/{project_id}/messages",
@@ -389,6 +438,7 @@ def run_submit(args: argparse.Namespace, base_url: str) -> dict[str, Any]:
                         args.model_display_name or args.model or "unknown"
                     ),
                 },
+                authorization=authorization,
             )
             result["message_event_id"] = posted.get("event", {}).get("id") or posted.get(
                 "event_id"
@@ -398,10 +448,11 @@ def run_submit(args: argparse.Namespace, base_url: str) -> dict[str, Any]:
             task_ref = str(args.report_task).strip()
             if task_ref.isdigit():
                 try:
-                    task = request_json(
+                    task = _submit_request(
                         base_url,
                         "GET",
                         f"/api/v1/projects/{project_id}/tasks/by-number/{task_ref}",
+                        authorization=authorization,
                     )
                 except SystemExit as error:
                     # A missing task number (404) or any other server error must
@@ -421,7 +472,7 @@ def run_submit(args: argparse.Namespace, base_url: str) -> dict[str, Any]:
             # session of this same identity: reclaim it explicitly instead of
             # failing the report with not_task_owner.
             try:
-                request_json(
+                _submit_request(
                     base_url,
                     "POST",
                     f"/api/v1/projects/{project_id}/tasks/{task_id}/claim",
@@ -431,12 +482,13 @@ def run_submit(args: argparse.Namespace, base_url: str) -> dict[str, Any]:
                         "reclaim": True,
                         "takeover": bool(args.takeover),
                     },
+                    authorization=authorization,
                 )
                 result["task_reclaimed"] = True
             except SystemExit:
                 result["task_reclaimed"] = False
             tests: list[dict[str, Any]] = parsed_tests
-            report = request_json(
+            report = _submit_request(
                 base_url,
                 "POST",
                 f"/api/v1/projects/{project_id}/tasks/{task_id}/reports",
@@ -449,6 +501,7 @@ def run_submit(args: argparse.Namespace, base_url: str) -> dict[str, Any]:
                     "commit_hash": str(args.commit or ""),
                     "no_code_change_reason": str(args.no_code_change or ""),
                 },
+                authorization=authorization,
             )
             result["report"] = {
                 "task_id": task_id,
@@ -464,7 +517,12 @@ def run_submit(args: argparse.Namespace, base_url: str) -> dict[str, Any]:
                 file=sys.stderr,
             )
         elif _leave_session(
-            base_url, project_id, session_id, session_token, quiet=True
+            base_url,
+            project_id,
+            session_id,
+            session_token,
+            quiet=True,
+            authorization=authorization,
         ):
             print(
                 f"note: session {session_id} was closed after the failure",
@@ -472,7 +530,13 @@ def run_submit(args: argparse.Namespace, base_url: str) -> dict[str, Any]:
             )
         raise
     if not args.keep_session:
-        _leave_session(base_url, project_id, session_id, session_token)
+        _leave_session(
+            base_url,
+            project_id,
+            session_id,
+            session_token,
+            authorization=authorization,
+        )
         result["left"] = True
     else:
         result["left"] = False
@@ -1129,6 +1193,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="acrb.v1 bundle: a file path or the literal value; omit with --token",
     )
     submit.add_argument("--token", default="", help="Single project credential (acr.*)")
+    submit.add_argument(
+        "--management-token",
+        default="",
+        help=(
+            "Management bearer used when the server requires management "
+            "authentication. Omit it and the command fails with "
+            "management_auth_required instead of a bare 401."
+        ),
+    )
     submit.add_argument("--message", default="", help="Room message body to post")
     submit.add_argument(
         "--report-task", default="", help="Task id or number for the work report"
