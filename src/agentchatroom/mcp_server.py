@@ -2323,17 +2323,23 @@ def task_update(
     token: str = "",
     status: str = "",
     title: str = "",
-    description: str = "",
+    description: str | None = None,
     acceptance_criteria: list[str] | None = None,
     depends_on: list[str] | None = None,
     priority: int | None = None,
     progress_percent: int | None = None,
-    current_step: str = "",
-    blocker_reason: str = "",
-    next_step: str = "",
+    current_step: str | None = None,
+    blocker_reason: str | None = None,
+    next_step: str | None = None,
     request_id: str = "",
 ) -> dict[str, Any]:
-    """Update owned task status or details within the server-side state machine."""
+    """Update owned task status or details within the server-side state machine.
+
+    `current_step`, `blocker_reason`, `next_step` and `description` keep the
+    domain's own convention: omitting the argument leaves the field as it is,
+    while an explicit empty string clears it. `title` is not clearable (the domain
+    rejects an empty title), so it still treats an empty string as "not supplied".
+    """
     try:
         _authorize_remote(project_id, "task:write")
     except DomainError as error:
@@ -2344,14 +2350,14 @@ def task_update(
         task_id,
         status=status or None,
         title=title or None,
-        description=description or None,
+        description=description,
         acceptance_criteria=acceptance_criteria,
         depends_on=depends_on,
         priority=priority,
         progress_percent=progress_percent,
-        current_step=current_step or None,
-        blocker_reason=blocker_reason or None,
-        next_step=next_step or None,
+        current_step=current_step,
+        blocker_reason=blocker_reason,
+        next_step=next_step,
         session_id=session_id,
         token=token,
         request_id=_mcp_request_id(request_id),
