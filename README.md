@@ -260,6 +260,8 @@ Linux 或 macOS：
 .venv/bin/agentchatroom stop
 ```
 
+进程已经不在时退出码为 0，JSON 里 `reason` 为 `not_running`。进程仍在、或停止动作本身失败时，同样把结果打到 stdout，退出码为 1。GUI 直接调用同一停止函数并读取返回字典，不经过这个退出码。
+
 查看日志：
 
 ```powershell

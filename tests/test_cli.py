@@ -211,6 +211,35 @@ def test_windows_server_stop_falls_back_when_taskkill_is_rejected(monkeypatch):
     assert calls["kill"] == [(4321, signal.SIGTERM)]
 
 
+def test_stop_command_exit_code_matches_whether_the_process_stopped(
+    monkeypatch, capsys
+):
+    """#301: a live process that did not stop is a failed command."""
+    monkeypatch.setattr(cli, "load_settings", lambda *_args, **_kwargs: object())
+
+    monkeypatch.setattr(
+        cli,
+        "stop_detached_server",
+        lambda _settings: {"stopped": False, "reason": "timeout", "pid": 7},
+    )
+    with pytest.raises(SystemExit) as failed:
+        main(["stop"])
+    assert failed.value.code == 1
+    assert json.loads(capsys.readouterr().out) == {
+        "stopped": False,
+        "reason": "timeout",
+        "pid": 7,
+    }
+
+    monkeypatch.setattr(
+        cli,
+        "stop_detached_server",
+        lambda _settings: {"stopped": False, "reason": "not_running"},
+    )
+    main(["stop"])
+    assert json.loads(capsys.readouterr().out)["reason"] == "not_running"
+
+
 def test_stop_removes_stale_pid_file(settings):
     pid_path = settings.data_dir / "server.pid"
     settings.data_dir.mkdir(parents=True, exist_ok=True)

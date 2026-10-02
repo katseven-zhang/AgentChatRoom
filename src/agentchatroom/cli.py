@@ -1559,7 +1559,12 @@ def main(argv: list[str] | None = None) -> None:
         )
         return
     if args.command == "stop":
-        print_result(stop_detached_server(load_settings(args.config)), args.json)
+        result = stop_detached_server(load_settings(args.config))
+        print_result(result, args.json)
+        # not_running is a successful no-op. A live process that did not
+        # stop, or a terminate error, must not look like success to scripts.
+        if result.get("stopped") is not True and result.get("reason") != "not_running":
+            raise SystemExit(1)
         return
     if args.command == "gui":
         from .gui import run_gui
