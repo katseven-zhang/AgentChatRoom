@@ -28,6 +28,7 @@ This adapter removes that failure mode without weakening the identity model:
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import time
@@ -39,6 +40,7 @@ logger = logging.getLogger(__name__)
 
 MCP_SESSION_ID_HEADER = b"mcp-session-id"
 SOFTWARE_KEY_HEADER = b"x-agentchatroom-software-key"
+AUTHORIZATION_HEADER = b"authorization"
 JSON_CONTENT_TYPE = b"application/json"
 SSE_ACCEPT = b"application/json, text/event-stream"
 ADOPTED_FROM_HEADER = b"x-agentchatroom-adopted-from"
@@ -55,6 +57,32 @@ ADOPTION_BODY_LIMIT = 8 * 1024 * 1024
 
 Scope = MutableMapping[str, Any]
 Message = MutableMapping[str, Any]
+
+
+def _software_key(scope: Scope) -> str:
+    """The declared software identity of this request, or empty when unusable."""
+    raw_key = _scope_header(scope, SOFTWARE_KEY_HEADER)
+    if not raw_key:
+        return ""
+    try:
+        return decode_http_identity_value(raw_key).strip()
+    except ValueError:
+        return ""
+
+
+def _request_identity(scope: Scope) -> str:
+    """A stable, non-reversible fingerprint of who is asking.
+
+    An adopted transport was created with one caller's credential and carries
+    that caller's Room binding, so it may only be reused by the same caller. The
+    fingerprint covers the credential and the declared software identity; a
+    rotated token or a different install therefore opens its own surrogate
+    instead of borrowing someone else's. Only a digest is kept, never the secret.
+    """
+    material = "\x00".join(
+        (_scope_header(scope, AUTHORIZATION_HEADER), _software_key(scope))
+    )
+    return hashlib.sha256(material.encode("utf-8", "surrogateescape")).hexdigest()
 
 
 def _scope_header(scope: Scope, name: bytes) -> str:
@@ -182,7 +210,7 @@ class TolerantSessionAdoptionMiddleware:
         self._handshake_timeout_seconds = float(handshake_timeout_seconds)
         self._max_parked = max(1, int(max_parked_handshakes))
         self._body_limit = max(1, int(body_limit))
-        self._adopted: dict[str, tuple[str, float]] = {}
+        self._adopted: dict[tuple[str, str], tuple[str, float]] = {}
         # Parked synthetic handshake tasks (kept referenced so they are never
         # garbage-collected while still running; each ends when its transport
         # is reaped).
@@ -212,6 +240,10 @@ class TolerantSessionAdoptionMiddleware:
         if not session_id or self._transport_active(session_id):
             await self.app(scope, receive, send)
             return
+        # A bookmark alone never identifies a caller, so it cannot identify an
+        # adopted transport either: the surrogate was opened with its creator's
+        # credential and re-attached to that creator's Room binding.
+        adoption_key = (session_id, _request_identity(scope))
 
         body = b""
         if method == "POST":
@@ -222,7 +254,7 @@ class TolerantSessionAdoptionMiddleware:
                 # silently truncated body that only fails as a parse error (#192).
                 await self._send_payload_too_large(send, error.limit)
                 return
-        surrogate = self._active_surrogate(session_id)
+        surrogate = self._active_surrogate(adoption_key)
         if surrogate is None:
             surrogate = await self._open_surrogate(scope)
             if surrogate is None:
@@ -231,13 +263,16 @@ class TolerantSessionAdoptionMiddleware:
                 # behaviour (401/404) still applies instead of hanging.
                 await self._forward(scope, send, body, session_id=None)
                 return
-            self._remember(session_id, surrogate)
-            self._restore_room_binding(session_id, surrogate, scope)
+            self._remember(adoption_key, surrogate)
             logger.info(
                 "Adopted reaped MCP session %s as %s",
                 session_id[:16],
                 surrogate[:16],
             )
+        # Run on every request, not only on the first adoption: the retained
+        # binding is re-attached to the surrogate under the same identity check,
+        # so a reuse cannot outlive the comparison that authorised it.
+        self._restore_room_binding(session_id, surrogate, scope)
         await self._forward(
             scope, send, body, session_id=surrogate, adopted_from=session_id
         )
@@ -260,18 +295,18 @@ class TolerantSessionAdoptionMiddleware:
             oldest = min(self._adopted.items(), key=lambda item: item[1][1])[0]
             self._adopted.pop(oldest, None)
 
-    def _active_surrogate(self, original_session_id: str) -> str | None:
-        entry = self._adopted.get(original_session_id)
+    def _active_surrogate(self, adoption_key: tuple[str, str]) -> str | None:
+        entry = self._adopted.get(adoption_key)
         if entry is None:
             return None
         surrogate, _ = entry
         if not self._transport_active(surrogate):
-            self._adopted.pop(original_session_id, None)
+            self._adopted.pop(adoption_key, None)
             return None
         return surrogate
 
-    def _remember(self, original_session_id: str, surrogate: str) -> None:
-        self._adopted[original_session_id] = (surrogate, time.monotonic())
+    def _remember(self, adoption_key: tuple[str, str], surrogate: str) -> None:
+        self._adopted[adoption_key] = (surrogate, time.monotonic())
         self._prune_adopted()
 
     def _restore_room_binding(
@@ -279,14 +314,7 @@ class TolerantSessionAdoptionMiddleware:
     ) -> None:
         if self._lookup_binding is None or self._adopt_binding is None:
             return
-        raw_key = _scope_header(scope, SOFTWARE_KEY_HEADER)
-        software_key = ""
-        if raw_key:
-            try:
-                software_key = decode_http_identity_value(raw_key).strip()
-            except ValueError:
-                software_key = ""
-        binding = self._lookup_binding(original_session_id, software_key)
+        binding = self._lookup_binding(original_session_id, _software_key(scope))
         if binding is None:
             return
         self._adopt_binding(surrogate, binding)
