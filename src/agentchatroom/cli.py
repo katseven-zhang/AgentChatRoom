@@ -435,8 +435,18 @@ def run_submit(args: argparse.Namespace, base_url: str) -> dict[str, Any]:
     except BaseException:
         # A report that died half-way must not leave this identity joined:
         # the Session would keep Presence and any task it just reclaimed.
-        if not args.keep_session:
-            _leave_session(base_url, project_id, session_id, session_token, quiet=True)
+        if args.keep_session:
+            print(
+                f"note: session {session_id} was kept because --keep-session was given",
+                file=sys.stderr,
+            )
+        elif _leave_session(
+            base_url, project_id, session_id, session_token, quiet=True
+        ):
+            print(
+                f"note: session {session_id} was closed after the failure",
+                file=sys.stderr,
+            )
         raise
     if not args.keep_session:
         _leave_session(base_url, project_id, session_id, session_token)

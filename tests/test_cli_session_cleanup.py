@@ -19,7 +19,7 @@ from test_cli_submit import _args, _prepared_project, _serve, _stop
 
 
 @pytest.mark.asyncio
-async def test_a_failing_report_still_leaves_the_session(settings, project_dir):
+async def test_a_failing_report_still_leaves_the_session(settings, project_dir, capsys):
     app = create_app(settings)
     project, _member, credential = _prepared_project(app, project_dir)
 
@@ -45,12 +45,13 @@ async def test_a_failing_report_still_leaves_the_session(settings, project_dir):
         assert "agent.joined" in kinds, "the fixture must fail after the join"
         assert "agent.left" in kinds
         assert all(agent["left_at"] for agent in app.state.service.snapshot(project["id"])["agents"])
+        assert "was closed after the failure" in capsys.readouterr().err
     finally:
         await _stop(server, server_task)
 
 
 @pytest.mark.asyncio
-async def test_keep_session_still_keeps_the_session_open(settings, project_dir):
+async def test_keep_session_still_keeps_the_session_open(settings, project_dir, capsys):
     app = create_app(settings)
     project, _member, credential = _prepared_project(app, project_dir)
 
@@ -82,6 +83,7 @@ async def test_keep_session_still_keeps_the_session_open(settings, project_dir):
         assert "agent.left" not in kinds
         assert [agent["name"] for agent in agents] == ["OpenCode"]
         assert agents[0]["left_at"] is None
+        assert "kept because --keep-session" in capsys.readouterr().err
     finally:
         await _stop(server, server_task)
 
