@@ -23,7 +23,14 @@ from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping
 
 from .config import Settings
-from .backup import backup_postgresql, backup_sqlite, restore_postgresql
+from .backup import (
+    BackupError,
+    _validate_sqlite_backup,
+    backup_postgresql,
+    backup_sqlite,
+    restore_postgresql,
+    restore_sqlite,
+)
 from .contracts import (
     ASSIGNMENT_RESPONSES,
     ASSIGNMENT_STATUSES,
@@ -10502,45 +10509,40 @@ class AgentChatRoomService:
             stamp = iso_now().replace(":", "").replace("-", "")
             target = directory / f"backup-{stamp}.sqlite"
             backend = self.settings.database_backend
+            # Write the audit row before the snapshot so the producer stamps
+            # MAX(events.id) once and the file actually contains that event.
+            # A later rewrite of the manifest made the cursor lie about the file.
+            self._emit_backup_event(
+                "backup.created",
+                payload={
+                    "backend": backend,
+                    "output": str(target),
+                    "source": source,
+                },
+                actor_session_id=actor_session_id,
+            )
+            latest_event_id = self._latest_event_id()
             if backend == "sqlite":
-                result = backup_sqlite(self.database.path, target)
+                result = backup_sqlite(
+                    self.database.path,
+                    target,
+                    latest_event_id=latest_event_id,
+                    source_label=source,
+                )
             elif backend == "postgresql":
                 database_url = os.getenv(self.settings.database_url_env, "")
-                result = backup_postgresql(database_url, target)
+                result = backup_postgresql(
+                    database_url,
+                    target,
+                    latest_event_id=latest_event_id,
+                    source_label=source,
+                )
             else:
                 raise DomainError(
                     "backup_backend_unsupported",
                     f"Backups are not supported for backend {backend}",
                     status_code=422,
                 )
-            latest_event_id = self._latest_event_id()
-            manifest_path = Path(result["manifest"])
-            manifest = json_load(manifest_path.read_text(encoding="utf-8"), {})
-            manifest["latest_event_id"] = latest_event_id
-            manifest["source"] = source
-            manifest_path.write_text(
-                json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
-                encoding="utf-8",
-            )
-            self._emit_backup_event(
-                "backup.created",
-                payload={
-                    "backend": backend,
-                    "output": result["output"],
-                    "manifest": str(manifest_path),
-                    "latest_event_id": latest_event_id,
-                    "source": source,
-                },
-                actor_session_id=actor_session_id,
-            )
-            # The audit event about this backup is part of the protected history:
-            # record the cursor again so a fresh backup is never "stale".
-            latest_event_id = self._latest_event_id()
-            manifest["latest_event_id"] = latest_event_id
-            manifest_path.write_text(
-                json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
-                encoding="utf-8",
-            )
             kept = self._prune_backups(max_kept)
             return {**result, "latest_event_id": latest_event_id, "pruned": kept}
 
@@ -10769,6 +10771,22 @@ class AgentChatRoomService:
                 status_code=409,
                 details={"backup_schema": manifest.get("database_schema_version"), "current_schema": current_schema},
             )
+        if self.settings.database_backend == "sqlite":
+            try:
+                _validate_sqlite_backup(target)
+            except BackupError as error:
+                self._emit_backup_event(
+                    "backup.restore_rejected",
+                    payload={"file": str(target), "reason": "backup_unusable"},
+                    actor_session_id=actor_session_id,
+                )
+                raise DomainError(
+                    "backup_unusable",
+                    "The backup file failed integrity or schema validation "
+                    "and the live database was not modified",
+                    status_code=409,
+                    details={"required_action": "delete_backup_and_retake"},
+                ) from error
         # A manifest with no recorded cursor is not the same as a cursor of 0.
         # CLI-produced backups never wrote one, and reading that as 0 made
         # every such backup look older than any non-empty database.
@@ -10842,18 +10860,10 @@ class AgentChatRoomService:
                                 "current_latest_event_id": latest_event_id,
                             },
                         )
-                    source_connection = sqlite3.connect(
-                        f"file:{target.as_posix()}?mode=ro", uri=True
-                    )
-                    try:
-                        # Dest is the same connection that already holds the
-                        # EXCLUSIVE lock and has no open transaction.
-                        source_connection.backup(live_connection)
-                    finally:
-                        source_connection.close()
                 except sqlite3.Error as error:
                     if live_connection is not None:
                         live_connection.close()
+                        live_connection = None
                     raise DomainError(
                         "database_busy",
                         f"The live database is busy; stop writers before restoring: {error}",
@@ -10862,6 +10872,25 @@ class AgentChatRoomService:
                 finally:
                     if live_connection is not None:
                         live_connection.close()
+                        live_connection = None
+                # The file was validated before this lock. Replace it atomically
+                # and drop WAL sidecars in the same step as restore_sqlite,
+                # instead of copying pages into the open live database.
+                try:
+                    restore_sqlite(
+                        target,
+                        Path(self.database.path),
+                        overwrite=True,
+                        write_manifest=False,
+                    )
+                except BackupError as error:
+                    raise DomainError(
+                        "backup_unusable",
+                        "The backup file failed integrity or schema validation "
+                        "and was not applied",
+                        status_code=409,
+                        details={"required_action": "delete_backup_and_retake"},
+                    ) from error
                 self._emit_backup_event(
                     "backup.restore_started",
                     payload={"file": str(target), "stale": stale},
@@ -10920,32 +10949,33 @@ class AgentChatRoomService:
                     payload={"file": str(target), "stale": stale},
                     actor_session_id=actor_session_id,
                 )
+        # unknown_cursor is not "cursor 0". Allowing the restore still discards
+        # every event the manifest cannot account for, so data_loss stays true.
+        data_loss = bool(stale or unknown_cursor)
+        baseline = 0 if backup_event_id is None else int(backup_event_id)
+        lost_events = max(0, int(latest_event_id) - baseline) if data_loss else 0
         self._emit_backup_event(
             "backup.restore_completed",
-            payload={"file": str(target), "restored_latest_event_id": backup_event_id},
+            payload={
+                "file": str(target),
+                "restored_latest_event_id": backup_event_id,
+                "data_loss": data_loss,
+                "unknown_cursor": unknown_cursor,
+                "lost_events": lost_events,
+                "current_latest_event_id": latest_event_id,
+            },
             actor_session_id=actor_session_id,
         )
         return {
             "backend": self.settings.database_backend,
             "input": str(target),
             "restored": True,
-            "data_loss": stale,
+            "data_loss": data_loss,
+            "unknown_cursor": unknown_cursor,
+            "lost_events": lost_events,
+            "backup_latest_event_id": backup_event_id,
+            "current_latest_event_id": latest_event_id,
         }
-
-    def _ensure_sqlite_restorable(self, backup_path: Path) -> None:
-        """Fail loudly when the live SQLite database cannot take a restore."""
-        probe = sqlite3.connect(self.database.path, timeout=0.5)
-        try:
-            probe.execute("BEGIN IMMEDIATE")
-            probe.execute("ROLLBACK")
-        except sqlite3.Error as error:
-            raise DomainError(
-                "database_busy",
-                f"The live database is busy; stop writers before restoring: {error}",
-                status_code=409,
-            ) from error
-        finally:
-            probe.close()
 
     # ------------------------------------------------------------------
     # Project documents: versioned binding/reference docs injected to Agents

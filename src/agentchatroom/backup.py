@@ -53,7 +53,11 @@ def _write_manifest(
         **details,
     }
     path = _manifest_path(target)
-    path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    temporary.write_text(
+        json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+    )
+    os.replace(temporary, path)
     return path
 
 
@@ -85,7 +89,11 @@ def _validate_sqlite_backup(source: Path) -> int:
 
 
 def backup_sqlite(
-    source: Path, target: Path, *, latest_event_id: int | None = None
+    source: Path,
+    target: Path,
+    *,
+    latest_event_id: int | None = None,
+    source_label: str | None = None,
 ) -> dict[str, Any]:
     source = source.expanduser().resolve()
     target = target.expanduser().resolve()
@@ -112,10 +120,13 @@ def backup_sqlite(
     except Exception:
         temporary.unlink(missing_ok=True)
         raise
+    details: dict[str, Any] = {"schema_version": schema_version}
+    if source_label:
+        details["source"] = source_label
     manifest = _write_manifest(
         target,
         backend="sqlite",
-        details={"schema_version": schema_version},
+        details=details,
         latest_event_id=latest_event_id,
     )
     return {"backend": "sqlite", "output": str(target), "manifest": str(manifest)}
@@ -145,7 +156,13 @@ def clear_sqlite_sidecars(target: Path) -> list[str]:
     return removed
 
 
-def restore_sqlite(source: Path, target: Path, *, overwrite: bool = False) -> dict[str, Any]:
+def restore_sqlite(
+    source: Path,
+    target: Path,
+    *,
+    overwrite: bool = False,
+    write_manifest: bool = True,
+) -> dict[str, Any]:
     source = source.expanduser().resolve()
     target = target.expanduser().resolve()
     if source == target:
@@ -175,20 +192,24 @@ def restore_sqlite(source: Path, target: Path, *, overwrite: bool = False) -> di
         temporary.unlink(missing_ok=True)
         raise
     removed_sidecars = clear_sqlite_sidecars(target)
-    manifest = _write_manifest(
-        target,
-        backend="sqlite",
-        details={
-            "restored_from": str(source),
-            "schema_version": schema_version,
-            "removed_sidecars": removed_sidecars,
-        },
-    )
+    manifest_path = ""
+    if write_manifest:
+        manifest_path = str(
+            _write_manifest(
+                target,
+                backend="sqlite",
+                details={
+                    "restored_from": str(source),
+                    "schema_version": schema_version,
+                    "removed_sidecars": removed_sidecars,
+                },
+            )
+        )
     return {
         "backend": "sqlite",
         "input": str(source),
         "output": str(target),
-        "manifest": str(manifest),
+        "manifest": manifest_path,
         "removed_sidecars": removed_sidecars,
     }
 
@@ -277,7 +298,11 @@ def _run_database_tool(
 
 
 def backup_postgresql(
-    database_url: str, target: Path, *, latest_event_id: int | None = None
+    database_url: str,
+    target: Path,
+    *,
+    latest_event_id: int | None = None,
+    source_label: str | None = None,
 ) -> dict[str, Any]:
     if not database_url.strip():
         raise BackupError("PostgreSQL database URL is required for backup")
@@ -312,10 +337,13 @@ def backup_postgresql(
     finally:
         if passfile is not None:
             passfile.unlink(missing_ok=True)
+    details: dict[str, Any] = {"format": "custom"}
+    if source_label:
+        details["source"] = source_label
     manifest = _write_manifest(
         target,
         backend="postgresql",
-        details={"format": "custom"},
+        details=details,
         latest_event_id=latest_event_id,
     )
     return {"backend": "postgresql", "output": str(target), "manifest": str(manifest)}

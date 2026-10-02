@@ -1657,19 +1657,24 @@ def create_app(
     @app.get("/api/v1/admin/backups")
     def list_managed_backups(request: Request) -> dict[str, Any]:
         _require_management(request)
+        effective = effective_backup_settings(resolved, backup_settings_override)
         return {
             "backups": service.list_backups(),
             "auto_backup": {
-                "enabled": resolved.auto_backup_enabled,
-                "interval_seconds": resolved.auto_backup_interval_seconds,
-                "max_kept": resolved.auto_backup_max_kept,
+                "enabled": effective["auto_backup_enabled"],
+                "interval_seconds": effective["auto_backup_interval_seconds"],
+                "max_kept": effective["auto_backup_max_kept"],
             },
         }
 
     @app.post("/api/v1/admin/backups")
     def create_managed_backup(request: Request) -> dict[str, Any]:
         _require_management(request)
-        return service.create_backup(source="management")
+        effective = effective_backup_settings(resolved, backup_settings_override)
+        return service.create_backup(
+            source="management",
+            max_kept=int(effective["auto_backup_max_kept"]),
+        )
 
     @app.post("/api/v1/admin/backups/restore")
     def restore_managed_backup(request: Request, body: BackupRestoreRequest) -> dict[str, Any]:

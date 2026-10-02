@@ -766,14 +766,14 @@ Web 端采用现代科技感设计系统与零构建原生 CSS 资产交付：
 
 - **位置可见性**：运行状态字段卡展示数据库类型、SQLite 绝对路径（PostgreSQL 显示脱敏 DSN 指向）、数据目录与日志路径，值全部来自运行时配置。
 - **立即备份**：`POST /api/v1/admin/backups`（管理认证）把数据库快照写入 `<数据目录>/backups/`，返回备份文件绝对路径（界面可复制）；备份清单记录 schema 版本与事件游标，操作写入审计事件 `backup.created`。
-- **从备份回滚**：`POST /api/v1/admin/backups/restore` 要求键入确认 `confirm="REPLACE"`（界面为二次确认弹窗）；安全校验包括：请求路径必须位于受管备份目录内且以 `backup-` 命名（否则 `backup_path_outside_root`）——恢复会把该文件整体覆盖为 Room 数据库，路径不受约束等于允许把宿主机上任意文件装成数据库；manifest 必须可解析（否则 `backup_manifest_unreadable`，不恢复无法验证的快照）；schema 版本一致（`backup_schema_mismatch`）；备份是否落后于当前最新写入（`backup_stale`，必须显式 `allow_data_loss=true` 接受丢弃较新数据）；数据库是否可写（`database_busy`）。拒绝与完成均写审计事件。回滚会丢弃备份之后的数据，请先确认没有任何 Agent 正在写入。SQLite 路径在 EXCLUSIVE 写锁窗口内完成 stale 判定与复制，并与 `create_backup`/auto_backup_worker 进程互斥串行；PostgreSQL 路径的 `backup.restore_started` 改为在 `pg_restore` **之后**落库——pg_restore 会重写目标库，先写的审计行会被它自己抹掉。
+- **从备份回滚**：`POST /api/v1/admin/backups/restore` 要求键入确认 `confirm="REPLACE"`（界面为二次确认弹窗）；安全校验包括：请求路径必须位于受管备份目录内且以 `backup-` 命名（否则 `backup_path_outside_root`）——恢复会把该文件整体覆盖为 Room 数据库，路径不受约束等于允许把宿主机上任意文件装成数据库；manifest 必须可解析（否则 `backup_manifest_unreadable`，不恢复无法验证的快照）；schema 版本一致（`backup_schema_mismatch`）；备份是否落后于当前最新写入（`backup_stale`，必须显式 `allow_data_loss=true` 接受丢弃较新数据）；数据库是否可写（`database_busy`）。拒绝与完成均写审计事件。回滚会丢弃备份之后的数据，请先确认没有任何 Agent 正在写入。SQLite 路径在改写 live 库之前对备份文件本身做 `PRAGMA integrity_check` 与 `schema_meta` 校验（空文件、截断文件、没有 `schema_meta` 的异库返回 `backup_unusable`，live 库不动），然后在进程互斥下用 `restore_sqlite` 做临时文件校验、`os.replace` 与 `-wal/-shm/-journal` 清理，不再把页直接拷进已打开的 live 库；PostgreSQL 路径的 `backup.restore_started` 改为在 `pg_restore` **之后**落库——pg_restore 会重写目标库，先写的审计行会被它自己抹掉。
 - **删除备份**：`DELETE /api/v1/admin/backups/{filename}`（管理认证）安全删除指定的数据库快照及其元数据清单（`.manifest.json`），Web 界面提供二次确认弹窗防误触。严格限制文件名必须符合 `backup-*.sqlite` 命名格式，禁止路径穿越或删除未受管快照，成功删除后写入审计事件 `backup.deleted`。
 - **自动备份**：受验证配置 `[backup]`：`auto_backup_enabled`（默认关闭）、`auto_backup_interval_seconds`（默认 3600，最小 60）、`auto_backup_max_kept`（默认 10，超出自动清理最旧备份），环境变量 `AGENTCHATROOM_AUTO_BACKUP_*` 可覆盖。项目设置对话框（项目设置重设计任务）接线同一配置，无第二套事实来源。保存后生效的保留数由服务记住，手动「立即备份」按**当前生效值**剪枝，而不是启动时的旧快照——否则把保留数调大后一次手动备份就会按旧值不可逆删掉多份备份。
 
 备份子系统的两条容错约束（CLI `backup.py` 与管理端共用）：
 
 - **单个坏 manifest 不得拖垮整个子系统。** 清单列举同时喂给管理页面和自动备份 worker，一个截断/二进制/无法解析的 manifest 若抛异常，会让列举返回 500 并让自动备份**静默永久停止**。现按条容错读取，并在列表中给出 `manifest_readable=false` 让运维看得见，而不是把「没有游标」误读成「备份很旧」。
-- **「没记录游标」不等于「游标为 0」。** CLI 生成的 manifest 从不写 `latest_event_id`，旧实现用 `int(... or 0)` 把它读成 0，于是任何此类备份相对非空库都判为 stale。现区分「未知」与「0」：未知时返回 `backup_cursor_unknown`（带 `required_action`），需显式 `allow_data_loss` 才继续，不会伪装成已证明的 stale。CLI `backup` 现主动读取事件游标并写入 manifest（`backup_sqlite` / `backup_postgresql` 新增可选 `latest_event_id`）；确实读不到游标的调用方会明确不写该字段，而不是让 manifest 看起来完整。
+- **「没记录游标」不等于「游标为 0」。** CLI 生成的 manifest 从不写 `latest_event_id`，旧实现用 `int(... or 0)` 把它读成 0，于是任何此类备份相对非空库都判为 stale。现区分「未知」与「0」：未知时返回 `backup_cursor_unknown`（带 `required_action`），需显式 `allow_data_loss` 才继续，不会伪装成已证明的 stale。允许继续时返回体和 `backup.restore_completed` 的 `data_loss` 为 true，并给出 `lost_events`（按当前最新事件号减去备份游标，无游标按 0 起算）以及 `unknown_cursor`，和「游标已知但落后」区分开。CLI `backup` 现主动读取事件游标并写入 manifest（`backup_sqlite` / `backup_postgresql` 新增可选 `latest_event_id`）；确实读不到游标的调用方会明确不写该字段，而不是让 manifest 看起来完整。
 
 CLI 侧的 `backup.py` 与上述管理端行为一致，且有两处额外约束：
 

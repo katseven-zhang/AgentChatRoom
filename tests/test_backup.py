@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 import sqlite3
+from pathlib import Path
 
 import pytest
 
@@ -153,6 +155,85 @@ def test_service_restore_rejects_unsafe_and_restores_with_confirmation(service, 
         stale["output"], confirm="REPLACE", allow_data_loss=True
     )
     assert restored_with_loss["data_loss"] is True
+
+
+def test_restore_rejects_unusable_files_and_keeps_the_live_database(service, project):
+    """#240: a zero-byte or foreign file must not replace the live Room."""
+    import sqlite3
+
+    from agentchatroom.database import SCHEMA_VERSION
+    from agentchatroom.errors import DomainError
+
+    service.post_message(project["id"], body="keep-me")
+    directory = service._backup_directory()
+    directory.mkdir(parents=True, exist_ok=True)
+
+    def plant(name: str, writer) -> Path:
+        target = directory / name
+        writer(target)
+        manifest = target.with_name(target.name + ".manifest.json")
+        manifest.write_text(
+            json.dumps(
+                {
+                    "database_schema_version": SCHEMA_VERSION,
+                    "latest_event_id": 1,
+                }
+            ),
+            encoding="utf-8",
+        )
+        return target
+
+    empty = plant("backup-empty-probe.sqlite", lambda path: path.write_bytes(b""))
+
+    def write_foreign(path: Path) -> None:
+        connection = sqlite3.connect(path)
+        connection.execute("CREATE TABLE unrelated(id INTEGER)")
+        connection.commit()
+        connection.close()
+
+    foreign = plant("backup-foreign-probe.sqlite", write_foreign)
+    for candidate in (empty, foreign):
+        with pytest.raises(DomainError) as refused:
+            service.restore_backup(
+                str(candidate), confirm="REPLACE", allow_data_loss=True
+            )
+        assert refused.value.code == "backup_unusable"
+        assert refused.value.details["required_action"] == "delete_backup_and_retake"
+    with service.database.connect() as connection:
+        present = connection.execute(
+            "SELECT COUNT(*) AS total FROM projects"
+        ).fetchone()["total"]
+    assert present >= 1
+
+
+def test_allow_data_loss_on_a_cursorless_backup_reports_the_loss(service, project):
+    """#369: no cursor plus allow_data_loss must not claim data_loss false."""
+    import json as json_module
+
+    service.post_message(project["id"], body="before-backup")
+    created = service.create_backup()
+    manifest_path = Path(created["manifest"])
+    manifest = json_module.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest.pop("latest_event_id", None)
+    manifest_path.write_text(json_module.dumps(manifest), encoding="utf-8")
+    service.post_message(project["id"], body="after-backup")
+
+    restored = service.restore_backup(
+        created["output"], confirm="REPLACE", allow_data_loss=True
+    )
+
+    assert restored["unknown_cursor"] is True
+    assert restored["data_loss"] is True
+    assert restored["lost_events"] >= 1
+    assert restored["backup_latest_event_id"] is None
+
+
+def test_explicit_retention_keeps_backups_above_the_startup_default(service, project):
+    """#352: a raised max_kept must be the value the next backup prunes with."""
+    service.enforce_backup_retention(50)
+    for _ in range(12):
+        service.create_backup(max_kept=50)
+    assert len(service.list_backups()) == 12
 
 
 def test_service_restore_rejects_schema_mismatch(service, project):
