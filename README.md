@@ -922,6 +922,10 @@ Windows 与 Ubuntu 上依次跑 `pytest` → `node --check` → `compileall` →
   请求成本随返回行数而不是文件大小增长；`server.pid` 也改为容错读取，内容不是纯数字
   （半写入、被别的进程占位、含非 ASCII 字节）时按「未托管」处理而不再抛 UnicodeDecodeError 变成 500。
   真正的写入端轮转/上限仍未落地，属于独立事项，不并入本条已修复范围。
+  同一张卡也收掉了首页缓存的无界增长：`index_html_cache` 原先是以
+  `(index.html mtime, 各资产 mtime)` 为键的 dict，每出现一组新的 mtime 组合就多存一份渲染后的
+  整页 HTML 且永不淘汰（长时间运行 + 反复改前端文件的管理端会一直攒）。现在只保留一份
+  `(key, html)`，键变了就地替换，因此常驻进程里最多存在当前那一版页面。
 - **连接等待两个后端同源**：`database.connect_timeout_seconds`（默认 10 秒）此前只作用于
   PostgreSQL，SQLite 侧在 `sqlite3.connect(timeout=…)` 与 `PRAGMA busy_timeout` 两处各硬编一份 10；
   现在两处都由该配置派生（SQLite 的「连接等待」就是驱动的 busy 等待，二者必须同源），

@@ -96,3 +96,44 @@ def test_admin_runtime_reports_a_live_pid(settings):
 
     assert body["process"]["pid"] == "4242"
     assert body["process"]["managed"] is True
+
+
+def _index_cache_cell(app):
+    for route in app.routes:
+        endpoint = getattr(route, "endpoint", None)
+        if getattr(endpoint, "__name__", "") == "web_index":
+            cells = dict(zip(endpoint.__code__.co_freevars, endpoint.__closure__ or ()))
+            if "index_html_cache" in cells:
+                return cells["index_html_cache"]
+    raise AssertionError("web_index route not found")
+
+
+def test_index_html_cache_holds_one_entry_and_evicts_the_old_one(tmp_path, settings):
+    import os
+    import time
+
+    from agentchatroom import api as api_module
+
+    web_dir = Path(api_module.__file__).with_name("web")
+    assets = ("app.js", "app.css", "favicon.svg")
+    before = {name: os.stat(web_dir / name).st_mtime_ns for name in assets}
+    try:
+        with TestClient(create_app(settings)) as client:
+            assert client.get("/").status_code == 200
+            first = _index_cache_cell(client.app).cell_contents
+            assert isinstance(first, tuple)
+            first_key = first[0]
+
+            stamp = int(time.time()) + 10
+            for name in assets:
+                os.utime(web_dir / name, (stamp, stamp))
+
+            assert client.get("/").status_code == 200
+            second = _index_cache_cell(client.app).cell_contents
+    finally:
+        for name, ns in before.items():
+            seconds = ns / 1e9
+            os.utime(web_dir / name, times=(seconds, seconds))
+
+    assert second[0] != first_key
+    assert isinstance(second[1], bytes) and b"?v=" in second[1]

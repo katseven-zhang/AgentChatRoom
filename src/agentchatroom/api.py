@@ -2677,7 +2677,11 @@ def create_app(
         # 验收退回修正：favicon 使用自身文件内容的指纹，而非复用 js/css 指纹。
         asset_fingerprint_cache: dict[str, tuple[tuple[int, int], str]] = {}
         fingerprint_assets = ("app.js", "app.css", "favicon.svg")
-        index_html_cache: dict[tuple[int, int, int, int], bytes] = {}
+        # One slot, not a dict keyed by mtimes: every distinct mtime combination
+        # used to add an entry that nothing ever evicted, so a long-lived server
+        # that touched index.html or an asset often enough kept every rendered
+        # copy of the page in memory (#282).
+        index_html_cache: tuple[tuple[int, ...], bytes] | None = None
 
         def _asset_fingerprint(name: str) -> str:
             asset = web_dir / name
@@ -2691,6 +2695,7 @@ def create_app(
 
         @app.get("/", include_in_schema=False)
         def web_index() -> Response:
+            nonlocal index_html_cache
             index_path = web_dir / "index.html"
             key = (
                 index_path.stat().st_mtime_ns,
@@ -2702,8 +2707,7 @@ def create_app(
             # Cache hits must reuse the stored document: computing ``html``
             # only inside the miss branch left it unbound on the second
             # request, turning every page refresh into a 500.
-            html = index_html_cache.get(key)
-            if html is None:
+            if index_html_cache is None or index_html_cache[0] != key:
                 html = index_path.read_bytes()
                 for name in fingerprint_assets:
                     html = re.sub(
@@ -2711,7 +2715,9 @@ def create_app(
                         b"\\g<1>" + _asset_fingerprint(name).encode(),
                         html,
                     )
-                index_html_cache[key] = html
+                index_html_cache = (key, html)
+            else:
+                html = index_html_cache[1]
             return Response(
                 html,
                 media_type="text/html",
