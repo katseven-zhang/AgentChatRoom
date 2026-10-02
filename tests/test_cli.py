@@ -371,6 +371,42 @@ def test_mcp_config_prints_grok_toml(monkeypatch, tmp_path, capsys):
     assert "enabled = true" in output
 
 
+def test_named_mcp_config_formats_use_real_profile_identity(monkeypatch, tmp_path, capsys):
+    """#303: named clients must not emit placeholder software identity."""
+    monkeypatch.setenv("AGENTCHATROOM_DATA_DIR", str(tmp_path / "runtime"))
+    monkeypatch.setenv("AGENTCHATROOM_EXTERNAL_BASE_URL", "https://room.example.test")
+    expected = {
+        "workbuddy-json": ("workbuddy", "WorkBuddy", "workbuddy"),
+        "grok-toml": ("grok-build", "Grok Build", "grok-build"),
+        "codex-toml": ("codex", "Codex", "codex"),
+    }
+    placeholders = (
+        "<stable-software-key>",
+        "<Software name>",
+        "<software-client-code>",
+    )
+    for transport in ("local-stdio", "remote-bridge", "streamable-http"):
+        for fmt, identity in expected.items():
+            main(["mcp-config", "--format", fmt, "--transport", transport])
+            output = capsys.readouterr().out
+            for placeholder in placeholders:
+                assert placeholder not in output
+            key, name, client = identity
+            assert key in output
+            assert name in output
+            assert client in output
+            if transport == "streamable-http":
+                assert "X-AgentChatRoom-Software-Key" in output
+                assert "X-AgentChatRoom-Software-Name" in output
+                assert "X-AgentChatRoom-Software-Client" in output
+            else:
+                assert f'AGENTCHATROOM_SOFTWARE_KEY = "{key}"' in output or (
+                    f'"AGENTCHATROOM_SOFTWARE_KEY": "{key}"' in output
+                )
+                assert name in output
+                assert client in output
+
+
 def test_mcp_config_prints_streamable_http_codex_toml(monkeypatch, tmp_path, capsys):
     monkeypatch.setenv("AGENTCHATROOM_EXTERNAL_BASE_URL", "https://room.example.test")
 

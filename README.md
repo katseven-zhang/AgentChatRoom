@@ -427,6 +427,8 @@ HTTP 同一路径匹配多个项目或多个 roots 中混有无法解析的路�
 .venv\Scripts\python.exe -m agentchatroom mcp-config --format codex-toml --transport local-stdio
 ```
 
+`workbuddy-json`、`grok-toml` 和 `codex-toml` 在 `local-stdio`、`remote-bridge`、`streamable-http` 三种 transport 下都打印该客户端 profile 自己的配置（`local_config_text` / `remote_bridge_config_text` / `streamable_http_config_text`）。其中 `AGENTCHATROOM_SOFTWARE_KEY`、`AGENTCHATROOM_SOFTWARE_NAME`、`AGENTCHATROOM_SOFTWARE_CLIENT` 是这个 profile 的真实身份，不以 `<` 开头，因此写进客户端后可以被 `room_bootstrap` 接受。它们不再走带占位身份的顶层 `generic_json` / `codex_toml` / `grok_toml` / `remote_bridge_toml`。`generic-json` 仍是待填写的通用模板，身份占位符必须换成用户确认的名称后才能连接。远程 Bridge 与 HTTP 配置里的项目凭据位置仍然是待粘贴的凭据槽，因为 `mcp-config` 执行时还没有签发凭据。
+
 开发期 stdio 入口推荐：
 
 ```powershell

@@ -1610,32 +1610,33 @@ def main(argv: list[str] | None = None) -> None:
     if args.command == "mcp-config":
         settings = load_settings(args.config, data_dir=args.data_dir)
         integration = build_mcp_integration(settings)
-        if args.transport == "remote-bridge":
-            formats = {
-                "generic-json": "remote_bridge_json",
-                "workbuddy-json": "remote_bridge_json",
-                "grok-toml": "remote_bridge_toml",
-                "codex-toml": "remote_bridge_toml",
-            }
-        elif args.transport == "streamable-http":
-            formats = {
-                "generic-json": "streamable_http_json",
-                "workbuddy-json": "streamable_http_json",
-                "grok-toml": "grok_streamable_http_toml",
-                "codex-toml": "codex_streamable_http_toml",
-            }
-        else:
-            formats = {
-                "generic-json": "generic_json",
-                "workbuddy-json": "generic_json",
-                "grok-toml": "grok_toml",
-                "codex-toml": "codex_toml",
-            }
-        output = integration[formats[args.format]]
-        if args.format in {"grok-toml", "codex-toml"}:
-            print(output, end="")
-        else:
-            print_result(output, args.json)
+        # generic-json stays the fill-in template. Every named client prints
+        # that profile's own config text, whose software identity is a real
+        # value rather than the `<...>` placeholders on the top-level aliases.
+        profile_ids = {
+            "workbuddy-json": "workbuddy",
+            "grok-toml": "grok_build",
+            "codex-toml": "codex",
+        }
+        text_keys = {
+            "local-stdio": "local_config_text",
+            "remote-bridge": "remote_bridge_config_text",
+            "streamable-http": "streamable_http_config_text",
+        }
+        profile_id = profile_ids.get(args.format)
+        if profile_id is not None:
+            output = integration["profiles"][profile_id][text_keys[args.transport]]
+            if args.format == "workbuddy-json":
+                print_result(json.loads(output), args.json)
+            else:
+                print(output, end="")
+            return
+        generic_keys = {
+            "local-stdio": "generic_json",
+            "remote-bridge": "remote_bridge_json",
+            "streamable-http": "streamable_http_json",
+        }
+        print_result(integration[generic_keys[args.transport]], args.json)
         return
 
     if args.command in {"backup", "restore"}:
