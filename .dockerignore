@@ -7,7 +7,8 @@
 # tooling the image never reads.
 #
 # Kept deliberately because deploy/Dockerfile COPYs them: pyproject.toml,
-# README.md, LICENSE, src/, deploy/config.server.example.toml.
+# README.md, LICENSE, requirements-docker.txt, src/, deploy/config.server.example.toml.
+# uv.lock is kept too: it is the source these requirement files are generated from.
 .agentchatroom/
 docs/
 evidence/

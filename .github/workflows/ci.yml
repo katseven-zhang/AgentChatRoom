@@ -25,6 +25,14 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
+      - name: Check release requirements are still derived from uv.lock
+        run: |
+          python -m pip install "uv==0.12.13"
+          uv export --frozen --no-dev --extra postgresql --no-editable --no-emit-project -o requirements-docker.txt
+          uv export --frozen --no-dev --extra dev --extra gui --no-editable --no-emit-project -o requirements-windows.txt
+          git diff --exit-code requirements-docker.txt requirements-windows.txt
+      - name: Check image build context size
+        run: python scripts/check_build_context.py
       - name: Install
         run: python -m pip install -e ".[dev]"
       - name: Test
