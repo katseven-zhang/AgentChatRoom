@@ -1701,10 +1701,38 @@ function renderTaskNavigation(tasks) {
     </button>`).join("");
 }
 
+function taskExpertFilterSignature(tasks, expert) {
+  const owners = [...new Set(tasks.map((task) => task.owner_session_id).filter(Boolean))].sort();
+  const phaseCounts = {};
+  for (const task of tasks) {
+    const phase = taskView(task).phase;
+    phaseCounts[phase] = (phaseCounts[phase] || 0) + 1;
+  }
+  return JSON.stringify({
+    owners,
+    phaseCounts,
+    execution: expert.execution || "",
+    verification: expert.verification || "",
+    integration: expert.integration || "",
+    priority: expert.priority,
+    owner: expert.owner || "",
+    phase: expert.phase || "",
+  });
+}
+
 function renderTaskExpertFilters(tasks) {
   const container = document.getElementById("task-expert-filters");
   if (!container) return;
   const expert = state.taskExpert;
+  const signature = taskExpertFilterSignature(tasks, expert);
+  const numberInput = container.querySelector('[data-expert="number"]');
+  const numberFocused = Boolean(numberInput) && document.activeElement === numberInput;
+  const selectionStart = numberFocused ? numberInput.selectionStart : null;
+  const selectionEnd = numberFocused ? numberInput.selectionEnd : null;
+  // The task-number box is rebuilt only when the option set or the counts
+  // change. Keystrokes and a busy-room refresh keep the same <input> (#320).
+  if (container.dataset.filterSignature === signature) return;
+  container.dataset.filterSignature = signature;
   const names = Object.fromEntries((state.snapshot?.agents || []).map((agent) => [agent.id, agent.name]));
   const owners = [...new Set(tasks.map((task) => task.owner_session_id).filter(Boolean))]
     .map((id) => `<option value="${escapeHtml(id)}" ${expert.owner === id ? "selected" : ""}>${escapeHtml(names[id] || shortId(id))}</option>`)
@@ -1735,6 +1763,13 @@ function renderTaskExpertFilters(tasks) {
     <label>负责人<select data-expert="owner"><option value="">全部</option>${owners}</select></label>
     <label>任务号<input type="search" inputmode="numeric" placeholder="#号" data-expert="number" value="${escapeHtml(expert.number)}"></label>
     ${phases.length ? `<label>精确状态<select data-expert="phase"><option value="">全部</option>${phaseOptions(phases)}</select></label>` : ""}`;
+  if (!numberFocused) return;
+  const restored = container.querySelector('[data-expert="number"]');
+  if (!restored) return;
+  restored.focus();
+  if (selectionStart != null && restored.setSelectionRange) {
+    restored.setSelectionRange(selectionStart, selectionEnd);
+  }
 }
 
 function renderTaskSortControls() {
