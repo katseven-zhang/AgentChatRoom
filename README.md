@@ -791,6 +791,7 @@ CLI 侧的 `backup.py` 与上述管理端行为一致，且有两处额外约束
 - 存储：文档是 Room 数据（数据库表 `project_documents`，schema v19），每次编辑生成不可变新版本，当前版本为指针；历史版本可查、绝不改写或删除。文档增删改全部写审计事件（`document.created` / `document.updated` / `document.archived`），文档更新随 Room 事件流增量可见，不做全量内容推送。
 - 读写权限：REST `GET /api/v1/projects/{id}/documents`（清单）与 `GET .../documents/{doc_key}`（含历史）为只读；创建新版本与归档（`POST .../documents`、`POST .../documents/{doc_key}/archive`）走管理认证，保留用于运维脚本场景。项目文档由 Agent 经 MCP 接口（`project_document_upsert`）进行不可变新版本维护，人工仅经 REST 脚本化操作，Web 管理端仅提供只读展示而不提供人工编辑界面。MCP 提供 `project_document_list`、`project_document_get`（按 kind/version 取全文）与 `project_document_upsert`；CLI 提供 `doc-list` / `doc-get`。规范注入与回执闭环保持不变。
 - 三者分工：仓库 `AGENTS.md` 定义协作流程，`README.md` 是产品公共契约，项目文档承载**本项目**的架构与工程规范，互不同步复制。
+- Web 只读展示的正文缓存按（项目, `doc_key`, 版本）三元组分区，切换项目与「尚未添加项目」都会清空该缓存：正文不会因两个项目使用同名 `doc_key`（甚至同版本号）而把项目 A 的内容显示在项目 B 下；请求返回时若项目已切换，这份迟到响应被直接丢弃，既不写缓存也不打补丁到当前界面。取文失败不再被静默吞掉：面板给出「文档加载失败」错误态与可点的重试按钮，并按同一三元组记住这次失败，避免每次重渲染都重发同一个注定失败的请求（此前会一直停在「正在加载文档…」）；手动重试会先清除该失败记录再取文，文档出新版本时也只按新版本重新判定。
 
 ### 项目设置：每个选项的语义与生效时机
 

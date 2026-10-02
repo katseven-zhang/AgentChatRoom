@@ -1099,6 +1099,8 @@ async function selectProject(projectId) {
     state.projectId = projectId;
     localStorage.setItem("agentchatroom.projectId", projectId);
     resetProjectFilters();
+    // 缓存虽已按项目分区，切项目仍要清空：离开的项目不该把正文长期留在内存里。
+    state.documentContentCache = {};
     state.events = [];
     state.eventIds = new Set();
     state.snapshot = snapshot;
@@ -1346,6 +1348,7 @@ function renderProjects() {
 function renderEmptyRoom() {
   stopPresenceRefresh();
   state.snapshot = null;
+  state.documentContentCache = {};
   state.events = [];
   state.members = [];
   state.credentials = [];
@@ -2096,13 +2099,24 @@ function renderWorkspaces() {
     : '<div class="empty-state">Agent 远程加入后会自动登记 Workspace</div>';
 }
 
-function documentCacheEntry(docKey, version) {
-  const cached = state.documentContentCache[docKey];
+function documentCacheKey(projectId, docKey) {
+  return `${projectId}|${docKey}`;
+}
+
+function documentCacheEntry(projectId, docKey, version) {
+  const cached = state.documentContentCache[documentCacheKey(projectId, docKey)];
   return cached && String(cached.version) === String(version) ? cached : null;
 }
 
+function documentErrorHtml(docKey, message) {
+  return `<span class="state-title">文档加载失败</span><span>${escapeHtml(message || "未知错误")}</span><button type="button" class="secondary-button state-retry" data-doc-retry="${escapeHtml(docKey)}">重试</button>`;
+}
+
 function documentBodyHtml(doc) {
-  const cached = documentCacheEntry(doc.doc_key, doc.version);
+  const cached = documentCacheEntry(state.projectId, doc.doc_key, doc.version);
+  if (cached && cached.failed) {
+    return `<div class="state-box error-state" data-doc-content="${escapeHtml(doc.doc_key)}">${documentErrorHtml(doc.doc_key, cached.message)}</div>`;
+  }
   if (cached) {
     return `<pre class="code-block project-doc-content" data-doc-content="${escapeHtml(doc.doc_key)}">${escapeHtml(cached.content)}</pre>`;
   }
@@ -2127,12 +2141,12 @@ function renderDocuments() {
         </summary>
         <div class="project-doc-body">
           ${documentBodyHtml(doc)}
-          <div class="doc-history secondary-text">${escapeHtml(documentHistoryText(documentCacheEntry(doc.doc_key, doc.version) || {}))}</div>
+          <div class="doc-history secondary-text">${escapeHtml(documentHistoryText(documentCacheEntry(state.projectId, doc.doc_key, doc.version) || {}))}</div>
         </div>
       </details>`).join("")
     : '<div class="empty-state">还没有项目文档。规范（binding）会在 Agent 认领任务时自动注入上下文并盖版本回执。</div>';
   docs.forEach((doc) => {
-    if (!documentCacheEntry(doc.doc_key, doc.version)) refreshDocumentBody(doc).catch(() => {});
+    if (!documentCacheEntry(state.projectId, doc.doc_key, doc.version)) refreshDocumentBody(doc);
   });
 }
 
@@ -2151,9 +2165,29 @@ function patchDocumentBody(loaded) {
 }
 
 async function refreshDocumentBody(doc) {
-  const result = await api(`/api/v1/projects/${state.projectId}/documents/${encodeURIComponent(doc.doc_key)}`);
-  const loaded = result.document;
-  state.documentContentCache[doc.doc_key] = loaded;
+  const requestedProject = state.projectId;
+  const cacheKey = documentCacheKey(requestedProject, doc.doc_key);
+  let loaded;
+  try {
+    const result = await api(`/api/v1/projects/${requestedProject}/documents/${encodeURIComponent(doc.doc_key)}`);
+    loaded = result.document;
+  } catch (error) {
+    if (state.projectId !== requestedProject) return null;
+    // 失败态按 (项目, doc_key, 版本) 记住：既不把同一注定失败的请求在每次渲染
+    // 时重发，也让界面给出可重试的错误态而不是一直“正在加载文档…”。
+    state.documentContentCache[cacheKey] = {
+      doc_key: doc.doc_key,
+      version: doc.version,
+      failed: true,
+      message: error && error.message ? error.message : "未知错误",
+    };
+    showDocumentError(doc.doc_key, error);
+    return null;
+  }
+  // 响应到达时项目可能已经切换：晚到的正文属于上一个项目，写进缓存或界面都会
+  // 让项目 B 显示项目 A 的文档。
+  if (state.projectId !== requestedProject) return null;
+  state.documentContentCache[cacheKey] = loaded;
   patchDocumentBody(loaded);
   return loaded;
 }
@@ -2164,7 +2198,7 @@ function showDocumentError(docKey, error) {
   const box = document.createElement("div");
   box.className = "state-box error-state";
   box.dataset.docContent = docKey;
-  box.innerHTML = `<span class="state-title">文档加载失败</span><span>${escapeHtml(error.message || "未知错误")}</span><button type="button" class="secondary-button state-retry" data-doc-retry="${escapeHtml(docKey)}">重试</button>`;
+  box.innerHTML = documentErrorHtml(docKey, error && error.message);
   container.replaceWith(box);
 }
 
@@ -2179,7 +2213,10 @@ function wireDocumentList() {
       loading.dataset.docContent = docKey;
       loading.textContent = "正在加载文档…";
       retryButton.closest(".state-box").replaceWith(loading);
-      if (doc) refreshDocumentBody(doc).catch((error) => showDocumentError(docKey, error));
+      // 失败记录会挡住同一 (doc_key, 版本) 的自动加载，重试必须先清除它，
+      // 否则下一次渲染会立刻还原成错误态而不是重新取文。
+      delete state.documentContentCache[documentCacheKey(state.projectId, docKey)];
+      if (doc) refreshDocumentBody(doc);
       return;
     }
   });
