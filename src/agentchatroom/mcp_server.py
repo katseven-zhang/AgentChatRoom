@@ -80,6 +80,11 @@ _session_bindings_lock = threading.RLock()
 # transport while resuming the same Room Session. The transport id is only a
 # client bookmark; identity is always re-derived from credentials and headers.
 _transport_tombstones: dict[str, tuple[RuntimeBinding, float]] = {}
+# Room Session orphaned by a bootstrap that never reached the domain (roots or
+# identity preparation failed). It revives nothing but the next bootstrap's
+# restore path, so the connection keeps no usable binding in the meantime, and it
+# expires under the same window as the adoption tombstones above.
+_pending_restores: dict[str, tuple[RuntimeBinding, float]] = {}
 _TOMBSTONE_DEFAULT_LIMIT = 256
 _TOMBSTONE_DEFAULT_TTL_SECONDS = 86400.0
 _tombstone_limit = _TOMBSTONE_DEFAULT_LIMIT
@@ -199,6 +204,11 @@ class ServiceBoundToolManager(CompatibleToolManager):
                     },
                 )
             if name == "room_bootstrap":
+                if restored is None:
+                    # Only this path may revive a Session that a preparation failure
+                    # orphaned, and reviving means restoring it -- every other tool
+                    # still finds no binding here and has to bootstrap again.
+                    restored = lookup_pending_restore(session_key)
                 access = get_access_token() if self.service_provider is not None else None
                 bundled_project_id = None
                 uses_bundle = bool(
@@ -216,25 +226,37 @@ class ServiceBoundToolManager(CompatibleToolManager):
                             "This MCP Session is already bound to another Project; open a new client task Session",
                             status_code=409,
                         )
-                # Rebinding must fail closed, including identity and roots errors.
+                # Rebinding fails closed from here: no tool may act on a workspace
+                # the client can no longer show.
                 persist_runtime_binding(session_key, None)
                 _runtime_binding.set(None)
-                # The pre-clear binding is offered to the domain so a live
-                # runtime restores its existing Session instead of creating a
-                # new one; a failed bootstrap still leaves no binding behind.
-                restore_token = _bootstrap_restore_binding.set(restored)
-                roots_token = _bootstrap_workspace_roots.set(
-                    await collect_mcp_workspace_roots(
+                try:
+                    roots = await collect_mcp_workspace_roots(
                         context,
                         timeout_seconds=get_service().settings.mcp_roots_timeout_seconds,
                         required=not uses_bundle,
                         allow_home_placeholder=bool(uses_bundle and bundled_project_id),
                     )
-                )
+                    http_identity = None
+                    if self.service_provider is not None:
+                        http_identity = _software_identity_from_http(context)
+                except DomainError:
+                    # The attempt never reached the domain -- the client could not
+                    # answer the roots question, or the identity read failed -- so it
+                    # must not cost the caller its Session identity either. Keep that
+                    # restorable while the live binding stays cleared; otherwise the
+                    # next bootstrap reports room_session="created" with no inherited
+                    # task, while the still-online old Session blocks reclaim.
+                    retain_pending_restore(session_key, restored)
+                    raise
+                # The pre-clear binding is offered to the domain so a live
+                # runtime restores its existing Session instead of creating a
+                # new one; a bootstrap the domain then refuses leaves no binding
+                # behind.
+                restore_token = _bootstrap_restore_binding.set(restored)
+                roots_token = _bootstrap_workspace_roots.set(roots)
                 if self.service_provider is not None:
-                    http_identity_token = _bootstrap_http_identity.set(
-                        _software_identity_from_http(context)
-                    )
+                    http_identity_token = _bootstrap_http_identity.set(http_identity)
             elif name == "room_join" and self.service_provider is not None:
                 # A remote join resolves identity from the same validated
                 # credential/header source as bootstrap, so identity is never a
@@ -262,6 +284,11 @@ class ServiceBoundToolManager(CompatibleToolManager):
                 # binding it stored is visible here but its ContextVar write is
                 # not. Re-persisting the stale local value would clear it.
                 persist_runtime_binding(session_key, get_runtime_binding(session_key))
+                if isinstance(result, dict) and result.get("ok") is True:
+                    # The Session is live again under this transport; the orphan
+                    # record that only existed to survive a preparation failure has
+                    # no job left and must not outlive the binding it restored.
+                    drop_pending_restore(session_key)
             elif name == "session_leave":
                 # Only a leave the domain actually accepted may destroy the binding.
                 # The tool answers a rejection with a normal `ok: False` envelope, so
@@ -527,6 +554,7 @@ def configure_transport_tombstones(
         if ttl_seconds is not None and ttl_seconds > 0:
             _tombstone_ttl_seconds = float(ttl_seconds)
         _prune_transport_tombstones_locked()
+        _prune_pending_restores_locked()
 
 
 def _prune_transport_tombstones_locked() -> None:
@@ -591,6 +619,45 @@ def adopt_transport_binding(
 def clear_transport_tombstones() -> None:
     with _session_bindings_lock:
         _transport_tombstones.clear()
+        _pending_restores.clear()
+
+
+def _prune_pending_restores_locked() -> None:
+    now = time.monotonic()
+    for key, (_, recorded) in list(_pending_restores.items()):
+        if now - recorded > _tombstone_ttl_seconds:
+            _pending_restores.pop(key, None)
+    while len(_pending_restores) > _tombstone_limit:
+        oldest = min(_pending_restores.items(), key=lambda item: item[1][1])[0]
+        _pending_restores.pop(oldest, None)
+
+
+def retain_pending_restore(session_key: str, binding: RuntimeBinding | None) -> None:
+    """Orphan a bootstrap's Session for the restore path only.
+
+    A preparation failure means the domain never saw this attempt, so the caller
+    should not lose its Session over it -- but the live binding stays cleared, so
+    no tool may act on a workspace the client can no longer show.
+    """
+    if not session_key or binding is None:
+        return
+    with _session_bindings_lock:
+        _prune_pending_restores_locked()
+        _pending_restores[session_key] = (binding, time.monotonic())
+
+
+def lookup_pending_restore(session_key: str) -> RuntimeBinding | None:
+    if not session_key:
+        return None
+    with _session_bindings_lock:
+        _prune_pending_restores_locked()
+        entry = _pending_restores.get(session_key)
+    return entry[0] if entry is not None else None
+
+
+def drop_pending_restore(session_key: str) -> None:
+    with _session_bindings_lock:
+        _pending_restores.pop(session_key, None)
 
 
 def session_transport_state(project_id: str, session_id: str) -> str:
@@ -666,8 +733,10 @@ def clear_runtime_binding(session_key: str | None = None) -> None:
         with _session_bindings_lock:
             _session_bindings.clear()
             _transport_tombstones.clear()
+            _pending_restores.clear()
         return
     persist_runtime_binding(session_key, None)
+    drop_pending_restore(session_key)
 
 
 def clear_bindings_for_agent_session(session_id: str) -> None:
@@ -677,6 +746,9 @@ def clear_bindings_for_agent_session(session_id: str) -> None:
         for key, binding in list(_session_bindings.items()):
             if binding is not None and binding.session_id == session_id:
                 _session_bindings[key] = None
+        for key, (pending, _) in list(_pending_restores.items()):
+            if pending.session_id == session_id:
+                _pending_restores.pop(key, None)
     current = _runtime_binding.get()
     if current is not None and current.session_id == session_id:
         _runtime_binding.set(None)
@@ -690,8 +762,25 @@ def _http_roots_required_error(message: str) -> DomainError:
         details={
             "required_action": REQUIRED_ACTIONS["ambiguous_workspace"],
             "http_correct_action": HTTP_UNREGISTERED_ROOTS_ACTION,
+            "session_restorable": True,
         },
     )
+
+
+# Not a bootstrap status, so it is not in REQUIRED_ACTIONS (that table is
+# contract-tested against BOOTSTRAP_STATES); this is the adapter's own next step.
+ROOTS_PREP_REQUIRED_ACTION = "restore_client_connection_and_retry_bootstrap"
+
+
+def _roots_prep_details(required_action: str) -> dict[str, Any]:
+    """Roots never reached the domain, so this connection lost no authority gain.
+
+    The live binding is cleared either way -- no tool may act on a workspace the
+    client can no longer show -- but the Room Session is kept restorable: restore
+    the client connection (or advertise one usable workspace) and bootstrap again
+    to get the same Session back, with its tasks and leases intact.
+    """
+    return {"required_action": required_action, "session_restorable": True}
 
 
 async def collect_mcp_workspace_roots(
@@ -731,9 +820,19 @@ async def collect_mcp_workspace_roots(
     try:
         result = await asyncio.wait_for(list_roots(), timeout=timeout_seconds)
     except TimeoutError as error:
-        raise DomainError("workspace_roots_unavailable", "Workspace roots timed out; restore the client connection before bootstrap", status_code=409) from error
+        raise DomainError(
+            "workspace_roots_unavailable",
+            "Workspace roots timed out; restore the client connection before bootstrap",
+            status_code=409,
+            details=_roots_prep_details(ROOTS_PREP_REQUIRED_ACTION),
+        ) from error
     except Exception as error:
-        raise DomainError("workspace_roots_unavailable", "Workspace roots failed; restore the client connection before bootstrap", status_code=409) from error
+        raise DomainError(
+            "workspace_roots_unavailable",
+            "Workspace roots failed; restore the client connection before bootstrap",
+            status_code=409,
+            details=_roots_prep_details(ROOTS_PREP_REQUIRED_ACTION),
+        ) from error
     advertised_roots = list(getattr(result, "roots", None) or [])
     roots: list[Path] = []
     for root in advertised_roots:
@@ -742,9 +841,19 @@ async def collect_mcp_workspace_roots(
         if path is not None:
             roots.append(path)
         else:
-            raise DomainError("workspace_roots_unavailable", "Workspace root is not a valid file URI", status_code=409)
+            raise DomainError(
+                "workspace_roots_unavailable",
+                "Workspace root is not a valid file URI",
+                status_code=409,
+                details=_roots_prep_details(REQUIRED_ACTIONS["ambiguous_workspace"]),
+            )
     if not roots:
-        raise DomainError("workspace_roots_unavailable", "Client supplied an empty workspace", status_code=409)
+        raise DomainError(
+            "workspace_roots_unavailable",
+            "Client supplied an empty workspace",
+            status_code=409,
+            details=_roots_prep_details(REQUIRED_ACTIONS["ambiguous_workspace"]),
+        )
     if allow_home_placeholder and len(roots) == 1:
         # Some clients advertise homedir() as a hardcoded "home" root, even
         # when the conversation is in another workspace. Treat that exact
@@ -828,6 +937,9 @@ def _check_stdio_lifetime() -> None:
         with _session_bindings_lock:
             for key in _session_bindings:
                 _session_bindings[key] = None
+            # Nor an orphaned one waiting to be restored: it belonged to the
+            # service generation that just stopped.
+            _pending_restores.clear()
         _runtime_binding.set(None)
         _stdio_generation = generation
 

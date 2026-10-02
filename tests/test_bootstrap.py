@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -751,6 +752,154 @@ def test_credential_rejected_session_leave_keeps_the_runtime_binding(
         refused["error"]["details"]["required_action"]
         == "retry_leave_or_continue_with_current_binding"
     )
+
+
+def test_roots_failure_keeps_the_previous_bootstrap_binding(
+    monkeypatch, service, project_dir
+):
+    """#270: roots 采集失败不是领域拒绝，不得把已有 Session 变成新会话。"""
+    _configure_software(monkeypatch)
+    project = _register_project(service, project_dir)
+    monkeypatch.setattr(mcp_server, "service", service)
+    monkeypatch.setattr(
+        service,
+        "settings",
+        replace(service.settings, mcp_roots_timeout_seconds=0.02),
+    )
+    monkeypatch.chdir(project_dir)
+    state = {"uris": [project_dir.resolve().as_uri()], "stalled": False}
+
+    class FakeContext:
+        def __init__(self) -> None:
+            async def list_roots():
+                if state["stalled"]:
+                    await asyncio.sleep(1)
+                return SimpleNamespace(
+                    roots=[SimpleNamespace(uri=uri) for uri in state["uris"]]
+                )
+
+            self.request_context = SimpleNamespace(
+                session=SimpleNamespace(
+                    list_roots=list_roots, session_id="roots-probe"
+                )
+            )
+
+    ctx = FakeContext()
+    first = _call_tool("room_bootstrap", {}, context=ctx)
+    assert first["ok"] is True
+    session_id = first["result"]["session"]["id"]
+    key = mcp_server.mcp_session_key(ctx)
+    binding = mcp_server.get_runtime_binding(key)
+    assert binding is not None
+
+    # Own work, so the loss would be observable rather than theoretical.
+    created = _call_tool(
+        "task_create",
+        {"title": "#270 keep this task", "acceptance_criteria": ["still owned"]},
+        context=ctx,
+    )
+    assert created["ok"] is True
+    task_id = created["result"]["task"]["id"]
+    assert _call_tool("task_claim", {"task_id": task_id}, context=ctx)["ok"] is True
+    leased = _call_tool(
+        "lease_acquire",
+        {"path_pattern": "#270-keep.py", "reason": "#270 restore after roots failure"},
+        context=ctx,
+    )
+    assert leased["ok"] is True
+    lease_id = leased["result"]["lease"]["id"]
+
+    # The client stops answering the roots question: a transient hiccup, not a
+    # rebinding attempt the domain refused.
+    state["stalled"] = True
+    failed = _call_tool("room_bootstrap", {}, context=ctx)
+    assert failed["ok"] is False
+    assert failed["error"]["code"] == "workspace_roots_unavailable"
+
+    # Fail closed is untouched: a connection whose roots went away gets no usable
+    # binding and no tool may act on it.
+    assert mcp_server.get_runtime_binding(key) is None
+    refused = _call_tool("room_sync", {}, context=ctx)
+    assert refused["ok"] is False
+    assert refused["error"]["code"] == "session_expired"
+
+    # What the failure must not cost is the Session identity itself.
+    state["stalled"] = False
+    again = _call_tool("room_bootstrap", {}, context=ctx)
+    assert again["ok"] is True
+    assert again["result"]["connection"]["room_session"] == "restored"
+    assert again["result"]["session"]["id"] == session_id
+    owned = service.get_task(project["id"], task_id)
+    assert owned["owner_session_id"] == session_id
+    leases = {
+        lease["id"]: lease
+        for lease in service.snapshot(project["id"])["leases"]
+    }
+    assert leases[lease_id]["session_id"] == session_id
+    assert mcp_server.lookup_pending_restore(key) is None
+
+    # The rejection also states the next step instead of quietly costing the run.
+    assert (
+        failed["error"]["details"]["required_action"]
+        == "restore_client_connection_and_retry_bootstrap"
+    )
+    assert failed["error"]["details"]["session_restorable"] is True
+
+
+def test_pending_restore_is_dropped_with_the_binding_lifecycle(monkeypatch, service, project_dir):
+    """#270: 恢复记录只是补偿，不能越过显式离开或服务重启存活。"""
+    _configure_software(monkeypatch)
+    _register_project(service, project_dir)
+    monkeypatch.setattr(mcp_server, "service", service)
+    monkeypatch.setattr(
+        service,
+        "settings",
+        replace(service.settings, mcp_roots_timeout_seconds=0.02),
+    )
+    monkeypatch.chdir(project_dir)
+    uri = project_dir.resolve().as_uri()
+    state = {"stalled": False}
+
+    class FakeContext:
+        def __init__(self) -> None:
+            async def list_roots():
+                if state["stalled"]:
+                    await asyncio.sleep(1)
+                return SimpleNamespace(roots=[SimpleNamespace(uri=uri)])
+
+            self.request_context = SimpleNamespace(
+                session=SimpleNamespace(
+                    list_roots=list_roots, session_id="pending-restore"
+                )
+            )
+
+    ctx = FakeContext()
+    key = mcp_server.mcp_session_key(ctx)
+    first = _call_tool("room_bootstrap", {}, context=ctx)
+    assert first["ok"] is True
+    session_id = first["result"]["session"]["id"]
+    assert mcp_server.lookup_pending_restore(key) is None
+
+    state["stalled"] = True
+    assert _call_tool("room_bootstrap", {}, context=ctx)["ok"] is False
+    pending = mcp_server.lookup_pending_restore(key)
+    assert pending is not None and pending.session_id == session_id
+
+    # A stop/start or a full registry reset must not be survived either.
+    mcp_server.clear_runtime_binding()
+    assert mcp_server.lookup_pending_restore(key) is None
+
+    state["stalled"] = False
+    restarted = _call_tool("room_bootstrap", {}, context=ctx)
+    assert restarted["ok"] is True
+    restarted_session = restarted["result"]["session"]["id"]
+    state["stalled"] = True
+    assert _call_tool("room_bootstrap", {}, context=ctx)["ok"] is False
+    assert mcp_server.lookup_pending_restore(key) is not None
+
+    # An explicit leave of that Session takes the orphan record with it.
+    mcp_server.clear_bindings_for_agent_session(restarted_session)
+    assert mcp_server.lookup_pending_restore(key) is None
 
 
 def test_bootstrap_does_not_log_live_token(monkeypatch, service, project_dir):

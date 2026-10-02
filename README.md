@@ -568,7 +568,7 @@ room_bootstrap
 2. 当前工作目录向上查找 `.agentchatroom/project.json`；
 3. 只有调用环境完全没有提供 roots 或 cwd 时，底层解析器才允许使用已验证的 `AGENTCHATROOM_PROJECT_PATH`。已提供但未登记的工作区必须失败，不能回退到旧项目。
 
-客户端提供 roots 时只解析 roots，不再混入服务进程的 cwd；未提供 roots 才检查 cwd。若当前工作区与配置路径冲突，当前工作区优先，并返回 `configured_project_path_ignored` 提示。未登记返回 `project_not_registered`，任何候选登记损坏返回 `registration_invalid`，多个不同 Project 返回 `ambiguous_workspace`。进程启动阶段不自动加入 Room，须等待客户端完成 `room_bootstrap` 后才建立 Presence，防止启动 cwd 或旧配置替换别的项目会话。
+客户端提供 roots 时只解析 roots，不再混入服务进程的 cwd；未提供 roots 才检查 cwd。若当前工作区与配置路径冲突，当前工作区优先，并返回 `configured_project_path_ignored` 提示。未登记返回 `project_not_registered`，任何候选登记损坏返回 `registration_invalid`，多个不同 Project 返回 `ambiguous_workspace`。roots 采集阶段的失败（客户端超时、不回报 roots、根 URI 非法、空工作区、身份头读取失败）发生在领域层之前，不算一次被拒绝的改绑，因此不该让调用方赔上自己的 Session：这条连接的可写绑定照旧被清空（看不到工作区的客户端不能继续写任何项目，后续工具调用得到 `session_expired`），但原 Room Session 会被放进一张“仅用于恢复”的有界表里，与采纳墓碑表共用同一套上限与存活窗口配置；错误体带 `required_action=restore_client_connection_and_retry_bootstrap`（没有可用工作区时是 `open_one_workspace_folder`）与 `session_restorable=true`。恢复客户端连接后重新 `room_bootstrap` 会回到同一个 Session（`connection.room_session="restored"`），任务与租约归属不变，不会出现“旧会话还在线却挡住 reclaim、新会话什么都不继承”。真正交给领域判断的尝试仍然完全失败封闭：跨 Project 的 `project_session_rebind_forbidden`、领域拒绝工作区/身份/登记的场合都不留下可写绑定，也不进入这张恢复表；显式 `session_leave`、服务 stop/start（generation 变化）与 `clear_runtime_binding` 都会一并清除恢复记录。进程启动阶段不自动加入 Room，须等待客户端完成 `room_bootstrap` 后才建立 Presence，防止启动 cwd 或旧配置替换别的项目会话。
 
 同一个软件身份可同时在同一或不同 Project 工作。独立 stdio 进程各自持有绑定；共享 HTTP 服务中的绑定按实际 MCP Session 隔离。多个客户端任务共用同一个 MCP 配置和服务进程，同时保有各自轻量 Session；新 Session 不关闭旧 Session，也不转移旧 Session 的任务。多项目 Session 第一次成功绑定后不能改绑另一个 Project；应由另一个客户端任务 Session 选择另一项凭据。普通 bootstrap 失败会废弃该连接旧绑定；被拒绝的跨 Project 改绑不会破坏原绑定，也不会影响其他连接。
 
