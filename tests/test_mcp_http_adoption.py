@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from types import SimpleNamespace
 
 import pytest
 
 from agentchatroom.mcp_http_adoption import (
+    IncompleteRequestBodyError,
     PayloadTooLargeError,
     _read_request_body,
     with_session_adoption,
@@ -465,3 +467,191 @@ async def test_normal_sized_adoption_post_still_replays():
     assert json.loads(body)["ok"] is True
     methods = [r["payload"].get("method") for r in app.requests]
     assert methods == ["initialize", "notifications/initialized", "tools/call"]
+
+
+class _StreamingApp:
+    """Streams like an SSE writer and closes only when the transport aborts."""
+
+    def __init__(self) -> None:
+        self.requests: list[dict] = []
+        self.active: dict[str, bool] = {}
+        self.observed: list[dict] = []
+        self._counter = 0
+
+    def is_active(self, transport_id: str) -> bool:
+        return bool(self.active.get(transport_id))
+
+    async def __call__(self, scope, receive, send) -> None:
+        chunks = bytearray()
+        while True:
+            message = await receive()
+            if message.get("type") != "http.request":
+                break
+            chunks.extend(message.get("body") or b"")
+            if not message.get("more_body"):
+                break
+        payload = json.loads(bytes(chunks) or b"{}")
+        self.requests.append({"method": payload.get("method")})
+        if payload.get("method") == "initialize":
+            self._counter += 1
+            session_id = f"synthetic-{self._counter}"
+            self.active[session_id] = True
+            await send(
+                {
+                    "type": "http.response.start",
+                    "status": 200,
+                    "headers": [(MCP_SESSION_ID.encode(), session_id.encode())],
+                }
+            )
+            await send({"type": "http.response.body", "body": b'{"result":{}}'})
+            return
+        if payload.get("method") == "notifications/initialized":
+            await send({"type": "http.response.start", "status": 202, "headers": []})
+            await send({"type": "http.response.body", "body": b""})
+            return
+        await send(
+            {
+                "type": "http.response.start",
+                "status": 200,
+                "headers": [(b"content-type", b"text/event-stream")],
+            }
+        )
+        await send(
+            {"type": "http.response.body", "body": b"data: one\n\n", "more_body": True}
+        )
+        self.observed.append(await receive())
+        await send({"type": "http.response.body", "body": b""})
+
+
+def _abort_scope() -> dict:
+    return {
+        "type": "http",
+        "method": "POST",
+        "path": "/mcp",
+        "headers": [
+            (MCP_SESSION_ID.encode(), b"reaped-1"),
+            (b"x-agentchatroom-software-key", b"workbuddy"),
+        ],
+        "query_string": b"",
+    }
+
+
+def _abort_receive(frames: list[dict]):
+    """A transport receive: hands over ``frames`` then blocks (client connected)."""
+    queue = list(frames)
+    stuck = asyncio.Event()
+
+    async def receive():
+        if queue:
+            return queue.pop(0)
+        await stuck.wait()
+        return {"type": "http.disconnect"}
+
+    return receive
+
+
+@pytest.mark.asyncio
+async def test_read_request_body_rejects_disconnect_before_completion():
+    """#306: a mid-body abort is a prefix, not a request, so it must not return."""
+    frames = [
+        {"type": "http.request", "body": b'{"method":"tools/call"', "more_body": True},
+        {"type": "http.disconnect"},
+    ]
+
+    async def receive():
+        return frames.pop(0)
+
+    with pytest.raises(IncompleteRequestBodyError) as exc_info:
+        await _read_request_body(receive, limit=4096)
+    assert exc_info.value.received == len(b'{"method":"tools/call"')
+
+
+@pytest.mark.asyncio
+async def test_truncated_body_is_rejected_instead_of_replayed_as_a_request():
+    app = FakeMcpApp()
+    middleware = _middleware(app)
+    messages: list[dict] = []
+
+    async def send(message):
+        messages.append(message)
+
+    await middleware(
+        _abort_scope(),
+        _abort_receive(
+            [
+                {
+                    "type": "http.request",
+                    "body": b'{"jsonrpc":"2.0","id":1,"method":"tools/call"',
+                    "more_body": True,
+                },
+                {"type": "http.disconnect"},
+            ]
+        ),
+        send,
+    )
+
+    start, body = _response(messages)
+    assert start["status"] == 400
+    error = json.loads(body)["error"]
+    assert error["code"] == "request_body_incomplete"
+    assert error["data"]["required_action"] == "resend_request"
+    # Neither the truncated prefix nor a surrogate handshake reached downstream.
+    assert app.requests == []
+
+
+@pytest.mark.asyncio
+async def test_client_abort_reaches_the_adopted_streaming_request():
+    """#306: the replay must forward a real disconnect, not park forever."""
+    app = _StreamingApp()
+    middleware = _middleware(app)
+    messages: list[dict] = []
+
+    async def send(message):
+        messages.append(message)
+
+    reads = 0
+
+    async def receive():
+        nonlocal reads
+        reads += 1
+        if reads == 1:
+            return {
+                "type": "http.request",
+                "body": json.dumps(_business_call("reaped-1")).encode(),
+                "more_body": False,
+            }
+        return {"type": "http.disconnect"}
+
+    await asyncio.wait_for(middleware(_abort_scope(), receive, send), timeout=2)
+
+    assert app.observed[-1] == {"type": "http.disconnect"}
+    start, _ = _response(messages)
+    assert start["status"] == 200
+
+
+@pytest.mark.asyncio
+async def test_connected_client_is_not_reported_as_aborted_mid_stream():
+    """The relay must forward disconnects, never invent them mid-response."""
+    app = _StreamingApp()
+    middleware = _middleware(app)
+
+    async def send(message):
+        pass
+
+    receive = _abort_receive(
+        [
+            {
+                "type": "http.request",
+                "body": json.dumps(_business_call("reaped-1")).encode(),
+                "more_body": False,
+            }
+        ]
+    )
+
+    task = asyncio.create_task(middleware(_abort_scope(), receive, send))
+    with pytest.raises(asyncio.TimeoutError):
+        await asyncio.wait_for(asyncio.shield(task), timeout=0.2)
+    assert app.observed == []
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task

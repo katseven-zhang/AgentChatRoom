@@ -239,7 +239,11 @@ class ExpiredSessionHintMiddleware:
                     # already-buffered prefix, byte-identical to the original).
                     passthrough_after_overflow = True
                     await send(start)
-                    for chunk in chunks:
+                    # ``chunks`` already ends with the current message, so the
+                    # prefix is everything before it; the current message is then
+                    # forwarded verbatim once. Re-sending it here would duplicate
+                    # those bytes and corrupt the JSON the client tries to parse.
+                    for chunk in chunks[:-1]:
                         await send(
                             {
                                 "type": "http.response.body",
@@ -247,8 +251,7 @@ class ExpiredSessionHintMiddleware:
                                 "more_body": True,
                             }
                         )
-                    if body:
-                        await send(message)
+                    await send(message)
                     chunks.clear()
                     buffering = False
                     return

@@ -163,3 +163,43 @@ async def test_expired_session_middleware_forwards_non_http_scopes():
 
     await with_expired_session_hints(app)({"type": "lifespan"}, receive, send)
     assert seen == ["lifespan"]
+
+
+@pytest.mark.asyncio
+async def test_oversized_404_overflow_forwards_every_frame_exactly_once():
+    """#306 follow-up: the overflow switch must stay byte-exact and keep its tail."""
+    from agentchatroom.mcp_http_recovery import _MAX_BUFFERED_BODY
+
+    payload = [b"a" * 4096] * 20
+    assert sum(len(chunk) for chunk in payload) > _MAX_BUFFERED_BODY
+
+    async def app(scope, receive, send):
+        await send(
+            {
+                "type": "http.response.start",
+                "status": 404,
+                "headers": [(b"content-type", b"application/json")],
+            }
+        )
+        for chunk in payload:
+            await send({"type": "http.response.body", "body": chunk, "more_body": True})
+        # A chunked response may close with an empty terminating frame.
+        await send({"type": "http.response.body", "body": b"", "more_body": False})
+
+    async def receive():
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    sent: list[dict] = []
+
+    async def send(message):
+        sent.append(message)
+
+    await with_expired_session_hints(app)(
+        {"type": "http", "method": "POST", "headers": []}, receive, send
+    )
+
+    frames = [message for message in sent if message["type"] == "http.response.body"]
+    # Core consequence: the frame that crossed the buffer used to be flushed twice.
+    assert b"".join(message.get("body") or b"" for message in frames) == b"".join(payload)
+    assert sum(1 for message in frames if not message.get("more_body")) == 1
+    assert frames[-1]["body"] == b""

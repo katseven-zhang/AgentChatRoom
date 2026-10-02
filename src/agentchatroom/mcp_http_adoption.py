@@ -128,6 +128,14 @@ class PayloadTooLargeError(Exception):
         self.limit = limit
 
 
+class IncompleteRequestBodyError(Exception):
+    """Raised when the client aborted before the adoption-path body completed."""
+
+    def __init__(self, received: int) -> None:
+        super().__init__(f"request body incomplete after {received} bytes")
+        self.received = received
+
+
 class _Recorder:
     """Minimal ASGI responder used for the server-side initialisation handshake."""
 
@@ -251,13 +259,20 @@ class TolerantSessionAdoptionMiddleware:
         adoption_key = (session_id, _request_identity(scope))
 
         body = b""
+        body_consumed = False
         if method == "POST":
+            body_consumed = True
             try:
                 body = await _read_request_body(receive, limit=self._body_limit)
             except PayloadTooLargeError as error:
                 # Fail closed with a structured 413 instead of replaying a
                 # silently truncated body that only fails as a parse error (#192).
                 await self._send_payload_too_large(send, error.limit)
+                return
+            except IncompleteRequestBodyError as error:
+                # The client is already gone: nothing may be replayed and no
+                # surrogate may be opened for a request that never completed.
+                await self._send_incomplete_body(send, error.received)
                 return
         surrogate = self._active_surrogate(adoption_key)
         if surrogate is None:
@@ -273,7 +288,14 @@ class TolerantSessionAdoptionMiddleware:
                         # credentials, shutdown, ...). Replay untouched so the
                         # original, closed behaviour (401/404) still applies
                         # instead of hanging.
-                        await self._forward(scope, send, body, session_id=None)
+                        await self._forward(
+                            scope,
+                            send,
+                            body,
+                            session_id=None,
+                            upstream_receive=receive,
+                            body_consumed=body_consumed,
+                        )
                         return
                     self._remember(adoption_key, surrogate)
                     logger.info(
@@ -286,7 +308,13 @@ class TolerantSessionAdoptionMiddleware:
         # so a reuse cannot outlive the comparison that authorised it.
         self._restore_room_binding(session_id, surrogate, scope)
         await self._forward(
-            scope, send, body, session_id=surrogate, adopted_from=session_id
+            scope,
+            send,
+            body,
+            session_id=surrogate,
+            adopted_from=session_id,
+            upstream_receive=receive,
+            body_consumed=body_consumed,
         )
 
     def _transport_active(self, transport_session_id: str) -> bool:
@@ -374,6 +402,37 @@ class TolerantSessionAdoptionMiddleware:
             {
                 "type": "http.response.start",
                 "status": 413,
+                "headers": [
+                    (b"content-type", b"application/json"),
+                    (b"content-length", str(len(payload)).encode("latin-1")),
+                ],
+            }
+        )
+        await send({"type": "http.response.body", "body": payload})
+
+    async def _send_incomplete_body(
+        self, send: Callable[[Message], Awaitable[None]], received: int
+    ) -> None:
+        payload = json.dumps(
+            {
+                "error": {
+                    "code": "request_body_incomplete",
+                    "message": "Client disconnected before the request body completed",
+                    "data": {
+                        "code": "request_body_incomplete",
+                        "received_bytes": received,
+                        "required_action": "resend_request",
+                    },
+                }
+            }
+        ).encode("utf-8")
+        logger.warning(
+            "Adoption dropped request aborted after %d body bytes", received
+        )
+        await send(
+            {
+                "type": "http.response.start",
+                "status": 400,
                 "headers": [
                     (b"content-type", b"application/json"),
                     (b"content-length", str(len(payload)).encode("latin-1")),
@@ -489,7 +548,9 @@ class TolerantSessionAdoptionMiddleware:
         body: bytes,
         *,
         session_id: str | None,
+        upstream_receive: Callable[[], Awaitable[Message]],
         adopted_from: str | None = None,
+        body_consumed: bool = False,
     ) -> None:
         headers = [
             (bytes(key), bytes(value))
@@ -512,19 +573,20 @@ class TolerantSessionAdoptionMiddleware:
                     (ADOPTED_FROM_HEADER, adopted_from.encode("latin-1"))
                 )
         delivered = False
-        # Parked forever: after the body is delivered there is no disconnect
-        # signal to relay, and a prematurely reported disconnect would truncate
-        # a streaming (SSE) response mid-body. POST SSE responses self-close
-        # after the JSON-RPC result event, ending the replay naturally.
-        parked = asyncio.Event()
 
         async def replay_receive() -> Message:
             nonlocal delivered
-            if delivered:
-                await parked.wait()
-                return {"type": "http.disconnect"}
-            delivered = True
-            return {"type": "http.request", "body": body, "more_body": False}
+            if body_consumed and not delivered:
+                delivered = True
+                return {"type": "http.request", "body": body, "more_body": False}
+            # The buffered body has been handed over, so the transport's own
+            # receive is the only source of a disconnect. Parking here instead
+            # meant a real client abort never reached the downstream app: the
+            # adopted request kept its stream alive until the transport was
+            # reaped (#306). Nothing is invented -- http.disconnect arrives when
+            # it actually happens, never synthesised early, so a streaming (SSE)
+            # response is still not truncated mid-body.
+            return await upstream_receive()
 
         async def replay_send(message: Message) -> None:
             if (
@@ -553,13 +615,17 @@ async def _read_request_body(
 
     Never returns a truncated body: hitting the limit raises
     :class:`PayloadTooLargeError` so the middleware can answer 413 instead
-    of replaying incomplete JSON-RPC downstream.
+    of replaying incomplete JSON-RPC downstream, and an abort before the
+    body completes raises :class:`IncompleteRequestBodyError` (#306).
     """
     chunks = bytearray()
     while True:
         message = await receive()
         if message.get("type") != "http.request":
-            break
+            # The client went away mid-body. The bytes buffered so far are a
+            # prefix of a request, not a request: returning them would replay a
+            # truncated JSON-RPC call downstream as though it were complete.
+            raise IncompleteRequestBodyError(len(chunks))
         chunks.extend(message.get("body") or b"")
         if len(chunks) > limit:
             raise PayloadTooLargeError(limit)
