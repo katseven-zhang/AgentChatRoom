@@ -4846,16 +4846,31 @@ class AgentChatRoomService:
             if order == "DESC":
                 events.reverse()
             items = self._project_task_history_items(connection, events)
-            next_after = items[-1]["event_id"] if items else after
-            next_before = items[0]["event_id"] if items else before
+            # An empty page still has to hand back the position it was asked
+            # about, not the zero default, so the opposite direction stays
+            # navigable instead of silently claiming there is nothing there.
+            next_after = items[-1]["event_id"] if items else (after or before)
+            next_before = items[0]["event_id"] if items else (before or after)
             # The Room-wide cursor moves with unrelated tasks, so forward
             # pagination bounds must be computed from THIS task's events:
             # only an event of this task after ``next_after`` means more.
-            task_latest_sql = (
-                f"SELECT MAX(project_seq) AS max_id FROM events WHERE {' AND '.join(clauses)}"
-            )
-            task_latest_row = connection.execute(task_latest_sql, parameters).fetchone()
-            task_latest = int(task_latest_row["max_id"] or 0)
+            # Boundary probes rather than ``bool(items)`` plus a count proxy:
+            # an empty page still has to answer honestly which side holds data,
+            # or the disabled direction is the one the user just walked past.
+            def _has_further(direction: str, boundary: int) -> bool:
+                # ``before`` of the first event can never match, but boundary 0
+                # on the forward side is a real position: it means the caller
+                # walked past the oldest event and newer data does exist.
+                if direction == "before" and boundary <= 1:
+                    return False
+                op = ">" if direction == "after" else "<"
+                row = connection.execute(
+                    f"SELECT 1 AS hit FROM events WHERE {' AND '.join(clauses)}"
+                    f" AND project_seq {op} ? LIMIT 1",
+                    [*parameters, boundary],
+                ).fetchone()
+                return row is not None
+
             latest = self.latest_cursor(connection, project_id)
             return {
                 "schema_version": TASK_HISTORY_SCHEMA_VERSION,
@@ -4869,8 +4884,8 @@ class AgentChatRoomService:
                 "cursor": next_after,
                 "next_after": next_after,
                 "next_before": next_before,
-                "has_more_after": bool(items) and next_after < task_latest,
-                "has_more_before": bool(items) and next_before > 1 and total > len(items),
+                "has_more_after": _has_further("after", next_after),
+                "has_more_before": _has_further("before", next_before),
                 "latest_cursor": latest,
                 "event_type": wanted_type,
             }
