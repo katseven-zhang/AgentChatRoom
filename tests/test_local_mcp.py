@@ -145,6 +145,34 @@ def test_local_mcp_apply_preserves_other_servers_and_creates_exact_backup(tmp_pa
     assert not list(config_path.parent.glob("*.tmp"))
 
 
+def test_null_mcp_servers_plans_and_applies_without_a_server_error(tmp_path):
+    """#298: {"mcpServers": null} is an empty map, not a 500."""
+    config_path = tmp_path / "home" / ".workbuddy" / "mcp.json"
+    config_path.parent.mkdir(parents=True)
+    config_path.write_text('{"mcpServers": null}\n', encoding="utf-8")
+    configurator = _configurator(tmp_path)
+    profile = _profile(tmp_path, "workbuddy")
+
+    plan = configurator.plan(
+        deployment_profile="local",
+        profile_id="workbuddy",
+        profile=profile,
+    )
+
+    assert plan["state"] == "unconfigured"
+    assert plan["mode"] == "managed_write"
+    result = configurator.apply(
+        deployment_profile="local",
+        profile_id="workbuddy",
+        profile=profile,
+        expected_current_sha256=plan["current_sha256"],
+    )
+    updated = json.loads(config_path.read_text(encoding="utf-8"))
+    assert isinstance(updated["mcpServers"], dict)
+    assert "agentchatroom" in updated["mcpServers"]
+    assert result["plan"]["state"] == "current"
+
+
 def test_local_mcp_plan_uses_an_existing_standard_trae_file_only(tmp_path):
     config_path = tmp_path / "appdata" / "Trae CN" / "User" / "mcp.json"
     config_path.parent.mkdir(parents=True)

@@ -132,7 +132,11 @@ class LocalMcpConfigurator:
         if not isinstance(parsed, dict):
             raise ValueError("MCP configuration root must be a JSON object")
         servers = parsed.get("mcpServers")
-        if servers is not None and not isinstance(servers, dict):
+        if servers is None:
+            # A present null is an empty map, not a missing key. Leaving it
+            # as None makes setdefault keep the null and the next .get crash.
+            parsed["mcpServers"] = {}
+        elif not isinstance(servers, dict):
             raise ValueError("mcpServers must be a JSON object")
         return parsed
 
@@ -163,7 +167,10 @@ class LocalMcpConfigurator:
         current: Mapping[str, Any], proposed_server: Mapping[str, Any]
     ) -> tuple[dict[str, Any], Any, dict[str, Any], bytes]:
         merged = copy.deepcopy(dict(current))
-        servers = merged.setdefault("mcpServers", {})
+        servers = merged.get("mcpServers")
+        if not isinstance(servers, dict):
+            servers = {}
+            merged["mcpServers"] = servers
         current_server = copy.deepcopy(servers.get("agentchatroom"))
         merged_server = LocalMcpConfigurator._merge_server(
             current_server, proposed_server
@@ -316,9 +323,21 @@ class LocalMcpConfigurator:
             )
 
         proposed_server = self._proposed_server(profile)
-        _merged, current_server, merged_server, serialized = self._merge_config(
-            current, proposed_server
-        )
+        try:
+            _merged, current_server, merged_server, serialized = self._merge_config(
+                current, proposed_server
+            )
+        except (TypeError, ValueError, AttributeError) as error:
+            raise DomainError(
+                "local_mcp_merge_failed",
+                "The MCP configuration could not be merged",
+                status_code=409,
+                details={
+                    "required_action": (
+                        "repair_the_mcp_servers_object_or_configure_manually"
+                    )
+                },
+            ) from error
         changed = _changed_fields(current_server, merged_server)
         configuration_state = (
             "unconfigured"
@@ -476,9 +495,21 @@ class LocalMcpConfigurator:
                 status_code=409,
             ) from error
         proposed_server = self._proposed_server(profile or {})
-        _merged, _current_server, merged_server, serialized = self._merge_config(
-            current, proposed_server
-        )
+        try:
+            _merged, _current_server, merged_server, serialized = self._merge_config(
+                current, proposed_server
+            )
+        except (TypeError, ValueError, AttributeError) as error:
+            raise DomainError(
+                "local_mcp_merge_failed",
+                "The MCP configuration could not be merged",
+                status_code=409,
+                details={
+                    "required_action": (
+                        "repair_the_mcp_servers_object_or_configure_manually"
+                    )
+                },
+            ) from error
         self._load_json(serialized)
 
         temp_path: Path | None = None
