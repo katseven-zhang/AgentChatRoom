@@ -393,7 +393,7 @@ Project 名称缺失或写错时，错误 details 返回当前凭据包中可用
 
 `room_bootstrap` 绑定成功时也会对服务器本地可访问的 checkout 确保该托管区块存在且与最新规则一致：缺失则创建、内容落后则更新（幂等，内容未变不写盘），并通过 `project_instructions_created` / `project_instructions_updated` 通知呈现；云端不可达或只读的根目录静默跳过，绝不阻塞绑定。该规则覆盖在本能力上线前登记的老项目。
 
-托管区块只保存可读 Project 名称与稳定协作流程，不保存 Token、Project ID/Key、Session、Agent 身份、游标或在线状态。支持 `AGENTS.md` 的 Agent 在新会话读取后会得到准确的 `room_bootstrap(project_name="...")` 调用，以及 `room_sync`、消息处理、任务领取/回执、文件 lease、`work_report`、独立 `review_submit` 和集成步骤。服务端仍以 Token、软件身份和 workspace roots 做最终授权与防串项目校验；`AGENTS.md` 不是授权凭据。已经打开的会话不保证自动重新读取文件，写入或改名后应新开会话或按客户端能力重新加载项目规则。
+托管区块只保存可读 Project 名称与稳定协作流程，不保存 Token、Project ID/Key、Session、Agent 身份、游标或在线状态。支持 `AGENTS.md` 的 Agent 在新会话读取后会得到准确的 `room_bootstrap(project_name="...")` 调用，以及 `room_sync`、消息处理、任务领取/回执、文件 lease、`work_report`、独立 `review_submit` 和集成步骤。服务端仍以 Token、软件身份和 workspace roots 做最终授权与防串项目校验；`AGENTS.md` 不是授权凭据。已经打开的会话不保证自动重新读取文件，写入或改名后应新开会话或按客户端能力重新加载项目规则。写回 `AGENTS.md` 托管块与 `.agentchatroom/project.json` 时不改动文件原有的行尾：读用不平滑换行的方式、写用不转换的方式，因此 LF 仓库不会被翻成 CRLF（Windows 上以前会整文件重写，用户只让工具管一段却被 diff 出全文件改动），CRLF 仓库也不会被压成 LF；若重算出的托管块与原文件只在行尾上不同，动作记为 `unchanged` 并不再改写用户文件。
 
 托管规则要求 Agent 在执行前区分三件事：**当前对话实际运行的工作空间**、**用户要求处理的目标项目**、**本 Session 绑定的 Room Project**。用户在 Agent 客户端发起或继续对话时可能选错项目工作空间（例如想处理另一个项目的工作，却在客户端打开了本项目的对话），因此三者不一致时——包括 Room 绑定与当前（错误）工作空间恰好匹配的情况——必须停止执行目标任务：不认领或回执其任务、不获取其文件租约、不读取或修改其文件，并明确告知当前对话所在工作空间与所请求项目的差异，请用户在 Agent 客户端切换到正确项目工作空间后继续或重新发起对话；目标项目不明确时先澄清，不猜测项目身份。禁止用重新绑定 Room Session、切换 Room Project、更改工作目录或跨目录操作来绕过：重绑 Room 不会改变客户端已经加载的对话工作区上下文，Room 绑定与当前工作空间一致也不构成执行另一项目的授权。恢复步骤只有一步：在 Agent 客户端切换到目标项目的工作空间（必要时新开对话以便规则重新加载），再按该工作空间的项目名执行 `room_bootstrap`。
 

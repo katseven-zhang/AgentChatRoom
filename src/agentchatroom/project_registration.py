@@ -147,6 +147,13 @@ def _project_instructions_error(path: Path, message: str) -> DomainError:
     )
 
 
+def _read_raw(path: Path) -> bytes:
+    try:
+        return path.read_bytes()
+    except OSError:
+        return b""
+
+
 def _read_project_instructions(path: Path) -> str:
     if not path.exists():
         return ""
@@ -156,7 +163,7 @@ def _read_project_instructions(path: Path) -> str:
             "Project AGENTS.md path exists but is not a regular file",
         )
     try:
-        return path.read_text(encoding="utf-8-sig")
+        return path.read_text(encoding="utf-8-sig", newline="")
     except (OSError, UnicodeError) as error:
         raise _project_instructions_error(
             path,
@@ -206,7 +213,7 @@ def _write_project_instructions(path: Path, text: str) -> None:
     temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
-        temporary.write_text(text, encoding="utf-8")
+        temporary.write_text(text, encoding="utf-8", newline="")
         temporary.replace(path)
     except OSError as error:
         try:
@@ -265,7 +272,11 @@ def write_project_coordination_instructions(
         if not updated.endswith(("\n", "\r")):
             updated += newline
         action = "updated"
-    if updated == existing:
+    # The END-marker range stops before the line's terminator, so re-rendering an
+    # already-managed file can differ from it by that one separator alone. Compare
+    # line-ending-insensitively: rewriting in that case would touch a user file
+    # whose managed block has not actually changed.
+    if updated.replace("\r\n", "\n") == existing.replace("\r\n", "\n"):
         action = "unchanged"
     else:
         _write_project_instructions(path, updated)
@@ -551,6 +562,7 @@ def _write_document(path: Path, document: dict[str, Any]) -> None:
         temporary.write_text(
             json.dumps(document, ensure_ascii=False, indent=2) + "\n",
             encoding="utf-8",
+            newline="\n",
         )
         temporary.replace(path)
     except OSError as error:
