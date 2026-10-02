@@ -460,6 +460,63 @@ def normalize_pattern(pattern: str) -> str:
     return "/".join(segments)
 
 
+def normalize_evidence_path(value: Any) -> str:
+    """Fold one changed-file claim without lease-glob semantics.
+
+    `files` on a message, handoff, or integration is a claim about concrete
+    files that a commit can prove. Reusing the lease pattern for it accepted
+    absolute and drive-letter paths (which reach outside the Project and end up
+    in exported audit data), and answered a blank entry with the lease error
+    code `invalid_path_pattern` on a surface that never mentioned a lease.
+    """
+    text = str(value or "").strip().replace("\\", "/")
+    if not text:
+        raise DomainError(
+            "invalid_changed_file",
+            "A changed file entry must not be empty",
+            status_code=422,
+            details={
+                "required_action": "list_project_relative_file_paths_without_globs",
+                "field": "files",
+            },
+        )
+    if any(marker in text for marker in "*?[]"):
+        raise DomainError(
+            "invalid_changed_file",
+            "A changed file must name one concrete path, not a glob pattern",
+            status_code=422,
+            details={
+                "required_action": "list_each_changed_file_separately",
+                "field": "files",
+                "value": text,
+            },
+        )
+    if text.startswith("/") or text.startswith("~") or re.match(r"^[A-Za-z]:", text):
+        raise DomainError(
+            "invalid_changed_file",
+            "A changed file must be relative to the project root",
+            status_code=422,
+            details={
+                "required_action": "strip_the_absolute_prefix_and_keep_the_project_relative_path",
+                "field": "files",
+                "value": text,
+            },
+        )
+    segments = [segment for segment in text.split("/") if segment not in ("", ".")]
+    if not segments or any(segment == ".." for segment in segments):
+        raise DomainError(
+            "invalid_changed_file",
+            "A changed file must stay inside the project",
+            status_code=422,
+            details={
+                "required_action": "keep_the_path_inside_the_project",
+                "field": "files",
+                "value": text,
+            },
+        )
+    return "/".join(segments)
+
+
 def lease_modes_conflict(left: str, right: str) -> bool:
     if "readonly" in {left, right}:
         return False
@@ -5215,7 +5272,7 @@ class AgentChatRoomService:
         list_limit = int(getattr(self.settings, "list_input_max_count", 100))
         clean_files = self._require_list_input_limit(
             "files",
-            sorted({normalize_pattern(path) for path in (files or [])}),
+            sorted({normalize_evidence_path(path) for path in (files or [])}),
             limit=list_limit,
         )
         clean_mentions = self._require_list_input_limit(
@@ -7186,7 +7243,7 @@ class AgentChatRoomService:
         clean_pending = clean_items(pending_items, "pending_items")
         clean_files = sorted(
             {
-                normalize_pattern(path)
+                normalize_evidence_path(path)
                 for path in self._require_list_input_limit(
                     "files",
                     files or [],
@@ -8334,7 +8391,7 @@ class AgentChatRoomService:
     ) -> dict[str, Any]:
         clean_files = self._require_list_input_limit(
             "files",
-            sorted({normalize_pattern(path) for path in files}),
+            sorted({normalize_evidence_path(path) for path in files}),
             limit=int(getattr(self.settings, "list_input_max_count", 100)),
         )
         clean_no_code_reason = no_code_change_reason.strip()
@@ -8678,7 +8735,7 @@ class AgentChatRoomService:
             )
         clean_files = sorted(
             {
-                normalize_pattern(path)
+                normalize_evidence_path(path)
                 for path in self._require_list_input_limit(
                     "files",
                     files or [],
