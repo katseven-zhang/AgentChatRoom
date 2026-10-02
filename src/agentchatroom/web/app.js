@@ -1145,6 +1145,10 @@ async function selectProject(projectId) {
 }
 
 function mergeEvents(events) {
+  // project_seq is dense inside one Project, so an arrival that jumps past the
+  // right edge means the stream handed us a later event while skipping the ones
+  // before it (#313). The edge has to be read before anything is merged.
+  const previousEdge = streamWatermark();
   for (const event of events) {
     if (!state.eventIds.has(event.id)) {
       state.eventIds.add(event.id);
@@ -1152,6 +1156,11 @@ function mergeEvents(events) {
     }
   }
   state.events.sort((a, b) => a.id - b.id);
+  const incomingEdge = events.reduce(
+    (highest, event) => Math.max(highest, Number(event.project_seq || 0)),
+    0
+  );
+  if (previousEdge && incomingEdge > previousEdge + 1) catchUpStream(previousEdge);
   if (state.events.length > 500) {
     state.events = state.events.slice(-500);
     state.eventIds = new Set(state.events.map((event) => event.id));
@@ -1269,16 +1278,35 @@ function renderForEvent(event) {
   renderAll();
 }
 
-function lastAppliedEventCursor() {
-  // The stream resumes with "give me events newer than this id", so the resume
-  // point must be the newest id this feed actually applied. The snapshot's own
-  // cursor is a server-side high-water that keeps advancing from polling even
-  // while the stream is broken, and resuming from it silently skips every
-  // event that landed in between (#313).
+function streamWatermark() {
+  // /events?after= and the SSE stream speak project_seq (the same space the
+  // server uses for Last-Event-ID), not the physical event id the feed keys its
+  // own de-duplication on. Mixing the two resumes from a mark that means
+  // something else entirely.
   return state.events.reduce(
-    (highest, event) => Math.max(highest, Number(event.id || 0)),
+    (highest, event) => Math.max(highest, Number(event.project_seq || 0)),
     0
   );
+}
+
+async function catchUpStream(fromSeq) {
+  // Backfill whatever the stream missed, one request at a time; the merged rows
+  // are re-checked by mergeEvents itself if a hole is still left.
+  if (!state.projectId || !fromSeq || state.streamCatchUpInFlight) return;
+  const projectId = state.projectId;
+  state.streamCatchUpInFlight = true;
+  try {
+    const page = await api(`/api/v1/projects/${projectId}/events?after=${fromSeq}&limit=200`);
+    if (projectId !== state.projectId) return;
+    const events = page.events || [];
+    if (!events.length) return;
+    mergeEvents(events);
+    renderAll();
+  } catch (error) {
+    showToast(error.message, "error");
+  } finally {
+    state.streamCatchUpInFlight = false;
+  }
 }
 
 function connectEvents(after) {
@@ -1292,10 +1320,15 @@ function connectEvents(after) {
     setConnection("online", "浏览器已连接");
     if (state.streamHadError) {
       state.streamHadError = false;
+      // Reconnecting only starts pushing events newer than the cursor we asked
+      // for: whatever landed while the socket was down is still missing, so the
+      // feed has to go and fetch it (#313).
+      const missedFrom = streamWatermark();
       refreshSnapshot(state.projectId).then((snapshot) => {
         if (!applySnapshotIfCurrent(state.projectId, snapshot)) return;
         renderAll();
       }).catch((error) => showToast(error.message, "error"));
+      catchUpStream(missedFrom);
     }
   };
   source.onerror = () => {
@@ -1303,7 +1336,7 @@ function connectEvents(after) {
     setConnection("offline", "浏览器正在重连");
     source.close();
     if (state.eventSource === source) state.eventSource = null;
-    const resumeAfter = Math.max(lastAppliedEventCursor(), Number(after || 0));
+    const resumeAfter = Math.max(streamWatermark(), Number(after || 0));
     probeAuthAndReconnect(projectId, resumeAfter).catch(() =>
       scheduleStreamRetry(projectId, resumeAfter)
     );
