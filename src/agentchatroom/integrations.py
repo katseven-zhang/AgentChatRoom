@@ -573,7 +573,7 @@ def build_mcp_integration(
                         profile_id=profile_id,
                         profile=profile,
                         transport="http",
-                        config_text="",
+                        config_text=http_config_text,
                         project=project,
                         mode="migrate_http",
                     )
