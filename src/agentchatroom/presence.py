@@ -5,6 +5,7 @@ import threading
 from dataclasses import dataclass, replace
 from typing import Callable
 
+from .contracts import PRESENCE_DROP_ERROR_CODES
 from .errors import DomainError
 from .services import AgentChatRoomService
 
@@ -199,11 +200,7 @@ class LocalPresenceManager:
                     session.token,
                 )
             except DomainError as error:
-                if error.code in {
-                    "session_not_found",
-                    "invalid_session_token",
-                    "session_closed",
-                }:
+                if error.code in PRESENCE_DROP_ERROR_CODES:
                     self.unregister(session.session_id)
                 if error.code == "session_closed":
                     # Explicit leave can close a session after this heartbeat

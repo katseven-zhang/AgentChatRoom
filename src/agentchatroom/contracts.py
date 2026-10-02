@@ -292,6 +292,20 @@ KNOWLEDGE_OWNER_KINDS = {"agent_key", "member"}
 KNOWLEDGE_SOURCE_TYPES = {"manual", "task_result", "import", "extractor"}
 KNOWLEDGE_REVIEW_VERDICTS = {"approved", "changes_requested"}
 
+# Error codes that prove a Session is gone, so keepalive must stop refreshing it
+# instead of re-trying every cycle. Server-side presence and the client-side
+# Bridge share one definition: `session_closed` matters because an explicit
+# session_leave closes the Session, and a lapsed token cannot be slid forward by
+# a heartbeat either -- only a fresh join can.
+PRESENCE_DROP_ERROR_CODES = frozenset(
+    {
+        "session_not_found",
+        "invalid_session_token",
+        "session_closed",
+        "session_token_expired",
+    }
+)
+
 
 class TestEvidence(TypedDict, total=False):
     """Structured command evidence shared by work reports and integrations."""

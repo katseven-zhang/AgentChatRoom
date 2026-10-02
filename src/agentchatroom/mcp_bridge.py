@@ -32,6 +32,7 @@ from .integrations import (
     SOFTWARE_NAME_HEADER,
     encode_http_identity_value,
 )
+from .contracts import PRESENCE_DROP_ERROR_CODES
 from .mcp_http_recovery import (
     DIRECT_CLIENT_RECONNECT_HINT,
     MCP_SESSION_EXPIRED_CODE,
@@ -456,7 +457,14 @@ class BridgePresenceManager:
                     "token": token,
                 }
         elif name == "session_leave":
-            self.sessions.pop(str(arguments.get("session_id", "")), None)
+            # The protocol does not require a client to name its own Session: the
+            # center fills session_id from the credential binding. So trust the
+            # Session the leave actually closed, or the one the caller named, and
+            # never an empty key -- popping "" left a closed Session heartbeating
+            # forever, one refused upstream write per cycle.
+            left = (payload.get("result") or {}).get("agent") or {}
+            session_id = str(left.get("id") or arguments.get("session_id") or "")
+            self.sessions.pop(session_id, None)
 
     async def heartbeat_once(self) -> None:
         for session_id, session in list(self.sessions.items()):
@@ -468,7 +476,7 @@ class BridgePresenceManager:
                 payload = tool_payload(result)
                 if payload and not payload.get("ok") and payload.get("error", {}).get(
                     "code"
-                ) in {"session_not_found", "invalid_session_token"}:
+                ) in PRESENCE_DROP_ERROR_CODES:
                     self.sessions.pop(session_id, None)
             except Exception as error:
                 logger.warning(
