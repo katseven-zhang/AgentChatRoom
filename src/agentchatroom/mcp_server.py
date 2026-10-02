@@ -1717,6 +1717,8 @@ def task_intake_reassign(
     target_session_id: str = "",
     note: str = "",
     request_id: str = "",
+    session_id: str = "",
+    token: str = "",
 ) -> dict[str, Any]:
     """Redirect an undefined user task intake to another available Agent."""
     try:
@@ -1730,6 +1732,8 @@ def task_intake_reassign(
         target_member_id=target_member_id,
         target_session_id=target_session_id or None,
         note=note,
+        session_id=session_id or None,
+        token=token or None,
         request_id=_mcp_request_id(request_id),
     )
 

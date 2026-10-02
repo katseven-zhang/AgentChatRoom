@@ -5557,6 +5557,9 @@ class AgentChatRoomService:
         target_member_id: str,
         target_session_id: str | None = None,
         note: str = "",
+        session_id: str | None = None,
+        token: str | None = None,
+        management_authorized: bool = False,
     ) -> dict[str, Any]:
         clean_member_id = target_member_id.strip()
         clean_session_id = target_session_id.strip() if target_session_id else None
@@ -5565,6 +5568,18 @@ class AgentChatRoomService:
                 "task_intake_target_required", "An Agent target is required"
             )
         with self.database.connect(write=True) as connection:
+            # Reassignment moves someone else's work, so it needs a real actor:
+            # either an authenticated Session or an authenticated management
+            # request. Anonymous callers used to succeed here and the audit
+            # event then recorded the actor as a manager nobody had proven.
+            actor_session_id: str | None = None
+            if session_id or token:
+                agent = self._authenticate(
+                    connection, project_id, str(session_id or ""), str(token or "")
+                )
+                actor_session_id = str(agent["id"])
+            elif not management_authorized:
+                raise _management_authorization_required("reassign a task intake")
             intake = self._require_task_intake(connection, project_id, intake_id)
             previous_status = str(intake["status"])
             if intake["status"] == "defined":
@@ -5624,6 +5639,7 @@ class AgentChatRoomService:
                 connection,
                 project_id,
                 "task.intake_reassigned",
+                actor_session_id=actor_session_id,
                 payload={
                     "intake_id": intake_id,
                     "previous_status": previous_status,
@@ -5631,6 +5647,7 @@ class AgentChatRoomService:
                     "target_member_id": member["id"],
                     "target_session_id": clean_session_id,
                     "note": note.strip(),
+                    "performed_by": "agent_session" if actor_session_id else "management",
                 },
             )
             updated = self._require_task_intake(connection, project_id, intake_id)

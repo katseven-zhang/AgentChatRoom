@@ -87,6 +87,7 @@ def test_reassign_task_intake_allows_active_offline_target_without_session(
         project["id"],
         intake["id"],
         target_member_id=second_target["agent"]["member_id"],
+        management_authorized=True,
     )["intake"]
     assert reassigned["target_member_id"] == second_target["agent"]["member_id"]
     assert reassigned["target_session_id"] is None

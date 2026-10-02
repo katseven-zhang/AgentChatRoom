@@ -104,6 +104,7 @@ def test_reassign_of_an_accepted_intake_is_declared_and_audited(
         intake["id"],
         target_member_id=members["other"]["agent"]["member_id"],
         note="handing the intake to another identity",
+        management_authorized=True,
     )["intake"]
 
     assert reassigned["status"] == "pending"
@@ -133,6 +134,7 @@ def test_reassign_refuses_states_the_contract_does_not_allow(
             project["id"],
             intake["id"],
             target_member_id=members["other"]["agent"]["member_id"],
+            management_authorized=True,
         )
 
     assert error.value.code in {
@@ -169,6 +171,7 @@ def test_reassign_requires_the_row_to_still_be_the_one_it_read(
             project["id"],
             intake["id"],
             target_member_id=members["other"]["agent"]["member_id"],
+            management_authorized=True,
         )
 
     assert error.value.code == "task_modified_concurrently"

@@ -470,6 +470,8 @@ def test_mcp_task_intake_supports_offline_targets_and_rejects_revoked(
         project["id"],
         submitted["result"]["intake"]["id"],
         creator["agent"]["member_id"],
+        session_id=creator["agent"]["id"],
+        token=creator["token"],
     )
     assert reassigned["ok"] is True
     assert reassigned["result"]["intake"]["target_session_id"] == creator["agent"]["id"]

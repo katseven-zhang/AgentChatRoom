@@ -643,6 +643,8 @@ class TaskIntakeReassign(StrictModel):
     target_member_id: str
     target_session_id: str | None = None
     note: str = ""
+    session_id: str | None = None
+    token: str | None = None
 
 
 class TaskIntakeDefine(StrictModel):
@@ -2312,10 +2314,18 @@ def create_app(
         intake_id: str,
         body: TaskIntakeReassign,
     ) -> dict[str, Any]:
+        _reject_credentials_in_query(request)
+        payload = body.model_dump()
+        # No Session credentials is a management surface, so it must clear the
+        # management authentication; an anonymous request is not authority.
+        management = not str(payload.get("session_id") or "").strip()
+        if management:
+            _require_management(request)
         return service.reassign_task_intake(
             project_id,
             intake_id,
-            **body.model_dump(),
+            **payload,
+            management_authorized=management,
             request_id=request.state.request_id,
         )
 
