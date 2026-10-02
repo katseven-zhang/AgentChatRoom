@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Callable
 
 from .errors import DomainError
@@ -113,6 +113,7 @@ class LocalPresenceManager:
         resolved_agent_key = agent_key.strip()
         with self._lock:
             if session_id in self._sessions:
+                self._adopt_transport(session_id, transport_key)
                 return False
         # Cold path only: the registry is process-local memory, so the first call
         # after an MCP process restart has to look the identity up. Resolve it
@@ -129,6 +130,7 @@ class LocalPresenceManager:
                 return False
         with self._lock:
             if session_id in self._sessions:
+                self._adopt_transport(session_id, transport_key)
                 return False
             self._sessions[session_id] = PresenceSession(
                 project_id=project_id,
@@ -138,6 +140,22 @@ class LocalPresenceManager:
                 transport_key=transport_key,
             )
             return True
+
+    def _adopt_transport(self, session_id: str, transport_key: str) -> None:
+        """Re-point an existing registration at the transport that is live now.
+
+        Transparent adoption hands a Session a new transport without a fresh
+        bootstrap, so this is the only signal that the old key has been reaped.
+        Leaving the stale key would make `heartbeat_once` treat a living client
+        as a dead transport and stop its keepalive, token slide and lease renewals.
+        The caller must hold `self._lock`.
+        """
+        if not transport_key:
+            return
+        existing = self._sessions[session_id]
+        if existing.transport_key == transport_key:
+            return
+        self._sessions[session_id] = replace(existing, transport_key=transport_key)
 
     def unregister(self, session_id: str) -> None:
         with self._lock:

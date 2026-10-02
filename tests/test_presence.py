@@ -131,6 +131,80 @@ def test_transport_cleanup_stops_keepalive_without_closing_the_room_session(
     assert agents[second["agent"]["id"]]["status"] == "offline"
 
 
+def test_adopted_transport_keeps_the_keepalive_beating(service, project):
+    """#292: 透明采纳换的是 transport，不是 Session；保活不得把活客户端当死的。"""
+    joined = service.join_room(
+        project["id"], name="Codex", client="codex", model="unknown",
+    )
+    session_id = joined["agent"]["id"]
+    live = {"transport-old"}
+    manager = LocalPresenceManager(
+        service,
+        enabled=True,
+        interval_seconds=60,
+        transport_check=lambda key: key in live,
+    )
+    manager.register(
+        project["id"], session_id, joined["token"],
+        agent_key=joined["agent"]["agent_key"], transport_key="transport-old",
+    )
+
+    # The old transport is reaped and the same Session is adopted onto a new one
+    # without a fresh bootstrap, so the only signal that the client is still
+    # alive is the transport key on the next tool call.
+    live.clear()
+    live.add("transport-new")
+    assert (
+        manager.ensure_registered(
+            project["id"], session_id, joined["token"], transport_key="transport-new"
+        )
+        is False
+    )
+
+    before = next(
+        agent["last_heartbeat"]
+        for agent in service.snapshot(project["id"])["agents"]
+        if agent["id"] == session_id
+    )
+    manager.heartbeat_once()
+
+    assert session_id in manager._sessions
+    assert manager._sessions[session_id].transport_key == "transport-new"
+    after = next(
+        agent["last_heartbeat"]
+        for agent in service.snapshot(project["id"])["agents"]
+        if agent["id"] == session_id
+    )
+    # The keepalive statement is the one that also slides the token and renews
+    # the task leases, so a moved last_heartbeat is the proof it was not skipped.
+    assert after > before
+
+
+def test_missing_transport_signal_keeps_the_live_transport_key(service, project):
+    joined = service.join_room(
+        project["id"], name="Codex", client="codex", model="unknown",
+    )
+    session_id = joined["agent"]["id"]
+    manager = LocalPresenceManager(
+        service,
+        enabled=True,
+        interval_seconds=60,
+        transport_check=lambda key: key == "transport-a",
+    )
+    manager.register(
+        project["id"], session_id, joined["token"],
+        agent_key=joined["agent"]["agent_key"], transport_key="transport-a",
+    )
+
+    assert (
+        manager.ensure_registered(project["id"], session_id, joined["token"]) is False
+    )
+
+    assert manager._sessions[session_id].transport_key == "transport-a"
+    manager.heartbeat_once()
+    assert session_id in manager._sessions
+
+
 def test_heartbeat_is_connection_liveness_not_manual_activity(service, project):
     joined = service.join_room(
         project["id"],
