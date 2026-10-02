@@ -726,8 +726,8 @@ GUI 的在线/离线巡检走 `list_session_presence(project_id)`，只返回 `i
 `contracts.task_view` 的取消守卫实现：只要执行面是 `cancelled`，投影就是
 `cancelled` 分组 `cancelled`、`needs_attention=false`，**与验证面/集成面残留什么无关**
 （先评审通过再集成失败、随后取消的任务曾把这三元组投成 `unclassified`，
-即“未分类”，看起来像数据坏了而不是被取消）。`TASK_VIEW_CANCELLED_VERIFICATION_STATUSES`
-声明的覆盖面就是全部已声明验证状态，因此守卫不需要任何附加条件；
+即“未分类”，看起来像数据坏了而不是被取消）。守卫刻意不带任何附加条件（未知或历史遗留的验证值也不得重新把取消遮住）；原先声明的
+`TASK_VIEW_CANCELLED_VERIFICATION_STATUSES` 全仓无消费者，已按验收标准删除而不是留着当注释；
 其余真正无法解释的三元组仍然如实落到 `unclassified`，不会被伪装成正常阶段。
 
 ### Web 视觉系统与微交互设计规范（#152 / #155）

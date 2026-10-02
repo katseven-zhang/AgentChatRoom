@@ -15,7 +15,6 @@ from agentchatroom.contracts import (
     TASK_INTEGRATION_STATUSES,
     TASK_VERIFICATION_STATUSES,
     TASK_VIEW_ALL_PHASES,
-    TASK_VIEW_CANCELLED_VERIFICATION_STATUSES,
     TASK_VIEW_UNCLASSIFIED_PHASE,
     task_view,
 )
@@ -50,10 +49,18 @@ def test_no_cancelled_triple_is_unclassified():
             verification,
             integration,
         )
-    assert VERIFICATIONS == sorted(TASK_VIEW_CANCELLED_VERIFICATION_STATUSES), (
-        "the declared guard must cover every verification status"
-    )
     assert TASK_VIEW_UNCLASSIFIED_PHASE in TASK_VIEW_ALL_PHASES
+
+
+def test_an_unknown_verification_value_cannot_reintroduce_the_masking():
+    view = task_view(
+        execution_status="cancelled",
+        verification_status="approved_by_a_future_release",
+        integration_status="failed",
+    )
+
+    assert view["phase"] == "cancelled"
+    assert view["group"] == "cancelled"
 
 
 def test_other_illegal_triples_still_report_unclassified():

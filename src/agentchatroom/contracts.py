@@ -110,10 +110,6 @@ TASK_VIEW_GROUP_CODES = (
 # todo stays out because 待认领 already has its own navigation entry.
 TASK_VIEW_ATTENTION_PHASES = {"changes_requested", "blocked", "integration_failed"}
 
-# Terminal-state guard: a cancelled task must never be masked by stale
-# verification/integration residue carried over from earlier phases.
-TASK_VIEW_CANCELLED_VERIFICATION_STATUSES = set(TASK_VERIFICATION_STATUSES)
-
 # "修改中" also covers released-after-review tasks returning to the pool as
 # (todo, changes_requested, pending) — contract of task #43.
 _TASK_VIEW_REOPEN_EXECUTION_STATUSES = {"todo", "claimed", "in_progress", "blocked"}
@@ -139,10 +135,11 @@ def task_view(
     integration = str(integration_status)
     if execution == "cancelled":
         # Terminal-state guard: a cancelled task stays cancelled whatever the
-        # other two faces hold. The coverage this needs is exactly
-        # TASK_VIEW_CANCELLED_VERIFICATION_STATUSES (every declared
-        # verification status), so no partner condition is required and
-        # integration or review residue can never mask the cancellation.
+        # other two faces hold, so integration or review residue carried over
+        # from an earlier phase can never mask the cancellation or drop the task
+        # out of the cancelled navigation group. The guard is unconditional on
+        # purpose: an unknown or legacy verification value must not reintroduce
+        # the masking this branch exists to prevent.
         phase = "cancelled"
     elif (
         execution == "completed"
