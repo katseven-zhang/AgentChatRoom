@@ -672,7 +672,7 @@ function renderMessageBodySafely(eventId, body) {
 function renderMessageBody(eventId, body) {
   const text = String(body || "");
   const lines = text.split("\n");
-  const expanded = state.expandedEvents.has(eventId);
+  const expanded = eventIsExpanded("feed", eventId);
   if (lines.length <= MESSAGE_COLLAPSE_LINES || expanded) {
     const toggle = lines.length > MESSAGE_COLLAPSE_LINES
       ? `<button class="expand-toggle" type="button" data-collapse-event="${eventId}">收起</button>`
@@ -759,11 +759,22 @@ function withBusy(work) {
     });
 }
 
-function rememberExpandedEvent(eventId) {
-  state.expandedEvents.add(Number(eventId));
-  if (state.expandedEvents.size <= 80) return;
-  const oldest = [...state.expandedEvents][0];
-  state.expandedEvents.delete(oldest);
+function expansionKey(namespace, eventId) {
+  return `${namespace}:${Number(eventId)}`;
+}
+
+function eventIsExpanded(namespace, eventId) {
+  return state.expandedEvents.has(expansionKey(namespace, eventId));
+}
+
+function rememberExpandedEvent(namespace, eventId) {
+  // Feed rows are keyed by the physical event id. History rows are keyed by
+  // project_seq (stored as event_id on the history item). The two number
+  // spaces overlap, so each view keeps its own prefix and its own cap (#327).
+  state.expandedEvents.add(expansionKey(namespace, eventId));
+  const own = [...state.expandedEvents].filter((item) => String(item).startsWith(`${namespace}:`));
+  if (own.length <= 80) return;
+  state.expandedEvents.delete(own[0]);
 }
 
 function resetProjectFilters() {
@@ -2831,13 +2842,13 @@ elements["project-list"].addEventListener("click", (event) => {
 elements["chat-stream"].addEventListener("click", (event) => {
   const expand = event.target.closest("[data-expand-event]");
   if (expand) {
-    rememberExpandedEvent(expand.dataset.expandEvent);
+    rememberExpandedEvent("feed", expand.dataset.expandEvent);
     if (state.snapshot) renderEvents(state.snapshot.agents, state.snapshot.tasks);
     return;
   }
   const collapse = event.target.closest("[data-collapse-event]");
   if (collapse) {
-    state.expandedEvents.delete(Number(collapse.dataset.collapseEvent));
+    state.expandedEvents.delete(expansionKey("feed", collapse.dataset.collapseEvent));
     if (state.snapshot) renderEvents(state.snapshot.agents, state.snapshot.tasks);
   }
 });
@@ -3139,8 +3150,8 @@ elements["task-timeline"].addEventListener("click", (event) => {
   const expand = event.target.closest("[data-expand-history]");
   if (expand) {
     const eventId = Number(expand.dataset.expandHistory);
-    if (state.expandedEvents.has(eventId)) state.expandedEvents.delete(eventId);
-    else rememberExpandedEvent(eventId);
+    if (eventIsExpanded("seq", eventId)) state.expandedEvents.delete(expansionKey("seq", eventId));
+    else rememberExpandedEvent("seq", eventId);
     const task = state.snapshot?.tasks.find((item) => item.id === state.editingTaskId);
     if (task) renderTaskTimeline(task);
     return;
@@ -3979,7 +3990,7 @@ function renderHistoryEvidence(item) {
   return (item.evidence_sections || []).map((section, index) => {
     const sectionId = `history-${item.event_id}-sec-${index}`;
     if (section.kind === "message") {
-      const expanded = state.expandedEvents.has(item.event_id);
+      const expanded = eventIsExpanded("seq", item.event_id);
       const body = String((section.items || [])[0] || "");
       const lines = body.split("\n");
       const canToggle = section.expandable;
