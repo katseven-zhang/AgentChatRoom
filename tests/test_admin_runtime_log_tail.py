@@ -12,7 +12,8 @@ from pathlib import Path
 
 from fastapi.testclient import TestClient
 
-from agentchatroom.api import _tail_text_lines, create_app
+from agentchatroom.api import create_app
+from agentchatroom.runtime_log import tail_text_lines
 
 
 def _write_log(path: Path, count: int, *, width: int = 40) -> None:
@@ -26,7 +27,7 @@ def test_tail_returns_the_newest_lines_without_reading_the_head(tmp_path):
     log = tmp_path / "server.log"
     _write_log(log, 5000)
 
-    lines, truncated = _tail_text_lines(log, 80)
+    lines, truncated = tail_text_lines(log, 80)
 
     assert truncated is False
     assert len(lines) == 80
@@ -40,7 +41,7 @@ def test_tail_stops_at_its_byte_budget_and_keeps_the_newest(tmp_path):
 
     # Asking for more lines than the byte budget can reach proves the scan is
     # bounded: it returns the newest block it managed to read and says so.
-    lines, truncated = _tail_text_lines(
+    lines, truncated = tail_text_lines(
         log, 100_000, chunk_bytes=4096, max_scan_bytes=8192
     )
 
@@ -53,20 +54,20 @@ def test_tail_stops_at_its_byte_budget_and_keeps_the_newest(tmp_path):
 def test_tail_zero_limit_reads_nothing(tmp_path):
     log = tmp_path / "server.log"
     _write_log(log, 100)
-    assert _tail_text_lines(log, 0) == ([], False)
+    assert tail_text_lines(log, 0) == ([], False)
 
 
 def test_tail_survives_undecodable_bytes_and_a_missing_file(tmp_path):
     log = tmp_path / "server.log"
     log.write_bytes(b"line one\n\xff\xfe broken byte\nline three\n")
 
-    lines, truncated = _tail_text_lines(log, 10)
+    lines, truncated = tail_text_lines(log, 10)
 
     assert truncated is False
     assert len(lines) == 3
     assert lines[0] == "line one"
     assert lines[2] == "line three"
-    assert _tail_text_lines(tmp_path / "absent.log", 10) == ([], False)
+    assert tail_text_lines(tmp_path / "absent.log", 10) == ([], False)
 
 
 def test_admin_runtime_tolerates_a_corrupt_pid_file(settings, tmp_path):

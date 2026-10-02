@@ -29,6 +29,7 @@ from .desktop import DirectoryPickerUnavailable, pick_directory
 from .errors import DomainError
 from .integrations import build_mcp_integration
 from .local_mcp import LocalMcpConfigurator
+from .runtime_log import tail_text_lines
 from .mcp_server import (
     adopt_transport_binding,
     configure_transport_tombstones,
@@ -293,50 +294,6 @@ class RequestIdASGIMiddleware:
             await send(message)
 
         await self.app(scope, receive, send_with_request_id)
-
-
-def _tail_text_lines(
-    path: Path,
-    limit: int,
-    *,
-    chunk_bytes: int = 65536,
-    max_scan_bytes: int = 8 * 1024 * 1024,
-) -> tuple[list[str], bool]:
-    """Return the last ``limit`` lines and whether the scan hit its byte budget.
-
-    ``server.log`` grows without bound because the detached process writes its
-    whole output there and nothing rotates it yet, so reading the entire file to
-    show 80 lines made this request cost linear in log size on the management
-    path. Scanning backwards in fixed blocks keeps the work proportional to what
-    is actually returned, and ``max_scan_bytes`` bounds the worst case.
-    """
-    if limit <= 0:
-        return [], False
-    try:
-        size = path.stat().st_size
-    except OSError:
-        return [], False
-    scanned = 0
-    end = size
-    buffer = b""
-    truncated = False
-    with path.open("rb") as handle:
-        while end > 0 and buffer.count(b"\n") <= limit:
-            start = max(0, end - chunk_bytes)
-            handle.seek(start)
-            buffer = handle.read(end - start) + buffer
-            scanned += end - start
-            end = start
-            if scanned >= max_scan_bytes:
-                truncated = end > 0
-                break
-    if truncated and end > 0:
-        # Drop the first partial line so the caller never sees a fragment.
-        newline = buffer.find(b"\n")
-        if newline != -1:
-            buffer = buffer[newline + 1 :]
-    lines = buffer.decode("utf-8", errors="replace").splitlines()
-    return lines[-limit:], truncated
 
 
 def bearer_token(authorization: str) -> str:
@@ -1647,7 +1604,7 @@ def create_app(
                 log_size_bytes = log_path.stat().st_size
             except OSError:
                 log_size_bytes = 0
-            tail, log_truncated = _tail_text_lines(log_path, lines)
+            tail, log_truncated = tail_text_lines(log_path, lines)
             log_lines = [_redact_log_line(line) for line in tail]
         pid_path = resolved.data_dir / "server.pid"
         # A pid file is written by another process: it can be empty, half-written,

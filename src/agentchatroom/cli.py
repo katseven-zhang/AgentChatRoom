@@ -33,6 +33,7 @@ from .backup import (
 )
 from .config import load_settings
 from .integrations import build_mcp_integration
+from .runtime_log import tail_text_lines
 
 
 MUTATING_HTTP_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
@@ -93,12 +94,15 @@ def print_server_log(settings, *, lines: int = 80, follow: bool = False) -> None
     pid_path = settings.data_dir / "server.pid"
     if not log_path.exists():
         raise SystemExit(f"AgentChatRoom log does not exist yet: {log_path}")
+    tail, truncated = tail_text_lines(log_path, lines)
+    for line in tail:
+        print(line)
+    if truncated:
+        print("[older log lines were not scanned: the tail byte budget was reached]")
+    if not follow:
+        return
     with log_path.open("r", encoding="utf-8", errors="replace") as handle:
-        content = handle.readlines()
-        for line in content[-lines:]:
-            print(line, end="")
-        if not follow:
-            return
+        handle.seek(0, os.SEEK_END)
         while True:
             line = handle.readline()
             if line:
@@ -107,6 +111,37 @@ def print_server_log(settings, *, lines: int = 80, follow: bool = False) -> None
                 return
             else:
                 time.sleep(0.2)
+
+
+def _leave_session(
+    base_url: str,
+    project_id: str,
+    session_id: str,
+    token: str,
+    *,
+    quiet: bool = False,
+) -> bool:
+    """Close a Session this command opened.
+
+    On the cleanup path the original failure matters more than the leave, so a
+    failed leave is reported on stderr instead of replacing that exit status.
+    """
+    try:
+        request_json(
+            base_url,
+            "POST",
+            f"/api/v1/projects/{project_id}/agents/{session_id}/leave",
+            {"token": token},
+        )
+        return True
+    except BaseException as error:
+        if not quiet:
+            raise
+        print(
+            f"warning: session {session_id} may still be joined: {error}",
+            file=sys.stderr,
+        )
+        return False
 
 
 class SubmitError(Exception):
@@ -317,93 +352,94 @@ def run_submit(args: argparse.Namespace, base_url: str) -> dict[str, Any]:
         "workspace_id": workspace_id,
     }
 
-    if has_message:
-        posted = request_json(
-            base_url,
-            "POST",
-            f"/api/v1/projects/{project_id}/messages",
-            {
-                "body": str(args.message).strip(),
-                "session_id": session_id,
-                "token": session_token,
-                "model_display_name": str(
-                    args.model_display_name or args.model or "unknown"
-                ),
-            },
-        )
-        result["message_event_id"] = posted.get("event", {}).get("id") or posted.get(
-            "event_id"
-        )
-
-    if has_report:
-        task_ref = str(args.report_task).strip()
-        if task_ref.isdigit():
-            try:
-                task = request_json(
-                    base_url,
-                    "GET",
-                    f"/api/v1/projects/{project_id}/tasks/by-number/{task_ref}",
-                )
-            except SystemExit as error:
-                # A missing task number (404) or any other server error must
-                # surface to the caller: silently falling back to treating the
-                # number as a task UUID would only produce a more confusing
-                # failure later (task_not_found on claim/report).
-                raise SubmitError(
-                    "submit_task_not_resolved",
-                    f"Could not resolve task number {task_ref!r} via "
-                    "tasks/by-number; do not pass it on as a task id",
-                    detail=str(error),
-                )
-            task_id = str(task.get("task", {}).get("id") or task.get("id") or "")
-        else:
-            task_id = task_ref
-        # A dead transport usually means the task was claimed by the previous
-        # session of this same identity: reclaim it explicitly instead of
-        # failing the report with not_task_owner.
-        try:
-            request_json(
+    try:
+        if has_message:
+            posted = request_json(
                 base_url,
                 "POST",
-                f"/api/v1/projects/{project_id}/tasks/{task_id}/claim",
+                f"/api/v1/projects/{project_id}/messages",
+                {
+                    "body": str(args.message).strip(),
+                    "session_id": session_id,
+                    "token": session_token,
+                    "model_display_name": str(
+                        args.model_display_name or args.model or "unknown"
+                    ),
+                },
+            )
+            result["message_event_id"] = posted.get("event", {}).get("id") or posted.get(
+                "event_id"
+            )
+
+        if has_report:
+            task_ref = str(args.report_task).strip()
+            if task_ref.isdigit():
+                try:
+                    task = request_json(
+                        base_url,
+                        "GET",
+                        f"/api/v1/projects/{project_id}/tasks/by-number/{task_ref}",
+                    )
+                except SystemExit as error:
+                    # A missing task number (404) or any other server error must
+                    # surface to the caller: silently falling back to treating the
+                    # number as a task UUID would only produce a more confusing
+                    # failure later (task_not_found on claim/report).
+                    raise SubmitError(
+                        "submit_task_not_resolved",
+                        f"Could not resolve task number {task_ref!r} via "
+                        "tasks/by-number; do not pass it on as a task id",
+                        detail=str(error),
+                    )
+                task_id = str(task.get("task", {}).get("id") or task.get("id") or "")
+            else:
+                task_id = task_ref
+            # A dead transport usually means the task was claimed by the previous
+            # session of this same identity: reclaim it explicitly instead of
+            # failing the report with not_task_owner.
+            try:
+                request_json(
+                    base_url,
+                    "POST",
+                    f"/api/v1/projects/{project_id}/tasks/{task_id}/claim",
+                    {
+                        "session_id": session_id,
+                        "token": session_token,
+                        "reclaim": True,
+                        "takeover": bool(args.takeover),
+                    },
+                )
+                result["task_reclaimed"] = True
+            except SystemExit:
+                result["task_reclaimed"] = False
+            tests: list[dict[str, Any]] = parsed_tests
+            report = request_json(
+                base_url,
+                "POST",
+                f"/api/v1/projects/{project_id}/tasks/{task_id}/reports",
                 {
                     "session_id": session_id,
                     "token": session_token,
-                    "reclaim": True,
-                    "takeover": bool(args.takeover),
+                    "summary": str(args.summary).strip(),
+                    "files": list(args.file),
+                    "tests": tests,
+                    "commit_hash": str(args.commit or ""),
+                    "no_code_change_reason": str(args.no_code_change or ""),
                 },
             )
-            result["task_reclaimed"] = True
-        except SystemExit:
-            result["task_reclaimed"] = False
-        tests: list[dict[str, Any]] = parsed_tests
-        report = request_json(
-            base_url,
-            "POST",
-            f"/api/v1/projects/{project_id}/tasks/{task_id}/reports",
-            {
-                "session_id": session_id,
-                "token": session_token,
-                "summary": str(args.summary).strip(),
-                "files": list(args.file),
-                "tests": tests,
-                "commit_hash": str(args.commit or ""),
-                "no_code_change_reason": str(args.no_code_change or ""),
-            },
-        )
-        result["report"] = {
-            "task_id": task_id,
-            "report_id": report.get("report", {}).get("id") or report.get("report_id"),
-            "task_status": report.get("task_status"),
-        }
-
+            result["report"] = {
+                "task_id": task_id,
+                "report_id": report.get("report", {}).get("id") or report.get("report_id"),
+                "task_status": report.get("task_status"),
+            }
+    except BaseException:
+        # A report that died half-way must not leave this identity joined:
+        # the Session would keep Presence and any task it just reclaimed.
+        if not args.keep_session:
+            _leave_session(base_url, project_id, session_id, session_token, quiet=True)
+        raise
     if not args.keep_session:
-        request_json(
-            base_url,
-            "POST",
-            f"/api/v1/projects/{project_id}/agents/{session_id}/leave",
-            {"token": session_token},
-        )
+        _leave_session(base_url, project_id, session_id, session_token)
         result["left"] = True
     else:
         result["left"] = False
