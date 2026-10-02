@@ -44,11 +44,14 @@ EXPECTED_ALL_COMBINATIONS = {
     # P9: the only phase that may be called finished
     ("completed", "approved", "done"): "done",
     ("completed", "not_required", "done"): "done",
-    # P10: terminal guard — cancelled wins over stale verification residue
-    ("cancelled", "not_required", "pending"): "cancelled",
-    ("cancelled", "pending", "pending"): "cancelled",
-    ("cancelled", "changes_requested", "pending"): "cancelled",
-    ("cancelled", "approved", "pending"): "cancelled",
+    # P10: terminal guard — cancelled wins over stale verification AND
+    # integration residue (#259: an integration attempt that ran before the
+    # cancellation used to project the cancelled task as "unclassified").
+    **{
+        ("cancelled", verification, integration): "cancelled"
+        for verification in sorted(TASK_VERIFICATION_STATUSES)
+        for integration in sorted(TASK_INTEGRATION_STATUSES)
+    },
 }
 
 
@@ -65,8 +68,6 @@ EXPECTED_UNCLASSIFIED_COMBINATIONS = {
     # integration only runs after execution completed
     ("in_progress", "not_required", "done"): "unclassified",
     ("todo", "not_required", "failed"): "unclassified",
-    ("cancelled", "approved", "done"): "unclassified",
-    ("cancelled", "not_required", "failed"): "unclassified",
     ("claimed", "changes_requested", "done"): "unclassified",
 }
 

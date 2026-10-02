@@ -137,7 +137,12 @@ def task_view(
     execution = str(execution_status)
     verification = str(verification_status)
     integration = str(integration_status)
-    if execution == "cancelled" and integration == "pending":
+    if execution == "cancelled":
+        # Terminal-state guard: a cancelled task stays cancelled whatever the
+        # other two faces hold. The coverage this needs is exactly
+        # TASK_VIEW_CANCELLED_VERIFICATION_STATUSES (every declared
+        # verification status), so no partner condition is required and
+        # integration or review residue can never mask the cancellation.
         phase = "cancelled"
     elif (
         execution == "completed"
