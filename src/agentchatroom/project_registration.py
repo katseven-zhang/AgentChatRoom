@@ -163,7 +163,10 @@ def _read_project_instructions(path: Path) -> str:
             "Project AGENTS.md path exists but is not a regular file",
         )
     try:
-        return path.read_text(encoding="utf-8-sig", newline="")
+        # Path.read_text(newline=) exists only on Python 3.13+. The project
+        # supports 3.11, and newline="" must keep the original line endings.
+        with path.open(encoding="utf-8-sig", newline="") as handle:
+            return handle.read()
     except (OSError, UnicodeError) as error:
         raise _project_instructions_error(
             path,
