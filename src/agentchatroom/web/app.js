@@ -1262,6 +1262,18 @@ function renderForEvent(event) {
   renderAll();
 }
 
+function lastAppliedEventCursor() {
+  // The stream resumes with "give me events newer than this id", so the resume
+  // point must be the newest id this feed actually applied. The snapshot's own
+  // cursor is a server-side high-water that keeps advancing from polling even
+  // while the stream is broken, and resuming from it silently skips every
+  // event that landed in between (#313).
+  return state.events.reduce(
+    (highest, event) => Math.max(highest, Number(event.id || 0)),
+    0
+  );
+}
+
 function connectEvents(after) {
   if (!state.projectId) return;
   const projectId = state.projectId;
@@ -1284,7 +1296,10 @@ function connectEvents(after) {
     setConnection("offline", "浏览器正在重连");
     source.close();
     if (state.eventSource === source) state.eventSource = null;
-    probeAuthAndReconnect(projectId, state.snapshot?.cursor || after).catch(() => scheduleStreamRetry(projectId, after));
+    const resumeAfter = Math.max(lastAppliedEventCursor(), Number(after || 0));
+    probeAuthAndReconnect(projectId, resumeAfter).catch(() =>
+      scheduleStreamRetry(projectId, resumeAfter)
+    );
   };
   source.addEventListener("room_event", async (message) => {
     const capturedProjectId = projectId;
