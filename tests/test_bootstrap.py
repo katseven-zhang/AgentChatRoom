@@ -684,6 +684,75 @@ def test_session_leave_clears_runtime_binding(monkeypatch, service, project_dir)
     assert expired["error"]["code"] == "session_expired"
 
 
+def test_rejected_session_leave_keeps_the_runtime_binding(monkeypatch, service, project_dir):
+    """#269: 被拒的离开不得销毁绑定——Token 在本机只有内存这一份。"""
+    _configure_software(monkeypatch)
+    _register_project(service, project_dir)
+    monkeypatch.setattr(mcp_server, "service", service)
+    monkeypatch.chdir(project_dir)
+    assert mcp_server.room_bootstrap()["ok"] is True
+    binding = mcp_server.get_runtime_binding()
+    assert binding is not None
+
+    refused = _call_tool("session_leave", {"token": "wrong-token-value-not-the-binding"})
+    assert refused["ok"] is False
+    assert refused["error"]["code"] == "runtime_context_mismatch"
+
+    # The Session is still addressable with the binding it already had, and the
+    # caller can keep working on it.
+    assert mcp_server.get_runtime_binding() == binding
+    assert _call_tool("room_sync")["ok"] is True
+
+    # ...and the rejection says so instead of failing silently.
+    assert (
+        refused["error"]["details"]["required_action"]
+        == "retry_leave_or_continue_with_current_binding"
+    )
+    assert refused["error"]["details"]["binding_retained"] is True
+
+    # The same leave with the real credentials still closes the Session.
+    left = _call_tool("session_leave")
+    assert left["ok"] is True
+    assert mcp_server.get_runtime_binding() is None
+
+
+def test_credential_rejected_session_leave_keeps_the_runtime_binding(
+    monkeypatch, service, project_dir
+):
+    """#269: 门禁拒绝（返回 ok:False 而非抛错）同样不得销毁绑定。"""
+    _configure_software(monkeypatch)
+    _register_project(service, project_dir)
+    monkeypatch.setattr(mcp_server, "service", service)
+    monkeypatch.chdir(project_dir)
+    assert mcp_server.room_bootstrap()["ok"] is True
+    binding = mcp_server.get_runtime_binding()
+    assert binding is not None
+
+    def forbidden(*args, **kwargs):
+        # Same code, message and status the real gateway raises for a credential
+        # that is not authorized for this Project.
+        raise DomainError(
+            "agent_token_project_forbidden",
+            "Agent token is not authorized for this Project",
+            status_code=403,
+        )
+
+    monkeypatch.setattr(mcp_server, "_authorize_remote", forbidden)
+    refused = _call_tool("session_leave")
+    assert refused["ok"] is False
+    assert refused["error"]["code"] == "agent_token_project_forbidden"
+
+    assert mcp_server.get_runtime_binding() == binding
+    # The room:join gate only guards leave, so the binding keeps working as before.
+    monkeypatch.setattr(mcp_server, "_authorize_remote", lambda *a, **k: None)
+    assert _call_tool("room_sync")["ok"] is True
+
+    assert (
+        refused["error"]["details"]["required_action"]
+        == "retry_leave_or_continue_with_current_binding"
+    )
+
+
 def test_bootstrap_does_not_log_live_token(monkeypatch, service, project_dir):
     _configure_software(monkeypatch)
     _register_project(service, project_dir)

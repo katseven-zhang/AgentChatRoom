@@ -119,6 +119,28 @@ HTTP_UNREGISTERED_ROOTS_ACTION = (
 )
 
 
+def _retain_session_leave_binding(payload: Any) -> None:
+    """Say, in place, that a rejected leave changed nothing for this Session.
+
+    The Session Token exists only in this process's memory and is never handed
+    back, so a leave that did not happen must keep the binding, the presence
+    heartbeat and the leases exactly as they were: dropping the binding would make
+    the caller's own Session unaddressable while presence still reports it online,
+    and `task_claim(reclaim=true)` is then refused (`task_owner_session_connected`)
+    with its leases still blocking other Agents until an explicit takeover.
+    """
+    if not isinstance(payload, dict):
+        return
+    error = payload.get("error")
+    if not isinstance(error, dict):
+        return
+    details = error.setdefault("details", {})
+    details.setdefault(
+        "required_action", "retry_leave_or_continue_with_current_binding"
+    )
+    details["binding_retained"] = True
+
+
 class ServiceBoundToolManager(CompatibleToolManager):
     def __init__(
         self,
@@ -141,6 +163,7 @@ class ServiceBoundToolManager(CompatibleToolManager):
         http_identity_token = None
         presence_token = None
         restore_token = None
+        leave_succeeded = False
         try:
             session_key = mcp_session_key(context)
         except DomainError as error:
@@ -240,11 +263,28 @@ class ServiceBoundToolManager(CompatibleToolManager):
                 # not. Re-persisting the stale local value would clear it.
                 persist_runtime_binding(session_key, get_runtime_binding(session_key))
             elif name == "session_leave":
-                persist_runtime_binding(session_key, None)
-                clear_bindings_for_agent_session(str(forwarded.get("session_id") or ""))
+                # Only a leave the domain actually accepted may destroy the binding.
+                # The tool answers a rejection with a normal `ok: False` envelope, so
+                # without this check a failed leave still erased the sole in-memory
+                # copy of the Session Token while presence kept the Session online.
+                leave_succeeded = bool(
+                    isinstance(result, dict) and result.get("ok") is True
+                )
+                if leave_succeeded:
+                    persist_runtime_binding(session_key, None)
+                    clear_bindings_for_agent_session(
+                        str(forwarded.get("session_id") or "")
+                    )
+                else:
+                    _retain_session_leave_binding(result)
             return result
         except DomainError as error:
-            return {"ok": False, **error.as_dict()}
+            payload = {"ok": False, **error.as_dict()}
+            if name == "session_leave":
+                # Rejected before it ever reached the domain: the credential gate or a
+                # runtime context mismatch is still a leave that did not happen.
+                _retain_session_leave_binding(payload)
+            return payload
         finally:
             if http_identity_token is not None:
                 _bootstrap_http_identity.reset(http_identity_token)
@@ -252,7 +292,7 @@ class ServiceBoundToolManager(CompatibleToolManager):
                 _bootstrap_workspace_roots.reset(roots_token)
             if restore_token is not None:
                 _bootstrap_restore_binding.reset(restore_token)
-            if name == "session_leave":
+            if name == "session_leave" and leave_succeeded:
                 _runtime_binding.set(None)
             else:
                 _runtime_binding.set(previous_binding)
@@ -1409,7 +1449,12 @@ def session_leave(
         token,
         request_id=_mcp_request_id(request_id),
     )
-    if result.get("ok") and presence_manager is not None:
+    if not result.get("ok"):
+        # A rejected leave must change nothing about this Session's state: the
+        # caller keeps its binding, presence keeps heartbeating, and the leases
+        # stay held until a leave that the domain actually accepts.
+        return result
+    if presence_manager is not None:
         presence_manager.unregister(session_id)
     binding = get_runtime_binding()
     if binding is not None and binding.session_id == session_id:
