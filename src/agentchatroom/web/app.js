@@ -3978,8 +3978,12 @@ async function loadTaskHistory(taskId, { direction } = {}) {
     total: page.total,
     next_after: items[items.length - 1]?.event_id || page.next_after,
     next_before: items[0]?.event_id || page.next_before,
-    has_more_after: direction === "later" ? Boolean(page.has_more_after) : direction === "earlier" ? true : Boolean(page.has_more_after),
-    has_more_before: direction === "earlier" ? Boolean(page.has_more_before) : direction === "later" ? true : Boolean(page.has_more_before),
+    // The server answers both directions for the window it actually returned,
+    // so the opposite flag must not be synthesised as "more exists": at the
+    // oldest or newest edge that keeps a pager button enabled forever and the
+    // next click fetches an empty page (#266).
+    has_more_after: Boolean(page.has_more_after),
+    has_more_before: Boolean(page.has_more_before),
     eventType,
   };
 }

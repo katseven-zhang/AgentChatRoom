@@ -645,7 +645,7 @@ MCP 不负责启动后台服务或 GUI。直接 HTTP MCP 不需要客户端创�
   2. 环境变量：`AGENTCHATROOM_MCP_MESSAGE_LIMIT`；
   3. 配置文件：`config.toml` 中的 `[coordination].mcp_message_limit`；
   4. 默认值：`5`。
-- **审计完整性保护**：该限制仅作用于 MCP Agent 上下文投影。底层的 append-only 事件历史、REST/Web 审计查询（`audit_query` / `/api/v1/projects/{id}/audit`）与任务时间线（`task_history`）始终完整记录所有事件，不被裁剪或改写。`message_acknowledge`（`acknowledge_event`）对同一 Session 重复确认幂等：首次写入 `event_acknowledgements` 并追加一条 `message.acknowledged`；再次确认（不同 `request_id`）返回可区分的 `already_acknowledged=true` 且 `event_id=null`，不再追加事件；相同 `request_id` 仍按通用 `idempotent_write` 重放。
+- **审计完整性保护**：该限制仅作用于 MCP Agent 上下文投影。底层的 append-only 事件历史、REST/Web 审计查询（`audit_query` / `/api/v1/projects/{id}/audit`）与任务时间线（`task_history`）始终完整记录所有事件，不被裁剪或改写。Web 任务时间线的翻页以服务端给出的窗口边界为准：`task_history` 的响应同时返回这一页的 `has_more_after` 与 `has_more_before`，前端「上一页/下一页」两个按钮的可用状态直接取这两个值，不再把相反方向臆断成“一定还有内容”——那种臆断在最早/最新一端会把按钮永久留在可点状态，下一次点击只取回空页，按 event_id 定位焦点事件的回环也走不到终点。`message_acknowledge`（`acknowledge_event`）对同一 Session 重复确认幂等：首次写入 `event_acknowledgements` 并追加一条 `message.acknowledged`；再次确认（不同 `request_id`）返回可区分的 `already_acknowledged=true` 且 `event_id=null`，不再追加事件；相同 `request_id` 仍按通用 `idempotent_write` 重放。
 
 ### Web 任务状态投影（方案 D v1）
 
