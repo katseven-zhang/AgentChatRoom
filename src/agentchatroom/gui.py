@@ -33,11 +33,20 @@ from .config import Settings, default_data_dir, load_settings, rewrite_config_te
 from .errors import DomainError
 from .gui_autostart import GuiInstanceGuard, LoginStartup
 from .gui_event_log import RoomEventTail, format_service_line, sanitize_gui_text
+from .runtime_log import tail_text_lines
 
 MIN_PORT = 1
 MAX_PORT = 65535
 _DIGITS_ONLY = re.compile(r"\A[0-9]+\Z")
 _RUNNING_URL = re.compile(r"running on (https?://\S+)")
+
+# The detached service appends to ``server.log`` forever and nothing rotates
+# it (a live checkout log measured 23 MB), and the address lookup runs on the
+# Tk thread from the 2 second poll. The reverse tail is therefore bounded twice
+# over: a line window for the common case and a byte cap for pathological
+# lines, so one lookup can never cost more than that cap.
+RUNNING_URL_TAIL_LINES = 400
+RUNNING_URL_TAIL_BYTES = 256 * 1024
 
 # Mirrors the server config rule: only loopback targets may bind without
 # management authentication.
@@ -174,13 +183,26 @@ def close_action(service_running: bool, user_choice: str | None) -> str:
 
 
 def running_url_from_log(log_path: Path) -> str | None:
-    """Return the newest actual listening address recorded in the server log."""
+    """Return the newest actual listening address recorded in the server log.
+
+    Reads through the shared bounded reverse tail used by ``agentchatroom
+    logs`` and the admin runtime panel: the previous full ``read_text`` cost
+    tens of megabytes on the Tk thread every two seconds.
+    """
     try:
-        content = Path(log_path).read_text(encoding="utf-8", errors="replace")
+        lines, _truncated = tail_text_lines(
+            Path(log_path),
+            RUNNING_URL_TAIL_LINES,
+            max_scan_bytes=RUNNING_URL_TAIL_BYTES,
+        )
     except OSError:
         return None
-    matches = _RUNNING_URL.findall(content)
-    return matches[-1] if matches else None
+    found: str | None = None
+    for line in lines:
+        match = _RUNNING_URL.search(line)
+        if match:
+            found = match.group(1)
+    return found
 
 
 def config_file_path(settings: Settings) -> Path:
@@ -190,18 +212,23 @@ def config_file_path(settings: Settings) -> Path:
     return settings.data_dir / "config.toml"
 
 
-def _format_toml_value(value: Any) -> str:
-    if isinstance(value, bool):
-        return "true" if value else "false"
-    if isinstance(value, (int, float)):
-        return str(value)
-    if isinstance(value, str):
-        escaped = value.replace("\\", "\\\\").replace('"', '\\"')
-        return f'"{escaped}"'
-    if isinstance(value, list):
-        inner = ", ".join(_format_toml_value(item) for item in value)
-        return f"[{inner}]"
-    raise ValueError(f"Unsupported config value: {value!r}")
+def _require_parsable_config(config_path: Path, current: str) -> None:
+    """Reject a hand-corrupted file before the GUI patches a line of it."""
+    if not current:
+        return
+    try:
+        tomllib.loads(current)
+    except tomllib.TOMLDecodeError as error:
+        raise DomainError(
+            "config_file_unparsable",
+            "The saved configuration cannot be read; repair or remove it first",
+            status_code=409,
+            details={
+                "required_action": "restore_config_from_backup_or_delete_it",
+                "config_path": str(config_path),
+                "toml_error": str(error),
+            },
+        ) from error
 
 
 def update_config_values(
@@ -210,44 +237,29 @@ def update_config_values(
     host: str | None = None,
     port: int | None = None,
 ) -> None:
-    """Persist the chosen host/port into the local config file for later launches."""
-    config_path = Path(config_path)
+    """Persist the chosen host/port into the local config file for later launches.
 
-    def build(_current: str) -> str:
-        document: dict[str, dict[str, Any]] = {}
-        if config_path.exists():
-            with config_path.open("rb") as handle:
-                try:
-                    loaded = tomllib.load(handle)
-                except tomllib.TOMLDecodeError as error:
-                    raise DomainError(
-                        "config_file_unparsable",
-                        "The saved configuration cannot be read; repair or remove it first",
-                        status_code=409,
-                        details={
-                            "required_action": "restore_config_from_backup_or_delete_it",
-                            "config_path": str(config_path),
-                            "toml_error": str(error),
-                        },
-                    ) from error
-            document = {name: dict(values) for name, values in loaded.items()}
-        server = dict(document.get("server", {}))
-        if host is not None:
-            server["host"] = host
-        if port is not None:
-            server["port"] = port
-        rebuilt: dict[str, dict[str, Any]] = {}
-        for name, values in document.items():
-            rebuilt[name] = server if name == "server" else values
-        if "server" not in rebuilt:
-            rebuilt["server"] = server
-        lines: list[str] = []
-        for name, values in rebuilt.items():
-            lines.append(f"[{name}]")
-            for key, value in values.items():
-                lines.append(f"{key} = {_format_toml_value(value)}")
-            lines.append("")
-        return "\n".join(lines)
+    Only the keys inside ``[server]`` are replaced, through the same shared
+    in-section writer the management settings endpoint uses, and the result
+    goes through the atomic read-modify-write path. The GUI used to rebuild the
+    whole document from a parsed dict, which erased every explanatory comment
+    the user copied from ``config.example.toml`` and raised ``TypeError``/
+    ``ValueError`` on root scalars, nested tables and array tables.
+    """
+    config_path = Path(config_path)
+    values: dict[str, Any] = {}
+    if host is not None:
+        values["host"] = host
+    if port is not None:
+        values["port"] = port
+    if not values:
+        return
+
+    from .api import upsert_toml_section
+
+    def build(current: str) -> str:
+        _require_parsable_config(config_path, current)
+        return upsert_toml_section(current, "server", values)
 
     rewrite_config_text(config_path, build)
 
@@ -397,8 +409,16 @@ def run_start_worker(
                         f"{host}:{port} 已写入配置，后续启动将使用该配置。",
                     )
                 )
-            except (OSError, ValueError) as error:
-                sink.put(("log", f"[配置写入失败] {error}"))
+            except (OSError, TypeError, ValueError, DomainError) as error:
+                # The service is already up: a config write problem is a
+                # separate, non-fatal report, never a fake 「启动失败」.
+                sink.put(
+                    (
+                        "log",
+                        f"[配置写入失败] 服务已启动，但 {host}:{port} 未能写入"
+                        f"配置文件（下次启动沿用原配置）：{type(error).__name__}: {error}",
+                    )
+                )
             if os.getenv("AGENTCHATROOM_PORT", "").strip() or os.getenv(
                 "AGENTCHATROOM_HOST", ""
             ).strip():
@@ -487,12 +507,61 @@ def tray_icon_image():
     return image
 
 
-def create_tray_icon(handle_action):
+TRAY_READY_TIMEOUT_SECONDS = 3.0
+
+# ``refresh_state`` probes the pid itself unless a caller already observed one;
+# ``None`` is a real observation ("the service is not running"), so a distinct
+# sentinel is required.
+_UNPROBED = object()
+
+
+def stop_tray_icon(icon) -> None:
+    """Best-effort pystray shutdown so its loop thread never outlives the GUI.
+
+    ``Icon.stop`` is a no-op while the backend never reached ``_running`` and
+    it raises when the native window handle is missing, so neither outcome may
+    be allowed to break Tk teardown.
+    """
+    if icon is None:
+        return
+    try:
+        icon.stop()
+    except Exception:
+        pass
+
+
+def tray_degraded_hint(reason: str, timeout_seconds: float) -> str:
+    """Return the Chinese degrade notice shown when the tray never appeared."""
+    detail = reason or (
+        f"系统托盘图标在 {timeout_seconds:g} 秒内没有完成注册（NIM_ADD 未生效）"
+    )
+    return (
+        f"{detail}：本次运行不会收起到系统托盘，关闭窗口时将询问结束服务或保留"
+        "服务，最小化只到任务栏；如需托盘请安装/修复 pystray 与 Pillow 后重启。"
+    )
+
+
+def create_tray_icon(
+    handle_action,
+    *,
+    ready_timeout: float = TRAY_READY_TIMEOUT_SECONDS,
+    note: Callable[[str], None] | None = None,
+):
     """Build a detached pystray icon wired to ``handle_action``; None if unavailable.
 
     ``handle_action`` receives one action key from :func:`build_tray_menu_spec`;
     pystray invokes callbacks on its own thread, so handlers must marshal back
     to the Tk loop themselves.
+
+    The win32 backend creates its window handle on the loop thread and only
+    then marks the icon ready, so showing the icon has to happen inside the
+    ready setup callback: setting ``visible`` from this thread ran before
+    ``_hwnd`` existed and, through pystray's ``if self._visible == value:
+    return`` early exit, turned pystray's own ready-time show into a no-op —
+    the shell never received NIM_ADD while the program believed it had.
+    Availability is therefore judged on the icon really being visible;
+    otherwise the loop is stopped and the caller degrades to the
+    window/taskbar-only path.
     """
     try:
         import pystray
@@ -501,6 +570,7 @@ def create_tray_icon(handle_action):
     image = tray_icon_image()
     if image is None:
         return None
+
     def menu_action(action_key: str):
         def invoke(icon, item):
             handle_action(action_key)
@@ -518,10 +588,33 @@ def create_tray_icon(handle_action):
         ]
     )
     icon = pystray.Icon("agentchatroom", image, "AgentChatRoom 控制台", menu)
+    shown = threading.Event()
+    failures: list[str] = []
+
+    def ready_setup(running_icon) -> None:
+        # pystray runs this only after the backend called ``_mark_ready``,
+        # which on win32 is after the notify window handle exists.
+        try:
+            running_icon.visible = True
+        except Exception as error:
+            failures.append(format_worker_error(error))
+            return
+        if getattr(running_icon, "visible", False):
+            shown.set()
+
+    def degrade() -> None:
+        stop_tray_icon(icon)
+        if note is not None:
+            note(tray_degraded_hint(failures[0] if failures else "", ready_timeout))
+
     try:
-        icon.run_detached()
-        icon.visible = True
-    except Exception:
+        icon.run_detached(ready_setup)
+    except Exception as error:
+        failures.append(format_worker_error(error))
+        degrade()
+        return None
+    if not shown.wait(timeout=ready_timeout) or not getattr(icon, "visible", False):
+        degrade()
         return None
     return icon
 
@@ -670,6 +763,14 @@ def run_gui(config_path: str | None = None, *, autostart: bool = False) -> None:
             self.action_active = False
             self.pending_exit_after_stop = False
             self.running_port: int | None = None
+            # The address the current service process actually listens on, plus
+            # the pid it belongs to. Remembering the URL (not just the port) is
+            # what keeps the 2 s poll off the log file entirely for a service
+            # this window started, and bounds it to one tail read per process
+            # for a service started elsewhere.
+            self.running_url: str | None = None
+            self.running_url_pid: int | None = None
+            self.poll_saw_running = False
             self.tray = None
             self.tray_hint_shown = False
 
@@ -793,8 +894,34 @@ def run_gui(config_path: str | None = None, *, autostart: bool = False) -> None:
             self.append_log("配置已重新加载，可以启动服务。")
             return True
 
-        def refresh_state(self) -> None:
-            pid = controller.running_pid()
+        def _running_url_for(self, pid: int | None) -> str | None:
+            """Return the listening address of ``pid``, remembering it per process.
+
+            A service this window started already reported its address in the
+            start result, so its status/front-end path costs no log reads at
+            all. Anything else is resolved once per process through the
+            bounded tail rather than on every poll tick.
+            """
+            if pid is None:
+                self.running_url = None
+                self.running_url_pid = None
+                return None
+            if self.running_url_pid != pid:
+                # A different process may listen somewhere else entirely.
+                self.running_url = None
+                self.running_url_pid = pid
+            if not self.running_url:
+                found = running_url_from_log(controller.log_path)
+                if found:
+                    self.running_url = found
+            return self.running_url
+
+        def refresh_state(self, observed_pid: Any = _UNPROBED) -> None:
+            pid = (
+                controller.running_pid()
+                if observed_pid is _UNPROBED
+                else observed_pid
+            )
             running = pid is not None
             start_enabled, stop_enabled = button_states(running, self.action_active)
             self.start_button.state(["!disabled"] if start_enabled else ["disabled"])
@@ -806,16 +933,18 @@ def run_gui(config_path: str | None = None, *, autostart: bool = False) -> None:
                 ["!disabled"] if running and not self.action_active else ["disabled"]
             )
             if running:
-                url = (
-                    controller.display_url(self._safe_host(), self.running_port)
-                    if self.running_port
-                    else running_url_from_log(controller.log_path)
+                url = resolve_frontend_url(
+                    self._running_url_for(pid),
+                    self._safe_host(),
+                    self.running_port or settings.port,
                 )
                 address = f" {url}" if url else ""
                 self.status_label.configure(
                     text=f"● 运行中{address} (pid {pid})", foreground="#1a7f37"
                 )
             else:
+                self.running_url = None
+                self.running_url_pid = None
                 self.status_label.configure(text="○ 已停止", foreground="#6b7280")
 
         def _safe_host(self) -> str:
@@ -825,10 +954,15 @@ def run_gui(config_path: str | None = None, *, autostart: bool = False) -> None:
                 return settings.host
 
         def poll_state(self) -> None:
-            was_running = controller.is_running()
-            self.refresh_state()
-            if was_running and not controller.is_running():
+            # One pid observation per tick, shared with the status refresh: the
+            # previous three separate probes around a whole-log read reported
+            # 「服务已退出」 for a service that was merely slow to appear.
+            pid = controller.running_pid()
+            running = pid is not None
+            if self.poll_saw_running and not running:
                 self.append_log("服务进程已退出（外部停止或异常退出）。")
+            self.poll_saw_running = running
+            self.refresh_state(pid)
             self.after(2000, self.poll_state)
 
         def drain_events(self) -> None:
@@ -846,6 +980,13 @@ def run_gui(config_path: str | None = None, *, autostart: bool = False) -> None:
             )
             if kind == "started":
                 self.running_port = self._launched_port(payload)
+                launched_url = str(payload.get("url") or "") or None
+                launched_pid = payload.get("pid")
+                if launched_url and isinstance(launched_pid, int):
+                    # Remember the address this window started, so neither the
+                    # status line nor 「打开前端」 ever reads the server log.
+                    self.running_url = launched_url
+                    self.running_url_pid = launched_pid
                 note = "服务已在运行" if payload.get("already_running") else "服务已启动"
                 self.append_log(
                     f"{note}：{payload.get('url', '')}（pid {payload.get('pid')}）"
@@ -957,14 +1098,16 @@ def run_gui(config_path: str | None = None, *, autostart: bool = False) -> None:
             )
 
         def on_frontend(self) -> None:
-            if controller.running_pid() is None:
+            pid = controller.running_pid()
+            if pid is None:
                 self.append_log("服务未运行，请先启动服务再打开前端。")
                 return
             host = self._safe_host()
+            # Same remembered-address path as the status line: a service
+            # started elsewhere costs one bounded tail read per process, never
+            # a fresh full-log scan per click.
             url = resolve_frontend_url(
-                running_url_from_log(controller.log_path)
-                if not self.running_port
-                else None,
+                self._running_url_for(pid),
                 host,
                 self.running_port or settings.port,
             )
@@ -1094,8 +1237,7 @@ def run_gui(config_path: str | None = None, *, autostart: bool = False) -> None:
 
         def shutdown_app(self) -> None:
             stop_tails()
-            if self.tray is not None:
-                self.tray.stop()
+            stop_tray_icon(self.tray)
             self.destroy()
 
     start_tails(settings)
@@ -1111,10 +1253,17 @@ def run_gui(config_path: str | None = None, *, autostart: bool = False) -> None:
         window.after(150, restore_on_second_launch)
 
     window.after(150, restore_on_second_launch)
+    tray_notes: list[str] = []
+
+    def report_tray_note(text: str) -> None:
+        tray_notes.append(text)
+        window.append_log(text)
+
     window.tray = create_tray_icon(
-        lambda action: window.after(0, window.handle_tray_action, action)
+        lambda action: window.after(0, window.handle_tray_action, action),
+        note=report_tray_note,
     )
-    if window.tray is None:
+    if window.tray is None and not tray_notes:
         window.append_log(
             "系统托盘不可用（需要 pystray 与 Pillow，可通过 pip install "
             "\"agentchatroom[gui]\" 安装）：关闭窗口将按原来的方式询问，"
@@ -1123,5 +1272,8 @@ def run_gui(config_path: str | None = None, *, autostart: bool = False) -> None:
     try:
         window.mainloop()
     finally:
+        # The pystray loop thread and its hidden window must not outlive the
+        # Tk mainloop, otherwise a fast close leaves the process running.
+        stop_tray_icon(window.tray)
         stop_tails()
         instance_guard.release()

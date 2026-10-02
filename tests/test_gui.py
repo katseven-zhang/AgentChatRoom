@@ -53,6 +53,24 @@ from agentchatroom.gui_event_log import (
 )
 
 
+def boot_gui_or_skip(gui_module, tk, **run_kwargs) -> None:
+    """Run the real GUI entry point, skipping this machine's broken Tcl/Tk runtime.
+
+    Tk init here intermittently loses init.tcl/tk.tcl: a probe at the top of a
+    test can pass while the probe inside ``run_gui`` (or the window itself)
+    still fails. Only a TclError fault becomes a skip, so a genuine regression
+    keeps failing the test.
+    """
+    try:
+        gui_module.run_gui(**run_kwargs)
+    except SystemExit as error:
+        if not isinstance(error.__cause__, tk.TclError):
+            raise
+        pytest.skip(f"Tcl/Tk runtime unavailable during boot: {error}")
+    except tk.TclError as error:
+        pytest.skip(f"Tcl/Tk runtime unavailable while building the window: {error}")
+
+
 @pytest.fixture
 def isolated_gui_instance_guard(monkeypatch) -> None:
     """Keep GUI layout tests independent of the user's running controller."""
@@ -271,12 +289,43 @@ def test_create_tray_icon_actions_have_pystray_compatible_signatures(monkeypatch
         return label, callback, default
 
     class Icon:
+        """pystray._win32 ordering: the handle exists only inside the loop thread.
+
+        ``visible`` therefore raises when it is set before the backend is
+        ready, which is exactly the NIM_ADD-before-_hwnd race #314 removed.
+        """
+
         def __init__(self, name, image, title, menu):
             self.menu = menu
-            self.visible = False
+            self._hwnd = None
+            self._visible = False
+            self.stop_calls = 0
 
-        def run_detached(self):
-            pass
+        @property
+        def visible(self) -> bool:
+            return self._visible
+
+        @visible.setter
+        def visible(self, value: bool) -> None:
+            if self._visible == value:
+                return
+            if value:
+                if self._hwnd is None:
+                    raise RuntimeError("NIM_ADD without a notify window handle")
+                self._visible = True
+            else:
+                self._visible = False
+
+        def run_detached(self, setup=None) -> None:
+            ready = setup or (lambda icon: setattr(icon, "visible", True))
+            threading.Thread(target=self._run, args=(ready,), daemon=True).start()
+
+        def _run(self, setup) -> None:
+            self._hwnd = object()
+            setup(self)
+
+        def stop(self) -> None:
+            self.stop_calls += 1
 
     monkeypatch.setitem(
         sys.modules,
@@ -288,6 +337,7 @@ def test_create_tray_icon_actions_have_pystray_compatible_signatures(monkeypatch
     icon = gui_module.create_tray_icon(actions.append)
     assert icon is not None
     assert icon.visible is True
+    assert icon.stop_calls == 0
     for _label, callback, _default in menu_items:
         callback(icon, None)
     assert actions == [action for _label, action, _default in build_tray_menu_spec()]
@@ -311,10 +361,12 @@ def test_gui_status_uses_full_width_row(
 
     windows = []
     monkeypatch.setattr(gui_module, "load_settings", lambda _config: settings)
-    monkeypatch.setattr(gui_module, "create_tray_icon", lambda _action: None)
+    monkeypatch.setattr(
+        gui_module, "create_tray_icon", lambda _action, **_kwargs: None
+    )
     monkeypatch.setattr(tk.Tk, "mainloop", lambda self: windows.append(self))
 
-    gui_module.run_gui()
+    boot_gui_or_skip(gui_module, tk)
     window = windows[0]
     try:
         assert window.status_label.master is window.start_button.master.master
@@ -356,10 +408,12 @@ def test_gui_login_checkbox_and_autostart_action(
     windows = []
     monkeypatch.setattr(gui_module, "load_settings", lambda _config: settings)
     monkeypatch.setattr(gui_module, "LoginStartup", lambda: startup)
-    monkeypatch.setattr(gui_module, "create_tray_icon", lambda _action: None)
+    monkeypatch.setattr(
+        gui_module, "create_tray_icon", lambda _action, **_kwargs: None
+    )
     monkeypatch.setattr(tk.Tk, "mainloop", lambda self: windows.append(self))
 
-    gui_module.run_gui(autostart=True)
+    boot_gui_or_skip(gui_module, tk, autostart=True)
     window = windows[0]
     try:
         assert window.login_startup_checkbox.cget("text") == "开机启动"
@@ -431,9 +485,11 @@ def test_login_autostart_config_error_keeps_gui_open_for_retry(
     )
     monkeypatch.setattr(gui_module, "LogTail", FakeLogTail)
     monkeypatch.setattr(gui_module, "RoomEventTail", FakeRoomTail)
-    monkeypatch.setattr(gui_module, "create_tray_icon", lambda _action: None)
+    monkeypatch.setattr(
+        gui_module, "create_tray_icon", lambda _action, **_kwargs: None
+    )
     monkeypatch.setattr(tk.Tk, "mainloop", mainloop)
-    gui_module.run_gui(autostart=True)
+    boot_gui_or_skip(gui_module, tk, autostart=True)
     window = windows[0]
     try:
         assert "配置读取失败" in window.log_view.get("1.0", "end")
