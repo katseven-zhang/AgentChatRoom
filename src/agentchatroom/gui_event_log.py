@@ -143,9 +143,10 @@ def format_room_event(
     verdict = str(data.get("verdict") or "")
 
     messages = {
-        "agent.joined": f"Agent {name} {'重新接入' if reconnected else '接入'} Room",
+        "agent.joined": (
+            f"Agent {name} {'重新接入' if (reconnected or data.get('reconnected')) else '接入'} Room"
+        ),
         "agent.left": f"Agent {name} 主动离开 Room",
-        "agent.session_replaced": None,  # joined follows in the same transaction
         "agent.identity_registered": f"Agent {name} 首次登记",
         "agent.credential_linked": f"Agent {name} 已关联接入凭据",
         "task.created": f"{name} 发布了{task}",
@@ -222,7 +223,6 @@ class RoomEventTail(threading.Thread):
         self.stop_event = stop_event
         self.poll_seconds = poll_seconds
         self.cursors: dict[str, int] = {}
-        self.replaced_sessions: set[str] = set()
         self.presence: dict[str, dict[str, str]] = {}
         self._next_presence_poll = 0.0
         self._error_reported = False
@@ -246,23 +246,13 @@ class RoomEventTail(threading.Thread):
                         continue
                     self.cursors[project_id] = seq
                     kind = event.get("event_type")
-                    session = str(event.get("actor_session_id") or "")
-                    if kind == "agent.session_replaced" and session:
-                        self.replaced_sessions.add(session)
-                        if len(self.replaced_sessions) > 1024:
-                            # A malformed/partial history must not grow this
-                            # transient join hint without bound.
-                            self.replaced_sessions.clear()
                     title = ""
                     if event.get("task_id"):
                         try:
                             title = str(self.service.get_task(project_id, str(event["task_id"])).get("title") or "")
                         except DomainError:
                             title = ""  # deleted task: event's own snapshot still formats
-                    line = format_room_event(event, project_name, task_title=title,
-                                             reconnected=session in self.replaced_sessions)
-                    if kind == "agent.joined":
-                        self.replaced_sessions.discard(session)
+                    line = format_room_event(event, project_name, task_title=title)
                     if line:
                         self.sink.put(("log", line))
                 if len(events) < 200:

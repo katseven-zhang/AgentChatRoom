@@ -4102,11 +4102,13 @@ class AgentChatRoomService:
             # conversations. Session ownership is intentionally independent:
             # joining a new conversation must not close another connection or
             # silently move its tasks and leases.
-            replacement = {
-                "previous_session_ids": [],
-                "transferred_task_ids": [],
-                "transferred_lease_ids": [],
-            }
+            previous_member_sessions = int(
+                connection.execute(
+                    "SELECT COUNT(*) AS total FROM agent_sessions"
+                    " WHERE project_id = ? AND member_id = ? AND id <> ?",
+                    (project_id, member_id, session_id),
+                ).fetchone()["total"]
+            )
             if member_created:
                 self._emit(
                     connection,
@@ -4149,14 +4151,6 @@ class AgentChatRoomService:
                             "name": cred_name,
                         },
                     )
-            if replacement["previous_session_ids"]:
-                self._emit(
-                    connection,
-                    project_id,
-                    "agent.session_replaced",
-                    actor_session_id=session_id,
-                    payload=replacement,
-                )
             event_id = self._emit(
                 connection,
                 project_id,
@@ -4172,7 +4166,7 @@ class AgentChatRoomService:
                     "client": client.strip(),
                     "model": model.strip(),
                     "role": role,
-                    "member_id": member_id,
+                    "reconnected": previous_member_sessions > 0,
                     "adopted_sessions": adopted_sessions,
                 },
             )
@@ -4187,7 +4181,6 @@ class AgentChatRoomService:
                 "agent": self._agent_dict(row),
                 "identity": self._member_dict(member),
                 "member_created": member_created,
-                "replaced": replacement,
                 "token": token,
                 "event_id": event_id,
                 "cursor": event_id,

@@ -459,9 +459,7 @@ def test_parallel_same_identity_session_does_not_transfer_task_or_lease(service,
         role="reviewer",
     )
 
-    assert second["replaced"]["previous_session_ids"] == []
-    assert second["replaced"]["transferred_task_ids"] == []
-    assert second["replaced"]["transferred_lease_ids"] == []
+    assert "replaced" not in second
     snapshot = service.snapshot(project["id"])
     stored_task = next(item for item in snapshot["tasks"] if item["id"] == task["id"])
     stored_lease = next(item for item in snapshot["leases"] if item["id"] == lease["id"])
@@ -514,8 +512,7 @@ def test_explicit_reclaim_recovers_unfinished_task_from_closed_identity_session(
         role="reviewer",
     )
 
-    assert second["replaced"]["previous_session_ids"] == []
-    assert second["replaced"]["transferred_task_ids"] == []
+    assert "replaced" not in second
     reclaimed = service.claim_task(
         project["id"], task["id"], second["agent"]["id"], second["token"],
         reclaim=True,
