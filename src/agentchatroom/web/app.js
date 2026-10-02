@@ -4138,10 +4138,26 @@ function renderTaskContract(task) {
 async function openTaskDetails(taskId, options = {}) {
   const task = state.snapshot?.tasks.find((item) => item.id === taskId);
   if (!task || !state.projectId) return;
+  const dialog = elements["task-edit-dialog"];
+  const alreadyOpen = Boolean(dialog.open);
+  const sameTask = alreadyOpen && state.editingTaskId === taskId;
   state.editingTaskId = taskId;
   state.focusEventId = Number(options.focusEventId || 0);
   if (options.eventType !== undefined) {
     elements["task-history-filter"].value = options.eventType || "";
+  }
+  renderTaskContract(task);
+  renderTaskAssignments(task);
+  elements["task-assign-button"].disabled = ["done", "cancelled"].includes(taskView(task).phase);
+  elements["task-release-button"].classList.toggle("is-hidden", !taskReleaseVisible(task));
+  elements["task-cancel-button"].classList.toggle("is-hidden", !taskCancelVisible(task));
+  // showModal throws InvalidStateError when the dialog is already open.
+  // The history window is reset only after that guard, and never for the
+  // task that is already on screen (#316).
+  if (!alreadyOpen) dialog.showModal();
+  if (sameTask) {
+    renderTaskTimeline(task);
+    return;
   }
   state.taskHistory = {
     taskId,
@@ -4150,13 +4166,7 @@ async function openTaskDetails(taskId, options = {}) {
     has_more_after: false,
     has_more_before: false,
   };
-  renderTaskContract(task);
-  renderTaskAssignments(task);
   renderTaskTimeline(task);
-  elements["task-assign-button"].disabled = ["done", "cancelled"].includes(taskView(task).phase);
-  elements["task-release-button"].classList.toggle("is-hidden", !taskReleaseVisible(task));
-  elements["task-cancel-button"].classList.toggle("is-hidden", !taskCancelVisible(task));
-  elements["task-edit-dialog"].showModal();
   try {
     await loadTaskHistory(taskId);
     if (state.focusEventId && !(state.taskHistory.items || []).some((item) => item.event_id === state.focusEventId || item.project_seq === state.focusEventId)) {
@@ -4185,10 +4195,16 @@ async function loadTaskHistoryUntil(taskId, eventSeq) {
 
 async function copyEventReference(eventId, taskNumber, projectSeq) {
   // 用户可读编号与深链都使用 project_seq；全局 id 不再对外暴露。
+  // replaceState updates the shareable hash without firing hashchange, so
+  // copying a reference inside the open dialog does not reopen it (#316).
   const seq = Number(projectSeq) || Number(eventId);
   const label = Number.isFinite(seq) && seq > 0 ? `事件 #${seq}` : "事件";
   const text = taskNumber ? `任务 #${taskNumber} / ${label}` : label;
-  location.hash = `event-${seq}`;
+  if (Number.isFinite(seq) && seq > 0 && typeof history !== "undefined" && history.replaceState) {
+    const next = new URL(location.href);
+    next.hash = `event-${seq}`;
+    history.replaceState(history.state, "", next);
+  }
   try {
     await navigator.clipboard.writeText(text);
     showToast("已复制事件引用");
