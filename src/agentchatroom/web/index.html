@@ -305,7 +305,11 @@
             <button id="project-folder-picker-button" type="button" class="secondary-button" disabled>选择文件夹</button>
           </span>
         </label>
-        <p class="form-hint">Git 仓库内的子文件夹会自动登记为该仓库的独立项目范围；普通目录按本地路径登记。</p>
+        <p class="form-hint">工作区可包含独立 Git 子仓库。检查后明确选择实际仓库；父目录及其他文件仍属于工作区。</p>
+        <button id="project-repository-inspect" type="button" class="secondary-button">检查 Git 仓库</button>
+        <label>实际仓库 <select id="project-repository-select" aria-label="选择实际仓库"><option value="__pending__">先检查项目文件夹</option></select></label>
+        <label>仓库相对路径 <input id="project-repository-input" autocomplete="off" placeholder="可手工填写更深层的仓库路径；留空保留本地目录"></label>
+        <p class="form-hint" id="project-repository-hint" aria-live="polite"></p>
         <p class="form-error" id="project-form-error" role="alert" hidden></p>
         <div class="dialog-actions">
           <button type="button" class="secondary-button dialog-close">取消</button>
@@ -451,6 +455,15 @@
         </div>
         <label>项目名称 <input id="settings-project-name" autocomplete="off" required>
           <small class="form-hint">生效时机：保存后立即生效 · 对谁生效：Room 内所有页面与导出数据</small></label>
+        <section>
+          <p class="form-hint" id="settings-workspace-root"></p>
+          <button id="settings-repository-inspect" type="button" class="secondary-button">重新检查 Git 仓库</button>
+          <label>实际仓库 <select id="settings-repository-select" aria-label="关联实际仓库"><option value="__pending__">点击重新检查</option></select></label>
+          <label>仓库相对路径 <input id="settings-repository-input" autocomplete="off" placeholder="父工作区内的实际 Git 仓库相对路径"></label>
+          <p class="form-hint" id="settings-repository-hint" aria-live="polite"></p>
+          <button id="settings-repository-save" type="button" class="secondary-button">确认关联此仓库</button>
+          <p class="form-error" id="settings-repository-error" role="alert" hidden></p>
+        </section>
         <label>租约冲突策略
           <select id="settings-lease-policy" title="作用于提交前检查（lease check）：「提示并记录」返回冲突清单由调用方决定；「提交前阻断」直接拒绝并写入审计事件。申请租约时的冲突始终拒绝，与本设置无关。">
             <option value="advisory">提示并记录</option>

@@ -61,9 +61,15 @@ from .contracts import (
 from .database import SCHEMA_VERSION, DatabaseBackend
 from .errors import DomainError
 from .project_registration import (
+    checkout_registration_change,
+    checkout_scope,
     detect_git_info,
     derive_logical_path,
     load_checkout_registration,
+    register_checkout_project,
+    repository_directory,
+    stored_project_scope,
+    validate_project_coordination_instructions,
 )
 from .task_history import (
     TASK_HISTORY_LIMIT_MAX,
@@ -493,12 +499,8 @@ def _project_scope(
 
 
 def _stored_project_scope(project: Mapping[str, Any]) -> tuple[str, str, str]:
-    logical_path = str(project["logical_path"] or "")
-    remote = str(project["git_remote"] or "")
-    if remote:
-        return ("git", normalize_remote(remote), logical_path.casefold())
-    root_path = Path(str(project["root_path"])).expanduser().resolve()
-    return ("path", os.path.normcase(str(root_path)), logical_path.casefold())
+    scope = stored_project_scope(dict(project))
+    return scope["kind"], scope["identity"], scope["logical_path"].casefold()
 
 
 class AgentChatRoomService:
@@ -510,6 +512,7 @@ class AgentChatRoomService:
         # so a backup cannot snapshot a half-restored SQLite file and restore
         # stale checks cannot race concurrent in-process backups.
         self._backup_restore_lock = threading.RLock()
+        self._repository_selection_lock = threading.RLock()
         # Wired by the API layer to the MCP transport state lookup: "alive",
         # "gone" (reaped transport, tombstone retained) or "unknown" for
         # sessions without an HTTP transport. Presence heartbeats are
@@ -1041,9 +1044,18 @@ class AgentChatRoomService:
             project_source = (
                 "git_remote"
                 if str(data.get("git_remote") or "").strip()
-                else "path"
+                else "git_local" if data.get("repository_path") else "path"
             )
         data["project_source"] = project_source
+        data["workspace_root"] = data["root_path"]
+        data["project_path"] = str(Path(data["root_path"]) / str(data.get("repository_path") or ""))
+        data["repository_root"] = ""
+        if project_source != "path" or data.get("repository_path"):
+            repository_root = Path(data["project_path"])
+            for _part in str(data.get("logical_path") or "").split("/"):
+                if _part:
+                    repository_root = repository_root.parent
+            data["repository_root"] = str(repository_root)
         if git_scope_recheck is not None:
             data["git_scope_recheck"] = dict(git_scope_recheck)
         return data
@@ -1637,6 +1649,170 @@ class AgentChatRoomService:
         data["active"] = ttl_active
         return data
 
+    def inspect_repository_candidates(self, root_path: str) -> dict[str, Any]:
+        """Bounded, explicit inspection; never run recursive discovery during polling."""
+        root = repository_directory(root_path)
+        deadline = time.monotonic() + self.settings.repository_scan_timeout_seconds
+        candidates: list[dict[str, Any]] = []
+        errors: list[dict[str, str]] = []
+        pending = [(root, 0)]
+        visited = 0
+        truncated = False
+        excludes = {name.casefold() for name in self.settings.repository_scan_excludes}
+        while pending:
+            if visited >= self.settings.repository_scan_max_directories or time.monotonic() >= deadline:
+                truncated = True
+                break
+            directory, depth = pending.pop(0)
+            visited += 1
+            try:
+                # A marker is only a cheap candidate hint; Git remains authoritative.
+                if depth == 0 or (directory / ".git").exists():
+                    remaining = max(0.001, (deadline - time.monotonic()) / 2)
+                    remote, git_root, is_worktree = detect_git_info(directory, timeout_seconds=remaining)
+                    if is_worktree and (depth == 0 or git_root == directory.resolve()):
+                        candidates.append({
+                            "relative_path": directory.relative_to(root).as_posix().replace("./", "")
+                                             if directory != root else "",
+                            "project_path": str(directory), "repository_root": str(git_root),
+                            "logical_path": derive_logical_path(directory, git_root),
+                            "project_source": _project_source_from_disk(remote, True),
+                        })
+                        continue
+                if depth >= self.settings.repository_scan_max_depth:
+                    # Report partial discovery even when no candidate was found at the depth limit.
+                    with os.scandir(directory) as entries:
+                        if any(entry.is_dir(follow_symlinks=False) and entry.name.casefold() not in excludes
+                               for entry in entries):
+                            truncated = True
+                    continue
+                with os.scandir(directory) as entries:
+                    children = []
+                    for entry in entries:
+                        if time.monotonic() >= deadline:
+                            truncated = True
+                            break
+                        candidate = Path(entry.path)
+                        if (entry.name.casefold() in excludes or entry.is_symlink()
+                                or (hasattr(candidate, "is_junction") and candidate.is_junction())):
+                            continue
+                        if entry.is_dir(follow_symlinks=False):
+                            try:
+                                candidate.resolve().relative_to(root)
+                            except ValueError:
+                                continue
+                            children.append(candidate)
+                            if len(pending) + len(children) + visited >= self.settings.repository_scan_max_directories:
+                                truncated = True
+                                break
+                    pending.extend((child, depth + 1) for child in sorted(children))
+            except OSError:
+                errors.append({"relative_path": directory.relative_to(root).as_posix(), "reason": "unreadable_directory"})
+        if time.monotonic() >= deadline:
+            truncated = True
+        return {
+            "schema_version": 1, "workspace_root": str(root), "candidates": candidates,
+            "selection_required": bool(candidates and candidates[0]["relative_path"]),
+            "complete": not truncated and not errors, "truncated": truncated,
+            "errors": errors, "visited_directories": visited,
+            "required_action": "select_repository_explicitly" if candidates else
+                               "enter_repository_relative_path_or_keep_local_directory" if truncated or errors else
+                               "keep_local_directory",
+        }
+
+    def _selected_repository(self, root: Path, selection: str | None) -> tuple[Path, str]:
+        if selection is None:
+            _remote, _git_root, is_worktree = _project_git_info(root)
+            if not is_worktree:
+                inspection = self.inspect_repository_candidates(str(root))
+                if inspection["candidates"] or not inspection["complete"]:
+                    raise DomainError(
+                        "repository_selection_required", "Inspect and explicitly select the repository, or keep the local directory",
+                        status_code=409, details=inspection,
+                    )
+            selection = ""
+        selected = repository_directory(root, selection)
+        relative = selected.relative_to(root).as_posix() if selected != root else ""
+        if relative:
+            _remote, _git_root, is_worktree = _project_git_info(selected)
+            if not is_worktree:
+                raise DomainError("repository_not_found", "Selected directory is not a Git worktree",
+                                  status_code=409, details={"required_action": "select_detected_repository"})
+        return selected, relative
+
+    def select_project_repository(self, project_id: str, repository_path: str) -> dict[str, Any]:
+        with self._repository_selection_lock:
+            return self._select_project_repository(project_id, repository_path)
+
+    def _select_project_repository(self, project_id: str, repository_path: str) -> dict[str, Any]:
+        """Associate a repository without moving the workspace or changing Room identity."""
+        with self.database.connect() as connection:
+            previous = dict(self._require_project(connection, project_id))
+        if previous["archived_at"] is not None:
+            raise DomainError("project_archived", "Restore the Room before selecting its repository", status_code=409)
+        root = repository_directory(previous["root_path"])
+        selected, relative = self._selected_repository(root, repository_path)
+        remote, git_root, is_worktree = _project_git_info(selected)
+        logical = derive_logical_path(selected, git_root)
+        scope = _project_scope(remote, git_root, logical)
+        registration = load_checkout_registration(root, logical_path=str(previous["logical_path"] or ""))
+        if registration and registration["project_key"] != previous["project_key"]:
+            raise DomainError("project_registration_conflict", "Workspace registration belongs to another Room",
+                              status_code=409, details={"required_action": "resolve_workspace_registration_conflict"})
+        validate_project_coordination_instructions(root)
+        # Existing repository associations cannot be silently changed into a different repository.
+        old_selection = str(previous.get("repository_path") or "")
+        _old_remote, old_git_root, old_is_worktree = _project_git_info(root)
+        if not old_selection and old_is_worktree and (
+            old_git_root != git_root or logical != str(previous["logical_path"] or "")
+        ):
+            raise DomainError("repository_selection_conflict", "A Git-scoped Room cannot move to another repository or subproject",
+                              status_code=409, details={"required_action": "use_a_separate_room_for_another_repository"})
+        if old_selection and relative != old_selection:
+            raise DomainError("repository_selection_conflict", "This Room is already associated with another repository",
+                              status_code=409, details={"required_action": "use_a_separate_room_for_another_repository"})
+        if previous["git_remote"] and normalize_remote(previous["git_remote"]) != normalize_remote(remote):
+            raise DomainError("repository_selection_conflict", "Repository identity differs from the Room",
+                              status_code=409, details={"required_action": "use_a_separate_room_for_another_repository"})
+        proposed = {**previous, "repository_path": relative, "git_remote": remote or None, "logical_path": logical}
+        # Preflight ownership before touching files; recheck again in the final write transaction.
+        with self.database.connect() as connection:
+            conflicts = [other for other in connection.execute("SELECT * FROM projects").fetchall()
+                         if other["id"] != project_id and other["archived_at"] is None and _stored_project_scope(other) == scope]
+            if conflicts:
+                raise DomainError("project_scope_conflict", "Selected repository scope belongs to another active Room",
+                                  status_code=409, details={"project_ids": [p["id"] for p in conflicts],
+                                                           "required_action": "use_the_existing_repository_room"})
+        # Filesystem/Git work runs before opening the SQL transaction. The context restores
+        # derived files if either registration or the transaction's ownership recheck fails.
+        with checkout_registration_change(root, proposed), self.database.connect(write=True) as connection:
+            current = dict(self._require_project(connection, project_id))
+            if any(current[key] != previous[key] for key in ("repository_path", "git_remote", "logical_path", "archived_at")):
+                raise DomainError("repository_selection_conflict", "Repository selection changed; refresh before retrying",
+                                  status_code=409, details={"required_action": "refresh_project"})
+            conflicts = [dict(other) for other in connection.execute("SELECT * FROM projects").fetchall()
+                         if other["id"] != project_id and other["archived_at"] is None and _stored_project_scope(other) == scope]
+            if conflicts:
+                raise DomainError("project_scope_conflict", "Selected repository scope belongs to another active Room",
+                                  status_code=409, details={"project_ids": [p["id"] for p in conflicts],
+                                                           "required_action": "use_the_existing_repository_room"})
+            if (old_selection, str(previous["git_remote"] or ""), previous["logical_path"]) == (relative, remote, logical):
+                project = self._project_dict(current, project_source=_project_source_from_disk(remote, is_worktree))
+                cursor = self.latest_cursor(connection, project_id)
+                event_id = None
+            else:
+                connection.execute("UPDATE projects SET repository_path = ?, git_remote = ?, logical_path = ?, updated_at = ? WHERE id = ?",
+                                   (relative, remote or None, logical, iso_now(), project_id))
+                cursor = event_id = self._emit(connection, project_id, "project.updated", payload={
+                    "changed_fields": ["repository_path", "git_remote", "logical_path"],
+                    "repository_path": relative, "previous_repository_path": old_selection,
+                    "workspace_root_unchanged": True,
+                })
+                row = connection.execute("SELECT * FROM projects WHERE id = ?", (project_id,)).fetchone()
+                project = self._project_dict(row, project_source=_project_source_from_disk(remote, is_worktree))
+        self._git_scope_probe_cache.pop(project_id, None)
+        return {"project": project, "event_id": event_id, "cursor": cursor}
+
     def create_project(
         self,
         *,
@@ -1644,6 +1820,7 @@ class AgentChatRoomService:
         name: str | None = None,
         logical_path: str = "",
         settings: dict[str, Any] | None = None,
+        repository_path: str | None = None,
     ) -> dict[str, Any]:
         root = Path(root_path).expanduser().resolve()
         if not root.is_dir():
@@ -1652,8 +1829,9 @@ class AgentChatRoomService:
                 "Project root must be an existing directory",
                 details={"root_path": str(root)},
             )
-        remote, git_root, is_work_tree = _project_git_info(root)
-        logical = derive_logical_path(root, git_root, logical_path)
+        selected, repository_path = self._selected_repository(root, repository_path)
+        remote, git_root, is_work_tree = _project_git_info(selected)
+        logical = derive_logical_path(selected, git_root, logical_path)
         candidate_scope = _project_scope(remote, git_root, logical)
         now = iso_now()
         normalized_settings = normalize_project_settings(settings)
@@ -1670,6 +1848,11 @@ class AgentChatRoomService:
             ]
             if len(active_conflicts) == 1:
                 existing = active_conflicts[0]
+                if repository_path and (str(existing["root_path"]) != str(root)
+                                        or str(dict(existing).get("repository_path") or "") != repository_path):
+                    raise DomainError("project_scope_conflict", "Selected repository is already registered to another Room",
+                                      status_code=409, details={"project_ids": [existing["id"]],
+                                                               "required_action": "use_the_existing_repository_room"})
                 return self._project_dict(
                     existing,
                     project_source=_project_source_from_disk(
@@ -1725,15 +1908,16 @@ class AgentChatRoomService:
             connection.execute(
                 """
                 INSERT INTO projects(
-                    id, project_key, name, root_path, git_remote, logical_path,
+                    id, project_key, name, root_path, repository_path, git_remote, logical_path,
                     settings_json, archived_at, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)
                 """,
                 (
                     project_id,
                     project_key,
                     name or root.name,
                     str(root),
+                    repository_path,
                     remote or None,
                     logical,
                     json_dump(normalized_settings),
@@ -1776,8 +1960,14 @@ class AgentChatRoomService:
                 "Project root must be an existing directory",
                 details={"root_path": str(root)},
             )
-        remote, git_root, _is_work_tree = _project_git_info(root)
-        logical = derive_logical_path(root, git_root, logical_path)
+        registration = load_checkout_registration(root, logical_path=logical_path)
+        selected_path = str((registration or {}).get("repository_path") or "")
+        selected = repository_directory(root, selected_path)
+        remote, git_root, _is_work_tree = _project_git_info(selected)
+        if selected_path and not _is_work_tree:
+            raise DomainError("repository_not_found", "Selected repository is no longer available",
+                              status_code=409, details={"required_action": "recheck_repository_selection"})
+        logical = derive_logical_path(selected, git_root, logical_path)
         candidate_scope = _project_scope(remote, git_root, logical)
         reg_key = str(registered_project_key or "").strip()
         with self.database.connect(write=True) as connection:
@@ -1927,6 +2117,7 @@ class AgentChatRoomService:
         return self.create_project(
             root_path=str(root),
             logical_path=logical,
+            repository_path=selected_path,
         )
 
     def list_projects(self) -> list[dict[str, Any]]:
@@ -1961,7 +2152,8 @@ class AgentChatRoomService:
         try:
             root = Path(root_path).expanduser().resolve()
             if root.is_dir():
-                remote, _git_root, is_work_tree = _project_git_info(root)
+                selected = repository_directory(root, str(project.get("repository_path") or ""))
+                remote, _git_root, is_work_tree = _project_git_info(selected)
                 source = _project_source_from_disk(remote, is_work_tree)
         except (OSError, DomainError):
             source = "path"
@@ -2034,8 +2226,9 @@ class AgentChatRoomService:
         if cached and cached[1] == "path" and (now - cached[0]) < GIT_SCOPE_RECHECK_TTL_SECONDS:
             return self._project_dict(project, project_source="path")
         try:
-            root = Path(root_path).expanduser().resolve()
-        except (OSError, ValueError):
+            workspace_root = Path(root_path).expanduser().resolve()
+            root = repository_directory(workspace_root, str(dict(project).get("repository_path") or ""))
+        except (OSError, ValueError, DomainError):
             return self._project_dict(project)
         if not root.is_dir():
             return self._project_dict(project)
@@ -2068,7 +2261,7 @@ class AgentChatRoomService:
             )
 
         candidate_scope = _project_scope(remote, git_root, logical)
-        norm_root = os.path.normcase(str(root))
+        norm_root = os.path.normcase(str(workspace_root))
 
         # Ownership resolution before any write (#166/#172 fail-closed).
         with self.database.connect() as connection:
@@ -2100,7 +2293,7 @@ class AgentChatRoomService:
             registration_unreadable = False
             try:
                 registration = load_checkout_registration(
-                    root, logical_path=logical
+                    workspace_root, logical_path=logical
                 )
             except DomainError:
                 registration = None
@@ -3039,6 +3232,20 @@ class AgentChatRoomService:
             worktree = self._validate_workspace_path("worktree", worktree)
         else:
             worktree = ""
+        with self.database.connect() as connection:
+            project_for_workspace = dict(self._require_project(connection, project_id))
+        selection = str(project_for_workspace.get("repository_path") or "")
+        metadata = dict(workspace_metadata or {})
+        if selection:
+            local_root = Path(local_path).expanduser().resolve()
+            if local_root.is_dir():
+                direct_scope = checkout_scope(local_root, repository_path="")
+                if direct_scope == stored_project_scope(project_for_workspace):
+                    selection = ""
+            metadata["repository_path"] = selection
+        else:
+            metadata.pop("repository_path", None)
+        workspace_metadata = metadata
         now = iso_now()
         with self.database.connect(write=True) as connection:
             self._require_project(connection, project_id)
@@ -7186,7 +7393,7 @@ class AgentChatRoomService:
                 )
             worktree = self._trusted_worktree(connection, project, agent)
         system_evidence = self._collect_git_evidence(
-            project, agent, commit_hash, worktree=worktree
+            project, agent, commit_hash, worktree=worktree, files=clean_files
         )
         stored_commit = str(system_evidence.get("commit_hash") or "")
         if commit_hash.strip() and (
@@ -8396,9 +8603,10 @@ class AgentChatRoomService:
             )
         root = Path(str(workspace["local_path"])).expanduser().resolve(strict=False)
         reported_raw = str(agent_data.get("worktree") or "").strip()
-        reported = (
-            Path(reported_raw).expanduser().resolve(strict=False) if reported_raw else root
-        )
+        reported_path = Path(reported_raw).expanduser() if reported_raw else root
+        if not reported_path.is_absolute():
+            reported_path = root / reported_path
+        reported = reported_path.resolve(strict=False)
         try:
             reported.relative_to(root)
         except ValueError as error:
@@ -8408,6 +8616,23 @@ class AgentChatRoomService:
                 status_code=403,
                 details={"workspace_id": workspace["id"]},
             ) from error
+        selection = str(dict(project).get("repository_path") or "")
+        if selection:
+            selection = str(json_load(workspace["metadata_json"], {}).get("repository_path", selection))
+            selected = repository_directory(root, selection)
+            if reported != root:
+                try:
+                    reported.relative_to(selected)
+                except ValueError as error:
+                    raise DomainError("untrusted_repository", "Session worktree is outside the selected repository",
+                                      status_code=403, details={"required_action": "use_selected_repository"}) from error
+                # A deeper independent repository is a different scope even inside the selected path.
+                _remote, actual_root, inside = _project_git_info(reported)
+                _selected_remote, selected_root, _selected_inside = _project_git_info(selected)
+                if inside and actual_root != selected_root:
+                    raise DomainError("untrusted_repository", "Session worktree belongs to a nested independent repository",
+                                      status_code=403, details={"required_action": "use_a_separate_repository_room"})
+            return selected
         return reported
 
     def _collect_git_status(self, worktree: Path) -> dict[str, Any]:
@@ -8420,9 +8645,55 @@ class AgentChatRoomService:
         commit_hash: str,
         *,
         worktree: Path | None = None,
+        files: list[str] | None = None,
     ) -> dict[str, Any]:
         resolved = worktree or Path(agent["worktree"] or project["root_path"])
-        return self._collect_git_evidence_from_worktree(resolved, commit_hash)
+        project_data = dict(project)
+        remote, git_root, is_worktree = _project_git_info(resolved)
+        if is_worktree:
+            stored_scope = stored_project_scope(project_data)
+            logical = derive_logical_path(resolved, git_root)
+            expected_logical = str(project_data.get("logical_path") or "")
+            identity_matches = (normalize_remote(remote) == stored_scope["identity"]
+                                if stored_scope["kind"] == "git" else
+                                os.path.normcase(str(git_root)) == stored_scope["identity"])
+            scope_matches = (logical.casefold() == expected_logical.casefold() or
+                             logical.casefold().startswith(expected_logical.casefold() + "/") or
+                             not expected_logical)
+            if not identity_matches or not scope_matches:
+                raise DomainError("untrusted_repository", "Git evidence belongs to a different repository scope",
+                                  status_code=403, details={"required_action": "select_repository_in_project_settings"})
+        evidence = self._collect_git_evidence_from_worktree(resolved, commit_hash)
+        evidence["schema_version"] = 2
+        evidence["workspace_root"] = str(project_data["root_path"])
+        evidence["repository_path"] = str(project_data.get("repository_path") or "")
+        evidence["file_evidence"] = self._repository_file_evidence(resolved, files or [])
+        return evidence
+
+    def _repository_file_evidence(self, root: Path, files: list[str]) -> list[dict[str, Any]]:
+        evidence = []
+        budget = self.settings.repository_evidence_max_file_bytes
+        for name in files:
+            item: dict[str, Any] = {"path": name}
+            try:
+                path = (root / name).resolve()
+                path.relative_to(root.resolve())
+                if not path.is_file():
+                    item["status"] = "missing_or_not_file"
+                elif path.stat().st_size > budget:
+                    item["status"] = "byte_budget_exceeded"
+                else:
+                    with path.open("rb") as stream:
+                        content = stream.read(budget + 1)
+                    if len(content) > budget:
+                        item["status"] = "byte_budget_exceeded"
+                    else:
+                        budget -= len(content)
+                        item.update(status="captured", size_bytes=len(content), sha256=hashlib.sha256(content).hexdigest())
+            except (OSError, ValueError):
+                item["status"] = "unreadable_or_outside_repository"
+            evidence.append(item)
+        return evidence
 
     def _collect_git_evidence_from_worktree(
         self,
@@ -8436,11 +8707,10 @@ class AgentChatRoomService:
                     creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
                     check=False,
                     capture_output=True,
-                    text=True,
                     timeout=5,
                     stdin=subprocess.DEVNULL,
                 )
-                return completed.returncode, completed.stdout.strip()
+                return completed.returncode, completed.stdout.decode("utf-8", "replace").strip()
             except (OSError, subprocess.SubprocessError):
                 return 1, ""
 
@@ -8452,18 +8722,23 @@ class AgentChatRoomService:
                 "worktree": str(worktree),
                 "reported_commit_exists": False,
                 "commit_hash": "unknown" if commit_hash.strip() else "",
+                "required_action": "inspect_and_select_repository_in_project_settings",
             }
         _, head = git("rev-parse", "HEAD")
         _, branch = git("branch", "--show-current")
-        _, status = git("status", "--porcelain")
+        _, status = git("-c", "core.quotepath=false", "status", "--porcelain", "--", ".")
+        _, repository_root = git("rev-parse", "--show-toplevel")
+        _, working_diff_stat = git("diff", "--stat", "HEAD", "--", ".")
+        commit_diff_stat = ""
         commit_exists = None
         commit_files: list[str] = []
         stored_commit = commit_hash.strip()
         if stored_commit:
-            commit_code, _ = git("rev-parse", "--verify", f"{stored_commit}^{{commit}}")
+            commit_code, verified_commit = git("rev-parse", "--verify", "--end-of-options", f"{stored_commit}^{{commit}}")
             commit_exists = commit_code == 0
             if commit_exists:
-                _, changed = git("show", "--format=", "--name-only", stored_commit)
+                _, changed = git("-c", "core.quotepath=false", "show", "--format=", "--name-only", verified_commit, "--", ".")
+                _, commit_diff_stat = git("show", "--format=", "--stat", verified_commit, "--", ".")
                 commit_files = sorted(
                     {line for line in changed.splitlines() if line.strip()}
                 )
@@ -8472,12 +8747,15 @@ class AgentChatRoomService:
         return {
             "captured": True,
             "worktree": str(worktree.resolve()),
+            "repository_root": repository_root,
             "head": head,
             "branch": branch,
             "dirty_files": status.splitlines()[:200] if status else [],
             "reported_commit_exists": commit_exists,
             "commit_files": commit_files,
             "commit_hash": stored_commit,
+            "commit_diff_stat": commit_diff_stat.splitlines()[:200],
+            "working_diff_stat": working_diff_stat.splitlines()[:200],
         }
 
     def latest_cursor(self, connection: Any, project_id: str) -> int:

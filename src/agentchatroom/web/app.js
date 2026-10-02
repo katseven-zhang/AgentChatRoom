@@ -65,6 +65,9 @@ const elements = Object.fromEntries(
     "message-form", "message-input", "send-message-button", "onboarding", "new-message-notice",
     "project-dialog", "project-form", "project-name-input", "project-path-input",
     "project-folder-picker-button", "project-form-error",
+    "project-repository-inspect", "project-repository-select", "project-repository-input", "project-repository-hint",
+    "settings-workspace-root", "settings-repository-inspect", "settings-repository-select",
+    "settings-repository-input", "settings-repository-hint", "settings-repository-save", "settings-repository-error",
     "task-dialog", "task-form", "task-raw-description-input", "task-target-agent-input",
     "task-target-agent-empty", "task-intake-submit", "task-intake-list", "task-table",
     "task-sort-controls",
@@ -1389,7 +1392,9 @@ function renderAll() {
   state.projects = state.projects.map((item) => item.id === project.id ? project : item);
   renderProjects();
   elements["room-name"].textContent = project.name;
-  elements["room-path"].textContent = project.root_path;
+  elements["room-path"].textContent = project.repository_path
+    ? `工作区：${project.root_path} · 仓库：${project.repository_root || project.project_path}`
+    : project.root_path;
   elements["chat-subtitle"].textContent = `${connectedAgentCount(agentIdentities)} 当前连接 / ${agentIdentities.length} 个 Agent`;
   elements["chat-subtitle"].title = `${connectedAgentCount(agentIdentities)} 当前连接 / ${agentIdentities.length} 个 Agent / 累计 ${agents.length} 次接入 · 游标 ${state.snapshot.cursor}`;
   elements["onboarding"].classList.add("is-hidden");
@@ -2402,6 +2407,13 @@ document.getElementById("archive-project-button").addEventListener("click", () =
 document.getElementById("project-settings-button").addEventListener("click", () => {
   if (!state.snapshot) return;
   const { project } = state.snapshot;
+  elements["settings-workspace-root"].textContent = `工作区：${project.root_path}`;
+  elements["settings-repository-input"].value = project.repository_path || "";
+  elements["settings-repository-select"].innerHTML = '<option value="__pending__">点击重新检查</option>';
+  elements["settings-repository-hint"].textContent = project.repository_path
+    ? `已关联：${project.repository_path}。关联保留本 Room 的历史和会话。`
+    : "尚未选择子仓库；重新检查后可关联实际仓库，保留当前 Room 历史。";
+  setDialogFormError(elements["settings-repository-error"], "");
   elements["settings-project-name"].value = project.name;
   elements["settings-lease-policy"].value = project.settings.lease_conflict_policy;
   elements["settings-roles"].value = project.settings.roles.join("\n");
@@ -3049,14 +3061,83 @@ elements["event-hide-system"].addEventListener("change", () => {
   if (state.snapshot) renderEvents(state.snapshot.agents, state.snapshot.tasks);
 });
 
+function renderRepositoryCandidates(prefix, result) {
+  const select = elements[`${prefix}-repository-select`];
+  const direct = result.candidates.some((candidate) => candidate.relative_path === "");
+  const options = [
+    ...(direct || result.complete && !result.candidates.length ? [] : ['<option value="__pending__">请明确选择仓库或保留本地目录</option>']),
+    `<option value="">${direct ? "当前目录的 Git 仓库" : "保留父目录为本地路径项目"}</option>`,
+    ...result.candidates.filter((candidate) => candidate.relative_path).map((candidate) =>
+      `<option value="${escapeHtml(candidate.relative_path)}">${escapeHtml(candidate.relative_path)} · ${escapeHtml(projectSource(candidate))}</option>`),
+  ];
+  select.innerHTML = options.join("");
+  select.dataset.inspectedRoot = result.workspace_root;
+  elements[`${prefix}-repository-hint`].textContent = `${result.candidates.length} 个仓库候选。${result.complete
+    ? "选择仓库后确认；不会自动选中第一个子仓库。"
+    : "检查未覆盖全部目录，可填写具体相对路径或明确保留本地目录。"}`;
+}
+
+async function inspectProjectRepositories() {
+  const root = elements["project-path-input"].value.trim();
+  const result = await api("/api/v1/local/repositories/inspect", {
+    method: "POST", body: JSON.stringify({ root_path: root }),
+  });
+  renderRepositoryCandidates("project", result);
+  elements["project-repository-select"].dataset.inputRoot = root;
+  return result;
+}
+
+for (const prefix of ["project", "settings"]) {
+  elements[`${prefix}-repository-select`].addEventListener("change", () => {
+    const value = elements[`${prefix}-repository-select`].value;
+    if (value !== "__pending__") elements[`${prefix}-repository-input`].value = value;
+  });
+}
+function resetProjectRepositorySelection() {
+  delete elements["project-repository-select"].dataset.inputRoot;
+  delete elements["project-repository-select"].dataset.inspectedRoot;
+  elements["project-repository-input"].value = "";
+  elements["project-repository-select"].innerHTML = '<option value="__pending__">先检查项目文件夹</option>';
+  elements["project-repository-hint"].textContent = "";
+}
+elements["project-path-input"].addEventListener("input", resetProjectRepositorySelection);
+elements["project-repository-inspect"].addEventListener("click", () =>
+  withBusy(inspectProjectRepositories).catch((error) => setProjectFormError(error.message)));
+elements["settings-repository-inspect"].addEventListener("click", () => withBusy(async () => {
+  const result = await api(`/api/v1/projects/${state.projectId}/repository/inspect`, { method: "POST" });
+  renderRepositoryCandidates("settings", result);
+}).catch((error) => setDialogFormError(elements["settings-repository-error"], error.message)));
+elements["settings-repository-save"].addEventListener("click", () => withBusy(async () => {
+  const selection = elements["settings-repository-input"].value.trim();
+  if (!selection && elements["settings-repository-select"].value === "__pending__") {
+    throw new Error("请检查并选择实际仓库，或明确选择保留本地目录");
+  }
+  await api(`/api/v1/projects/${state.projectId}/repository`, {
+    method: "PUT", body: JSON.stringify({ repository_path: selection }),
+  });
+  setDialogFormError(elements["settings-repository-error"], "");
+  showToast("仓库已关联，Room 历史已保留");
+  await loadProjects(state.projectId);
+}).catch((error) => setDialogFormError(elements["settings-repository-error"], error.message)));
+
 async function submitProjectForm() {
   setProjectFormError("");
   try {
+    const select = elements["project-repository-select"];
+    if (select.dataset.inputRoot !== elements["project-path-input"].value.trim()) {
+      await withBusy(inspectProjectRepositories);
+    }
+    const selection = elements["project-repository-input"].value.trim();
+    if (!selection && select.value === "__pending__") {
+      setProjectFormError("已检测到子仓库或检查未完成。请明确选择实际仓库，或保留父目录为本地项目。");
+      return;
+    }
     const project = await withBusy(() => api("/api/v1/projects", {
       method: "POST",
       body: JSON.stringify({
         name: elements["project-name-input"].value.trim() || null,
         root_path: elements["project-path-input"].value.trim(),
+        repository_path: selection,
       }),
     }));
     elements["project-dialog"].close();
@@ -3079,7 +3160,10 @@ elements["project-form"].addEventListener("submit", async (event) => {
 });
 
 // 关闭弹窗（成功、取消或右上角 ×）时清掉错误横幅，下次打开是干净状态。
-elements["project-dialog"].addEventListener("close", () => setProjectFormError(""));
+elements["project-dialog"].addEventListener("close", () => {
+  setProjectFormError("");
+  resetProjectRepositorySelection();
+});
 
 
 elements["settings-form"].addEventListener("submit", async (event) => {

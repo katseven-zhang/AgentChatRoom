@@ -463,6 +463,15 @@ class ProjectCreate(StrictModel):
     name: str | None = None
     logical_path: str = ""
     settings: dict[str, Any] = Field(default_factory=dict)
+    repository_path: str | None = None
+
+
+class RepositoryInspection(StrictModel):
+    root_path: str
+
+
+class RepositorySelection(StrictModel):
+    repository_path: str
 
 
 class LocalFolderPickRequest(StrictModel):
@@ -1631,6 +1640,19 @@ def create_app(
                 status_code=500,
             )
         return {"cancelled": False, "path": str(selected_path)}
+
+    @app.post("/api/v1/local/repositories/inspect")
+    def inspect_repositories(body: RepositoryInspection) -> dict[str, Any]:
+        return service.inspect_repository_candidates(body.root_path)
+
+    @app.post("/api/v1/projects/{project_id}/repository/inspect")
+    def inspect_project_repositories(project_id: str) -> dict[str, Any]:
+        project = service.get_project(project_id)
+        return service.inspect_repository_candidates(project["root_path"])
+
+    @app.put("/api/v1/projects/{project_id}/repository")
+    def select_project_repository(project_id: str, body: RepositorySelection) -> dict[str, Any]:
+        return service.select_project_repository(project_id, body.repository_path)
 
     @app.post("/api/v1/projects", status_code=201)
     def create_project(body: ProjectCreate) -> dict[str, Any]:

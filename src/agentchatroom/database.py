@@ -12,7 +12,7 @@ if TYPE_CHECKING:
     from .config import Settings
 
 
-SCHEMA_VERSION = 25
+SCHEMA_VERSION = 26
 
 
 class DatabaseBackend(Protocol):
@@ -34,6 +34,7 @@ CREATE TABLE IF NOT EXISTS projects (
     project_key TEXT NOT NULL UNIQUE,
     name TEXT NOT NULL,
     root_path TEXT NOT NULL,
+    repository_path TEXT NOT NULL DEFAULT '',
     git_remote TEXT,
     logical_path TEXT NOT NULL DEFAULT '',
     settings_json TEXT NOT NULL DEFAULT '{}',
@@ -435,6 +436,7 @@ CREATE TABLE IF NOT EXISTS project_document_heads (
 """
 
 MIGRATIONS = {
+    26: "SELECT 1;",  # Portable conditional column migration below.
     2: """
         ALTER TABLE agent_sessions ADD COLUMN token_expires_at TEXT NOT NULL DEFAULT '1970-01-01T00:00:00Z';
         ALTER TABLE file_leases ADD COLUMN renewed_at TEXT NOT NULL DEFAULT '1970-01-01T00:00:00Z';
@@ -914,6 +916,13 @@ def migrate_knowledge_source_event_ids(connection: Any) -> None:
         )
 
 
+def ensure_repository_path_schema(connection: Any, *, postgres: bool = False) -> None:
+    if postgres:
+        connection.execute("ALTER TABLE projects ADD COLUMN IF NOT EXISTS repository_path TEXT NOT NULL DEFAULT ''")
+    elif not any(row["name"] == "repository_path" for row in connection.execute("PRAGMA table_info(projects)").fetchall()):
+        connection.execute("ALTER TABLE projects ADD COLUMN repository_path TEXT NOT NULL DEFAULT ''")
+
+
 def ensure_event_number_schema(connection: Any, *, postgres: bool = False) -> None:
     """Add the Project-scoped event number column and its unique index.
 
@@ -1109,6 +1118,8 @@ class Database:
                     connection.executescript(MIGRATIONS[target])
                     if target == 25:
                         migrate_knowledge_source_event_ids(connection)
+                    if target == 26:
+                        ensure_repository_path_schema(connection)
                     connection.execute("UPDATE schema_meta SET version = ?", (target,))
                     version = target
 

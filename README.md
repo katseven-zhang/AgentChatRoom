@@ -322,6 +322,44 @@ REST、CLI 或 Web 自定义。Agent 只提供实际 `project_path`；后端自�
 任何显式传入值只能与后端派生结果一致，不能使用绝对路径、`..` 或虚构目录
 改写 Project 身份。
 
+父工作区本身不是 Git 仓库、其内包含独立子仓库时，工作区根、实际 Git 根和 Room
+作用域分别记录。添加项目点击“检查 Git 仓库”后，明确选择候选的相对路径；即使
+只有一个子仓库也不会默认选择。多个候选由用户选择，零候选可保留普通本地项目。
+选择当前 Git 目录或同仓库子项目时保持既有 `logical_path` 派生语义。普通子目录
+不会被当作独立仓库，`.git` 文件形式的 worktree 与无 origin 仓库都受支持。
+
+已有父目录 Room 可在“项目设置 → 重新检查 Git 仓库 → 确认关联此仓库”关联实际
+仓库，保留原 Project 身份、`root_path`、任务、历史、成员凭据、Session 和租约。
+新增的 `repository_path` 是父工作区内的相对路径；`workspace_root` 表示工作区，
+`project_path`/`repository_root` 表示实际范围与 Git 根。后端更新 checkout 登记，
+Agent 不手改 `project.json`。已关联仓库不能静默换成另一仓库；候选已被其他活动
+Room 占用时返回 `project_scope_conflict` 与下一步，登记冲突返回
+`project_registration_conflict`。旧历史只追加关联事件，不改写过去的证据。
+
+候选检查走共享领域服务，REST 为 `POST /api/v1/local/repositories/inspect`
+（`root_path`）、`POST /api/v1/projects/{id}/repository/inspect` 和
+`PUT /api/v1/projects/{id}/repository`（`repository_path`）。创建项目也支持
+`repository_path`；缺省且发现子仓库时返回 `repository_selection_required`，显式
+空串表示保留父目录本地项目。CLI 提供 `repository-inspect <workspace>`、
+`repository-select <project-id> <relative-path>` 与 `project-add --repository-path`。
+bootstrap 和 MCP Work Report 读取同一后端登记的选择，不改变 Session 的 Room。
+
+检查按需执行，列表、快照和详情轮询不会递归扫描。`[coordination]` 的
+`repository_scan_max_depth=3`、`repository_scan_max_directories=256`、
+`repository_scan_timeout_seconds=5.0`、`repository_scan_excludes`
+（默认 `.git,.agentchatroom,.venv,node_modules,build,dist`）控制扫描预算。配置优先级
+为环境变量 `AGENTCHATROOM_<大写配置名>` > TOML > 默认值；排除目录环境值用逗号
+分隔。目录链接和联接不递归，规范化后越界的选择拒绝；权限错误、深度或预算耗尽
+返回 `complete=false`、`truncated` 和 `errors`，不能将部分扫描宣称为零仓库。
+可以手工填写预算之外的具体相对路径，由 Git 再核验。
+
+Work Report 使用明确选定的实际仓库校验 `commit_hash`，采集提交文件、提交 diff
+统计、工作树 diff 统计以及文件/产物的大小和 SHA-256。`files` 相对于证据中的
+实际 `worktree`；缺失/非文件、越界或不可读文件明确标记，文件读取总预算由
+`repository_evidence_max_file_bytes=8388608` 控制。父目录其它文件不会纳入该仓库；
+另一仓库的提交、Session 工作树和符号链接产物不能绕过 Room 边界。自动 Git/文件
+证据只证明本地采集事实，独立验收仍由不同软件身份完成。
+
 一个规范化代码项目作用域对应一个活动 Project/Room。同一 Git remote 与
 `logical_path`，或同一本地规范化路径与 `logical_path`，不能创建第二个活动
 Room。`room_join` 会从忽略的 `.agentchatroom/project.json` 读取后端登记并自动
@@ -385,7 +423,7 @@ Project 名称缺失或写错时，错误 details 返回当前凭据包中可用
 
 托管区块只保存可读 Project 名称与稳定协作流程，不保存 Token、Project ID/Key、Session、Agent 身份、游标或在线状态。支持 `AGENTS.md` 的 Agent 在新会话读取后会得到准确的 `room_bootstrap(project_name="...")` 调用，以及 `room_sync`、消息处理、任务领取/回执、文件 lease、`work_report`、独立 `review_submit` 和集成步骤。服务端仍以 Token、软件身份和 workspace roots 做最终授权与防串项目校验；`AGENTS.md` 不是授权凭据。已经打开的会话不保证自动重新读取文件，写入或改名后应新开会话或按客户端能力重新加载项目规则。
 
-托管规则要求 Agent 在执行前区分三件事：**当前对话实际运行的工作空间**、**用户要求处理的目标项目**、**本 Session 绑定的 Room Project**。用户在 Agent 客户端发起或继续对话时可能选错项目工作空间（例如想处理另一个项目的工作，却在客户端打开了本项目的对话），因此三者不一致时——包括 Room 绑定与当前（错误）工作空间恰好匹配的情况——必须停止执行目标任务：不认领或回执其任务、不获取其文件租约、不读取或修改其文件，并明确告知当前对话所在工作空间与所请求项目的差异，请用户在 Agent 客户端切换到正确项目工作空间后继续或重新发起对话；目标项目不明确时先澄清，不猜测项目身份。禁止用重新绑定 Room Session、切换 Room Project、更改工作目录或跨目录操作来绕过：重绑 Room 不会改变客户端已经加载的对话工作区上下文，Room 绑定与当前工作空间一致也不构成执行另一项目的授权。恢复步骤只有一步：在 Agent 客户端切换到目标项目的工作空间（必要时新开对话以便规则重新加载），再按该工作空间的项目名执行 `room_bootstrap`。
+托管规则要求分别核对**当前对话工作区**、**用户授权的目标目录**和**当前 Session 的 Room 作用域**。用户明确指定的目标位于当前工作区内部时，普通子目录、独立 Git 子仓库、`.git` 文件 worktree 都可支持；目录名或 Git 根不同本身不意味着工作区不匹配。先规范化路径确认包含关系、核对 Room 归属，并使用明确选定的仓库采集 Git 证据。链接解析后越界、目标位于当前工作区之外或归属另一个 Room 时才停止，告知实际边界及冲突；不能通过改工作目录、重绑 Session 或自行修改登记绕过隔离。确属客户端打开了其它工作区时，请用户切换正确工作区再 bootstrap；工作区内的合法子目录无需仅因 Git 根不同而切换客户端工作区。
 
 HTTP 同一路径匹配多个项目或多个 roots 中混有无法解析的路径时失败封闭，不按数据库顺序选择第一个项目。本机 stdio 单机路径保持 `workspace_roots > cwd > env`：使用 checkout 登记校验，不走 HTTP 的 DB 优先捷径；登记损坏不得被数据库路径命中绕过。`AGENTCHATROOM_PROJECT_PATH` 只是兜底。
 

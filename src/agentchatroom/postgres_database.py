@@ -13,6 +13,7 @@ from .database import (
     ensure_agent_identity_columns,
     ensure_event_number_schema,
     ensure_project_member_columns,
+    ensure_repository_path_schema,
     ensure_task_assignment_member_column,
     ensure_task_number_schema,
     migrate_knowledge_source_event_ids,
@@ -156,6 +157,8 @@ class PostgresDatabase:
                     connection.executescript(MIGRATIONS[target])
                     if target == 25:
                         migrate_knowledge_source_event_ids(connection)
+                    if target == 26:
+                        ensure_repository_path_schema(connection, postgres=True)
                     connection.execute(
                         "UPDATE schema_meta SET version = ?", (target,)
                     )
