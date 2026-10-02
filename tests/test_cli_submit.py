@@ -234,6 +234,35 @@ async def test_submit_reports_unknown_project_with_known_names(settings, project
         await _stop(server, server_task)
 
 
+@pytest.mark.asyncio
+async def test_submit_refuses_two_projects_that_share_a_name(
+    settings, project_dir, tmp_path
+):
+    """#302: the same display name must not silently select the first Project."""
+    app = create_app(settings)
+    first, _member, _credential = _prepared_project(app, project_dir, name="Shared")
+    other = tmp_path / "other-room"
+    other.mkdir()
+    second, _member2, _credential2 = _prepared_project(app, other, name="Shared")
+
+    server, server_task, url = await _serve(app)
+    try:
+        with pytest.raises(SubmitError) as excinfo:
+            await asyncio.to_thread(
+                run_submit,
+                _args(project="Shared", token=_credential["token"], message="x"),
+                url,
+            )
+        assert excinfo.value.code == "submit_project_ambiguous"
+        assert excinfo.value.required_action == "pass_project_id"
+        assert first["id"] in excinfo.value.message
+        assert second["id"] in excinfo.value.message
+        assert str(first["root_path"]) in excinfo.value.message
+        assert str(second["root_path"]) in excinfo.value.message
+    finally:
+        await _stop(server, server_task)
+
+
 def test_submit_bundle_decoder_round_trips_projects(tmp_path):
     import base64
     import json

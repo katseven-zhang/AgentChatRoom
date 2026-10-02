@@ -248,21 +248,31 @@ def run_submit(args: argparse.Namespace, base_url: str) -> dict[str, Any]:
 
     projects = request_json(base_url, "GET", "/api/v1/projects")["projects"]
     wanted = str(args.project).strip()
-    project = next(
-        (
-            item
-            for item in projects
-            if item.get("id") == wanted
-            or str(item.get("name") or "").strip().casefold() == wanted.casefold()
-        ),
-        None,
-    )
-    if project is None:
+    # Names stay non-unique. A duplicate display name must fail closed here
+    # instead of adding a UNIQUE constraint that existing Rooms may already
+    # violate, and instead of silently taking the first row.
+    matches = [
+        item
+        for item in projects
+        if item.get("id") == wanted
+        or str(item.get("name") or "").strip().casefold() == wanted.casefold()
+    ]
+    if not matches:
         known = ", ".join(sorted(str(item.get("name") or "") for item in projects))
         raise SubmitError(
             "submit_project_not_found",
             f"Project {wanted!r} was not found on the service (known: {known})",
         )
+    if len(matches) > 1:
+        listed = "; ".join(
+            f"{item.get('id')} root_path={item.get('root_path')}" for item in matches
+        )
+        raise SubmitError(
+            "submit_project_ambiguous",
+            f"Project {wanted!r} matches more than one Project; pass --project <id>. {listed}",
+            "pass_project_id",
+        )
+    project = matches[0]
     project_id = str(project["id"])
     project_name = str(project.get("name") or "")
 
