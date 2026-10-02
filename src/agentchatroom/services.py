@@ -3985,6 +3985,12 @@ class AgentChatRoomService:
                             "required_action": "register_workspace_or_omit_host_id",
                         },
                     )
+            credential = None
+            # Only a credential already linked to a member proves that join.
+            # An unlinked credential used to skip the proof and adopt whatever
+            # member_id the caller supplied, which minted a Session as that
+            # identity and then pinned the credential to them.
+            credential_proves_member = False
             if credential_id:
                 credential = connection.execute(
                     """
@@ -4004,13 +4010,20 @@ class AgentChatRoomService:
                 # 12h Session; previously only the existence of the row was
                 # checked, so a revoked Token kept full write authority.
                 _require_live_credential(credential)
-                if member_id and credential["member_id"] not in {None, member_id}:
+                linked_member_id = credential["member_id"]
+                if (
+                    linked_member_id
+                    and member_id
+                    and str(linked_member_id) != str(member_id)
+                ):
                     raise DomainError(
                         "project_member_mismatch",
                         "Agent credential is linked to a different project member",
                         status_code=409,
                     )
-                member_id = member_id or credential["member_id"]
+                if linked_member_id:
+                    member_id = str(linked_member_id)
+                    credential_proves_member = True
             if member_id:
                 member = self._require_member(connection, project_id, member_id)
                 if member["status"] != "active":
@@ -4028,7 +4041,7 @@ class AgentChatRoomService:
                 # one of these proofs any caller could mint a Session as
                 # another software identity and inherit its independence,
                 # lease takeovers and append-only history.
-                if not credential_id:
+                if not credential_proves_member:
                     self._require_joinable_member_identity(
                         member,
                         software_key=software_key,

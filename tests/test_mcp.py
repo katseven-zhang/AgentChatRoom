@@ -278,6 +278,69 @@ def test_join_room_refuses_another_members_identity(monkeypatch, service, projec
     assert {item["id"] for item in identities} == {victim_member_id}
 
 
+def test_unlinked_credential_cannot_adopt_another_member(service, project_dir):
+    """#267 review: an unlinked credential does not prove a named member.
+
+    Presenting credential_id used to skip the identity proof whenever the
+    credential row existed. A credential whose member_id is still NULL then
+    adopted the caller's member_id and linked itself to that victim.
+    """
+    project = service.create_project(root_path=str(project_dir))
+    victim = service.join_room(
+        project["id"],
+        software_key="victim",
+        name="Victim",
+        client="victim-client",
+        model="unknown",
+    )
+    victim_member_id = victim["agent"]["member_id"]
+    issued = service.issue_agent_token(project["id"], name="Unlinked")
+    credential_id = issued["credential"]["id"]
+    assert not issued["credential"]["member_id"]
+
+    with pytest.raises(DomainError) as forged:
+        service.join_room(
+            project["id"],
+            software_key="intruder",
+            name="Intruder",
+            client="intruder-client",
+            model="unknown",
+            member_id=victim_member_id,
+            credential_id=credential_id,
+            manage_member_reference=True,
+        )
+
+    assert forged.value.code == "software_identity_mismatch"
+    assert forged.value.status_code == 403
+    assert forged.value.details["required_action"] == (
+        "restore_configured_software_identity_or_use_management_credential"
+    )
+    credential = next(
+        item
+        for item in service.list_agent_tokens(project["id"])
+        if item["id"] == credential_id
+    )
+    assert not credential["member_id"]
+    sessions = service.snapshot(project["id"])["agents"]
+    assert [item["id"] for item in sessions] == [victim["agent"]["id"]]
+    assert sessions[0]["client"] == "victim-client"
+    identities = service.snapshot(project["id"])["agent_identities"]
+    assert {item["id"] for item in identities} == {victim_member_id}
+
+    linked = service.issue_agent_token(
+        project["id"], name="Linked to victim", member_id=victim_member_id
+    )
+    proved = service.join_room(
+        project["id"],
+        name="Victim again",
+        client="victim-client",
+        model="unknown",
+        member_id=victim_member_id,
+        credential_id=linked["credential"]["id"],
+    )
+    assert proved["agent"]["member_id"] == victim_member_id
+
+
 def test_join_room_accepts_the_same_software_identity(monkeypatch, service, project_dir):
     """#267: proving the same software key still allows a second conversation."""
     monkeypatch.setattr(mcp_server, "service", service)

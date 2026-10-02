@@ -1650,6 +1650,57 @@ def test_join_refuses_a_revoked_credential(settings, project_dir):
         assert client.get(f"/api/v1/projects/{project['id']}/snapshot").json()["agents"] == []
 
 
+def test_join_refuses_unlinked_credential_naming_another_member(settings, project_dir):
+    """#267 review: REST join must not mint the victim's Session from an unlinked credential."""
+    with TestClient(create_app(settings)) as client:
+        project = client.post(
+            "/api/v1/projects",
+            json={"root_path": str(project_dir), "name": "Unlinked join"},
+        ).json()
+        victim = client.post(
+            f"/api/v1/projects/{project['id']}/agents/join",
+            json={
+                "name": "Victim",
+                "client": "victim-client",
+                "model": "unknown",
+            },
+        )
+        assert victim.status_code == 201
+        victim_member_id = victim.json()["agent"]["member_id"]
+        issued = client.post(
+            f"/api/v1/projects/{project['id']}/agent-tokens",
+            json={"name": "Unlinked token"},
+        ).json()
+        credential_id = issued["credential"]["id"]
+        assert not issued["credential"]["member_id"]
+
+        forged = client.post(
+            f"/api/v1/projects/{project['id']}/agents/join",
+            json={
+                "name": "Intruder",
+                "client": "intruder-client",
+                "model": "unknown",
+                "member_id": victim_member_id,
+                "credential_id": credential_id,
+            },
+        )
+
+        assert forged.status_code == 403
+        error = forged.json()["error"]
+        assert error["code"] == "software_identity_mismatch"
+        assert error["details"]["required_action"] == (
+            "restore_configured_software_identity_or_use_management_credential"
+        )
+        listed = client.get(f"/api/v1/projects/{project['id']}/agent-tokens").json()
+        credential = next(
+            item for item in listed["credentials"] if item["id"] == credential_id
+        )
+        assert not credential["member_id"]
+        agents = client.get(f"/api/v1/projects/{project['id']}/snapshot").json()["agents"]
+        assert [item["id"] for item in agents] == [victim.json()["agent"]["id"]]
+        assert agents[0]["client"] == "victim-client"
+
+
 def test_join_refuses_an_expired_credential(service, project_dir):
     """#333: an expired credential must not open a new Session either."""
     project = service.create_project(root_path=str(project_dir))
