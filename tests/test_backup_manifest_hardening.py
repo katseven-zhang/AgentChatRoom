@@ -193,6 +193,124 @@ def test_postgres_restore_audits_after_the_restore_runs(service, project, monkey
     )
 
 
+def test_interrupted_manifest_write_leaves_the_published_file(tmp_path, monkeypatch):
+    """#250: a failed publish must not replace a complete manifest with a partial one."""
+    import os
+
+    from agentchatroom.backup import _write_manifest
+
+    target = tmp_path / "backup-keep.sqlite"
+    target.write_bytes(b"x")
+    published = target.with_name(target.name + ".manifest.json")
+    published.write_text('{"complete": true}\n', encoding="utf-8")
+    original = published.read_bytes()
+
+    def fail_replace(src, dst):
+        raise OSError("interrupted before publish")
+
+    monkeypatch.setattr(os, "replace", fail_replace)
+
+    with pytest.raises(OSError, match="interrupted before publish"):
+        _write_manifest(
+            target, backend="sqlite", details={"source": "test"}, latest_event_id=3
+        )
+
+    assert published.read_bytes() == original
+    assert [path for path in tmp_path.iterdir() if path.suffix == ".tmp"] == []
+
+
+def test_postgres_restore_blocks_a_writer_until_pg_restore_returns(
+    service, project, monkeypatch
+):
+    """#249: a second writer cannot commit while pg_restore is still running."""
+    import threading
+    from contextlib import contextmanager
+
+    target = _managed_backup(service, project, cursor=10**9)
+    lock = threading.Lock()
+    phases: list[str] = []
+
+    @contextmanager
+    def hold_restore_lock():
+        assert lock.acquire(timeout=2)
+        phases.append("locked")
+        try:
+            yield
+        finally:
+            phases.append("unlocked")
+            lock.release()
+
+    service.database.hold_restore_lock = hold_restore_lock
+    monkeypatch.setattr(
+        service, "settings", replace(service.settings, database_backend="postgresql")
+    )
+    writer_started = threading.Event()
+    writer_finished = threading.Event()
+
+    def writer():
+        writer_started.set()
+        acquired = lock.acquire(timeout=2)
+        phases.append("writer" if acquired else "writer-gave-up")
+        if acquired:
+            lock.release()
+        writer_finished.set()
+
+    def fake_restore(*_args, **_kwargs):
+        phases.append("pg_restore")
+        thread = threading.Thread(target=writer)
+        thread.start()
+        assert writer_started.wait(timeout=2)
+        thread.join(timeout=0.2)
+        assert not writer_finished.is_set()
+        phases.append("pg_restore_done")
+
+    monkeypatch.setattr("agentchatroom.services.restore_postgresql", fake_restore)
+
+    service.restore_backup(str(target), confirm="REPLACE")
+
+    assert writer_finished.wait(timeout=2)
+    assert phases.index("locked") < phases.index("pg_restore")
+    assert phases.index("pg_restore_done") < phases.index("unlocked")
+    assert phases.index("unlocked") < phases.index("writer")
+
+
+def test_postgres_restore_lock_is_a_session_advisory_lock():
+    """#249: the shipped PostgreSQL lock is the same key writers already take."""
+    from agentchatroom.postgres_database import (
+        POSTGRES_WRITE_LOCK_KEY,
+        PostgresDatabase,
+    )
+
+    calls: list[tuple[str, object]] = []
+
+    class Raw:
+        def execute(self, sql, params=None):
+            calls.append((sql, params))
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+    class Pool:
+        def connection(self, timeout=None):
+            return Raw()
+
+    database = PostgresDatabase.__new__(PostgresDatabase)
+    database._opened = True
+    database.connect_timeout_seconds = 1
+    database._pool = Pool()
+
+    with database.hold_restore_lock():
+        assert calls[0] == (
+            "SELECT pg_advisory_lock(%s)",
+            (POSTGRES_WRITE_LOCK_KEY,),
+        )
+    assert calls[1][0] == "SELECT pg_advisory_unlock(%s)"
+    assert calls[1][1] == (POSTGRES_WRITE_LOCK_KEY,)
+
+
 def test_cli_backup_stamps_the_event_cursor(service, project, tmp_path):
     """#295: a backup made outside the service must not be cursor-unknown."""
     from agentchatroom.backup import backup_sqlite

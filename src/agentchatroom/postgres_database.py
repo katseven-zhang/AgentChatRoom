@@ -120,6 +120,29 @@ class PostgresDatabase:
             tuple[PostgresConnection, bool] | None
         ] = ContextVar(f"agentchatroom_postgres_connection_{id(self)}", default=None)
 
+    @contextmanager
+    def hold_restore_lock(self) -> Iterator[None]:
+        """Block other writers from the stale check until pg_restore returns.
+
+        Writers already take ``pg_advisory_xact_lock`` on
+        ``POSTGRES_WRITE_LOCK_KEY`` for one transaction. A session-level lock
+        on that same key is not dropped when pg_restore rebuilds tables, and
+        it is not confined to the transaction that only read the event cursor.
+        """
+        self._ensure_open()
+        with self._pool.connection(timeout=self.connect_timeout_seconds) as raw:
+            raw.execute(
+                "SELECT pg_advisory_lock(%s)",
+                (POSTGRES_WRITE_LOCK_KEY,),
+            )
+            try:
+                yield
+            finally:
+                raw.execute(
+                    "SELECT pg_advisory_unlock(%s)",
+                    (POSTGRES_WRITE_LOCK_KEY,),
+                )
+
     def _ensure_open(self) -> None:
         if self._opened:
             return

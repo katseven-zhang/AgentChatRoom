@@ -17,6 +17,7 @@ import subprocess
 import threading
 import time
 import uuid
+from contextlib import contextmanager
 from functools import wraps
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -10688,6 +10689,25 @@ class AgentChatRoomService:
             row = connection.execute("SELECT COALESCE(MAX(id), 0) AS latest FROM events").fetchone()
             return int(row["latest"])
 
+    @contextmanager
+    def _hold_postgres_write_lock(self):
+        """Keep other PostgreSQL writers out until pg_restore finishes.
+
+        SQLite exclusion is the file lock taken above this call. PostgreSQL
+        writers take ``pg_advisory_xact_lock`` for a single transaction, which
+        ends as soon as the cursor read returns. ``hold_restore_lock`` keeps a
+        session lock on the same key until the restore process returns.
+        """
+        if self.settings.database_backend != "postgresql":
+            yield
+            return
+        holder = getattr(self.database, "hold_restore_lock", None)
+        if not callable(holder):
+            yield
+            return
+        with holder():
+            yield
+
     def restore_backup(
         self,
         backup_path: str,
@@ -10897,58 +10917,61 @@ class AgentChatRoomService:
                     actor_session_id=actor_session_id,
                 )
             else:
-                latest_event_id = self._latest_event_id()
-                stale = (
-                    backup_event_id is not None
-                    and backup_event_id < latest_event_id
-                )
-                unknown_cursor = backup_event_id is None
-                if (stale or unknown_cursor) and not allow_data_loss:
-                    reason = "backup_stale" if stale else "backup_cursor_unknown"
-                    self._emit_backup_event(
-                        "backup.restore_rejected",
-                        payload={
-                            "file": str(target),
-                            "reason": reason,
-                            "backup_latest_event_id": backup_event_id,
-                            "current_latest_event_id": latest_event_id,
-                        },
-                        actor_session_id=actor_session_id,
+                with self._hold_postgres_write_lock():
+                    latest_event_id = self._latest_event_id()
+                    stale = (
+                        backup_event_id is not None
+                        and backup_event_id < latest_event_id
                     )
-                    if unknown_cursor:
+                    unknown_cursor = backup_event_id is None
+                    if (stale or unknown_cursor) and not allow_data_loss:
+                        reason = "backup_stale" if stale else "backup_cursor_unknown"
+                        self._emit_backup_event(
+                            "backup.restore_rejected",
+                            payload={
+                                "file": str(target),
+                                "reason": reason,
+                                "backup_latest_event_id": backup_event_id,
+                                "current_latest_event_id": latest_event_id,
+                            },
+                            actor_session_id=actor_session_id,
+                        )
+                        if unknown_cursor:
+                            raise DomainError(
+                                "backup_cursor_unknown",
+                                "The backup manifest records no event cursor, so it "
+                                "cannot be proven current; pass allow_data_loss to "
+                                "restore it anyway",
+                                status_code=409,
+                                details={
+                                    "backup_latest_event_id": None,
+                                    "current_latest_event_id": latest_event_id,
+                                    "required_action": "retake_backup_or_allow_data_loss",
+                                },
+                            )
                         raise DomainError(
-                            "backup_cursor_unknown",
-                            "The backup manifest records no event cursor, so it "
-                            "cannot be proven current; pass allow_data_loss to "
-                            "restore it anyway",
+                            "backup_stale",
+                            "The backup is older than the current database; pass allow_data_loss "
+                            "to accept losing newer events",
                             status_code=409,
                             details={
-                                "backup_latest_event_id": None,
+                                "backup_latest_event_id": backup_event_id,
                                 "current_latest_event_id": latest_event_id,
-                                "required_action": "retake_backup_or_allow_data_loss",
                             },
                         )
-                    raise DomainError(
-                        "backup_stale",
-                        "The backup is older than the current database; pass allow_data_loss "
-                        "to accept losing newer events",
-                        status_code=409,
-                        details={
-                            "backup_latest_event_id": backup_event_id,
-                            "current_latest_event_id": latest_event_id,
-                        },
+                    database_url = os.getenv(self.settings.database_url_env, "")
+                    # pg_restore rewrites the database it targets, so an audit row
+                    # written before it runs is destroyed by its own restore. The
+                    # started/completed trail is emitted around the call below, the
+                    # same way the SQLite branch does it. The session advisory lock
+                    # stays held until this call returns, so another process cannot
+                    # commit into the window pg_restore is about to erase.
+                    restore_postgresql(database_url, target)
+                    self._emit_backup_event(
+                        "backup.restore_started",
+                        payload={"file": str(target), "stale": stale},
+                        actor_session_id=actor_session_id,
                     )
-                database_url = os.getenv(self.settings.database_url_env, "")
-                # pg_restore rewrites the database it targets, so an audit row
-                # written before it runs is destroyed by its own restore. The
-                # started/completed trail is emitted around the call below, the
-                # same way the SQLite branch does it.
-                restore_postgresql(database_url, target)
-                self._emit_backup_event(
-                    "backup.restore_started",
-                    payload={"file": str(target), "stale": stale},
-                    actor_session_id=actor_session_id,
-                )
         # unknown_cursor is not "cursor 0". Allowing the restore still discards
         # every event the manifest cannot account for, so data_loss stays true.
         data_loss = bool(stale or unknown_cursor)
