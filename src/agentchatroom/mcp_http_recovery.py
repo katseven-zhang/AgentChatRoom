@@ -16,6 +16,8 @@ from __future__ import annotations
 import json
 from typing import Any, Awaitable, Callable, MutableMapping
 
+from mcp.shared.exceptions import McpError
+
 # Wire contract shared by the server adapter and the stdio Bridge.
 MCP_SESSION_EXPIRED_CODE = "mcp_session_expired"
 MCP_SESSION_RECONNECT_ACTION = "reconnect_mcp_session"
@@ -25,6 +27,14 @@ MCP_SESSION_EXPIRED_STATUS = "expired"
 # The SDK's message for both an unknown/expired session id and a session id that
 # was created under a different credential. Both mean "re-initialise".
 EXPIRED_SESSION_MESSAGE = "Session not found"
+
+# A client that goes through the SDK never sees the 404 as a status: the client
+# transport turns a 404 on a request into an in-band JSON-RPC error it raises as
+# McpError, so the expired session has to be recognised from that error too.
+SESSION_TERMINATED_ERROR_CODE = 32600
+EXPIRED_SESSION_ERROR_MESSAGES = frozenset(
+    {"session terminated", "session not found"}
+)
 
 HTTP_404 = 404
 _MAX_BUFFERED_BODY = 64 * 1024
@@ -111,8 +121,25 @@ def _header_value(headers: Any, name: str) -> str:
     return ""
 
 
+def session_terminated_error(error: BaseException) -> bool:
+    """True for the SDK's in-band report that the center no longer knows the session."""
+    inner = getattr(error, "error", None)
+    if inner is None:
+        return False
+    if getattr(inner, "code", None) != SESSION_TERMINATED_ERROR_CODE:
+        return False
+    message = str(getattr(inner, "message", "") or "").strip().casefold()
+    return message in EXPIRED_SESSION_ERROR_MESSAGES
+
+
 def expired_session_exception(error: BaseException) -> bool:
-    """Inspect an exception tree for an expired-session HTTP 404 from the center."""
+    """Inspect an exception tree for an expired-session signal from the center.
+
+    Two shapes count, because which one you get depends on how the request was
+    issued: a raw HTTP client sees the spec's 404 (with our session-state header
+    or expired payload), while an SDK client never sees a status at all -- the
+    transport converts the 404 into a JSON-RPC error it raises as ``McpError``.
+    """
     pending: list[BaseException] = [error]
     visited: set[int] = set()
     while pending:
@@ -120,6 +147,8 @@ def expired_session_exception(error: BaseException) -> bool:
         if id(current) in visited:
             continue
         visited.add(id(current))
+        if isinstance(current, McpError) and session_terminated_error(current):
+            return True
         response = getattr(current, "response", None)
         status = getattr(response, "status_code", None)
         if status == HTTP_404:
