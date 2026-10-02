@@ -2634,6 +2634,14 @@ elements["token-secret-close"].addEventListener("click", () => {
   elements["token-secret-dialog"].close();
 });
 
+// 一次性 Secret 只在签发那一次给出。原生 <dialog> 按 Escape 会先触发 cancel 再触发
+// close，而 close 监听会把内容清空——按一个键就永久丢掉刚签发的凭据，只能再签一个。
+// 取消事件必须挡下来，只留下显式的「我已保存」出口（#321）。
+elements["token-secret-dialog"].addEventListener("cancel", (event) => {
+  event.preventDefault();
+  showToast("这个 Secret 只显示一次，请按「我已保存」确认后再关闭");
+});
+
 elements["token-secret-dialog"].addEventListener("close", () => {
   state.issuedHttpSetup = null;
   elements["token-secret-section"].hidden = false;
