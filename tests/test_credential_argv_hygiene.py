@@ -70,3 +70,32 @@ def test_token_is_no_longer_a_required_argument(monkeypatch):
     # An explicit token still works (it is the operator's choice), so the parser
     # must not fail; it simply no longer *requires* the secret on argv.
     assert module.parse_args().token == LIVE_TOKEN
+
+
+def test_explicit_token_flag_prints_a_deprecation_warning_without_the_value(monkeypatch, capfd):
+    monkeypatch.delenv("AGENTCHATROOM_AGENT_TOKEN", raising=False)
+    module = _load("verify_remote_hosts")
+    monkeypatch.setattr(
+        sys, "argv",
+        ["verify_remote_hosts.py", "--url", "http://h/mcp", "--project-id", "p",
+         "--workspace-a", "a", "--workspace-b", "b", "--token", LIVE_TOKEN],
+    )
+    args = module.parse_args()
+    captured = capfd.readouterr()
+    assert args.token == LIVE_TOKEN
+    assert "deprecated" in captured.err
+    assert "AGENTCHATROOM_AGENT_TOKEN" in captured.err
+    # the warning itself must not reproduce the secret it is warning about
+    assert LIVE_TOKEN not in captured.err
+
+
+def test_environment_token_does_not_warn(monkeypatch, capfd):
+    monkeypatch.setenv("AGENTCHATROOM_AGENT_TOKEN", LIVE_TOKEN)
+    module = _load("verify_remote_hosts")
+    monkeypatch.setattr(
+        sys, "argv",
+        ["verify_remote_hosts.py", "--url", "http://h/mcp", "--project-id", "p",
+         "--workspace-a", "a", "--workspace-b", "b"],
+    )
+    module.parse_args()
+    assert LIVE_TOKEN not in capfd.readouterr().err

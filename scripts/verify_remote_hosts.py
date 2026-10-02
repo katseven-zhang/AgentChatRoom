@@ -39,7 +39,16 @@ def parse_args() -> argparse.Namespace:
         help="Optional prefix for idempotent write keys; defaults to a unique run prefix",
     )
     parser.add_argument("--timeout", type=float, default=15.0)
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.token:
+        # Never echo the value: the whole point is that argv is readable by other
+        # accounts on this machine.
+        print(
+            "WARNING: --token is deprecated and puts a live Agent Token in this "
+            "machine's process arguments; set AGENTCHATROOM_AGENT_TOKEN instead.",
+            file=sys.stderr,
+        )
+    return args
 
 
 @dataclass
