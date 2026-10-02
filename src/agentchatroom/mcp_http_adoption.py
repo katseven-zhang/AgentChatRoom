@@ -211,6 +211,11 @@ class TolerantSessionAdoptionMiddleware:
         self._max_parked = max(1, int(max_parked_handshakes))
         self._body_limit = max(1, int(body_limit))
         self._adopted: dict[tuple[str, str], tuple[str, float]] = {}
+        # One adoption at a time per (bookmark, identity): the read-check-write
+        # around ``_open_surrogate`` spans awaits, so without this a client
+        # retrying in parallel opened a separate transport per request and each
+        # one parked a handshake task until the bound failed adoption closed.
+        self._adopting: dict[tuple[str, str], asyncio.Lock] = {}
         # Parked synthetic handshake tasks (kept referenced so they are never
         # garbage-collected while still running; each ends when its transport
         # is reaped).
@@ -256,19 +261,26 @@ class TolerantSessionAdoptionMiddleware:
                 return
         surrogate = self._active_surrogate(adoption_key)
         if surrogate is None:
-            surrogate = await self._open_surrogate(scope)
-            if surrogate is None:
-                # The server-side handshake is impossible (invalid credentials,
-                # shutdown, ...). Replay untouched so the original, closed
-                # behaviour (401/404) still applies instead of hanging.
-                await self._forward(scope, send, body, session_id=None)
-                return
-            self._remember(adoption_key, surrogate)
-            logger.info(
-                "Adopted reaped MCP session %s as %s",
-                session_id[:16],
-                surrogate[:16],
-            )
+            async with self._adoption_lock(adoption_key):
+                # Re-check inside the lock: a parallel request with the same
+                # bookmark and identity may already have finished the handshake,
+                # and sharing that transport is the whole point.
+                surrogate = self._active_surrogate(adoption_key)
+                if surrogate is None:
+                    surrogate = await self._open_surrogate(scope)
+                    if surrogate is None:
+                        # The server-side handshake is impossible (invalid
+                        # credentials, shutdown, ...). Replay untouched so the
+                        # original, closed behaviour (401/404) still applies
+                        # instead of hanging.
+                        await self._forward(scope, send, body, session_id=None)
+                        return
+                    self._remember(adoption_key, surrogate)
+                    logger.info(
+                        "Adopted reaped MCP session %s as %s",
+                        session_id[:16],
+                        surrogate[:16],
+                    )
         # Run on every request, not only on the first adoption: the retained
         # binding is re-attached to the surrogate under the same identity check,
         # so a reuse cannot outlive the comparison that authorised it.
@@ -294,6 +306,26 @@ class TolerantSessionAdoptionMiddleware:
         while len(self._adopted) > self._map_limit:
             oldest = min(self._adopted.items(), key=lambda item: item[1][1])[0]
             self._adopted.pop(oldest, None)
+        # A guard lock is only worth keeping while it still names a live mapping
+        # or an adoption in flight; otherwise the lock table would outgrow the
+        # bounded map it protects.
+        for key, lock in list(self._adopting.items()):
+            if key not in self._adopted and not lock.locked():
+                self._adopting.pop(key, None)
+        while len(self._adopting) > self._map_limit:
+            idle = next(
+                (k for k, lock in self._adopting.items() if not lock.locked()), None
+            )
+            if idle is None:
+                break
+            self._adopting.pop(idle, None)
+
+    def _adoption_lock(self, adoption_key: tuple[str, str]) -> asyncio.Lock:
+        lock = self._adopting.get(adoption_key)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._adopting[adoption_key] = lock
+        return lock
 
     def _active_surrogate(self, adoption_key: tuple[str, str]) -> str | None:
         entry = self._adopted.get(adoption_key)

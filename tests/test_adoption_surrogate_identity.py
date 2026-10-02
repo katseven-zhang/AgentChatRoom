@@ -10,9 +10,11 @@ tool arguments, so the second caller could write as the first one.
 
 from __future__ import annotations
 
+import asyncio
 import json
 from types import SimpleNamespace
 
+import pytest
 from starlette.testclient import TestClient
 
 from agentchatroom.mcp_http_adoption import (
@@ -150,3 +152,81 @@ def test_a_rotated_credential_for_one_identity_is_not_reused_either():
     assert _post(client, "/mcp", "tools/call", "token-a2", "caller-a").status_code == 200
 
     assert [item[1] for item in center.forwarded] == ["surrogate-1", "surrogate-2"]
+
+
+@pytest.mark.asyncio
+async def test_parallel_retries_of_one_bookmark_share_a_single_handshake():
+    """#354: the check-then-act spans awaits, so retries used to multiply transports."""
+    center = SlowCenter()
+    adopted: list = []
+    middleware = _middleware(center, adopted)
+
+    statuses = await asyncio.gather(
+        *(_issue(middleware, "token-a", "caller-a") for _ in range(5))
+    )
+
+    assert statuses == [200] * 5
+    assert center.initializations == 1, "five parallel retries opened five transports"
+    assert [item[1] for item in center.forwarded] == ["surrogate-1"] * 5
+    # One guard lock per (bookmark, identity): the table must not grow with the
+    # number of requests either.
+    assert len(middleware._adopting) <= 1
+
+
+class SlowCenter(Center):
+    """Center whose handshake is slow enough for the retries to overlap."""
+
+    async def __call__(self, scope, receive, send) -> None:
+        body = b""
+        while True:
+            message = await receive()
+            body += message.get("body", b"") or b""
+            if message.get("more_body") is not True:
+                break
+        request = json.loads(body.decode("utf-8")) if body else {}
+        if request.get("method") == "initialize":
+            await asyncio.sleep(0.05)
+
+        async def one_shot():
+            return {"type": "http.request", "body": body, "more_body": False}
+
+        await super().__call__(scope, one_shot, send)
+
+
+async def _issue(middleware, auth: str, software: str) -> int:
+    body = json.dumps(
+        {"jsonrpc": "2.0", "id": "1", "method": "tools/call", "params": {}}
+    ).encode("utf-8")
+    delivered = {"sent": False, "status": 0}
+
+    async def receive():
+        if not delivered["sent"]:
+            delivered["sent"] = True
+            return {"type": "http.request", "body": body, "more_body": False}
+        return {"type": "http.disconnect"}
+
+    async def send(message):
+        if message.get("type") == "http.response.start":
+            delivered["status"] = int(message.get("status") or 0)
+
+    scope = {
+        "type": "http",
+        "asgi": {"version": "3.0"},
+        "http_version": "1.1",
+        "method": "POST",
+        "scheme": "http",
+        "path": "/mcp",
+        "raw_path": b"/mcp",
+        "query_string": b"",
+        "root_path": "",
+        "client": ("test", 1),
+        "server": ("test", 80),
+        "headers": [
+            (b"content-type", b"application/json"),
+            (b"authorization", f"Bearer {auth}".encode()),
+            (SOFTWARE_KEY_HEADER, software.encode()),
+            (MCP_SESSION_ID_HEADER, BOOKMARK.encode()),
+        ],
+    }
+    await middleware(scope, receive, send)
+    return delivered["status"]
