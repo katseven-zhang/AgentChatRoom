@@ -908,10 +908,26 @@ def run_gui(config_path: str | None = None, *, autostart: bool = False) -> None:
         else:
             log_stop = threading.Event()
             log_tail = LogTail(active_settings.data_dir / "server.log", sink, log_stop)
+        # Reuse the live service when the retry points at the same database.
+        # RoomEventTail builds its own AgentChatRoomService otherwise, and each
+        # one of those owns a database handle plus a registered TokenTouchBuffer
+        # worker, so a config retry used to stack a second set per attempt and
+        # leave the previous one's atexit entry pointing at a closed database.
+        previous_room = old_room[1] if old_room is not None else None
+        previous_service = getattr(previous_room, "service", None)
+        same_database = bool(
+            previous_service is not None
+            and previous_settings is not None
+            and previous_settings.database_path == active_settings.database_path
+            and previous_settings.database_backend == active_settings.database_backend
+        )
         room_stop = threading.Event()
         try:
             room_events: RoomEventTail | None = RoomEventTail(
-                active_settings, sink, room_stop
+                active_settings,
+                sink,
+                room_stop,
+                service=previous_service if same_database else None,
             )
         except Exception as error:
             # create_database raises here for a postgresql backend with no
@@ -924,16 +940,12 @@ def run_gui(config_path: str | None = None, *, autostart: bool = False) -> None:
                     "服务日志与启停功能不受影响；修复 [database] 配置后点击"
                     "「启动服务」即可重试。"
                 )
-        if room_events is not None and (
-            old_room is not None and previous_settings is not None
-            and previous_settings.database_path == active_settings.database_path
-            and previous_settings.database_backend == active_settings.database_backend
-            and (not isinstance(old_room[1], threading.Thread)
-                 or not old_room[1].is_alive())
+        if room_events is not None and same_database and (
+            not isinstance(previous_room, threading.Thread)
+            or not previous_room.is_alive()
         ):
             # A configuration retry using the same database must not drop events
             # between the old tail stopping and the new one beginning.
-            previous_room = old_room[1]
             room_events.cursors = previous_room.cursors.copy()
             room_events.presence = {
                 key: value.copy() for key, value in previous_room.presence.items()

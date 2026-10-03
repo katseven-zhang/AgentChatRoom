@@ -608,8 +608,9 @@ def test_login_autostart_config_error_keeps_gui_open_for_retry(
             pass
 
     class FakeRoomTail:
-        def __init__(self, active_settings, _sink, stop_event):
+        def __init__(self, active_settings, _sink, stop_event, *, service=None):
             self.settings, self.stop_event = active_settings, stop_event
+            self.service = service
             self.cursors, self.presence = {}, {}
             room_tails.append(self)
 
@@ -684,20 +685,21 @@ def test_config_retry_keeps_the_old_room_reader_when_the_rebuild_fails(
             pass
 
     class FakeRoomTail:
-        def __init__(self, active_settings, _sink, stop_event):
+        def __init__(self, active_settings, _sink, stop_event, *, service=None):
             self.settings, self.stop_event = active_settings, stop_event
+            self.service = service
             self.cursors, self.presence = {}, {}
             room_tails.append(self)
 
         def start(self):
             pass
 
-    def exploding_room_tail(active_settings, sink, stop_event):
+    def exploding_room_tail(active_settings, sink, stop_event, *, service=None):
         # Same failure create_database raises for a postgresql backend whose
         # connection URL is missing.
         if room_tails:
             raise ValueError("AGENTCHATROOM_TEST_URL must contain a connection URL")
-        return FakeRoomTail(active_settings, sink, stop_event)
+        return FakeRoomTail(active_settings, sink, stop_event, service=service)
 
     windows = []
     observed: dict = {}

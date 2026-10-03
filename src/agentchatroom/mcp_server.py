@@ -74,6 +74,12 @@ _runtime_binding: ContextVar[RuntimeBinding | None] = ContextVar(
     default=None,
 )
 _session_bindings: dict[str, RuntimeBinding | None] = {}
+# When each HTTP-transport binding key was last written. A key minted from the
+# ``mcp-session-id`` header has no connection object behind it, so nothing else
+# ever removes it: without this the table only ever grew for the process
+# lifetime. Stdio keys are excluded because ``mcp_session_key`` reclaims them
+# through the weakref callback, and ``stdio:local`` is a fixed singleton.
+_session_binding_written: dict[str, float] = {}
 _session_bindings_lock = threading.RLock()
 # Bounded tombstone table: transport session id -> (Room Session binding, recorded
 # at). It lets a request that presents a reaped mcp-session-id adopt a fresh
@@ -89,6 +95,13 @@ _TOMBSTONE_DEFAULT_LIMIT = 256
 _TOMBSTONE_DEFAULT_TTL_SECONDS = 86400.0
 _tombstone_limit = _TOMBSTONE_DEFAULT_LIMIT
 _tombstone_ttl_seconds = _TOMBSTONE_DEFAULT_TTL_SECONDS
+# The live binding table gets the same window as the tombstone table: a binding
+# whose client disconnected without a reap is indistinguishable from an adopted
+# one by the time anyone notices, so it ages out on the same schedule.
+_BINDING_DEFAULT_LIMIT = 256
+_BINDING_DEFAULT_TTL_SECONDS = 86400.0
+_binding_limit = _BINDING_DEFAULT_LIMIT
+_binding_ttl_seconds = _BINDING_DEFAULT_TTL_SECONDS
 _transport_keys: dict[int, tuple[weakref.ReferenceType, str]] = {}
 _active_binding_key: ContextVar[str | None] = ContextVar("mcp_binding_key", default=None)
 _loaded_identity: tuple[str, str, str] | None = None
@@ -499,7 +512,7 @@ def mcp_session_key(context: Any = None) -> str:
                     entry = _transport_keys.get(object_id)
                     if entry is not None and entry[0] is reference:
                         _transport_keys.pop(object_id, None)
-                        _session_bindings.pop(key, None)
+                        _drop_session_binding_locked(key)
             try:
                 reference = weakref.ref(session, released)
             except TypeError:
@@ -557,6 +570,27 @@ def configure_transport_tombstones(
         _prune_pending_restores_locked()
 
 
+def configure_session_bindings(
+    *,
+    limit: int | None = None,
+    ttl_seconds: float | None = None,
+) -> None:
+    """Bound the live MCP binding table (count and age).
+
+    Separate from :func:`configure_transport_tombstones` because the two tables
+    answer different questions: a tombstone enables adoption, while a stale
+    binding is only ever a leak. The defaults match so an operator who never
+    calls this still gets both bounded.
+    """
+    global _binding_limit, _binding_ttl_seconds
+    with _session_bindings_lock:
+        if limit is not None and limit > 0:
+            _binding_limit = int(limit)
+        if ttl_seconds is not None and ttl_seconds > 0:
+            _binding_ttl_seconds = float(ttl_seconds)
+        _prune_session_bindings_locked()
+
+
 def _prune_transport_tombstones_locked() -> None:
     now = time.monotonic()
     for key, (_, recorded) in list(_transport_tombstones.items()):
@@ -574,6 +608,10 @@ def retain_transport_tombstone(transport_session_id: str) -> RuntimeBinding | No
     key = f"{HTTP_TRANSPORT_KEY_PREFIX}{transport_session_id}"
     with _session_bindings_lock:
         binding = _session_bindings.pop(key, None)
+        # The tombstone table now owns this binding's retention; leaving the
+        # age index entry would let the prune drop a binding that adoption is
+        # about to look up.
+        _session_binding_written.pop(key, None)
         if binding is not None:
             _transport_tombstones[transport_session_id] = (binding, time.monotonic())
         _prune_transport_tombstones_locked()
@@ -714,9 +752,51 @@ def get_runtime_binding(session_key: str | None = None) -> RuntimeBinding | None
     return _runtime_binding.get()
 
 
+def _prune_session_bindings_locked() -> None:
+    """Drop binding keys nothing is going to ask for again.
+
+    A key minted from the ``mcp-session-id`` header is only ever reclaimed when
+    its transport is reaped into the tombstone table, which a client that just
+    disconnects never triggers. Age and count bound it the same way the
+    tombstone table bounds itself, so a long-lived server does not accumulate a
+    binding per HTTP request for the whole process lifetime.
+    """
+    now = time.monotonic()
+    for key, written in list(_session_binding_written.items()):
+        if now - written > _binding_ttl_seconds:
+            _drop_session_binding_locked(key)
+    while len(_session_binding_written) > _binding_limit:
+        oldest = min(_session_binding_written.items(), key=lambda item: item[1])[0]
+        _drop_session_binding_locked(oldest)
+
+
+def _drop_session_binding_locked(session_key: str) -> None:
+    _session_binding_written.pop(session_key, None)
+    _session_bindings.pop(session_key, None)
+
+
+def _binding_key_needs_pruning(session_key: str) -> bool:
+    """Whether this key's only reclamation path is the periodic prune.
+
+    A stdio key backed by a live connection object owns itself through the
+    weakref callback in :func:`mcp_session_key`, and ``stdio:local`` is one
+    fixed singleton, so neither is tracked. Everything else - HTTP transport
+    keys from a client header, and stdio keys for objects that cannot be
+    weak-referenced - has to be bounded here or not at all.
+    """
+    if session_key == "stdio:local":
+        return False
+    return not any(key == session_key for _ref, key in _transport_keys.values())
+
+
 def persist_runtime_binding(session_key: str, binding: RuntimeBinding | None) -> None:
     with _session_bindings_lock:
         _session_bindings[session_key] = binding
+        if _binding_key_needs_pruning(session_key):
+            _session_binding_written[session_key] = time.monotonic()
+            _prune_session_bindings_locked()
+        else:
+            _session_binding_written.pop(session_key, None)
 
 
 def set_runtime_binding(
@@ -732,6 +812,7 @@ def clear_runtime_binding(session_key: str | None = None) -> None:
     if session_key is None:
         with _session_bindings_lock:
             _session_bindings.clear()
+            _session_binding_written.clear()
             _transport_tombstones.clear()
             _pending_restores.clear()
         return
@@ -746,6 +827,9 @@ def clear_bindings_for_agent_session(session_id: str) -> None:
         for key, binding in list(_session_bindings.items()):
             if binding is not None and binding.session_id == session_id:
                 _session_bindings[key] = None
+                # The binding is dead, so its age index entry would only keep the
+                # key alive until the prune runs; drop both together.
+                _session_binding_written.pop(key, None)
         for key, (pending, _) in list(_pending_restores.items()):
             if pending.session_id == session_id:
                 _pending_restores.pop(key, None)
