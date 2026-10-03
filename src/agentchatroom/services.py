@@ -8254,6 +8254,7 @@ class AgentChatRoomService:
         task_id: str | None = None,
         reason: str = "",
         ttl_seconds: int | None = None,
+        takeover: bool = False,
     ) -> dict[str, Any]:
         pattern = normalize_pattern(path_pattern)
         if mode not in LEASE_MODES:
@@ -8312,12 +8313,56 @@ class AgentChatRoomService:
                     and row["owner_member_id"]
                     and row["owner_member_id"] == claimant_member_id
                 ):
-                    # Same software identity, new session: the successor
-                    # transparently takes over the stale lease of its own
-                    # identity (a reaped transport cannot release it itself) -
-                    # but only where the new scope actually replaces the old one.
+                    # Same software identity, new session. This is a transfer of
+                    # working state, so it follows the same contract task_claim
+                    # and the assignment-accept path enforce: an ordinary
+                    # request never preempts a live owner. Only a Session the
+                    # liveness evidence proves gone may be replaced silently,
+                    # and that case is still recorded as an attributable event
+                    # below. Otherwise the caller has to say takeover=true.
                     if _pattern_covers(pattern, row["path_pattern"]):
-                        superseded.append(dict(row))
+                        successor_liveness = self._owner_liveness(
+                            connection, project_id, str(row["session_id"])
+                        )
+                        # Only positive evidence of death counts as consent to
+                        # transfer: the Session left, its row is gone, or the
+                        # transport probe says the connection was reaped. A stale
+                        # heartbeat is merely an absence of evidence - the
+                        # Session may be mid long edit - so it is not enough,
+                        # and neither is an unavailable probe. In those cases
+                        # the caller has to say takeover=True, which is cheap
+                        # and auditable, while a wrong silent transfer silently
+                        # removes another conversation's protection.
+                        predecessor_gone = (
+                            successor_liveness["owner"] is None
+                            or successor_liveness["owner"]["left_at"] is not None
+                            or str(successor_liveness["transport_state"]) == "gone"
+                        )
+                        if not predecessor_gone and not takeover:
+                            raise DomainError(
+                                "lease_owner_session_connected",
+                                "A Session of this software identity still holds "
+                                f"the lease on {row['path_pattern']}; release it, or "
+                                "take it over explicitly with takeover=true",
+                                status_code=409,
+                                details={
+                                    "lease_id": row["id"],
+                                    "owner_session_id": str(row["session_id"]),
+                                    "owner_transport_state": successor_liveness[
+                                        "transport_state"
+                                    ],
+                                    "required_action": "release_lease_or_takeover_true",
+                                },
+                            )
+                        superseded.append(
+                            {
+                                **dict(row),
+                                "owner_gone": predecessor_gone,
+                                "owner_transport_state": str(
+                                    successor_liveness["transport_state"]
+                                ),
+                            }
+                        )
                     continue
                 conflicts.append(
                     {
@@ -8352,6 +8397,15 @@ class AgentChatRoomService:
                         "UPDATE file_leases SET released_at = ? WHERE id = ?",
                         (now.isoformat().replace("+00:00", "Z"), stale["id"]),
                     )
+                    # The reason has to say which of the two admitted paths ran,
+                    # so an operator reading the log can tell an audited
+                    # deliberate takeover from a predecessor this service
+                    # positively knows is gone.
+                    takeover_reason = (
+                        "same_member_takeover"
+                        if stale.get("owner_gone")
+                        else "same_member_takeover_explicit"
+                    )
                     self._emit(
                         connection,
                         project_id,
@@ -8360,7 +8414,12 @@ class AgentChatRoomService:
                         payload={
                             "lease_id": stale["id"],
                             "path_pattern": stale["path_pattern"],
-                            "reason": "same_member_takeover",
+                            "reason": takeover_reason,
+                            "predecessor_session_id": str(stale["session_id"]),
+                            "predecessor_proven_gone": bool(stale.get("owner_gone")),
+                            "predecessor_transport_state": stale.get(
+                                "owner_transport_state", "not_checked"
+                            ),
                         },
                     )
                 # 幂等：同一 Session 对同一（归一化）范围的活跃租约重复申请

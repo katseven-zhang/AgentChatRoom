@@ -3092,10 +3092,17 @@ def test_agent_stays_online_with_recent_activity_despite_stale_heartbeat(
     assert current["status"] != "offline"
 
 
-def test_silent_owner_lease_stays_enforced_until_ttl_or_same_member_takeover(
+def test_live_owner_lease_is_not_silently_taken_over_by_the_same_identity(
     service, project, joined_agents
 ):
-    """#119: presence 窗口不再使租约失效；同成员新会话接管，他成员仍被挡。"""
+    """A live Session of the same identity keeps its lease until it says so.
+
+    Joining the room is not consent to lose work: ``join_room`` explicitly
+    promises it never closes another Session nor moves its work. A successor
+    that wants the scope must therefore say ``takeover=True`` (or wait for the
+    predecessor to release). Only the very last assertion below - a Session the
+    liveness evidence proves gone - is allowed to transfer silently.
+    """
     first, second = joined_agents
     lease = service.acquire_lease(
         project["id"],
@@ -3103,6 +3110,9 @@ def test_silent_owner_lease_stays_enforced_until_ttl_or_same_member_takeover(
         token=first["token"],
         path_pattern="src/reclaimable/**",
     )["lease"]
+
+    # Presence is display-only, so a stale heartbeat alone does not invalidate
+    # the lease: the predecessor is still the owner and still connected.
     stale = (
         utc_now() - timedelta(seconds=service.settings.heartbeat_timeout_seconds + 1)
     ).isoformat().replace("+00:00", "Z")
@@ -3126,7 +3136,95 @@ def test_silent_owner_lease_stays_enforced_until_ttl_or_same_member_takeover(
         )
     assert excinfo.value.code == "lease_conflict"
 
-    # 同一软件身份的新会话接管同成员遗留租约（自动释放旧租约并授予新租约）。
+    successor = service.join_room(
+        project["id"],
+        name="Builder successor",
+        client="codex",
+        model="test-model",
+        role="executor",
+    )
+    # Same identity, live predecessor, no explicit intent: refused, and the
+    # predecessor's lease survives the refusal untouched.
+    with pytest.raises(DomainError) as live_owner:
+        service.acquire_lease(
+            project["id"],
+            session_id=successor["agent"]["id"],
+            token=successor["token"],
+            path_pattern="src/reclaimable/**",
+        )
+    assert live_owner.value.code == "lease_owner_session_connected"
+    assert live_owner.value.details["owner_session_id"] == first["agent"]["id"]
+    assert (
+        live_owner.value.details["required_action"]
+        == "release_lease_or_takeover_true"
+    )
+    still_held = next(
+        item
+        for item in service.list_leases(project["id"], include_inactive=True)
+        if item["id"] == lease["id"]
+    )
+    assert still_held["released_at"] is None
+    assert not any(
+        (event.get("payload") or {}).get("reason", "").startswith("same_member_takeover")
+        for event in service.list_events(project["id"], after=0)["events"]
+        if event["event_type"] == "lease.released"
+    )
+
+    # The explicit, audited path: takeover=True preempts the live owner and
+    # records which predecessor it displaced and why.
+    acquired = service.acquire_lease(
+        project["id"],
+        session_id=successor["agent"]["id"],
+        token=successor["token"],
+        # Acquiring a narrower scope must NOT retire the identity's broader
+        # lease (#235); that direction is covered in tests/test_lease_scope.py.
+        path_pattern="src/reclaimable/**",
+        takeover=True,
+    )
+    assert acquired["lease"]["active"] is True
+
+    history = service.list_leases(project["id"], include_inactive=True)
+    released = next(item for item in history if item["id"] == lease["id"])
+    assert released["released_at"] is not None
+    takeover_event = next(
+        event
+        for event in service.list_events(project["id"], after=0)["events"]
+        if event["event_type"] == "lease.released"
+        and (event.get("payload") or {}).get("lease_id") == lease["id"]
+    )
+    assert takeover_event["actor_session_id"] == successor["agent"]["id"]
+    payload = takeover_event["payload"]
+    assert payload["reason"] == "same_member_takeover_explicit"
+    # Attributable: the log names the displaced Session, so an operator can
+    # tell which conversation lost the scope rather than only that it did.
+    assert payload["predecessor_session_id"] == first["agent"]["id"]
+    assert payload["predecessor_proven_gone"] is False
+
+
+def test_lease_of_a_session_with_a_reaped_transport_transfers_without_a_takeover_flag(
+    service, project, joined_agents
+):
+    """A predecessor whose transport is reaped needs no takeover flag.
+
+    This is the one silent case that stays. A dead transport cannot release
+    anything, so requiring an explicit flag from the successor would strand the
+    scope until the TTL lapsed - the takeover flag would be unobtainable in
+    exactly the case it exists for. It is still recorded, and recorded
+    differently from the deliberate takeover above, so reading the log tells the
+    two apart. Note the predecessor never leaves the room here: it crashed.
+    """
+    first, _ = joined_agents
+    lease = service.acquire_lease(
+        project["id"],
+        session_id=first["agent"]["id"],
+        token=first["token"],
+        path_pattern="src/recoverable/**",
+    )["lease"]
+
+    # A crashed Session: still inside the heartbeat window, so silence alone
+    # proves nothing, but the transport probe positively reports it gone.
+    service.transport_liveness_check = lambda project_id, session_id: "gone"
+
     successor = service.join_room(
         project["id"],
         name="Builder successor",
@@ -3138,23 +3236,74 @@ def test_silent_owner_lease_stays_enforced_until_ttl_or_same_member_takeover(
         project["id"],
         session_id=successor["agent"]["id"],
         token=successor["token"],
-        # The successor takes over the same scope it replaces. Acquiring a
-        # narrower scope must NOT retire the identity's broader lease (#235);
-        # that direction is covered in tests/test_lease_scope.py.
-        path_pattern="src/reclaimable/**",
+        path_pattern="src/recoverable/**",
     )
     assert acquired["lease"]["active"] is True
 
-    history = service.list_leases(project["id"], include_inactive=True)
-    released = next(item for item in history if item["id"] == lease["id"])
-    assert released["released_at"] is not None
     takeover_event = next(
         event
         for event in service.list_events(project["id"], after=0)["events"]
         if event["event_type"] == "lease.released"
-        and (event.get("payload") or {}).get("reason") == "same_member_takeover"
+        and (event.get("payload") or {}).get("lease_id") == lease["id"]
     )
     assert takeover_event["actor_session_id"] == successor["agent"]["id"]
+    assert takeover_event["payload"]["reason"] == "same_member_takeover"
+    assert takeover_event["payload"]["predecessor_session_id"] == first["agent"]["id"]
+    assert takeover_event["payload"]["predecessor_proven_gone"] is True
+    assert takeover_event["payload"]["predecessor_transport_state"] == "gone"
+
+
+def test_a_silent_predecessor_is_not_treated_as_proven_gone(
+    service, project, joined_agents
+):
+    """Silence plus no transport probe is absence of evidence, not evidence.
+
+    This is the negative case that keeps the exemption honest: with the probe
+    reporting nothing, a predecessor that merely went quiet must still block a
+    same-identity successor, otherwise the exemption above would quietly become
+    "any timeout transfers the lease" and AC1 would be unmet in practice.
+    """
+    first, _ = joined_agents
+    lease = service.acquire_lease(
+        project["id"],
+        session_id=first["agent"]["id"],
+        token=first["token"],
+        path_pattern="src/quiet/**",
+    )["lease"]
+    stale = (
+        utc_now() - timedelta(seconds=service.settings.heartbeat_timeout_seconds + 1)
+    ).isoformat().replace("+00:00", "Z")
+    with service.database.connect(write=True) as connection:
+        connection.execute(
+            "UPDATE agent_sessions SET last_heartbeat = ? WHERE id = ?",
+            (stale, first["agent"]["id"]),
+        )
+
+    successor = service.join_room(
+        project["id"],
+        name="Builder successor",
+        client="codex",
+        model="test-model",
+        role="executor",
+    )
+    with pytest.raises(DomainError) as quiet_owner:
+        service.acquire_lease(
+            project["id"],
+            session_id=successor["agent"]["id"],
+            token=successor["token"],
+            path_pattern="src/quiet/**",
+        )
+    assert quiet_owner.value.code == "lease_owner_session_connected"
+    assert quiet_owner.value.details["owner_transport_state"] in {
+        "unavailable",
+        "not_checked",
+    }
+    still_held = next(
+        item
+        for item in service.list_leases(project["id"], include_inactive=True)
+        if item["id"] == lease["id"]
+    )
+    assert still_held["released_at"] is None
 
 
 def test_git_worktrees_share_room_and_logical_projects_remain_distinct(

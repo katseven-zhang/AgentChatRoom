@@ -304,6 +304,12 @@ def test_a_rejected_acquire_does_not_release_the_predecessor_lease(
             token=successor["token"],
             path_pattern="src/*.py",
             mode="exclusive",
+            # takeover=true so the request gets past its own identity's live
+            # predecessor and all the way to the foreign-conflict decision. The
+            # bug under test is about what a *rejected* request does to the
+            # predecessor's lease, so the rejection has to be the conflict one.
+            # The live-predecessor gate has its own test in test_services.py.
+            takeover=True,
         )
     assert conflict.value.code == "lease_conflict"
     assert {item["path_pattern"] for item in conflict.value.details["conflicts"]} == {
@@ -380,6 +386,10 @@ def test_a_replacing_takeover_does_retire_the_covered_lease(service, project_dir
         token=successor["token"],
         path_pattern="src/**",
         mode="exclusive",
+        # A broader scope from the same identity replaces the narrower lease.
+        # The predecessor is still live, so the successor says so explicitly;
+        # what this test pins is the scope comparison, not the consent flag.
+        takeover=True,
     )
     active = {
         lease["id"]
@@ -391,7 +401,7 @@ def test_a_replacing_takeover_does_retire_the_covered_lease(service, project_dir
         event
         for event in service.query_audit(project_id)["events"]
         if event["event_type"] == "lease.released"
-        and event["payload"].get("reason") == "same_member_takeover"
+        and event["payload"].get("reason") == "same_member_takeover_explicit"
     ]
     assert [event["payload"]["lease_id"] for event in takeover] == [narrow["lease"]["id"]]
 

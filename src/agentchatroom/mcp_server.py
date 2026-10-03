@@ -2374,9 +2374,14 @@ def lease_acquire(
     task_id: str = "",
     reason: str = "",
     ttl_seconds: int | None = None,
+    takeover: bool = False,
     request_id: str = "",
 ) -> dict[str, Any]:
-    """Acquire a time-limited file or glob lease and report overlap conflicts."""
+    """Acquire a time-limited file or glob lease and report overlap conflicts.
+
+    Set takeover=true to preempt a lease a live Session of the same software
+    identity still holds; without it such a request is refused.
+    """
     try:
         _authorize_remote(project_id, "lease:write")
     except DomainError as error:
@@ -2391,6 +2396,7 @@ def lease_acquire(
         task_id=task_id or None,
         reason=reason,
         ttl_seconds=ttl_seconds,
+        takeover=takeover,
         request_id=_mcp_request_id(request_id),
     )
 
