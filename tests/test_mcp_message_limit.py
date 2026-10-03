@@ -332,6 +332,102 @@ def test_the_operator_may_still_post_the_system_kind(service, project):
     assert event["actor_session_id"] is None
 
 
+def test_incremental_sync_larger_than_the_window_delivers_every_message_in_order(
+    service, project, joined_agents
+):
+    """A burst bigger than the window must arrive whole, oldest first (#238).
+
+    The existing incremental test only ever added two messages against a window
+    of five, so it never exercised the case the fix exists for. Taking the
+    newest `limit` rows and then advancing the cursor to the project head marks
+    every older unread message as read - and a requires_ack blocker that is
+    never delivered is a message the acknowledgement loop depends on being
+    seen. So the assertions below are about the *whole* burst arriving, in
+    order, across as many round trips as it takes.
+
+    The bootstrap inject is deliberately a "most recent window" view, so the
+    burst is posted after it: what is under test is the incremental path that
+    follows a cursor, not that first window.
+    """
+    executor, reviewer = joined_agents
+    service.update_project(project["id"], settings={"mcp_message_limit": 5})
+
+    # Some history so the bootstrap inject has a window to show and a cursor to
+    # continue from.
+    for index in range(8):
+        service.post_message(
+            project["id"],
+            body=f"History {index}",
+            kind="message",
+            session_id=executor["agent"]["id"],
+            token=executor["token"],
+            model_display_name="test-model",
+        )
+    bootstrap = service.room_sync(
+        project["id"],
+        session_id=reviewer["agent"]["id"],
+        token=reviewer["token"],
+        mcp_context=True,
+        initial_inject=True,
+    )
+    assert len(bootstrap["events"]) == 5
+    cursor = bootstrap["cursor"]
+
+    # One ack-requiring blocker, then a burst well past the window.
+    blocker = service.post_message(
+        project["id"],
+        body="BLOCKER: hold the release",
+        kind="blocker",
+        session_id=executor["agent"]["id"],
+        token=executor["token"],
+        model_display_name="test-model",
+        requires_ack=True,
+    )["event_id"]
+    burst = [
+        service.post_message(
+            project["id"],
+            body=f"Burst message {index}",
+            kind="message",
+            session_id=executor["agent"]["id"],
+            token=executor["token"],
+            model_display_name="test-model",
+        )["event_id"]
+        for index in range(12)
+    ]
+    expected = [blocker, *burst]
+
+    # Drain by repeatedly syncing from the bootstrap cursor. Every message must
+    # arrive exactly once, in ascending order, and the run must converge.
+    delivered: list[int] = []
+    after = cursor
+    rounds = 0
+    while True:
+        rounds += 1
+        assert rounds <= len(expected), "sync did not converge"
+        page = service.room_sync(
+            project["id"],
+            session_id=reviewer["agent"]["id"],
+            token=reviewer["token"],
+            mcp_context=True,
+            after=after,
+        )
+        delivered.extend(event["project_seq"] for event in page["events"])
+        if not page["has_more"]:
+            break
+        # A full window each time, and the cursor advances by exactly what was
+        # delivered - never past it, which is how messages used to be skipped.
+        assert len(page["events"]) == 5
+        assert page["cursor"] == delivered[-1]
+        after = page["cursor"]
+
+    assert delivered == sorted(delivered), "incremental sync delivered out of order"
+    assert len(delivered) == len(set(delivered)), "a message was delivered twice"
+    assert delivered == expected, (
+        f"expected {len(expected)} messages in order, got {len(delivered)}; "
+        f"missing {sorted(set(expected) - set(delivered))}"
+    )
+
+
 def test_configuration_precedence(monkeypatch, tmp_path, service, project, joined_agents):
     executor, reviewer = joined_agents
 

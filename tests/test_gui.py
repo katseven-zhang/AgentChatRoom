@@ -824,6 +824,64 @@ def test_port_probe_rejects_live_reusable_listener() -> None:
         assert port_is_free("127.0.0.1", listener.getsockname()[1]) is False
 
 
+def test_port_probe_matches_this_platform_socket_option_policy() -> None:
+    """The SO_REUSEADDR choice is platform-dependent, so pin it per platform.
+
+    ``port_is_free`` enables SO_REUSEADDR everywhere except Windows, because on
+    Windows that option lets a probe *share* a live listener rather than fail -
+    which would report a port in use as free. That branch was previously only
+    reachable on POSIX, since the TIME_WAIT restart test skips on Windows, so
+    the one platform where the option is deliberately absent had no coverage at
+    all.
+
+    A real listening socket is the only honest probe here: an address already
+    bound must be reported as taken, whatever the platform does with the
+    option. Asserting the reported answer on both platforms is what makes the
+    ``os.name != "nt"`` condition meaningful rather than incidental.
+    """
+    with socket.socket() as listener:
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(1)
+        port = listener.getsockname()[1]
+        assert port_is_free("127.0.0.1", port) is False
+    # Released, the same address is free again - the probe is not simply
+    # returning False for everything.
+    assert port_is_free("127.0.0.1", port) is True
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows socket option policy")
+def test_windows_probe_does_not_enable_address_reuse() -> None:
+    """On Windows the probe must not set SO_REUSEADDR, and must say so.
+
+    Enabling it there would let the probe bind alongside a live listener and
+    report a busy port as free, so the GUI would happily restart onto a port
+    somebody else already owns. This asserts the observable consequence - a
+    live listener is reported as taken - and pins the option itself, so the
+    guard cannot be quietly deleted on the strength of the first assertion
+    alone.
+    """
+    observed: list[int] = []
+    original_setsockopt = socket.socket.setsockopt
+
+    def spy_setsockopt(self, level, option, value):  # type: ignore[no-untyped-def]
+        observed.append(option)
+        return original_setsockopt(self, level, option, value)
+
+    port = available_port()
+    with socket.socket() as listener:
+        listener.bind(("127.0.0.1", port))
+        listener.listen(1)
+        socket.socket.setsockopt = spy_setsockopt  # type: ignore[method-assign]
+        try:
+            assert port_is_free("127.0.0.1", port) is False
+        finally:
+            socket.socket.setsockopt = original_setsockopt  # type: ignore[method-assign]
+
+    # SO_REUSEADDR is never requested on this platform, whether or not the
+    # probe happened to need the socket option for anything else.
+    assert socket.SO_REUSEADDR not in observed
+
+
 @pytest.mark.skipif(os.name == "nt", reason="POSIX TCP TIME_WAIT restart semantics")
 def test_port_probe_allows_restart_after_server_active_close() -> None:
     with socket.socket() as listener:

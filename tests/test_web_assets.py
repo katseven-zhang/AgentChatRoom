@@ -39,6 +39,26 @@ def test_dialog_toast_top_layer_routing_and_close_adoption():
 
 
 
+def test_project_dialog_reports_failures_where_they_can_be_read():
+    """#163/#321: the project dialog's failure must land where someone sees it.
+
+    This harness existed but nothing ran it: no pytest case referenced it, so
+    the regression it guards could break without any test turning red. It is
+    wired in here so the main flow executes it like its two siblings.
+
+    Two failure surfaces are in play. While the dialog is open the message goes
+    to the inline banner, because the page-level toast is blurred behind
+    dialog::backdrop; once the dialog is closed the banner has no reader, so the
+    same failure has to go to the toast instead. An implementation that only
+    did the first would report a failure into an element nobody is looking at.
+    """
+    result = subprocess.run(
+        ["node", str(Path(__file__).with_name("project_dialog_error.cjs"))],
+        capture_output=True, text=True, timeout=20,
+    )
+    assert result.returncode == 0, result.stderr
+
+
 def test_web_add_project_issues_without_pasting_raw_config():
     """加入本项目：主流程零粘贴可签发；#141 起手动粘贴故障恢复区整体移除。"""
     markup = (WEB_DIR / "index.html").read_text(encoding="utf-8")
