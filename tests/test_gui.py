@@ -51,24 +51,7 @@ from agentchatroom.gui_autostart import (
 from agentchatroom.gui_event_log import (
     RoomEventTail, format_room_event, format_service_line, sanitize_gui_text,
 )
-
-
-def boot_gui_or_skip(gui_module, tk, **run_kwargs) -> None:
-    """Run the real GUI entry point, skipping this machine's broken Tcl/Tk runtime.
-
-    Tk init here intermittently loses init.tcl/tk.tcl: a probe at the top of a
-    test can pass while the probe inside ``run_gui`` (or the window itself)
-    still fails. Only a TclError fault becomes a skip, so a genuine regression
-    keeps failing the test.
-    """
-    try:
-        gui_module.run_gui(**run_kwargs)
-    except SystemExit as error:
-        if not isinstance(error.__cause__, tk.TclError):
-            raise
-        pytest.skip(f"Tcl/Tk runtime unavailable during boot: {error}")
-    except tk.TclError as error:
-        pytest.skip(f"Tcl/Tk runtime unavailable while building the window: {error}")
+from tests.conftest import boot_gui_or_skip, require_tk_runtime
 
 
 @pytest.fixture
@@ -127,10 +110,7 @@ def test_second_gui_launch_restores_minimized_window() -> None:
     from ctypes import wintypes
     from uuid import uuid4
 
-    try:
-        import tkinter as tk
-    except ImportError as error:
-        pytest.skip(f"Tk display unavailable: {error}")
+    tk = require_tk_runtime()
     try:
         window = tk.Tk()
     except tk.TclError as error:
@@ -346,16 +326,7 @@ def test_create_tray_icon_actions_have_pystray_compatible_signatures(monkeypatch
 def test_gui_status_uses_full_width_row(
     monkeypatch, settings, isolated_gui_instance_guard
 ) -> None:
-    try:
-        import tkinter as tk
-    except ImportError as error:
-        pytest.skip(f"Tk unavailable: {error}")
-    try:
-        probe = tk.Tk()
-        probe.withdraw()
-        probe.destroy()
-    except tk.TclError as error:
-        pytest.skip(f"Tk display unavailable: {error}")
+    tk = require_tk_runtime()
 
     import agentchatroom.gui as gui_module
 
@@ -379,13 +350,7 @@ def test_gui_status_uses_full_width_row(
 def test_gui_login_checkbox_and_autostart_action(
     monkeypatch, settings, isolated_gui_instance_guard
 ) -> None:
-    try:
-        import tkinter as tk
-        probe = tk.Tk()
-        probe.withdraw()
-        probe.destroy()
-    except (ImportError, tk.TclError) as error:
-        pytest.skip(f"Tk display unavailable: {error}")
+    tk = require_tk_runtime()
 
     import agentchatroom.gui as gui_module
 
@@ -436,13 +401,7 @@ def test_gui_login_checkbox_and_autostart_action(
 def test_login_autostart_config_error_keeps_gui_open_for_retry(
     monkeypatch, settings, isolated_gui_instance_guard, same_data_dir
 ) -> None:
-    try:
-        import tkinter as tk
-        probe = tk.Tk()
-        probe.withdraw()
-        probe.destroy()
-    except (ImportError, tk.TclError) as error:
-        pytest.skip(f"Tk display unavailable: {error}")
+    tk = require_tk_runtime()
 
     import agentchatroom.gui as gui_module
 
