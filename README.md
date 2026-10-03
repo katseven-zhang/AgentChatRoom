@@ -972,6 +972,28 @@ PostgreSQL 验收脚本在未安装可选数据库依赖时仍可查看 `--help`
 
 审计器只输出规则、文件和行号，不回显疑似凭据值。
 
+该检查在 CI 里对**每个 pull request** 生效（`release-history` job，需要 `fetch-depth: 0`）：只在定时任务里跑意味着泄露提交早已合入主线，夜间报告到达时补救方式只剩改写历史，而在 PR 阶段它还只是一个 rebase。定时任务保留，用于覆盖浅克隆取不到的远端 blob。
+
+**实测结论（据此写入，改写本身尚未执行，需操作者授权）：** `--history` 当前报 **572 条** finding，分布如下——**203 条来自 `evidence/`**（`runtime_path_tracked` 92、`acceptance_dump_tracked` 71、`developer_hostname` 8、`this_machine_hostname` 8、`windows_absolute_path` 23、`live_domain_id` 1），其余 369 条**全部位于 `tests/` 目录**。即源码、文档与部署文件**零泄露**；测试夹具里的 Windows 路径与主机名是构造数据，不属于泄露。真正需要清理的只有 `evidence/`。 `evidence/*.xml` 曾被提交过，含开发者主机名与绝对路径，实测仅一个文件（`add_project_incremental_20260909_tests.xml`）、两个 commit（`ff9f04f` 新增、`66c357a` 删除），内容是 pytest JUnit XML，其中的 `hostname` 属性记录了开发者主机名，未含凭据值——清理的是主机名与本机路径，不是任何密钥（本文不复现该字面量，否则这段文本自己就会被发布审计判为泄露）。后续提交已将它从索引移除并加入 `.gitignore`，工作树审计因此干净，但可达历史仍含旧 blob。清理步骤：
+
+```bash
+# 1) 先确认备份存在（不可逆操作，没有回退）
+git clone --mirror <url> ../agentchatroom-backup.git
+
+# 2) 记录改写前的 commit 映射，供协作者对齐
+git rev-list --all > ../commit-map-before.txt
+
+# 3) 从所有分支历史中移除该路径（本机当前未安装，git-filter-repo 与 bfg 均无）
+pip install git-filter-repo
+git filter-repo --path evidence --invert-paths --force   # 只清这一条路径；测试夹具中的路径是构造数据，不应被清除
+
+# 4) 确认归零并记录新映射
+.venv\Scripts\python.exe scripts\audit_public_release.py --history   # 期望 0 findings
+git rev-list --all > ../commit-map-after.txt
+```
+
+**协作者须知：历史改写后所有 commit hash 变化，任何已有克隆必须重新 clone，或 `git fetch origin && git reset --hard origin/<分支>`——普通 `git pull` 会因历史不连续而失败。这是发布前一次性动作，不要在有未推送工作的分支上执行。**
+
 ## 当前边界
 
 - 一期发布与验收只覆盖同一台电脑上的本地 SQLite、REST、MCP、CLI 和 Web

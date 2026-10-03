@@ -179,3 +179,54 @@ def test_fresh_checkout_creates_only_an_empty_ignored_runtime(monkeypatch, tmp_p
     assert settings.database_path.is_file()
     assert service.list_projects() == []
     assert list(checkout.rglob("*.db")) == [settings.database_path]
+
+
+def test_max_findings_turns_a_known_backlog_into_a_ratchet(monkeypatch, capsys) -> None:
+    """#370: the history scan cannot gate a PR while its backlog exists.
+
+    The tests carry Windows-shaped paths and hostnames on purpose, so the trunk
+    already reports findings nobody can act on. Blocking on those would stall
+    every pull request. A ceiling instead fails only when the count rises,
+    which is the part that means a new leak arrived.
+    """
+    import scripts.audit_public_release as audit
+
+    def fixed_findings(_root):
+        return [
+            audit.Finding("git:abc", "evidence/old.xml", None, "developer_hostname"),
+            audit.Finding("git:abc", "tests/test_x.py", 12, "windows_absolute_path"),
+        ]
+
+    monkeypatch.setattr(audit, "audit_history", fixed_findings)
+    monkeypatch.setattr(audit, "ROOT", audit.Path("."))
+    monkeypatch.setattr(
+        __import__("sys"), "argv", ["audit", "--history", "--max-findings", "5"]
+    )
+    assert audit.main() == 0, "a backlog under the ceiling must not fail"
+
+    monkeypatch.setattr(
+        __import__("sys"), "argv", ["audit", "--history", "--max-findings", "1"]
+    )
+    assert audit.main() == 1, "exceeding the ceiling must fail"
+    assert "exceeds the baseline" in capsys.readouterr().out
+
+
+def test_max_findings_defaults_to_no_ceiling(monkeypatch) -> None:
+    """Omitting the flag keeps the original all-or-nothing behaviour."""
+    import scripts.audit_public_release as audit
+
+    monkeypatch.setattr(
+        audit,
+        "audit_working_tree",
+        lambda _root: [audit.Finding("working-tree", "a", None, "runtime_path_tracked")],
+    )
+    monkeypatch.setattr(audit, "ROOT", audit.Path("."))
+    monkeypatch.setattr(__import__("sys"), "argv", ["audit"])
+    assert audit.main() == 1
+    monkeypatch.setattr(
+        __import__("sys"), "argv", ["audit", "--max-findings", "10"]
+    )
+    # The ceiling replaces the verdict: under it the finding is reported and
+    # tolerated, which is the whole point - a backlog that still fails the job
+    # would block every pull request and change nothing.
+    assert audit.main() == 0

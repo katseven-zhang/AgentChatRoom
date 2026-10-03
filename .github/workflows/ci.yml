@@ -50,7 +50,19 @@ jobs:
   release-history:
     name: Audit reachable Git history for private runtime data
     runs-on: ubuntu-latest
-    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    # Not a plain merge gate. The reachable-history scan cannot gate a pull
+    # request yet: the tests carry Windows-shaped paths, hostnames and
+    # id-shaped tokens on purpose, and only the credential rule has a
+    # test-fixture exemption, so the existing trunk already reports findings
+    # that nobody can act on. Blocking on those would stall every pull request
+    # for a reason with no fix.
+    #
+    # What it does instead is hold the line. HISTORY_FINDING_BASELINE is the
+    # measured count on the trunk; a commit that raises it has added a leak and
+    # fails, while the known backlog neither blocks nor hides. Lower the
+    # baseline as the backlog is cleaned - the evidence/ blobs first, which are
+    # the only findings outside tests/.
+    if: always()
     steps:
       - uses: actions/checkout@v7
         with:
@@ -58,5 +70,9 @@ jobs:
       - uses: actions/setup-python@v7
         with:
           python-version: "3.11"
-      - name: Audit every reachable blob
-        run: python scripts/audit_public_release.py --history
+      - name: Audit every reachable blob against the known backlog
+        env:
+          HISTORY_FINDING_BASELINE: "572"
+        run: |
+          python scripts/audit_public_release.py --history \
+            --max-findings "$HISTORY_FINDING_BASELINE"
