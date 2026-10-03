@@ -1752,14 +1752,18 @@ def task_get(project_id: str = "", task_id: str = "") -> dict[str, Any]:
         _authorize_remote(project_id, "room:read")
     except DomainError as error:
         return {"ok": False, **error.as_dict()}
-    def _get_with_documents(pid: str, tid: str) -> dict[str, Any]:
-        service = get_service()
-        task = service.get_task(pid, tid)
-        # Additive injection: keeps the historical task-object contract intact.
-        task["project_documents"] = service.injectable_project_documents(pid)
+    # One domain method and one connection, so the task and its documents are a
+    # single snapshot - the third private copy of this assembly is gone. The tool
+    # still answers with the bare task object it has always returned: the
+    # document payload rides inside it, and the historical shape is what Agents
+    # and the compatibility harness read.
+    def _task_with_documents(pid: str, tid: str) -> dict[str, Any]:
+        payload = get_service().get_task_with_documents(pid, tid)
+        task = dict(payload["task"])
+        task["project_documents"] = payload["project_documents"]
         return task
 
-    return _tool_result(_get_with_documents, project_id, task_id)
+    return _tool_result(_task_with_documents, project_id, task_id)
 
 
 @mcp.tool()

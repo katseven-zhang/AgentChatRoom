@@ -2401,11 +2401,11 @@ def create_app(
 
     @app.get("/api/v1/projects/{project_id}/tasks/{task_id}")
     def get_task(project_id: str, task_id: str) -> dict[str, Any]:
-        task = service.get_task(project_id, task_id)
-        # Additive injection keeps the historical {"task": ...} response intact
-        # while surfacing current binding documents for the caller.
-        task["project_documents"] = service.injectable_project_documents(project_id)
-        return {"task": task}
+        # One domain method, one connection: the task and the documents injected
+        # alongside it are read in the same snapshot, so a document published
+        # between the two reads cannot appear as a version the task never saw.
+        # This route used to call two methods and splice the result together.
+        return service.get_task_with_documents(project_id, task_id)
 
     @app.get("/api/v1/projects/{project_id}/tasks/{task_id}/history")
     def list_task_history(
