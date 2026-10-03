@@ -713,7 +713,9 @@ Agent 自报的 `worktree` 不会被服务盲目信任。Work Report 采集 Git 
 审计保留期清理只移除整个过期事件，不改写或重排留存事件，并且不会销毁自己留下的凭证：
 
 - **`audit.purged` 不再被清理**。它记录"发生过清理"，若被下一次保留窗口按同一条语句删掉，历史就默变了且无法证明。台账 payload 记录 `purged_from` / `purged_before`（被清掉的首尾 `project_seq`）、`deleted_events` 与 `deferred_referenced`。
-- **仍被引用的事件延后删除**。`event_acknowledgements.event_id` 对 `events(id)` 是 `ON DELETE CASCADE`，直接删会把"谁何时确认了哪条消息"一并抹掉，而更晚的 `message.acknowledged` 仍引用已不存在的编号；每个任务的 `spec_receipt` 由**最新一条带 `project_documents` 快照的 `task.claimed`** 推导，该事件被清掉会让回执静默退化成 `{}`，永远误判该任务未绑定文档。这两类事件本轮一律延后。
+- **仍被引用的事件延后删除**。`event_acknowledgements.event_id` 对 `events(id)` 是 `ON DELETE CASCADE`，直接删会把"谁何时确认了哪条消息"一并抹掉，而更晚的 `message.acknowledged` 仍引用已不存在的编号；每个任务的 `spec_receipt` 由**最新一条带 `project_documents` 快照的进入事件**推导（`task.claimed` / `task.assignment_acknowledged` / `task.reclaimed` 三条路径），该事件被清掉会让回执静默退化成 `{}`，永远误判该任务未绑定文档。这两类事件本轮一律延后。
+**三条进入任务的路径都写回执**：接受指派与接管原本来都不会落回执，因为只有 `task.claimed` 写过，而以开始工作时当时的binding 文档版本会在整个任务生命周期里失记。任何三条路径都写快照后，回执取“最新一条**实际携带快照**的进入事件”——拒绝实说不写快照的那一条（拒绝接受就不算）。任务列表投影与单任务读取共用同一套事件集，两边不会分叉。
+**验收链的事件记录状态迁移而不只是终态**：`work.reported`、`review.submitted`、`task.integration_completed`、`task.integration_failed` 的 payload 都带 `from_*`——`task_history.state_changes()` 只报告成对的前后值，只有后值的事件在历史面板上不会显示任何迁移。**集成前也校依赖**：依赖门控现在是共享的，集成路径也走它，且先于“已集成”判定——否则依赖回归时重复集成只会报“已完成”，调用方永远不会知道依赖已经失败。
 - **读路径给出 `purged_before`**。`list_events` / `room_sync` 返回 `purged_before` 与 `cursor_is_purged`，让持有旧游标的一方能区分"中间有空洞"和"你已经在起点"，而不是把空洞当成没有新事件。
 
 MCP 的同步工具函数不再内联占用事件循环。SDK 默认直接调用同步函数，导致一次 `work_report` 的 Git 子进程期间，同进程的 REST、SSE 和其他 MCP 客户端全部停摆；现在同步工具经 `anyio.to_thread` 在工作线程执行，领域调用本身不变。`room_bootstrap` 的绑定因此从共享注册表回读，而不是从只在线程内可见的 ContextVar 回读，避免线程边界把刚建立的绑定覆盖成空。这条下沉对每一个 advertise 出来的工具一致生效，并且 stdio 与 Streamable-HTTP 两种形态用的是同一个工具管理器（`create_mcp()` 与进程内 `mcp` 都构造 `ServiceBoundToolManager`），所以不存在“HTTP 快了、stdio 还堵着”的部署差异；这一点由回归测试锁住：注册表里每个工具要么本身是 async，要么签名满足可下沉条件（新增一个不满足条件的工具会直接测红），两个各自 sleep 的同步工具被并发调用时总耗时接近一次而非两次，并且都跑在非事件循环线程上。部署约定不变：MCP、REST、SSE 同进程同循环，任何工具内的磁盘/子进程工作都必须走这条下沉路径，不要在适配层里新增同步阻塞调用。

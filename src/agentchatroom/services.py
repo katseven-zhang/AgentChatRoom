@@ -2286,20 +2286,27 @@ class AgentChatRoomService:
             str(row["id"]): {} for row in materialized
         }
         project_id = str(materialized[0]["project_id"])
-        for claim_event in connection.execute(
+        # Same three entry events the single-task lookup reads, and the same
+        # "newest one that actually carries a snapshot" rule. This projection had
+        # its own narrower query, so the task list showed {} for every task that
+        # entered through an assignment or a reclaim even after the single-task
+        # read was fixed.
+        entry_placeholders = ", ".join("?" for _ in self.TASK_ENTRY_EVENTS)
+        for entry_event in connection.execute(
             f"""
             SELECT task_id, payload_json FROM events
-            WHERE project_id = ? AND event_type = 'task.claimed'
+            WHERE project_id = ? AND event_type IN ({entry_placeholders})
               AND task_id IN ({placeholders})
-            ORDER BY id ASC
+            ORDER BY id DESC
             """,
-            [project_id, *task_ids],
+            [project_id, *self.TASK_ENTRY_EVENTS, *task_ids],
         ):
-            snapshot = json_load(claim_event["payload_json"], {}).get(
+            snapshot = json_load(entry_event["payload_json"], {}).get(
                 "project_documents"
             )
-            if snapshot:
-                spec_receipts[str(claim_event["task_id"])] = snapshot
+            task_key = str(entry_event["task_id"])
+            if snapshot and not spec_receipts.get(task_key):
+                spec_receipts[task_key] = snapshot
         assembled: list[dict[str, Any]] = []
         for row in materialized:
             data = self._task_dict(row)
@@ -6589,6 +6596,11 @@ class AgentChatRoomService:
                         "transferred_lease_ids": lease_ids,
                         "execution_status": task["execution_status"],
                         "explicit_live_takeover": bool(takeover and owner_connected),
+                        # The new owner starts reading under the standards as
+                        # they stand now, not as they stood for the previous one.
+                        "project_documents": self._binding_document_snapshot(
+                            connection, project_id
+                        ),
                     },
                 )
                 row = connection.execute(
@@ -7557,6 +7569,14 @@ class AgentChatRoomService:
                     "note": note.strip(),
                     "reclaimed_from_session_id": reclaimed_from_session_id,
                     "transferred_lease_ids": transferred_lease_ids,
+                    # Accepting an assignment is the third way into a task, and
+                    # it was leaving no receipt - a task that started this way
+                    # reported spec_receipt {} for its whole life.
+                    "project_documents": (
+                        self._binding_document_snapshot(connection, project_id)
+                        if response == "accepted"
+                        else {}
+                    ),
                 },
             )
             updated_assignment = connection.execute(
@@ -8887,6 +8907,17 @@ class AgentChatRoomService:
                     "tests": tests,
                     "system_evidence": system_evidence,
                     "released_lease_ids": released_lease_ids,
+                    # from_* pairs: the history panel derives transitions from
+                    # these, and work.reported is where a task first leaves
+                    # in_progress.
+                    "from_status": task["status"],
+                    "status": "awaiting_review",
+                    "from_execution_status": task["execution_status"],
+                    "execution_status": "completed",
+                    "from_verification_status": task["verification_status"],
+                    "verification_status": "pending",
+                    "from_integration_status": task["integration_status"],
+                    "integration_status": "pending",
                     "spec_receipt": self._latest_claim_document_snapshot(
                         connection, project_id, task_id
                     ),
@@ -8901,8 +8932,15 @@ class AgentChatRoomService:
                 payload={
                     "report_id": report_id,
                     "no_code_change_reason": clean_no_code_reason,
+                    # from_* pairs, so the report that starts verification is
+                    # visible as a transition rather than only as an end state.
+                    "from_status": task["status"],
+                    "status": "awaiting_review",
+                    "from_execution_status": task["execution_status"],
                     "execution_status": "completed",
+                    "from_verification_status": task["verification_status"],
                     "verification_status": "pending",
+                    "from_integration_status": task["integration_status"],
                     "integration_status": "pending",
                 },
             )
@@ -9036,8 +9074,17 @@ class AgentChatRoomService:
                     "verdict": verdict,
                     "criteria": criteria,
                     "notes": notes.strip(),
+                    # from_* pairs: task_history.state_changes() reports nothing
+                    # for an event carrying only the new value, so a review that
+                    # turned a task from in_progress to completed showed no
+                    # transition in the task's own history.
+                    "from_status": task["status"],
+                    "status": next_status,
+                    "from_execution_status": task["execution_status"],
                     "execution_status": next_execution_status,
+                    "from_verification_status": task["verification_status"],
                     "verification_status": next_verification_status,
+                    "from_integration_status": task["integration_status"],
                     "integration_status": "pending",
                 },
             )
@@ -9125,6 +9172,15 @@ class AgentChatRoomService:
                     "Task must be execution-complete and independently approved before integration",
                     status_code=409,
                 )
+            # The dependency gate is shared, so integration uses it too. It used
+            # to guard only entry into work, which meant a task whose dependency
+            # later regressed (reopened, rolled back) could still be integrated
+            # on the strength of a stale approval.
+            #
+            # It runs before the already-integrated check on purpose: otherwise
+            # a re-integration attempt reports "already done" and the caller
+            # never learns that the dependency is now unfinished.
+            self._require_finished_dependencies(connection, task_id)
             if task["integration_status"] == "done":
                 raise DomainError(
                     "task_already_integrated",
@@ -9214,8 +9270,14 @@ class AgentChatRoomService:
                     "integrated_by": (
                         "agent" if integrator_session_id else "manager"
                     ),
+                    # from_* pairs, for the same reason as review.submitted.
+                    "from_status": task["status"],
+                    "status": "done" if result == "done" else "integration_failed",
+                    "from_execution_status": task["execution_status"],
                     "execution_status": "completed",
+                    "from_verification_status": task["verification_status"],
                     "verification_status": "approved",
+                    "from_integration_status": task["integration_status"],
                     "integration_status": result,
                 },
             )
@@ -11757,20 +11819,37 @@ class AgentChatRoomService:
         ).fetchall()
         return {row["doc_key"]: row["current_version"] for row in rows}
 
+    #: The three ways a Session can come to own a task. Only the first one used
+    #: to stamp a receipt, so a task that started through an assignment or a
+    #: reclaim reported an empty spec_receipt forever - and that receipt is what
+    #: proves which document versions the work was actually held to.
+    TASK_ENTRY_EVENTS = (
+        "task.claimed",
+        "task.assignment_acknowledged",
+        "task.reclaimed",
+    )
+
     def _latest_claim_document_snapshot(
         self, connection: Any, project_id: str, task_id: str
     ) -> dict[str, int]:
-        row = connection.execute(
-            """
-            SELECT payload_json FROM events
-            WHERE project_id = ? AND task_id = ? AND event_type = 'task.claimed'
-            ORDER BY id DESC LIMIT 1
+        placeholders = ", ".join("?" for _ in self.TASK_ENTRY_EVENTS)
+        rows = connection.execute(
+            f"""
+            SELECT event_type, payload_json FROM events
+            WHERE project_id = ? AND task_id = ?
+              AND event_type IN ({placeholders})
+            ORDER BY id DESC
             """,
-            (project_id, task_id),
-        ).fetchone()
-        if row is None:
-            return {}
-        return json_load(row["payload_json"], {}).get("project_documents") or {}
+            (project_id, task_id, *self.TASK_ENTRY_EVENTS),
+        ).fetchall()
+        for row in rows:
+            # An accepted assignment or a reclaim stamps the snapshot; a
+            # declined or blocked one does not, so keep looking back rather than
+            # treating the empty one as an answer.
+            snapshot = json_load(row["payload_json"], {}).get("project_documents")
+            if snapshot:
+                return snapshot
+        return {}
 
     def injectable_project_documents(
         self, project_id: str, *, connection: Any = None
