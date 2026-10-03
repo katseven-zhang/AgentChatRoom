@@ -321,6 +321,9 @@ class LogTail(threading.Thread):
         self.sink = sink
         self.stop_event = stop_event
         self.tail_lines = tail_lines
+        # One line per failure streak rather than one per poll tick: a share
+        # that stays unreachable for an hour must not fill the panel.
+        self._read_error_reported = False
 
     def run(self) -> None:
         handle = None
@@ -331,7 +334,10 @@ class LogTail(threading.Thread):
                     if not self.path.exists():
                         self.stop_event.wait(0.5)
                         continue
-                    handle = self.path.open("r", encoding="utf-8", errors="replace")
+                    handle = self._open()
+                    if handle is None:
+                        self.stop_event.wait(1.0)
+                        continue
                     for line in handle.read().splitlines()[-self.tail_lines :]:
                         formatted = format_service_line(line.rstrip("\r\n"))
                         if formatted:
@@ -351,7 +357,17 @@ class LogTail(threading.Thread):
                     handle.close()
                     handle = None
                     continue
-                line = handle.readline()
+                try:
+                    line = handle.readline()
+                except OSError:
+                    # Antivirus, OneDrive and network shares all take the file
+                    # away for a moment. Losing the thread here would freeze the
+                    # log panel for the rest of the session with no explanation,
+                    # so drop the handle, say so once, and reopen on the next
+                    # pass - the same shape RoomEventTail uses.
+                    self._report_read_error(handle)
+                    handle = None
+                    continue
                 if line:
                     formatted = format_service_line(line.rstrip("\r\n"))
                     if formatted:
@@ -360,7 +376,36 @@ class LogTail(threading.Thread):
                     self.stop_event.wait(0.2)
         finally:
             if handle is not None:
-                handle.close()
+                try:
+                    handle.close()
+                except OSError:
+                    pass
+
+    def _open(self):
+        """Open the log, tolerating a file that is temporarily unavailable."""
+        try:
+            handle = self.path.open("r", encoding="utf-8", errors="replace")
+        except OSError:
+            self._note_unavailable()
+            return None
+        self._read_error_reported = False
+        return handle
+
+    def _note_unavailable(self) -> None:
+        if self._read_error_reported:
+            return
+        self._read_error_reported = True
+        self.sink.put(
+            ("log", "[服务日志] 暂时无法读取日志文件，稍后自动重试。")
+        )
+
+    def _report_read_error(self, handle: Any) -> None:
+        """Close what we have and say once that the panel is still retrying."""
+        try:
+            handle.close()
+        except OSError:
+            pass
+        self._note_unavailable()
 
 
 def _drain(sink: Queue, *, limit: int = 200) -> list[Any]:
@@ -1138,6 +1183,12 @@ def run_gui(config_path: str | None = None, *, autostart: bool = False) -> None:
             run_stop_worker(sink, stop_fn=controller.stop)
 
         def on_close(self) -> None:
+            # A second close while a stop is already in flight reaches
+            # finish_exit_after_stop with nothing left to stop, and the user is
+            # asked to confirm a stop that already finished. Every other exit
+            # entry guards on this pair; these two did not.
+            if self.action_active or self.pending_exit_after_stop:
+                return
             if self.tray is not None:
                 self.hide_to_tray()
                 return
@@ -1206,6 +1257,8 @@ def run_gui(config_path: str | None = None, *, autostart: bool = False) -> None:
                 self.on_tray_quit()
 
         def on_tray_quit(self) -> None:
+            if self.action_active or self.pending_exit_after_stop:
+                return
             running = controller.is_running()
             choice: str | None = None
             if running:
@@ -1234,6 +1287,12 @@ def run_gui(config_path: str | None = None, *, autostart: bool = False) -> None:
             if stopped:
                 self.shutdown_app()
                 return
+            # A queued worker event can land after the window is gone. Asking a
+            # destroyed window a question raises TclError on the worker thread
+            # and the user never learns the stop did not finish, so treat it as
+            # the end of the line instead.
+            if not self._window_alive():
+                return
             force = messagebox.askyesno(
                 "停止未完成",
                 "服务停止未完成。稍后可运行「关闭 AgentChatRoom.cmd」清理残留进程。\n\n"
@@ -1244,6 +1303,13 @@ def run_gui(config_path: str | None = None, *, autostart: bool = False) -> None:
             else:
                 self.action_active = False
                 self.refresh_state()
+
+        def _window_alive(self) -> bool:
+            """Whether this window still exists to receive a dialog."""
+            try:
+                return bool(self.winfo_exists())
+            except Exception:  # noqa: BLE001 - a dead Tk must not raise here
+                return False
 
         def shutdown_app(self) -> None:
             stop_tails()

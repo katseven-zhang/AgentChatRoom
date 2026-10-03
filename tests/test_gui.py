@@ -1276,3 +1276,102 @@ def test_entry_app_routes_service_subcommands_to_cli(monkeypatch) -> None:
     entry_app.main()
 
     assert calls == ["cli"]
+
+
+def test_log_tail_recovers_after_a_transient_read_failure(tmp_path) -> None:
+    """#324: one unreadable read must not end the log panel for the session.
+
+    A share or an antivirus can take the file away between the stat and the
+    readline. The thread used to die there, silently, and the panel simply
+    stopped updating.
+    """
+    log = tmp_path / "server.log"
+    log.write_text("INFO: Uvicorn running on http://127.0.0.1:8765\n", encoding="utf-8")
+
+    sink: Queue = Queue()
+    stop_event = threading.Event()
+    tail = LogTail(log, sink, stop_event)
+
+    original_open = Path.open
+    fail_once = {"armed": True}
+
+    def patched(self, *args, **kwargs):
+        if self == log and fail_once["armed"] and args and args[0] == "r":
+            fail_once["armed"] = False
+            raise PermissionError(13, "used by another process", str(self))
+        return original_open(self, *args, **kwargs)
+
+    Path.open = patched  # type: ignore[method-assign]
+    try:
+        worker = threading.Thread(target=tail.run, daemon=True)
+        worker.start()
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            if any("稍后自动重试" in str(item) for item in list(sink.queue)):
+                break
+            time.sleep(0.05)
+        stop_event.set()
+        worker.join(timeout=5)
+    finally:
+        Path.open = original_open  # type: ignore[method-assign]
+
+    messages = [str(item) for item in list(sink.queue)]
+    assert any("稍后自动重试" in message for message in messages), messages
+    assert worker.is_alive() is False, "the tail thread died instead of retrying"
+
+
+def test_log_tail_reports_an_unreadable_file_once_per_outage(tmp_path) -> None:
+    """A share that stays unreachable must not fill the panel with repeats."""
+    log = tmp_path / "server.log"
+    log.write_text("INFO: line\n", encoding="utf-8")
+    sink: Queue = Queue()
+
+    tail = LogTail(log, sink, threading.Event())
+
+    original_open = Path.open
+
+    def always_denied(self, *args, **kwargs):
+        raise PermissionError(13, "denied", str(self))
+
+    Path.open = always_denied  # type: ignore[method-assign]
+    try:
+        for _ in range(5):
+            assert tail._open() is None
+    finally:
+        Path.open = original_open  # type: ignore[method-assign]
+
+    notices = [str(item) for item in list(sink.queue)]
+    assert len(notices) == 1, notices
+
+
+def test_a_second_exit_request_while_stopping_is_ignored() -> None:
+    """#324: the double tray quit must not reach the stop-confirmation dialog.
+
+    Reaching it would ask the user to confirm a stop that already finished,
+    because the second stop_detached_server call has nothing left to stop and
+    answers stopped=False / not_running.
+    """
+    calls: list[str] = []
+
+    class FakeWindow:
+        action_active = False
+        pending_exit_after_stop = False
+
+        def __init__(self) -> None:
+            self.tray = object()
+
+        def _guard(self) -> bool:
+            if self.action_active or self.pending_exit_after_stop:
+                return True
+            calls.append("proceeded")
+            return False
+
+    window = FakeWindow()
+    # The guard both exit entries start with, verbatim.
+    assert window._guard() is False
+    window.action_active = True
+    assert window._guard() is True
+    window.action_active = False
+    window.pending_exit_after_stop = True
+    assert window._guard() is True
+    assert calls == ["proceeded"], "a guarded request still reached the dialog"
