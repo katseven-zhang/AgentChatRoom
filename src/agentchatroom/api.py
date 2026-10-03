@@ -391,6 +391,9 @@ class ProjectDocumentUpsert(StrictModel):
     kind: str
     title: str
     content: str
+    # The version the editor loaded. Absent means "create or replace", which is
+    # what the Web console sends when it has nothing open to lose.
+    expected_version: int | None = None
 
 
 class BackupSettingsUpdate(StrictModel):
@@ -2284,7 +2287,9 @@ def create_app(
             kind=body.kind,
             title=body.title,
             content=body.content,
-            actor="management",
+            management_authorized=True,
+            expected_version=body.expected_version,
+            request_id=request.state.idempotency_request_id,
         )
 
     @app.post("/api/v1/projects/{project_id}/documents/{doc_key}/archive")
@@ -2292,7 +2297,12 @@ def create_app(
         project_id: str, doc_key: str, request: Request
     ) -> dict[str, Any]:
         _require_management(request)
-        return service.archive_project_document(project_id, doc_key, actor="management")
+        return service.archive_project_document(
+            project_id,
+            doc_key,
+            management_authorized=True,
+            request_id=request.state.idempotency_request_id,
+        )
 
     @app.get("/api/v1/projects/{project_id}/audit")
     def query_audit(

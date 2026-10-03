@@ -11549,6 +11549,10 @@ class AgentChatRoomService:
         kind: str,
         title: str,
         content: str,
+        session_id: str = "",
+        token: str = "",
+        management_authorized: bool = False,
+        expected_version: int | None = None,
         actor: str | None = None,
     ) -> dict[str, Any]:
         key = str(doc_key or "").strip()
@@ -11586,12 +11590,52 @@ class AgentChatRoomService:
             )
         now = iso_now()
         with self.database.connect(write=True) as connection:
+            # A binding document is injected verbatim into every Agent's task
+            # response, so writing one is a privileged act and has to be
+            # attributable. The previous signature took a free-text actor and
+            # authenticated nobody: any caller holding document:write could
+            # replace the Room's own rules, and the event named nobody.
+            #
+            # Management authority stands on its own - the console has no Agent
+            # Session - so it skips the Agent credential check rather than
+            # demanding an identity the caller does not have. The Agent path is
+            # the one that must be refused.
+            actor_row: Mapping[str, Any] | None = None
+            if management_authorized:
+                if session_id and token:
+                    actor_row = self._authenticate(
+                        connection, project_id, session_id, token or ""
+                    )
+            else:
+                actor_row = self._authenticate(
+                    connection, project_id, session_id, token or ""
+                )
+                raise _management_authorization_required(
+                    "write a project document"
+                )
             self._require_project(connection, project_id)
             head = connection.execute(
                 "SELECT * FROM project_document_heads WHERE project_id = ? AND doc_key = ?",
                 (project_id, key),
             ).fetchone()
             created = head is None
+            # Optimistic lock: a writer that read version N must still find N,
+            # or the document it meant to edit has moved under it.
+            if expected_version is not None:
+                current = int(head["current_version"]) if head else 0
+                if current != require_int_or_default(
+                    expected_version, "expected_version", 0
+                ):
+                    raise DomainError(
+                        "project_document_modified_concurrently",
+                        "The document changed since it was read",
+                        status_code=409,
+                        details={
+                            "expected_version": expected_version,
+                            "current_version": current,
+                            "required_action": "reload_the_document_and_retry",
+                        },
+                    )
             next_version = int(head["current_version"]) + 1 if head else 1
             document_id = new_id("doc")
             connection.execute(
@@ -11610,7 +11654,7 @@ class AgentChatRoomService:
                     next_version,
                     clean_content,
                     len(clean_content.encode("utf-8")),
-                    actor,
+                    str(actor or "") or (actor_row["id"] if actor_row else ""),
                     now,
                 ),
             )
@@ -11637,6 +11681,7 @@ class AgentChatRoomService:
                 connection,
                 project_id,
                 "document.created" if created else "document.updated",
+                actor_session_id=actor_row["id"] if actor_row else None,
                 payload={
                     "doc_key": key,
                     "kind": kind,
@@ -11649,10 +11694,30 @@ class AgentChatRoomService:
             return self.get_project_document(project_id, key)
 
     def archive_project_document(
-        self, project_id: str, doc_key: str, *, actor: str | None = None
+        self,
+        project_id: str,
+        doc_key: str,
+        *,
+        session_id: str = "",
+        token: str = "",
+        management_authorized: bool = False,
+        actor: str | None = None,
     ) -> dict[str, Any]:
         now = iso_now()
         with self.database.connect(write=True) as connection:
+            # Same rule as upsert: management authority stands alone, an Agent
+            # needs it and cannot supply it for itself.
+            actor_row = None
+            if management_authorized:
+                if session_id and token:
+                    actor_row = self._authenticate(
+                        connection, project_id, session_id, token or ""
+                    )
+            else:
+                self._authenticate(connection, project_id, session_id, token or "")
+                raise _management_authorization_required(
+                    "archive a project document"
+                )
             head = connection.execute(
                 "SELECT * FROM project_document_heads WHERE project_id = ? AND doc_key = ?",
                 (project_id, doc_key),
@@ -11675,6 +11740,7 @@ class AgentChatRoomService:
                 connection,
                 project_id,
                 "document.archived",
+                actor_session_id=actor_row["id"] if actor_row else None,
                 payload={"doc_key": doc_key, "actor": actor},
             )
         return self.get_project_document(project_id, doc_key)

@@ -80,15 +80,31 @@ def test_reads_and_presence_are_not_touched(tool_name):
     }
 
 
+def _as_management(session) -> dict:
+    """Credentials plus explicit management authority (#252)."""
+    return {
+        "session_id": session["agent"]["id"],
+        "token": session["token"],
+        "management_authorized": True,
+    }
+
+
 def test_document_upsert_replays_instead_of_bumping_a_second_version(
     service, project
 ):
+    manager = service.join_room(
+        project["id"],
+        software_key="bridge-mgr",
+        name="BridgeMgr",
+        client="pytest",
+        model="unknown",
+    )
     call = dict(
         doc_key="bridge-replay",
         kind="reference",
         title="Replay",
         content="body",
-        actor="agent",
+        **_as_management(manager),
     )
     first = service.upsert_project_document(
         project["id"], request_id="req-doc-1", **call

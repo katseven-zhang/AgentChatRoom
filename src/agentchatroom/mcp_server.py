@@ -1720,23 +1720,29 @@ def project_document_upsert(
     kind: str = "binding",
     title: str = "",
     content: str = "",
+    expected_version: int | None = None,
     request_id: str = "",
 ) -> dict[str, Any]:
-    """Create a new immutable version of a project document (binding or reference)."""
-    try:
-        _authorize_remote(project_id, "document:write")
-    except DomainError as error:
-        return {"ok": False, **error.as_dict()}
-    return _tool_result(
-        get_service().upsert_project_document,
-        project_id,
-        doc_key=doc_key,
-        kind=kind,
-        title=title,
-        content=content,
-        actor="agent",
-        request_id=_mcp_request_id(request_id),
-    )
+    """Create a new immutable version of a project document (binding or reference).
+
+    Management-only. A binding document is injected verbatim into every Agent's
+    task response, so an Agent that could write one could hand every other Agent
+    instructions of its own choosing. The management surface is REST; this tool
+    reports the refusal rather than pretending the permission exists.
+    """
+    return {
+        "ok": False,
+        "error": {
+            "code": "management_auth_required",
+            "message": (
+                "Writing a project document requires management authority; "
+                "use the authenticated management REST route"
+            ),
+            "details": {
+                "required_action": "write_the_project_document_from_the_console"
+            },
+        },
+    }
 
 
 @mcp.tool()

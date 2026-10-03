@@ -1212,16 +1212,30 @@ def test_mcp_room_join_uses_unique_existing_room_without_project_key(
     assert len(service.list_projects()) == 1
 
 
+def _as_management(session) -> dict:
+    """Credentials plus explicit management authority (#252)."""
+    return {
+        "session_id": session["agent"]["id"],
+        "token": session["token"],
+        "management_authorized": True,
+    }
+
+
 def test_mcp_room_join_returns_document_manifest(
     monkeypatch, service, project_dir
 ):
+    manager = service.join_room(
+        service.create_project(root_path=str(project_dir))["id"],
+        software_key="mgr", name="Mgr", client="pytest", model="unknown",
+    )
+    existing_id = manager["agent"]["project_id"]
     service.upsert_project_document(
-        existing_id := service.create_project(root_path=str(project_dir))["id"],
+        existing_id,
         doc_key="standards",
         kind="binding",
         title="工程规范",
         content="先取租约",
-        actor="management",
+        **_as_management(manager),
     )
     monkeypatch.setattr(mcp_server, "service", service)
     _configure_local_software(
