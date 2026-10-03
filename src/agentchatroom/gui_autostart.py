@@ -6,6 +6,7 @@ configuration: disabling login startup must never stop a running service.
 
 from __future__ import annotations
 
+import hashlib
 import os
 import subprocess
 import sys
@@ -14,6 +15,11 @@ from pathlib import Path
 
 RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 VALUE_NAME = "AgentChatRoom"
+
+#: Object-name prefix for the single-instance mutex and its activation event.
+#: The data-directory digest is appended so two consoles that manage different
+#: data directories never lock each other out.
+INSTANCE_NAME_PREFIX = "AgentChatRoom_GUI_SingleInstance"
 
 
 def startup_command(*, executable: Path | None = None, frozen: bool | None = None) -> str:
@@ -113,12 +119,39 @@ class LoginStartup:
             raise OSError("开机启动项移除后校验失败")
 
 
+def instance_guard_name(data_dir: Path | str | None) -> str:
+    """Return the single-instance object name for one data directory.
+
+    The single-instance scope is the data directory, not the executable: a
+    development checkout and a packaged release on the same machine manage
+    different databases, service pid files and log files, so the second one
+    must not refuse to start because the first one already holds the lock.
+    Windows object names accept no path separators, so the resolved data
+    directory is folded into a short digest appended to the shared prefix.
+    """
+    if data_dir is None:
+        return INSTANCE_NAME_PREFIX
+    try:
+        resolved = str(Path(data_dir).expanduser().resolve()).casefold()
+    except OSError:
+        # An unreadable path still has to yield a stable name; the raw text is
+        # enough to keep two different directories apart.
+        resolved = str(data_dir).casefold()
+    digest = hashlib.sha256(resolved.encode("utf-8")).hexdigest()[:16]
+    return f"{INSTANCE_NAME_PREFIX}_{digest}"
+
+
 class GuiInstanceGuard:
-    """Keep one controller window and notify it when another launch arrives."""
+    """Keep one controller window and notify it when another launch arrives.
+
+    ``name`` must come from :func:`instance_guard_name` so the guard is scoped
+    to one data directory; the raw default only stays for callers that have no
+    data directory to derive it from.
+    """
 
     def __init__(
         self,
-        name: str = "AgentChatRoom_GUI_SingleInstance",
+        name: str = INSTANCE_NAME_PREFIX,
         window_title: str | None = None,
     ) -> None:
         self._name = name

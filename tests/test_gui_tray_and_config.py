@@ -38,7 +38,8 @@ STARTED_URL = "http://127.0.0.1:8765"
 # shared fakes
 # --------------------------------------------------------------------------------------
 class _Guard:
-    def __init__(self, *, window_title: str) -> None:
+    def __init__(self, *, name: str, window_title: str) -> None:
+        assert name
         assert window_title
 
     def acquire(self) -> bool:
