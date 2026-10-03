@@ -1791,6 +1791,195 @@ def test_work_must_be_independently_reviewed(service, project, joined_agents):
     assert review_event["project_seq"] < integration_event["project_seq"]
 
 
+def test_reviewer_independence_survives_the_owner_changing_or_disappearing(
+    service, project, joined_agents
+):
+    """Independence is judged on who wrote the task, not on who owns it now.
+
+    Ownership is not authorship. The old check compared the reviewer only with
+    ``tasks.owner_session_id``, so any transition that cleared or moved that one
+    column - a release, a reassignment, a Session that ended - silently made the
+    executing identity an acceptable reviewer of its own code. Each case below
+    ends with the owner in a state where that one comparison has nothing to
+    reject on, and each must still refuse: the durable record of authorship is
+    the set of Sessions in ``work_reports``.
+    """
+    author, reviewer = joined_agents
+    task = service.create_task(
+        project["id"],
+        title="Implement payments",
+        acceptance_criteria=["Charges run"],
+        actor_session_id=author["agent"]["id"],
+        token=author["token"],
+    )["task"]
+    service.claim_task(
+        project["id"], task["id"], author["agent"]["id"], author["token"]
+    )
+    service.update_task(
+        project["id"], task["id"], status="in_progress",
+        session_id=author["agent"]["id"], token=author["token"],
+    )
+    service.submit_work_report(
+        project["id"], task["id"],
+        session_id=author["agent"]["id"], token=author["token"],
+        summary="Implemented charges",
+        files=["src/payments.py"],
+        tests=[{"command": "pytest", "exit_code": 0}],
+    )
+    # Sanity: with the owner intact the author is refused, which is the
+    # behaviour that already worked. Everything below is the case that did not.
+    with pytest.raises(DomainError) as intact:
+        service.submit_review(
+            project["id"], task["id"],
+            reviewer_session_id=author["agent"]["id"], token=author["token"],
+            verdict="approved", criteria=[{"criterion": "Charges run", "status": "passed"}],
+        )
+    assert intact.value.code == "reviewer_not_independent"
+
+    # The owner goes away; the author remains the only party who wrote the task.
+    with service.database.connect(write=True) as connection:
+        connection.execute(
+            "UPDATE tasks SET owner_session_id = NULL WHERE id = ?", (task["id"],)
+        )
+    with pytest.raises(DomainError) as after_release:
+        service.submit_review(
+            project["id"], task["id"],
+            reviewer_session_id=author["agent"]["id"], token=author["token"],
+            verdict="approved", criteria=[{"criterion": "Charges run", "status": "passed"}],
+        )
+    # Not "independent because there is nothing to compare" - refused as the
+    # author it is.
+    assert after_release.value.code == "reviewer_not_independent"
+    assert author["agent"]["id"] in (
+        after_release.value.details["contributing_session_ids"]
+    )
+    # And the refusal left the task awaiting review rather than verified.
+    with service.database.connect() as connection:
+        row = connection.execute(
+            "SELECT verification_status FROM tasks WHERE id = ?", (task["id"],)
+        ).fetchone()
+    assert row["verification_status"] == "pending"
+
+    # A reviewer who genuinely did not write the task is still accepted, so the
+    # rule rejects authorship and not reviews.
+    approved = service.submit_review(
+        project["id"], task["id"],
+        reviewer_session_id=reviewer["agent"]["id"], token=reviewer["token"],
+        verdict="approved", criteria=[{"criterion": "Charges run", "status": "passed"}],
+    )
+    assert approved["verification_status"] == "approved"
+
+
+def test_review_is_refused_when_no_work_report_records_the_author(
+    service, project, joined_agents
+):
+    """No authorship record means independence cannot be shown, so refuse.
+
+    Defaulting to "independent" whenever the comparison has nothing to compare
+    is what let a cleared owner pass review. With the record absent there is no
+    second party to demonstrate, so the honest answer is to refuse and say what
+    is missing.
+    """
+    author, reviewer = joined_agents
+    task = service.create_task(
+        project["id"],
+        title="Implement refunds",
+        acceptance_criteria=["Refunds run"],
+        actor_session_id=author["agent"]["id"],
+        token=author["token"],
+    )["task"]
+    service.claim_task(
+        project["id"], task["id"], author["agent"]["id"], author["token"]
+    )
+    service.update_task(
+        project["id"], task["id"], status="in_progress",
+        session_id=author["agent"]["id"], token=author["token"],
+    )
+    service.submit_work_report(
+        project["id"], task["id"],
+        session_id=author["agent"]["id"], token=author["token"],
+        summary="Implemented refunds",
+        files=["src/refunds.py"],
+        tests=[{"command": "pytest", "exit_code": 0}],
+    )
+    with service.database.connect(write=True) as connection:
+        connection.execute(
+            "DELETE FROM work_reports WHERE task_id = ?", (task["id"],)
+        )
+        connection.execute(
+            "UPDATE tasks SET owner_session_id = NULL WHERE id = ?", (task["id"],)
+        )
+
+    # Even a reviewer who did not write the task is refused: nothing here can
+    # establish who did, so approving would record an independence that was
+    # never demonstrated.
+    with pytest.raises(DomainError) as unprovable:
+        service.submit_review(
+            project["id"], task["id"],
+            reviewer_session_id=reviewer["agent"]["id"], token=reviewer["token"],
+            verdict="approved", criteria=[{"criterion": "Refunds run", "status": "passed"}],
+        )
+    assert unprovable.value.code == "reviewer_independence_unprovable"
+    assert unprovable.value.details["required_action"] == "restore_work_report"
+
+
+def test_review_is_refused_when_a_reporting_session_carries_no_identity(
+    service, project, joined_agents
+):
+    """A contributing Session that cannot be named blocks the review too.
+
+    ``agent_sessions.member_id`` is nullable and ``agent_key`` defaults to
+    empty, so a Session row can exist while naming no software identity at all.
+    An identity that cannot be named also cannot be excluded from the review -
+    and that is precisely the identity a reviewer might turn out to be.
+    Refusing is the only answer that does not record an independence nobody
+    actually checked.
+    """
+    author, reviewer = joined_agents
+    task = service.create_task(
+        project["id"],
+        title="Implement webhooks",
+        acceptance_criteria=["Webhooks fire"],
+        actor_session_id=author["agent"]["id"],
+        token=author["token"],
+    )["task"]
+    service.claim_task(
+        project["id"], task["id"], author["agent"]["id"], author["token"]
+    )
+    service.update_task(
+        project["id"], task["id"], status="in_progress",
+        session_id=author["agent"]["id"], token=author["token"],
+    )
+    service.submit_work_report(
+        project["id"], task["id"],
+        session_id=author["agent"]["id"], token=author["token"],
+        summary="Implemented webhooks",
+        files=["src/webhooks.py"],
+        tests=[{"command": "pytest", "exit_code": 0}],
+    )
+    # The reporting Session exists but names no identity: the row survived some
+    # cleanup while its link to a durable member did not.
+    with service.database.connect(write=True) as connection:
+        connection.execute(
+            "UPDATE agent_sessions SET member_id = NULL, agent_key = '' WHERE id = ?",
+            (author["agent"]["id"],),
+        )
+
+    with pytest.raises(DomainError) as unresolvable:
+        service.submit_review(
+            project["id"], task["id"],
+            reviewer_session_id=reviewer["agent"]["id"], token=reviewer["token"],
+            verdict="approved", criteria=[{"criterion": "Webhooks fire", "status": "passed"}],
+        )
+    assert unresolvable.value.code == "reviewer_independence_unprovable"
+    assert author["agent"]["id"] in (
+        unresolvable.value.details["unresolvable_report_sessions"]
+    )
+    assert unresolvable.value.details["required_action"] == (
+        "restore_session_or_reassign_task"
+    )
+
+
 def test_same_software_cannot_become_an_independent_reviewer_by_reconnecting(
     service, project
 ):
