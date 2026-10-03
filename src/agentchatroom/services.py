@@ -298,7 +298,29 @@ def utc_now() -> datetime:
 
 
 def iso_now() -> str:
-    return utc_now().isoformat().replace("+00:00", "Z")
+    """The current instant in a fixed-width UTC form.
+
+    ``isoformat()`` drops the fractional part when it is exactly zero, so two
+    instants a few hundred milliseconds apart could produce ``...13Z`` and
+    ``...13.000001Z`` - and those do not sort in the order they happened:
+    ``'...13.000001Z' < '...13Z'`` is true as a string comparison, so a
+    text-ordered ``ORDER BY created_at`` puts the later row first. Since
+    several listings order on that column with no tie-break, the width has to
+    be constant. ``parse_time`` still accepts both spellings, so historical
+    rows written before this keep reading.
+    """
+    return utc_now().strftime("%Y-%m-%dT%H:%M:%S.%f") + "Z"
+
+
+def format_instant(moment: datetime) -> str:
+    """Render one instant the way :func:`iso_now` does.
+
+    Deadlines and creation stamps share columns and comparisons with the values
+    ``iso_now`` produces, so they have to be spelled the same way: an
+    isoformat-without-fraction stamp next to a fixed-width one is what made a
+    text-ordered listing non-monotonic.
+    """
+    return moment.strftime("%Y-%m-%dT%H:%M:%S.%f") + "Z"
 
 
 def parse_time(value: str) -> datetime:
@@ -570,9 +592,17 @@ def _pattern_covers(broad: str, narrow: str) -> bool:
     A same-identity takeover must only retire leases the new scope actually
     replaces. Releasing a broader lease because it merely *overlaps* a narrower
     request silently shrank the caller's own protection.
+
+    Comparison folds case, storage does not: a lease registered as
+    ``README.md`` keeps that spelling in the Room while still conflicting with
+    one registered as ``readme.md``. Windows and macOS filesystems do not
+    distinguish them, so treating the two as different scopes let two Agents hold
+    exclusive leases on one file - the exact outcome this check exists to
+    prevent. The siblings here already compare with casefold, so the case
+    sensitivity was the outlier rather than the rule.
     """
-    broad = normalize_pattern(broad)
-    narrow = normalize_pattern(narrow)
+    broad = normalize_pattern(broad).casefold()
+    narrow = normalize_pattern(narrow).casefold()
     if broad == narrow:
         return True
     if fnmatch.fnmatchcase(narrow, broad):
@@ -618,8 +648,15 @@ def _patterns_can_cover_same_path(left: str, right: str) -> bool:
 
 
 def patterns_overlap(left: str, right: str) -> bool:
-    left = normalize_pattern(left)
-    right = normalize_pattern(right)
+    """True when two lease scopes can cover a common path.
+
+    Case is folded here for the same reason as in ``_pattern_covers``: the
+    stored pattern keeps its spelling, but two Agents naming one file
+    differently still collide on it, because the filesystem they are protecting
+    does not distinguish the two names either.
+    """
+    left = normalize_pattern(left).casefold()
+    right = normalize_pattern(right).casefold()
     if left == right or fnmatch.fnmatchcase(left, right) or fnmatch.fnmatchcase(right, left):
         return True
     left_prefix = _static_prefix(left)
@@ -3770,7 +3807,7 @@ class AgentChatRoomService:
                         "current_expires_at": previous_expires_at,
                     },
                 )
-            expires_at = expires_time.isoformat().replace("+00:00", "Z")
+            expires_at = format_instant(expires_time)
             now = iso_now()
             connection.execute(
                 "UPDATE agent_credentials SET expires_at = ?, updated_at = ? WHERE id = ?",
@@ -8343,7 +8380,7 @@ class AgentChatRoomService:
                 JOIN agent_sessions a ON a.id = l.session_id
                 WHERE l.project_id = ? AND l.released_at IS NULL AND l.expires_at > ?
                 """,
-                (project_id, now.isoformat().replace("+00:00", "Z")),
+                (project_id, format_instant(now)),
             ).fetchall()
             conflicts = []
             superseded: list[dict[str, Any]] = []
@@ -8397,7 +8434,7 @@ class AgentChatRoomService:
                 for stale in superseded:
                     connection.execute(
                         "UPDATE file_leases SET released_at = ? WHERE id = ?",
-                        (now.isoformat().replace("+00:00", "Z"), stale["id"]),
+                        (format_instant(now), stale["id"]),
                     )
                     self._emit(
                         connection,
@@ -8444,7 +8481,7 @@ class AgentChatRoomService:
                         # mode: returning the readonly lease while the caller
                         # believes it holds exclusive would leave check_leases
                         # and the pre-commit policy blind to real writers.
-                        stamped = now.isoformat().replace("+00:00", "Z")
+                        stamped = format_instant(now)
                         connection.execute(
                             """
                             UPDATE file_leases
@@ -8453,7 +8490,7 @@ class AgentChatRoomService:
                             """,
                             (
                                 mode,
-                                expires.isoformat().replace("+00:00", "Z"),
+                                format_instant(expires),
                                 stamped,
                                 ttl,
                                 existing["id"],
@@ -8489,8 +8526,8 @@ class AgentChatRoomService:
                         "cursor": self.latest_cursor(connection, project_id),
                     }
                 lease_id = new_id("lease")
-                created_at = now.isoformat().replace("+00:00", "Z")
-                expires_at = expires.isoformat().replace("+00:00", "Z")
+                created_at = format_instant(now)
+                expires_at = format_instant(expires)
                 connection.execute(
                     """
                     INSERT INTO file_leases(

@@ -63,6 +63,11 @@ def translate_qmark(sql: str) -> str:
 
 
 def postgres_script(script: str) -> str:
+    # REAL is float4: about seven significant decimal digits, so a unix
+    # timestamp loses the sub-second part it is stored to carry, and the
+    # management session expiry comparison drifts by enough to expire a live
+    # session early. The SQLite side keeps REAL for its own storage format; this
+    # translation is where the wider type belongs, next to the other two.
     return (
         script.replace("INTEGER PRIMARY KEY AUTOINCREMENT", "BIGSERIAL PRIMARY KEY")
         .replace(
@@ -70,6 +75,8 @@ def postgres_script(script: str) -> str:
             "event_id BIGINT NOT NULL REFERENCES events(id)",
         )
         .replace("last_read_cursor INTEGER NOT NULL", "last_read_cursor BIGINT NOT NULL")
+        .replace("expires_at REAL NOT NULL", "expires_at DOUBLE PRECISION NOT NULL")
+        .replace("created_at REAL NOT NULL", "created_at DOUBLE PRECISION NOT NULL")
     )
 
 
