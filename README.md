@@ -826,6 +826,8 @@ Room 中的沉淀知识以版本化 Knowledge Asset 保存，默认类型包括�
 - 修改正文总是追加新版本并记录内容哈希，历史版本只读；普通操作不能覆盖或删除历史内容。
 - 已批准资产不能被直接修改，必须先标记 `superseded`，再以新候选版本重新提交审核。
 - `rejected` 资产可以修改后重新进入审核；`archived` 是终态。
+- **终态写入需要授权与理由。** `archive` / `supersede` 不可逆，因此要求调用者是当前版本的提交身份（同一 member/agent_key）或持有管理授权（`management_authorized`，由 REST 层按 `management_authenticated(request)` 传入、MCP 工具恒为 Agent 身份），否则 403 `knowledge_write_not_permitted`。同时 `reason` 必填（空或空白 → 422 `knowledge_reason_required`），因为它是不可逆删除唯一的书面记录。**状态校验先于理由校验**：本就不可行的转移（如 candidate → superseded）先报 `knowledge_invalid_transition`，避免让调用方去改错的东西。
+- **候选资产自我更新走乐观锁。** 追加新版本时 `UPDATE` 带先前状态谓词并校 `rowcount`，并发转移会得到 `knowledge_concurrent_transition` 而不是被静默覆盖。注意 candidate 可以追加自身版本（状态不变、只换 `current_version_id`），所以转移表里没有 candidate → candidate 的边并不代表自我更新被拒。
 
 每个版本记录可追溯来源：`source_type`（manual、task_result、import、extractor）、可选的 Task/Work Report/Review/Integration 引用、相关事件 ID，以及创建者 Session 和 Agent Identity。来源引用会规范化：只提供 Report/Review/Integration 而省略 Task 时，自动从被引用记录派生 Task 链接；`task_result` 来源必须直接或间接标识其 Task。默认配置下，关联 Task 的资产在批准前要求该 Task 已通过独立验证。
 

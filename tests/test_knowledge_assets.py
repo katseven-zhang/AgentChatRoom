@@ -737,8 +737,14 @@ def test_mcp_tools_reuse_domain_service(monkeypatch, service, project_dir):
     assert reviewed["ok"] is True
     assert reviewed["result"]["status"] == "approved"
 
+    # A terminal write needs a reason (#355): it is the only record of why an
+    # irreversible removal happened.
     superseded = mcp_server.knowledge_supersede(
-        project_id, asset_id, executor["agent"]["id"], executor["token"]
+        project_id,
+        asset_id,
+        executor["agent"]["id"],
+        executor["token"],
+        reason="Replaced by a newer decision",
     )
     assert superseded["ok"] is True
     assert superseded["result"]["status"] == "superseded"

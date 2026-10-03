@@ -9369,6 +9369,12 @@ class AgentChatRoomService:
                         "Archived knowledge assets cannot receive new versions",
                         status_code=409,
                     )
+                # A candidate may append a new version of itself: that is how an
+                # author corrects wording, and each version is kept. The
+                # transition table has no candidate -> candidate edge because
+                # the row's status does not change - only its current_version_id
+                # does - so the status guard below would otherwise reject a
+                # documented behaviour (test_body_edits_append_new_versions).
                 if asset["status"] != "candidate" and "candidate" not in (
                     KNOWLEDGE_ASSET_TRANSITIONS[asset["status"]]
                 ):
@@ -9418,14 +9424,25 @@ class AgentChatRoomService:
                 ).encode()
             ).hexdigest()
             if revision:
-                connection.execute(
+                # Compare-and-set on the previous status. Without the predicate
+                # two concurrent submissions both write 'candidate' and the
+                # loser's new version is silently orphaned; with it the loser is
+                # told the asset moved instead of overwriting it.
+                revised = connection.execute(
                     """
                     UPDATE knowledge_assets
                     SET status = 'candidate', updated_at = ?
-                    WHERE id = ? AND project_id = ?
+                    WHERE id = ? AND project_id = ? AND status = ?
                     """,
-                    (now, new_asset_id, project_id),
+                    (now, new_asset_id, project_id, asset["status"]),
                 )
+                if revised.rowcount != 1:
+                    raise DomainError(
+                        "knowledge_concurrent_transition",
+                        "The knowledge asset changed concurrently; retry",
+                        status_code=409,
+                        details={"asset_id": new_asset_id},
+                    )
             else:
                 connection.execute(
                     """
@@ -9750,9 +9767,10 @@ class AgentChatRoomService:
         session_id: str,
         token: str,
         reason: str = "",
+        management_authorized: bool = False,
     ) -> dict[str, Any]:
         with self.database.connect(write=True) as connection:
-            self._authenticate(connection, project_id, session_id, token)
+            actor = self._authenticate(connection, project_id, session_id, token)
             asset = self._require_knowledge_asset(connection, project_id, asset_id)
             if "superseded" not in KNOWLEDGE_ASSET_TRANSITIONS[asset["status"]]:
                 raise DomainError(
@@ -9766,6 +9784,15 @@ class AgentChatRoomService:
                         ),
                     },
                 )
+            reason = self._require_knowledge_final_write_authority(
+                connection,
+                project_id,
+                asset,
+                actor,
+                reason=reason,
+                action="supersede",
+                management_authorized=management_authorized,
+            )
             now = iso_now()
             superseded = connection.execute(
                 """
@@ -9804,6 +9831,69 @@ class AgentChatRoomService:
                 "cursor": event_id,
             }
 
+    def _require_knowledge_final_write_authority(
+        self,
+        connection: Any,
+        project_id: str,
+        asset: Mapping[str, Any],
+        actor: Mapping[str, Any],
+        *,
+        reason: str,
+        action: str,
+        management_authorized: bool,
+    ) -> str:
+        """Guard a terminal knowledge write: owner or management, with a reason.
+
+        ``archive`` and ``supersede`` are irreversible - ``archived`` has no
+        outgoing transition - so a default-permission Agent could otherwise
+        retire knowledge somebody else wrote, and could do it silently. The
+        rule mirrors member maintenance: either the caller is the identity that
+        wrote the current version, or it acts with management authorization, and
+        in both cases it has to say why, because the reason is the only record
+        of why an irreversible removal happened.
+
+        Returns the trimmed reason so the caller does not repeat the strip.
+        """
+        # Status is checked by the caller before this runs: an impossible
+        # transition is the more fundamental refusal, and reporting "reason
+        # required" for an asset that could not have moved anyway would send
+        # the caller to fix the wrong thing.
+        clean_reason = str(reason or "").strip()
+        if not clean_reason:
+            raise DomainError(
+                "knowledge_reason_required",
+                f"{action} requires a reason; it is recorded in the event",
+                status_code=422,
+                details={"required_action": f"pass_a_reason_to_{action}"},
+            )
+        if management_authorized:
+            return clean_reason
+        version = connection.execute(
+            "SELECT created_by_session_id FROM knowledge_asset_versions WHERE id = ?",
+            (asset["current_version_id"],),
+        ).fetchone()
+        author_session_id = version["created_by_session_id"] if version else None
+        if not author_session_id or author_session_id == actor["id"]:
+            return clean_reason
+        author = connection.execute(
+            "SELECT id, member_id, agent_key FROM agent_sessions WHERE id = ?",
+            (author_session_id,),
+        ).fetchone()
+        if self._same_agent_identity(author, actor):
+            return clean_reason
+        raise DomainError(
+            "knowledge_write_not_permitted",
+            f"Only the submitting identity or a management session may {action} "
+            "knowledge it did not write",
+            status_code=403,
+            details={
+                "asset_id": asset["id"],
+                "required_action": (
+                    f"ask_the_author_or_a_management_session_to_{action}"
+                ),
+            },
+        )
+
     @idempotent_write("knowledge.archive")
     def archive_knowledge_asset(
         self,
@@ -9813,9 +9903,10 @@ class AgentChatRoomService:
         session_id: str,
         token: str,
         reason: str = "",
+        management_authorized: bool = False,
     ) -> dict[str, Any]:
         with self.database.connect(write=True) as connection:
-            self._authenticate(connection, project_id, session_id, token)
+            actor = self._authenticate(connection, project_id, session_id, token)
             asset = self._require_knowledge_asset(connection, project_id, asset_id)
             if "archived" not in KNOWLEDGE_ASSET_TRANSITIONS[asset["status"]]:
                 raise DomainError(
@@ -9829,6 +9920,15 @@ class AgentChatRoomService:
                         ),
                     },
                 )
+            reason = self._require_knowledge_final_write_authority(
+                connection,
+                project_id,
+                asset,
+                actor,
+                reason=reason,
+                action="archive",
+                management_authorized=management_authorized,
+            )
             now = iso_now()
             archived = connection.execute(
                 """

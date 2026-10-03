@@ -2791,10 +2791,15 @@ def create_app(
         asset_id: str,
         body: KnowledgeAssetAction,
     ) -> dict[str, Any]:
+        # A terminal write. The domain requires the submitting identity or
+        # a management session, so the flag is passed as a fact rather than
+        # enforced here: an author is allowed without management auth, and
+        # _require_knowledge_final_write_authority turns down anyone else.
         return service.supersede_knowledge_asset(
             project_id,
             asset_id,
             **body.model_dump(),
+            management_authorized=management_authenticated(request),
             request_id=request.state.idempotency_request_id,
         )
 
@@ -2805,10 +2810,15 @@ def create_app(
         asset_id: str,
         body: KnowledgeAssetAction,
     ) -> dict[str, Any]:
+        # A terminal write. The domain requires the submitting identity or
+        # a management session, so the flag is passed as a fact rather than
+        # enforced here: an author is allowed without management auth, and
+        # _require_knowledge_final_write_authority turns down anyone else.
         return service.archive_knowledge_asset(
             project_id,
             asset_id,
             **body.model_dump(),
+            management_authorized=management_authenticated(request),
             request_id=request.state.idempotency_request_id,
         )
 
