@@ -704,7 +704,7 @@ Agent 自报的 `worktree` 不会被服务盲目信任。Work Report 采集 Git 
 
 采集 Git 证据时不使用 `text=True`。`text=True` 按**进程 locale** 解码，而 Windows 上那是控制台 ANSI 码页、并非 git 实际写出的 UTF-8：非 ASCII 分支名或路径会变成乱码写进不可改事件，而 `UnicodeDecodeError` 属于 `ValueError`，会绕过只捕获 `OSError`/`SubprocessError` 的处理，表现为 500。证据采集与 PostgreSQL 工具调用现统一经 `run_git_capture()` / 显式 `decode("utf-8", "replace")` 处理，git 失败降级为 `captured: false` 而不是中断报告。
 
-写事务的范围只包含数据库本身，不包含磁盘与子进程。带 `request_id` 的幂等写入先用一个短事务查重并写入「处理中」占位记录并提交，再在**不持有写锁**的情况下执行领域动作（领域动作自己开自己的事务），最后再用另一个短事务写回响应。因此一次 `work_report` 在采集 Git 证据期间不会阻塞任何其他写路径。动作失败时占位记录会被清除，修正后的重试不会被永久钉在 `idempotency_in_progress`；进程在动作提交后、响应写回前硬崩溃属于已知取舍，此时该 `request_id` 仍会显示处理中。
+写事务的范围只包含数据库本身，不包含磁盘与子进程。带 `request_id` 的幂等写入先用一个短事务查重并写入「处理中」占位记录并提交，再在**不持有写锁**的情况下执行领域动作（领域动作自己开自己的事务），最后再用另一个短事务写回响应。因此一次 `work_report` 在采集 Git 证据期间不会阻塞任何其他写路径。**幂等键与关联头是两个不同的键**：只有显式 `Idempotency-Key` 才让写入可去重，`X-Request-ID` 只是关联/追踪标识。网关常按连接复用同一个 `X-Request-ID`，把它当去重键会让两个真正不同的写入在整个保留窗口内互撞 `idempotency_conflict`（409）；现在全部 28 个写路由统一取 `Idempotency-Key`，不带该头就不做去重（`request_id` 仍照常生成用于事件与日志关联）。**TTL 绑定的操作不做陈旧回放**：`lease.acquire` 与 `session.heartbeat` 回放前查库确认租约未被释放且未过期（或 Session token 未过期），失效则丢弃记录重新执行，因此重放拿到的是活的租约/心跳而不是一句已经不成立的「已获得」。注意记录里存的是授予时刻的截止时间快照，判断必须查实时行。动作失败时占位记录会被清除，修正后的重试不会被永久钉在 `idempotency_in_progress`；进程在动作提交后、响应写回前硬崩溃属于已知取舍，此时该 `request_id` 仍会显示处理中。
 
 写锁竞争是正常且可重试的结果，不再是内部错误：SQLite 忙等待超时后统一返回 `database_write_contended`（503，`required_action=retry_after_short_backoff`），REST / MCP / CLI 由此得到同一套可恢复语义，而不是裸 `sqlite3.OperationalError` 变成 500。
 
