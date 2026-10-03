@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 import re
 import subprocess
 import uuid
@@ -175,11 +176,19 @@ def _read_project_instructions(path: Path) -> str:
 
 
 def _managed_instructions_range(path: Path, text: str) -> tuple[int, int] | None:
+    # Blanks around a marker are a formatting difference, not a different block.
+    # Requiring the marker at column zero meant an editor that trimmed the line
+    # or applied indentation stopped it being recognised, so the writer found no
+    # range, appended a second block, and the file grew a copy per bootstrap.
     begin_matches = list(
-        re.finditer(rf"(?m)^{re.escape(PROJECT_INSTRUCTIONS_BEGIN)}\r?$", text)
+        re.finditer(
+            rf"(?m)^[ \t]*{re.escape(PROJECT_INSTRUCTIONS_BEGIN)}[ \t]*\r?$", text
+        )
     )
     end_matches = list(
-        re.finditer(rf"(?m)^{re.escape(PROJECT_INSTRUCTIONS_END)}\r?$", text)
+        re.finditer(
+            rf"(?m)^[ \t]*{re.escape(PROJECT_INSTRUCTIONS_END)}[ \t]*\r?$", text
+        )
     )
     if not begin_matches and not end_matches:
         return None
@@ -561,9 +570,66 @@ def validate_project_scope(
             )
 
 
-def _write_document(path: Path, document: dict[str, Any]) -> None:
+# Read-modify-write on the registration file is not atomic, and bootstrap runs
+# from more than one Agent. A lock file in the same directory serialises the
+# writers; O_CREAT|O_EXCL is the portable form and needs no dependency.
+_REGISTRATION_LOCK_STALE_SECONDS = 30
+_REGISTRATION_LOCK_WAIT_SECONDS = 5
+
+
+def _lock_path_for(path: Path) -> Path:
+    return path.with_name(f".{path.name}.lock")
+
+
+def _acquire_registration_lock(path: Path) -> Any:
+    """Take the per-registration lock, or wait briefly for whoever holds it."""
+    lock = _lock_path_for(path)
+    deadline = time.monotonic() + _REGISTRATION_LOCK_WAIT_SECONDS
+    while True:
+        try:
+            handle = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            os.write(handle, str(os.getpid()).encode("ascii"))
+            os.close(handle)
+            return lock
+        except FileExistsError:
+            # A writer that crashed leaves the lock behind. Break it once it is
+            # clearly older than any legitimate write, or the file stays locked
+            # for good after one kill.
+            try:
+                age = time.time() - lock.stat().st_mtime
+            except OSError:
+                age = 0
+            if age > _REGISTRATION_LOCK_STALE_SECONDS:
+                try:
+                    lock.unlink()
+                except OSError:
+                    pass
+                continue
+            if time.monotonic() >= deadline:
+                raise DomainError(
+                    "project_registration_locked",
+                    "Another Agent is writing this checkout registration; "
+                    "retry once it finishes",
+                    status_code=409,
+                    details={
+                        "required_action": "retry_the_bootstrap_after_the_other_write"
+                    },
+                )
+            time.sleep(0.05)
+
+
+def _release_registration_lock(lock: Path) -> None:
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
+        lock.unlink()
+    except OSError:
+        pass
+
+
+def _write_document(path: Path, document: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lock = _acquire_registration_lock(path)
+    temporary: Path | None = None
+    try:
         temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
         temporary.write_text(
             json.dumps(document, ensure_ascii=False, indent=2) + "\n",
@@ -578,6 +644,15 @@ def _write_document(path: Path, document: dict[str, Any]) -> None:
             status_code=500,
             details={"path": str(path)},
         ) from error
+    finally:
+        # A temporary file left behind is litter inside the user's checkout, and
+        # it is the evidence that something went wrong.
+        if temporary is not None:
+            try:
+                temporary.unlink()
+            except OSError:
+                pass
+        _release_registration_lock(lock)
 
 
 def register_checkout_project(
@@ -633,7 +708,13 @@ def register_checkout_project(
     if existing is None:
         registrations.append(entry)
     else:
-        registrations[registrations.index(existing)] = entry
+        # Merge over the stored entry rather than replacing it. A newer build
+        # writing a subset of the keys used to delete everything the other one
+        # had recorded, and the file is shared by every checkout in the repo.
+        position = registrations.index(existing)
+        merged = dict(existing)
+        merged.update(entry)
+        registrations[position] = merged
     document["registrations"] = sorted(
         registrations,
         key=lambda registration: str(registration.get("logical_path", "")),
