@@ -31,11 +31,19 @@ from .backup import (
     restore_sqlite,
 )
 from .config import build_service_base_url, load_settings
-from .integrations import build_mcp_integration
+from .integrations import MCP_CLIENT_PROFILES, build_mcp_integration
 from .runtime_log import running_url_from_log, tail_text_lines
 
 
 MUTATING_HTTP_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
+# The retired `--format` spellings, kept so existing scripts keep working.
+# `--client` is generated from MCP_CLIENT_PROFILES and does not need an entry
+# here, so adding a client no longer means editing the CLI.
+LEGACY_FORMAT_PROFILE_IDS = {
+    "workbuddy-json": "workbuddy",
+    "grok-toml": "grok_build",
+    "codex-toml": "codex",
+}
 _WINDOWS = os.name == "nt"
 
 
@@ -1019,14 +1027,33 @@ def build_parser() -> argparse.ArgumentParser:
         help="Runtime data directory to embed in local stdio MCP configuration",
     )
     mcp_config.add_argument(
+        "--client",
+        choices=sorted(MCP_CLIENT_PROFILES),
+        help=(
+            "Print this client's own preset. The list comes from the same "
+            "MCP_CLIENT_PROFILES the service publishes, so a new client needs "
+            "no CLI change. Its software identity is a real value, not a "
+            "placeholder."
+        ),
+    )
+    mcp_config.add_argument(
         "--format",
         choices=["generic-json", "workbuddy-json", "grok-toml", "codex-toml"],
         default="generic-json",
+        help=(
+            "Legacy format alias. Retained so existing scripts keep working; "
+            "prefer --client, whose list is generated rather than restated."
+        ),
     )
     mcp_config.add_argument(
         "--transport",
         choices=["local-stdio", "streamable-http", "remote-bridge"],
         default="local-stdio",
+    )
+    mcp_config.add_argument(
+        "--list-clients",
+        action="store_true",
+        help="List the client profiles this build can print and exit",
     )
 
     project = commands.add_parser("project-add", help="Add a project")
@@ -1701,35 +1728,51 @@ def main(argv: list[str] | None = None) -> None:
         )
         return
     if args.command == "mcp-config":
+        if args.list_clients:
+            print_result(
+                {
+                    "clients": [
+                        {
+                            "id": profile_id,
+                            "label": profile.get("label", profile_id),
+                            "vendor": profile.get("vendor", ""),
+                            "format": profile.get("format", ""),
+                            "managed_local_config": isinstance(
+                                profile.get("local_config"), dict
+                            ),
+                        }
+                        for profile_id, profile in sorted(MCP_CLIENT_PROFILES.items())
+                    ]
+                },
+                args.json,
+            )
+            return
         settings = load_settings(args.config, data_dir=args.data_dir)
         integration = build_mcp_integration(settings)
-        # generic-json stays the fill-in template. Every named client prints
-        # that profile's own config text, whose software identity is a real
-        # value rather than the `<...>` placeholders on the top-level aliases.
-        profile_ids = {
-            "workbuddy-json": "workbuddy",
-            "grok-toml": "grok_build",
-            "codex-toml": "codex",
-        }
+        # A named client prints that profile's own config text for the chosen
+        # transport, whose software identity is a real value rather than the
+        # `<...>` placeholders on the top-level aliases. `generic` stays the
+        # fill-in template.
         text_keys = {
             "local-stdio": "local_config_text",
             "remote-bridge": "remote_bridge_config_text",
             "streamable-http": "streamable_http_config_text",
         }
-        profile_id = profile_ids.get(args.format)
-        if profile_id is not None:
-            output = integration["profiles"][profile_id][text_keys[args.transport]]
-            if args.format == "workbuddy-json":
-                print_result(json.loads(output), args.json)
-            else:
-                print(output, end="")
-            return
         generic_keys = {
             "local-stdio": "generic_json",
             "remote-bridge": "remote_bridge_json",
             "streamable-http": "streamable_http_json",
         }
-        print_result(integration[generic_keys[args.transport]], args.json)
+        profile_id = args.client or LEGACY_FORMAT_PROFILE_IDS.get(args.format)
+        if profile_id is None:
+            print_result(integration[generic_keys[args.transport]], args.json)
+            return
+        profile = integration["profiles"][profile_id]
+        output = profile[text_keys[args.transport]]
+        if profile.get("format") == "json":
+            print_result(json.loads(output), args.json)
+        else:
+            print(output, end="")
         return
 
     if args.command in {"backup", "restore"}:

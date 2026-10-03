@@ -12,6 +12,10 @@ from .http_identity import encode_http_identity_value
 MCP_SERVER_NAME = "agentchatroom"
 MCP_MODULE = "agentchatroom.mcp_server"
 MCP_BRIDGE_MODULE = "agentchatroom.mcp_bridge"
+# Subcommand the packaged exe dispatches to the Bridge, mirroring how it
+# already dispatches `mcp` for the local stdio server.
+MCP_BRIDGE_SUBCOMMAND = "mcp-bridge"
+
 AGENT_TOKEN_PLACEHOLDER = "<paste-issued-project-credential-bundle>"
 AGENT_TOKEN_ENV_VAR = "AGENTCHATROOM_AGENT_TOKEN"
 SOFTWARE_KEY_ENV_VAR = "AGENTCHATROOM_SOFTWARE_KEY"
@@ -21,6 +25,31 @@ PROJECT_PATH_ENV_VAR = "AGENTCHATROOM_PROJECT_PATH"
 SOFTWARE_KEY_HEADER = "X-AgentChatRoom-Software-Key"
 SOFTWARE_NAME_HEADER = "X-AgentChatRoom-Software-Name"
 SOFTWARE_CLIENT_HEADER = "X-AgentChatRoom-Software-Client"
+
+
+def resolve_bridge_launcher(
+    settings: Settings, *, frozen: bool | None = None
+) -> tuple[str, list[str]]:
+    """Return the (command, args) a client should use to start the Bridge.
+
+    A packaged build ships one exe and no interpreter, so the only launcher
+    that can work is the exe itself plus a subcommand; a configured
+    `mcp_bridge_command` still wins, because an operator who set it knows where
+    a real interpreter or bridge launcher lives. In source mode the configured
+    command with `mcp_bridge_args` is used verbatim, which defaults to
+    `python -m agentchatroom.mcp_bridge` -- there `-m` is consumed by the
+    interpreter, so it never reaches the Bridge's own strict argparse.
+    """
+    is_frozen = bool(getattr(sys, "frozen", False)) if frozen is None else frozen
+    configured_command = str(settings.mcp_bridge_command or "").strip()
+    configured_args = [str(item) for item in (settings.mcp_bridge_args or [])]
+    if is_frozen and configured_command == "python":
+        # The default only makes sense next to an interpreter.
+        return str(Path(sys.executable).resolve()), [MCP_BRIDGE_SUBCOMMAND]
+    if not configured_args:
+        return configured_command, ["-m", MCP_BRIDGE_MODULE]
+    return configured_command, configured_args
+
 
 # Client-specific details live at the integration boundary. The MCP server and
 # its domain model remain vendor-neutral; adding a client only adds a profile.
@@ -354,6 +383,9 @@ def build_mcp_integration(
     else:
         command = str(Path(python_executable or sys.executable).resolve())
         server_args = ["-m", MCP_MODULE]
+    bridge_command, bridge_args = resolve_bridge_launcher(
+        settings, frozen=bool(getattr(sys, "frozen", False))
+    )
     environment = {
         "AGENTCHATROOM_DATA_DIR": str(settings.data_dir),
         "AGENTCHATROOM_PRESENCE_KEEPALIVE_ENABLED": str(
@@ -401,8 +433,16 @@ def build_mcp_integration(
         # The remote Bridge runs on the Agent computer, not on the center.
         # Keep its launcher independently configurable instead of leaking the
         # center's Python absolute path into a client configuration.
-        "command": settings.mcp_bridge_command,
-        "args": ["-m", MCP_BRIDGE_MODULE],
+        #
+        # Frozen builds ship one exe and no interpreter, so the launcher becomes
+        # the exe itself plus a subcommand. The local stdio branch above
+        # already does this for `mcp`; the Bridge needs the same treatment or a
+        # packaged center hands every remote client a config that can never
+        # start. `-m <module>` is only correct when a Python interpreter is
+        # actually the command -- there it is consumed by the interpreter and
+        # never reaches the Bridge's own argparse.
+        "command": bridge_command,
+        "args": list(bridge_args),
         "env": bridge_environment,
     }
     remote_bridge_json = {"mcpServers": {MCP_SERVER_NAME: bridge_server}}
@@ -483,8 +523,8 @@ def build_mcp_integration(
             _profile_identity_environment(profile_id, profile)
         )
         profile_bridge_server = {
-            "command": settings.mcp_bridge_command,
-            "args": ["-m", MCP_BRIDGE_MODULE],
+            "command": bridge_command,
+            "args": list(bridge_args),
             "env": profile_bridge_environment,
         }
         profile_bridge_json = {
@@ -591,6 +631,11 @@ def build_mcp_integration(
         "env": environment,
         "generic_json": generic_json,
         "generic_json_text": generic_json_text,
+        # The generic TOML template. `codex_toml` and `grok_toml` below are
+        # retained compatibility aliases for exactly this string: they used to
+        # be distinct per-client artifacts in name only, and a client that
+        # needs its own format should read profiles[*] instead.
+        "generic_toml_text": toml_text,
         "codex_toml": toml_text,
         "grok_toml": toml_text,
         "onboarding_prompt": (

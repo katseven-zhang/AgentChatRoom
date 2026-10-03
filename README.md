@@ -293,8 +293,8 @@ Linux 或 macOS：
 
 1. 打开 Web 管理端并创建 Project。
 2. 本机部署可点击“选择文件夹”打开系统目录选择器，也可手工填写需要协作的项目文件夹；取消选择不会修改原输入。该路径只保存在运行数据库和 checkout 本地登记中，不会写入公开仓库配置。
-3. 点击“接入 Agent”，在“首次配置软件”与“已配置软件，加入本项目”两个场景中选择（Web 不再提供客户端选择行与恢复场景选项）；Web 只提供 HTTP 直连。首次配置签发后生成一份包含明文 Project↔Token 映射、真实 MCP 配置和对应指令的完整提示词；加入项目同样只需确认客户端、可选成员与权限（凭据名称自动派生、默认有效期 365 天），签发后生成由已配置 Agent 在客户端本地增量合并的提示词，无需用户粘贴现有配置。
-4. 可以把页面生成的 MCP 接入信息交给 Agent：内容只包含目标客户端、HTTP 连接和当前环境动态生成的 `agentchatroom` 配置，配置位置、写入方式和异常处理由 Agent 自行判断并向用户反馈。旧 stdio 配置可先从客户端删除，再用页面生成的同名 HTTP 配置重新接入；stdio 与远程 Bridge 的后端兼容接口仍保留，但不再显示在 Web 接入流程中。
+3. 点击“接入 Agent”，在“首次配置软件”与“已配置软件，加入本项目”两个场景中选择，并选择目标客户端与连接方式。目标客户端来自服务端发布的 `integrations.profiles`，与 CLI 的 `--client` 同源；连接方式有 HTTP 直连、本机 stdio、远程 Bridge 三种，HTTP 仍是主路径并默认选中。带 `local_config` 的客户端（本机 WorkBuddy、Trae）额外提供「本机配置助手」：服务端只检测并备份该客户端自己的配置文件，校验 sha256 后再写入，不托管其它客户端的路径；没有可托管路径的客户端在页面上会明确说明需要手动写入，而不是给出一个必然失败的按钮。首次配置签发后生成一份包含明文 Project↔Token 映射、真实 MCP 配置和对应指令的完整提示词；加入项目同样只需确认客户端、可选成员与权限（凭据名称自动派生、默认有效期 365 天），签发后生成由已配置 Agent 在客户端本地增量合并的提示词，无需用户粘贴现有配置。
+4. 可以把页面生成的 MCP 接入信息交给 Agent：内容只包含目标客户端、HTTP 连接和当前环境动态生成的 `agentchatroom` 配置，配置位置、写入方式和异常处理由 Agent 自行判断并向用户反馈。旧 stdio 配置可先从客户端删除，再用页面生成的同名 HTTP 配置重新接入；stdio 与远程 Bridge 在页面连接方式里可直接选择，默认仍是 HTTP。
 5. 按页面提示重启客户端、重新加载 MCP 或新开会话。配置文件已写入不等于已经连接，必须等左侧显示该软件在当前 Room“已连接”。左侧已连接只表示 MCP 连接 Presence，不等于当前模型对话已经同步。
 6. Agent 开始工作前调用一次 `room_bootstrap`。不要读取或修改 `mcp.json` / `config.toml`，也不要检查源码或数据库；只有该工具返回 `identity_not_configured` 时才回到 Web“接入 Agent”重新生成 HTTP 配置。
 7. 在 Room 动态中查看消息、模型标签、任务进展、文件占用、验证结果和事件顺序。动态与最近活动里展示的事件编号是项目内序号（同一 Project 从 1 连续递增；不同 Project 各自独立编号）；分页游标、深链 `#event-N` 与 Agent 引用同样使用项目内序号，不再暴露全局事件 ID。Room 动态默认勾选“只看消息动态”，仅展示普通消息、决策、阻塞三类消息事件；加入/离开 Room、连接状态、任务状态、租约等系统事件默认隐藏，取消勾选即可查看全部动态。该筛选只作用于面板展示（首次加载、实时追加、刷新和切换项目共用同一过滤），事件本身仍完整追加记录，任务详情时间线与审计查询不受影响。
@@ -407,7 +407,7 @@ HTTP 同一路径匹配多个项目或多个 roots 中混有无法解析的路�
 | --- | --- | --- |
 | HTTP 直连（`streamable-http`） | A 单机主路径；B/C 传输基础 | 客户端支持 url + Bearer；多项目凭据包按名称选择 Project，连接不拉起适配器进程 |
 | 本机 stdio（`local-stdio`） | A 单机兼容与调试 | 客户端暂不满足 HTTP 接入要求，可使用 Web 本机配置助手 |
-| 远程 Bridge（`remote-bridge`） | B/C 补充 | 客户端只能拉起本地进程，由 Bridge 转发到中心 `/mcp` |
+| 远程 Bridge（`remote-bridge`） | B/C 补充 | 客户端只能拉起本地进程，由 Bridge 转发到中心 `/mcp`。源码形态用 `[server].mcp_bridge_command` + `mcp_bridge_args`（默认 `python -m agentchatroom.mcp_bridge`，`-m` 由解释器消费，不会到达 Bridge 自己的参数解析）；冻结 EXE 没有解释器，改为 exe 自身 + `mcp-bridge` 子命令 |
 
 `/api/v1/*` 业务端点行为不变。stdio 与 Bridge 保持向后兼容。
 
@@ -419,15 +419,16 @@ HTTP 同一路径匹配多个项目或多个 roots 中混有无法解析的路�
 .venv\Scripts\python.exe -m agentchatroom mcp-config --format generic-json --transport local-stdio
 ```
 
-生成特定客户端格式：
+列出本构建支持的全部客户端，并按客户端生成配置：
 
 ```powershell
-.venv\Scripts\python.exe -m agentchatroom mcp-config --format workbuddy-json --transport local-stdio
-.venv\Scripts\python.exe -m agentchatroom mcp-config --format grok-toml --transport local-stdio
-.venv\Scripts\python.exe -m agentchatroom mcp-config --format codex-toml --transport local-stdio
+.venv\Scripts\python.exe -m agentchatroom mcp-config --list-clients
+.venv\Scripts\python.exe -m agentchatroom mcp-config --client workbuddy --transport local-stdio
+.venv\Scripts\python.exe -m agentchatroom mcp-config --client trae --transport streamable-http
+.venv\Scripts\python.exe -m agentchatroom mcp-config --client codex --transport remote-bridge
 ```
 
-`workbuddy-json`、`grok-toml` 和 `codex-toml` 在 `local-stdio`、`remote-bridge`、`streamable-http` 三种 transport 下都打印该客户端 profile 自己的配置（`local_config_text` / `remote_bridge_config_text` / `streamable_http_config_text`）。其中 `AGENTCHATROOM_SOFTWARE_KEY`、`AGENTCHATROOM_SOFTWARE_NAME`、`AGENTCHATROOM_SOFTWARE_CLIENT` 是这个 profile 的真实身份，不以 `<` 开头，因此写进客户端后可以被 `room_bootstrap` 接受。它们不再走带占位身份的顶层 `generic_json` / `codex_toml` / `grok_toml` / `remote_bridge_toml`。`generic-json` 仍是待填写的通用模板，身份占位符必须换成用户确认的名称后才能连接。远程 Bridge 与 HTTP 配置里的项目凭据位置仍然是待粘贴的凭据槽，因为 `mcp-config` 执行时还没有签发凭据。
+`--client` 的取值直接来自 `integrations.MCP_CLIENT_PROFILES`，与 `GET /api/v1/integrations/mcp` 返回的 `profiles` 同源：新增一个客户端只需加一个 profile，CLI 与页面下拉都会自动出现，不必各自维护一份名字表。`--client` 在 `local-stdio`、`remote-bridge`、`streamable-http` 三种 transport 下都打印该客户端 profile 自己的配置（`local_config_text` / `remote_bridge_config_text` / `streamable_http_config_text`），并按该客户端自己的格式输出（JSON 或 TOML），产物可直接解析。旧的 `--format workbuddy-json|grok-toml|codex-toml` 作为 `--client` 的别名保留，输出逐字节相同。其中 `AGENTCHATROOM_SOFTWARE_KEY`、`AGENTCHATROOM_SOFTWARE_NAME`、`AGENTCHATROOM_SOFTWARE_CLIENT` 是这个 profile 的真实身份，不以 `<` 开头，因此写进客户端后可以被 `room_bootstrap` 接受。它们不再走带占位身份的顶层 `generic_json` / `codex_toml` / `grok_toml`：顶层的 `codex_toml` 与 `grok_toml` 是同一份通用 TOML 模板（等同 `generic_toml_text`），并非各客户端的真实产物，真实产物只在 `profiles[*]` 下。`generic-json` 仍是待填写的通用模板，身份占位符必须换成用户确认的名称后才能连接。远程 Bridge 与 HTTP 配置里的项目凭据位置仍然是待粘贴的凭据槽，因为 `mcp-config` 执行时还没有签发凭据。
 
 开发期 stdio 入口推荐：
 

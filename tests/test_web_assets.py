@@ -267,12 +267,30 @@ assert.notEqual(generic.softwareKey, 'standard-mcp-');
     assert "沿用现有身份合并接入" in javascript
 
 
-def test_frontend_exposes_only_http_while_backend_keeps_migration_support():
+def test_frontend_exposes_every_reachable_transport_and_client_profile():
+    """#357: every advertised transport must be selectable and usable.
+
+    The transport tabs used to ship HTTP only while `localMcpAssistantSupported`
+    required `integrationTransport === "local"` and a profile carrying
+    `local_config`. The assistant was therefore unreachable, and
+    `local_mcp_profile_unsupported` was the only reachable outcome, yet
+    /api/v1/config/public still advertised `local_mcp_config_assistant`.
+    """
     markup = (WEB_DIR / "index.html").read_text(encoding="utf-8")
     javascript = (WEB_DIR / "app.js").read_text(encoding="utf-8")
     assert '<option value="migrate_http">' not in markup
-    assert 'data-integration-transport="local"' not in markup
-    assert 'data-integration-transport="remote"' not in markup
+    for transport in ("http", "local", "remote"):
+        assert f'data-integration-transport="{transport}"' in markup, transport
+    # A per-client profile selector, or the local assistant stays unreachable.
+    assert 'id="integration-client-profile"' in markup
+    assert "function renderIntegrationProfileOptions()" in javascript
+    assert "state.integration.profiles" in javascript
+    # Transport availability is served, not hard-coded.
+    assert "transports.streamable_http" in javascript
+    assert "transports.remote_stdio_bridge" in javascript
+    # Selecting a client that has no managed path must say so rather than
+    # offering an apply button that would 404.
+    assert "local_config" in javascript
     assert 'state.integrationOnboardingMode === "migrate_http"' in javascript
     assert 'item.dataset.integrationTransport === "http"' in javascript
 
@@ -375,8 +393,8 @@ def test_web_bootstrap_and_phase_one_local_agent_hooks_are_complete():
     assert 'autocomplete="current-password"' in markup
     assert "function renderIntegrationJoin()" in javascript
     assert 'data-integration-transport="http"' in markup
-    assert 'data-integration-transport="local"' not in markup
-    assert 'data-integration-transport="remote"' not in markup
+    assert 'data-integration-transport="local"' in markup
+    assert 'data-integration-transport="remote"' in markup
     assert "streamable_http_config_text" in javascript
     assert "remote_bridge_config_text" in javascript
     assert 'id="token-config-value"' in markup
@@ -892,8 +910,8 @@ def test_web_local_mcp_assistant_separates_write_reload_and_presence_states():
     assert '>接入 Agent</button>' in markup
     assert '<h2 id="integration-dialog-title">接入 Agent</h2>' in markup
     assert 'data-integration-transport="http"' in markup
-    assert 'data-integration-transport="local"' not in markup
-    assert 'data-integration-transport="remote"' not in markup
+    assert 'data-integration-transport="local"' in markup
+    assert 'data-integration-transport="remote"' in markup
     assert '连接方式' in markup
     assert 'id="integration-http-token-guide"' in markup
     assert 'id="integration-open-token-button"' in markup

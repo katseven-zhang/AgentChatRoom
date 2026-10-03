@@ -33,6 +33,11 @@ mcp_http_tombstone_limit = 256
 mcp_http_tombstone_ttl_seconds = 86400.0
 # Command used by a remote stdio Bridge on each Agent computer.
 mcp_bridge_command = "python"
+# Argument vector for that Bridge. The default reaches the module through a
+# Python interpreter. A packaged build ships one exe and no interpreter, so it
+# passes ["mcp-bridge"] instead and this setting is left empty: the exe detects
+# that and substitutes its own path plus the subcommand.
+mcp_bridge_args = ["-m", "agentchatroom.mcp_bridge"]
 external_base_url = ""
 # Only trust forwarded headers from explicitly configured proxy addresses.
 trusted_proxy_headers = true

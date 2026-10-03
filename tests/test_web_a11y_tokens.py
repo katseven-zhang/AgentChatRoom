@@ -17,7 +17,7 @@ def test_dialogs_name_their_headings_and_transport_choice_is_a_group():
         labelledby = re.search(r'aria-labelledby="([^"]+)"', dialog)
         assert labelledby, dialog
         assert f'id="{labelledby.group(1)}"' in markup
-    assert 'role="group" aria-label="连接方式（仅 HTTP）"' in markup
+    assert 'role="group" aria-label="连接方式"' in markup
     stylesheet = (WEB_DIR / "app.css").read_text(encoding="utf-8")
     hover = stylesheet[
         stylesheet.index(".agent-item:hover {") : stylesheet.index(".agent-item.is-disconnected")

@@ -5,7 +5,7 @@ import sys
 import threading
 import tomllib
 import uuid
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import urlparse
@@ -32,6 +32,7 @@ CONFIG_FILE_SCHEMA: dict[str, dict[str, tuple[type, ...]]] = {
         "mcp_http_tombstone_limit": (int,),
         "mcp_http_tombstone_ttl_seconds": (int, float),
         "mcp_bridge_command": (str,),
+        "mcp_bridge_args": (list, str),
         "external_base_url": (str,),
         "trusted_proxy_headers": (bool,),
         "trusted_proxy_ips": (str,),
@@ -180,6 +181,47 @@ def format_host_for_url(host: str) -> str:
     return text
 
 
+DEFAULT_MCP_BRIDGE_ARGS = ["-m", "agentchatroom.mcp_bridge"]
+
+
+def _resolve_bridge_args(
+    environment_value: str | None, file_value: Any
+) -> list[str]:
+    """Normalize the Bridge argument vector from TOML or the environment.
+
+    An argv vector is a list, and a shell string would have to be re-split with
+    quoting rules that differ per platform. The environment override therefore
+    uses JSON, the one encoding both TOML and every shell agree on, and falls
+    back to the TOML list. The default keeps the source-mode
+    ``python -m agentchatroom.mcp_bridge`` launch, where ``-m`` is consumed by
+    the interpreter and never reaches the Bridge's own argparse.
+    """
+    import json
+
+    raw_environment = str(environment_value or "").strip()
+    if raw_environment:
+        try:
+            parsed = json.loads(raw_environment)
+        except ValueError as error:
+            raise ValueError(
+                "AGENTCHATROOM_MCP_BRIDGE_ARGS must be a JSON array of strings, "
+                'for example ["mcp-bridge"]'
+            ) from error
+        if not isinstance(parsed, list):
+            raise ValueError(
+                "AGENTCHATROOM_MCP_BRIDGE_ARGS must be a JSON array of strings"
+            )
+        return [str(item) for item in parsed]
+    if isinstance(file_value, str):
+        raw_file = file_value.strip()
+        if not raw_file:
+            raise ValueError("MCP Bridge args must not be empty")
+        return json.loads(raw_file)
+    if isinstance(file_value, list):
+        return [str(item) for item in file_value]
+    return list(DEFAULT_MCP_BRIDGE_ARGS)
+
+
 def parse_service_url(url: str) -> tuple[str, int | None]:
     """Split a service base URL back into ``(host, port)``.
 
@@ -239,6 +281,12 @@ class Settings:
     mcp_http_tombstone_limit: int = 256
     mcp_http_tombstone_ttl_seconds: float = 86400.0
     mcp_bridge_command: str = "python"
+    # Argument vector for the remote Bridge launcher. A list is required for the
+    # packaged exe, where the Bridge is the exe itself plus a subcommand; the
+    # default keeps the source-mode `python -m agentchatroom.mcp_bridge` form.
+    mcp_bridge_args: list[str] = field(
+        default_factory=lambda: ["-m", "agentchatroom.mcp_bridge"]
+    )
     external_base_url: str = ""
     trusted_proxy_headers: bool = True
     trusted_proxy_ips: str = "127.0.0.1"
@@ -375,6 +423,7 @@ def _merge_toml(path: Path) -> dict[str, Any]:
             "mcp_http_tombstone_ttl_seconds"
         ),
         "mcp_bridge_command": raw.get("server", {}).get("mcp_bridge_command"),
+        "mcp_bridge_args": raw.get("server", {}).get("mcp_bridge_args"),
         "external_base_url": raw.get("server", {}).get("external_base_url"),
         "trusted_proxy_headers": raw.get("server", {}).get(
             "trusted_proxy_headers"
@@ -582,6 +631,10 @@ def load_settings(
             "AGENTCHATROOM_MCP_BRIDGE_COMMAND",
             file_values.get("mcp_bridge_command", "python"),
         ).strip(),
+        "mcp_bridge_args": _resolve_bridge_args(
+            os.getenv("AGENTCHATROOM_MCP_BRIDGE_ARGS"),
+            file_values.get("mcp_bridge_args"),
+        ),
         "external_base_url": os.getenv(
             "AGENTCHATROOM_EXTERNAL_BASE_URL",
             file_values.get("external_base_url", ""),
@@ -884,6 +937,15 @@ def load_settings(
         raise ValueError("MCP HTTP path must start with / and have no trailing /")
     if not str(values["mcp_bridge_command"]).strip():
         raise ValueError("MCP Bridge command must not be empty")
+    if not isinstance(values["mcp_bridge_args"], list) or not all(
+        isinstance(item, str) for item in values["mcp_bridge_args"]
+    ):
+        raise ValueError("MCP Bridge args must be a list of strings")
+    if not values["mcp_bridge_args"]:
+        raise ValueError(
+            "MCP Bridge args must not be empty: the Bridge is launched as "
+            "<command> <args...>, and an empty vector cannot reach the module"
+        )
     if values["mcp_http_session_idle_timeout_seconds"] <= 0:
         raise ValueError("MCP HTTP session idle timeout must be positive")
     if values["mcp_http_tombstone_limit"] <= 0:

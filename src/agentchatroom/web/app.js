@@ -88,6 +88,8 @@ const elements = Object.fromEntries(
     "integration-local-reload", "integration-local-facts", "integration-local-backup",
     "integration-local-refresh", "integration-local-apply",
     "integration-transport-tabs", "integration-http-token-guide", "integration-open-token-button",
+    "integration-client-profile", "integration-client-profile-hint",
+    "integration-transport-hint",
     "integration-http-action-title", "integration-http-action-description", "integration-http-action-steps",
     "integration-target-project",
     "member-list", "refresh-audit-button", "audit-event-filter",
@@ -2890,13 +2892,29 @@ document.getElementById("integration-onboarding-mode").addEventListener("change"
   if (state.integrationOnboardingMode === "first_setup") void refreshLocalMcpPlan();
 });
 
+elements["integration-client-profile"].addEventListener("change", (event) => {
+  if (!state.integration?.profiles?.[event.target.value]) return;
+  state.integrationFormat = event.target.value;
+  // A profile switch invalidates any detection result: the plan is per profile.
+  state.integrationLocalRequest += 1;
+  state.integrationLocalPlan = null;
+  state.integrationLocalApplyResult = null;
+  renderIntegrationTabs();
+  renderIntegrationConfig();
+  renderOnboardingPrompt();
+  renderHttpTokenGuide();
+  renderLocalMcpPlan();
+  if (state.integrationTransport === "local") void refreshLocalMcpPlan();
+});
+
 elements["integration-transport-tabs"].addEventListener("click", (event) => {
   const button = event.target.closest("[data-integration-transport]");
-  if (!button) return;
+  if (!button || button.hidden) return;
   state.integrationTransport = button.dataset.integrationTransport;
   document.querySelectorAll("[data-integration-transport]").forEach((item) => {
     item.classList.toggle("is-active", item === button);
   });
+  renderIntegrationTransportHint();
   renderIntegrationConfig();
   renderOnboardingPrompt();
   state.integrationLocalPlan = null;
@@ -4512,13 +4530,66 @@ async function downloadProjectExport() {
   showToast("审计数据已导出 (JSON)");
 }
 
-function renderIntegrationTabs() {
-  // 配置助手只保留通用标准 MCP 接入（具名客户端预设仅在后端 CLI 里），
-  // 单一选项不再渲染切换行；profile 仍经 state.integrationFormat 使用。
-  if (!state.integration?.profiles) return;
-  if (!Object.keys(state.integration.profiles).includes(state.integrationFormat)) {
+// 目标客户端选择器。profile 列表来自服务端发布的 integrations.profiles，
+// 顺序即发布顺序；带 local_config 的客户端才有本机配置助手。
+function renderIntegrationProfileOptions() {
+  const select = elements["integration-client-profile"];
+  if (!select || !state.integration?.profiles) return;
+  const profiles = state.integration.profiles;
+  if (!Object.keys(profiles).includes(state.integrationFormat)) {
     state.integrationFormat = "generic";
   }
+  const signature = Object.keys(profiles).join("|");
+  if (select.dataset.profileSignature !== signature) {
+    select.dataset.profileSignature = signature;
+    select.innerHTML = Object.entries(profiles).map(([profileId, profile]) => {
+      const managed = profile.local_config ? "（支持本机配置助手）" : "";
+      return `<option value="${escapeHtml(profileId)}">${escapeHtml(profile.label || profileId)}${escapeHtml(managed)}</option>`;
+    }).join("");
+  }
+  select.value = state.integrationFormat;
+  const profile = profiles[state.integrationFormat] || {};
+  const hint = elements["integration-client-profile-hint"];
+  if (hint) {
+    hint.textContent = profile.local_config
+      ? `${profile.config_path_hint || ""}该客户端支持由服务端检测并写入本机配置。`.trim()
+      : `${profile.config_path_hint || ""}该客户端没有可托管的本机配置文件路径，本机 stdio 需手动写入。`.trim();
+  }
+}
+
+function renderIntegrationTabs() {
+  renderIntegrationProfileOptions();
+  const transports = state.integration?.transports || {};
+  // 传输方式的可用性由服务端发布，冻结 EXE 也据此隐藏用不了的入口。
+  const available = [
+    ["http", transports.streamable_http?.enabled !== false],
+    ["local", true],
+    ["remote", transports.remote_stdio_bridge?.enabled !== false],
+  ].filter(([, enabled]) => enabled).map(([transport]) => transport);
+  document.querySelectorAll("[data-integration-transport]").forEach((item) => {
+    item.hidden = !available.includes(item.dataset.integrationTransport);
+  });
+  if (!available.includes(state.integrationTransport)) {
+    state.integrationTransport = available[0] || "http";
+  }
+  document.querySelectorAll("[data-integration-transport]").forEach((item) => {
+    item.classList.toggle("is-active", item.dataset.integrationTransport === state.integrationTransport);
+  });
+  renderIntegrationTransportHint();
+}
+
+function renderIntegrationTransportHint() {
+  const hint = elements["integration-transport-hint"];
+  if (!hint) return;
+  const profile = state.integration?.profiles?.[state.integrationFormat] || {};
+  const text = {
+    http: "HTTP 直连是主路径：共用一个服务，不为每条连接拉起适配器进程。",
+    local: profile.local_config
+      ? "本机 stdio 由本进程拉起适配器；该客户端的配置文件可由服务端检测、备份后写入。"
+      : "本机 stdio 由本进程拉起适配器；该客户端没有可托管的配置路径，需按下方配置手动写入。",
+    remote: "远程 Bridge 在 Agent 计算机上把本地 stdio 转发到中心，只适合客户端只能拉起本地进程的场景。",
+  };
+  hint.textContent = text[state.integrationTransport] || text.http;
 }
 
 function localMcpAssistantSupported() {

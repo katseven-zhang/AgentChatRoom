@@ -1683,6 +1683,10 @@ def create_app(
                 "local_folder_picker": resolved.deployment_profile == "local",
                 "local_mcp_config_assistant": (
                     resolved.deployment_profile == "local"
+                    and any(
+                        isinstance(profile.get("local_config"), dict)
+                        for profile in build_mcp_integration(resolved)["profiles"].values()
+                    )
                 ),
                 "streamable_http_mcp": resolved.mcp_http_enabled,
                 "streamable_http_mcp_path": resolved.mcp_http_path,
