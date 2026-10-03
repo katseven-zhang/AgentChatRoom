@@ -740,6 +740,28 @@ def require_int_field(value: Any, field: str) -> Any:
     return int(value)
 
 
+def require_int_or_default(value: Any, field: str, default: int) -> int:
+    """Integer input with a fallback, refusing booleans.
+
+    Paging parameters are optional, and the old spelling was
+    ``int(after or 0)``. That quietly accepted ``after=true`` as 1: JSON
+    booleans reach the domain as bool, and ``0 <= True <= 4`` or ``int(True)``
+    is a valid number, so a client sending the wrong type got a confident
+    answer instead of a correction. The default is only for a missing value or
+    an explicit falsy zero, never for a wrong type.
+    """
+    if value is None:
+        return default
+    if not is_strict_int(value):
+        raise DomainError(
+            f"invalid_{field}",
+            f"{field.replace('_', ' ')} must be an integer",
+            status_code=422,
+            details={"field": field},
+        )
+    return int(value)
+
+
 def credential_state_error(reason: str) -> DomainError:
     """Map a credential failure onto the shared Project-credential vocabulary.
 
@@ -3392,10 +3414,11 @@ class AgentChatRoomService:
                     "required_action": "pass_supported_permissions_or_omit_the_field",
                 },
             )
+        # A boolean TTL satisfies the range check as 1 second; refuse the type.
         ttl = (
             self.settings.agent_token_ttl_seconds
             if expires_in_seconds is None
-            else expires_in_seconds
+            else require_int_or_default(expires_in_seconds, "expires_in_seconds", 0)
         )
         if not self.min_agent_token_ttl_seconds() <= ttl <= (
             self.settings.max_agent_token_ttl_seconds
@@ -3661,6 +3684,9 @@ class AgentChatRoomService:
         *,
         extend_by_seconds: int,
     ) -> dict[str, Any]:
+        extend_by_seconds = require_int_or_default(
+            extend_by_seconds, "extend_by_seconds", 0
+        )
         if not self.min_agent_token_ttl_seconds() <= extend_by_seconds <= (
             self.settings.max_agent_token_ttl_seconds
         ):
@@ -3748,10 +3774,11 @@ class AgentChatRoomService:
         *,
         expires_in_seconds: int | None = None,
     ) -> dict[str, Any]:
+        # A boolean TTL satisfies the range check as 1 second; refuse the type.
         ttl = (
             self.settings.agent_token_ttl_seconds
             if expires_in_seconds is None
-            else expires_in_seconds
+            else require_int_or_default(expires_in_seconds, "expires_in_seconds", 0)
         )
         if not self.min_agent_token_ttl_seconds() <= ttl <= (
             self.settings.max_agent_token_ttl_seconds
@@ -4671,8 +4698,8 @@ class AgentChatRoomService:
         after: int = 0,
         limit: int = 200,
     ) -> dict[str, Any]:
-        limit = max(1, min(limit, 1000))
-        after = max(0, int(after or 0))
+        limit = max(1, min(require_int_or_default(limit, "limit", 200), 1000))
+        after = require_int_or_default(after, "after", 0)
         rows = connection.execute(
             """
             SELECT * FROM events
@@ -4863,9 +4890,9 @@ class AgentChatRoomService:
         ``has_newer`` report continuation under the same filters.
         """
         self.enforce_audit_retention_throttled(project_id)
-        limit = max(1, min(limit, 1000))
-        after = max(0, int(after or 0))
-        before = max(0, int(before or 0))
+        limit = max(1, min(require_int_or_default(limit, "limit", 200), 1000))
+        after = require_int_or_default(after, "after", 0)
+        before = require_int_or_default(before, "before", 0)
         if after and before and after >= before:
             raise DomainError(
                 "conflicting_audit_window",
@@ -4954,10 +4981,10 @@ class AgentChatRoomService:
         limit: int = 50,
         event_type: str = "",
     ) -> dict[str, Any]:
-        limit = max(1, min(int(limit or 50), TASK_HISTORY_LIMIT_MAX))
-        after = max(0, int(after or 0))
-        before = max(0, int(before or 0))
-        cursor = max(0, int(cursor or 0))
+        limit = max(1, min(require_int_or_default(limit, "limit", 50), TASK_HISTORY_LIMIT_MAX))
+        after = require_int_or_default(after, "after", 0)
+        before = require_int_or_default(before, "before", 0)
+        cursor = require_int_or_default(cursor, "cursor", 0)
         if cursor and after and cursor != after:
             raise DomainError(
                 "conflicting_history_cursor",
@@ -8234,10 +8261,12 @@ class AgentChatRoomService:
                 "invalid_lease_mode",
                 "Lease mode must be readonly, shared, or exclusive",
             )
+        # A boolean TTL would satisfy "between 1 and max" as 1 second, quietly
+        # taking the shortest lease instead of rejecting the wrong type.
         ttl = (
             self.settings.default_lease_ttl_seconds
             if ttl_seconds is None
-            else ttl_seconds
+            else require_int_or_default(ttl_seconds, "ttl_seconds", 0)
         )
         if not 1 <= ttl <= self.settings.max_lease_ttl_seconds:
             raise DomainError(
