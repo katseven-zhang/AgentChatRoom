@@ -23,7 +23,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from starlette.datastructures import MutableHeaders
 
 from . import __version__
-from .config import Settings, load_settings, rewrite_config_text
+from .config import Settings, build_service_base_url, load_settings, rewrite_config_text
 from .database import create_database
 from .desktop import DirectoryPickerUnavailable, pick_directory
 from .errors import DomainError
@@ -1096,8 +1096,9 @@ def create_app(
             f"{resolved.management_token_env} must contain at least 24 characters "
             "when management authentication is required"
         )
-    public_host = "127.0.0.1" if resolved.host in {"0.0.0.0", "::"} else resolved.host
-    base_url = resolved.external_base_url or f"http://{public_host}:{resolved.port}"
+    base_url = resolved.external_base_url or build_service_base_url(
+        resolved.host, resolved.port
+    )
     mcp_url = f"{base_url}{resolved.mcp_http_path}"
     http_presence_manager = LocalPresenceManager(
         service,

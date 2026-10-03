@@ -30,7 +30,7 @@ from .backup import (
     restore_postgresql,
     restore_sqlite,
 )
-from .config import load_settings
+from .config import build_service_base_url, load_settings
 from .integrations import build_mcp_integration
 from .runtime_log import tail_text_lines
 
@@ -87,8 +87,13 @@ def print_result(value: Any, compact: bool) -> None:
 
 
 def service_url(host: str, port: int) -> str:
-    browser_host = "127.0.0.1" if host in {"0.0.0.0", "::"} else host
-    return f"http://{browser_host}:{port}"
+    """Build the service base URL through the shared policy.
+
+    The construction lives in ``config.build_service_base_url`` so the CLI,
+    REST, MCP config and GUI cannot disagree about wildcard hosts or IPv6
+    brackets; this name is kept because it is the CLI's public spelling.
+    """
+    return build_service_base_url(host, port)
 
 
 def configured_service_url(settings) -> str:

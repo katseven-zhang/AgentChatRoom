@@ -5,7 +5,7 @@ import sys
 from pathlib import Path
 from typing import Any, Mapping
 
-from .config import Settings
+from .config import Settings, build_service_base_url
 from .http_identity import encode_http_identity_value
 
 
@@ -380,8 +380,9 @@ def build_mcp_integration(
     generic_json = {"mcpServers": {MCP_SERVER_NAME: server}}
     generic_json_text = json.dumps(generic_json, ensure_ascii=False, indent=2) + "\n"
     toml_text = _build_toml(server, environment)
-    public_host = "127.0.0.1" if settings.host in {"0.0.0.0", "::"} else settings.host
-    base_url = settings.external_base_url or f"http://{public_host}:{settings.port}"
+    base_url = settings.external_base_url or build_service_base_url(
+        settings.host, settings.port
+    )
     remote_url = f"{base_url}{settings.mcp_http_path}"
     bridge_environment = {
         "AGENTCHATROOM_SERVER_URL": remote_url,

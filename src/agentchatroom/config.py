@@ -163,6 +163,35 @@ def normalize_knowledge_kinds(values: Any) -> tuple[str, ...]:
     return unique
 
 
+WILDCARD_BIND_HOSTS = frozenset({"0.0.0.0", "::"})
+
+
+def format_host_for_url(host: str) -> str:
+    """Return ``host`` as it must appear inside a URL authority.
+
+    An IPv6 literal has to be bracketed: ``http://::1:8765`` is not a URL, and
+    the port ends up looking like part of the address. The rule is structural -
+    any host containing a colon is an IPv6 literal - so it does not depend on
+    enumerating the addresses a platform may hand out.
+    """
+    text = str(host).strip()
+    if ":" in text and not text.startswith("["):
+        return f"[{text}]"
+    return text
+
+
+def build_service_base_url(host: str, port: int) -> str:
+    """Build the ``http://host:port`` base URL a client on this machine opens.
+
+    A wildcard bind address is not connectable, so it becomes the IPv4
+    loopback. Every adapter (REST, MCP config, CLI, GUI) formats the service
+    address through here: four private copies of this rule meant a fix reached
+    only some of them, and the copies disagreed about IPv6.
+    """
+    browser_host = "127.0.0.1" if str(host).strip() in WILDCARD_BIND_HOSTS else host
+    return f"http://{format_host_for_url(browser_host)}:{int(port)}"
+
+
 @dataclass(frozen=True, slots=True)
 class Settings:
     data_dir: Path
