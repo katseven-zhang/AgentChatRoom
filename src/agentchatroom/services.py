@@ -5939,8 +5939,9 @@ class AgentChatRoomService:
                     "Task creation requires the authenticated Agent session of the operator",
                 )
             self._authenticate(connection, project_id, actor_session_id, token or "")
-            for dependency_id in dependencies:
-                self._require_satisfiable_dependency(connection, project_id, dependency_id)
+            self._require_acyclic_dependencies(
+                connection, project_id, task_id, dependencies
+            )
             task_number = self._next_task_number(connection, project_id)
             try:
                 connection.execute(
@@ -6111,6 +6112,114 @@ class AgentChatRoomService:
                 status_code=409,
                 details={"blockers": [dict(row) for row in blockers]},
             )
+
+    def list_dependency_cycles(self, project_id: str) -> dict[str, Any]:
+        """Report tasks that already sit inside a dependency cycle.
+
+        ``create_task`` and ``update_task`` now refuse to write a cycle, but
+        rows written before that guard existed are still in the table and stay
+        permanently unclaimable. This is a read-only report: it never edits
+        dependencies and never rewrites an event, so an operator can see the
+        damage and repair it deliberately.
+        """
+        with self.database.connect() as connection:
+            self._require_project(connection, project_id)
+            rows = connection.execute(
+                """
+                WITH RECURSIVE reach(root_id, task_id, depth) AS (
+                    SELECT task_id, depends_on_task_id, 1
+                    FROM task_dependencies
+                    UNION
+                    SELECT r.root_id, d.depends_on_task_id, r.depth + 1
+                    FROM reach r
+                    JOIN task_dependencies d ON d.task_id = r.task_id
+                    WHERE r.depth < 64
+                )
+                SELECT root_id, task_id
+                FROM reach
+                WHERE root_id = task_id
+                GROUP BY root_id, task_id
+                ORDER BY root_id
+                """
+            ).fetchall()
+            member_ids = sorted({row["root_id"] for row in rows})
+            if not member_ids:
+                return {"cycles": [], "cycle_task_count": 0}
+            numbers = {
+                row["id"]: row["task_number"]
+                for row in connection.execute(
+                    "SELECT id, task_number FROM tasks WHERE project_id = ? AND id IN ({})".format(
+                        ",".join("?" * len(member_ids))
+                    ),
+                    (project_id, *member_ids),
+                ).fetchall()
+            }
+        cycles = [
+            {
+                "task_id": task_id,
+                "task_number": numbers.get(task_id),
+                "required_action": "rewrite_depends_on_to_break_the_cycle",
+            }
+            for task_id in member_ids
+        ]
+        return {"cycles": cycles, "cycle_task_count": len(cycles)}
+
+    def _require_acyclic_dependencies(
+        self,
+        connection: Any,
+        project_id: str,
+        task_id: str,
+        dependencies: list[str],
+    ) -> None:
+        """Reject a dependency set that would make ``task_id`` unreachable.
+
+        A cycle is written by pointing A at B after B already points at A, so
+        the edge is accepted one task at a time and the graph only becomes
+        cyclic after the insert. Every task inside the cycle then reports
+        ``task_dependencies_incomplete`` for **every** member forever: the
+        blocker query can never be satisfied, and the only escape is
+        rewriting ``depends_on`` with the full list guessed from outside.
+
+        Both ``create_task`` and ``update_task`` wire dependencies up, and
+        ``define_task_from_intake`` delegates to ``create_task``, so the check
+        lives here once. A task that does not exist yet (``create_task``
+        mints its id before the insert) cannot already be a cycle member, so
+        the reachability walk starts from each dependency.
+        """
+        for dependency_id in dependencies:
+            if dependency_id == task_id:
+                raise DomainError(
+                    "task_dependency_cycle",
+                    "A task cannot depend on itself",
+                    details={
+                        "depends_on_task_id": dependency_id,
+                        "task_id": task_id,
+                        "required_action": "remove_the_self_dependency",
+                    },
+                )
+            self._require_satisfiable_dependency(connection, project_id, dependency_id)
+            reaches_task = connection.execute(
+                """
+                WITH RECURSIVE chain(task_id) AS (
+                    SELECT depends_on_task_id FROM task_dependencies WHERE task_id = ?
+                    UNION
+                    SELECT d.depends_on_task_id
+                    FROM task_dependencies d JOIN chain c ON d.task_id = c.task_id
+                )
+                SELECT 1 FROM chain WHERE task_id = ? LIMIT 1
+                """,
+                (dependency_id, task_id),
+            ).fetchone()
+            if reaches_task:
+                raise DomainError(
+                    "task_dependency_cycle",
+                    "Task dependencies cannot contain a cycle",
+                    details={
+                        "depends_on_task_id": dependency_id,
+                        "task_id": task_id,
+                        "required_action": "break_the_dependency_cycle_before_claiming",
+                    },
+                )
 
     def _require_satisfiable_dependency(
         self, connection: Any, project_id: str, dependency_id: str
@@ -7809,29 +7918,9 @@ class AgentChatRoomService:
                 if depends_on is None
                 else list(dict.fromkeys(depends_on))
             )
-            for dependency_id in next_dependencies:
-                if dependency_id == task_id:
-                    raise DomainError(
-                        "task_dependency_cycle", "A task cannot depend on itself"
-                    )
-                self._require_satisfiable_dependency(connection, project_id, dependency_id)
-                reaches_current = connection.execute(
-                    """
-                    WITH RECURSIVE chain(task_id) AS (
-                        SELECT depends_on_task_id FROM task_dependencies WHERE task_id = ?
-                        UNION
-                        SELECT d.depends_on_task_id
-                        FROM task_dependencies d JOIN chain c ON d.task_id = c.task_id
-                    )
-                    SELECT 1 FROM chain WHERE task_id = ? LIMIT 1
-                    """,
-                    (dependency_id, task_id),
-                ).fetchone()
-                if reaches_current:
-                    raise DomainError(
-                        "task_dependency_cycle",
-                        "Task dependencies cannot contain a cycle",
-                    )
+            self._require_acyclic_dependencies(
+                connection, project_id, task_id, next_dependencies
+            )
             next_blocker_reason = (
                 task["blocker_reason"]
                 if blocker_reason is None
