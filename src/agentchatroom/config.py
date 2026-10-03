@@ -180,6 +180,25 @@ def format_host_for_url(host: str) -> str:
     return text
 
 
+def parse_service_url(url: str) -> tuple[str, int | None]:
+    """Split a service base URL back into ``(host, port)``.
+
+    The inverse of ``build_service_base_url``: a caller that learns the
+    address at runtime needs the host and port back to record it, and the
+    host is unbracketed again so it can be stored as a listen address.
+    """
+    text = str(url or "").strip()
+    if not text:
+        return "", None
+    parsed = urlparse(text)
+    if not parsed.netloc:
+        return "", None
+    try:
+        return parsed.hostname or "", parsed.port
+    except ValueError:
+        return "", None
+
+
 def build_service_base_url(host: str, port: int) -> str:
     """Build the ``http://host:port`` base URL a client on this machine opens.
 

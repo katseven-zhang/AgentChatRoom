@@ -32,7 +32,7 @@ from .backup import (
 )
 from .config import build_service_base_url, load_settings
 from .integrations import build_mcp_integration
-from .runtime_log import tail_text_lines
+from .runtime_log import running_url_from_log, tail_text_lines
 
 
 MUTATING_HTTP_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
@@ -810,6 +810,7 @@ def _start_detached_server_locked(
     config_path: str | None = None,
 ) -> dict[str, Any]:
     pid_path = settings.data_dir / "server.pid"
+    log_path = settings.data_dir / "server.log"
     if pid_path.exists():
         try:
             existing_pid = int(pid_path.read_text(encoding="ascii").strip())
@@ -817,16 +818,22 @@ def _start_detached_server_locked(
             pid_path.unlink(missing_ok=True)
         else:
             if process_is_running(existing_pid):
+                # The requested host/port is only what the caller asked for.
+                # The process that is actually running may have bound a
+                # different address, and echoing the request back as
+                # "already running at ..." sent the GUI to the wrong port and
+                # wrote that wrong address into config.toml.
                 return {
                     "started": False,
                     "already_running": True,
                     "pid": existing_pid,
-                    "url": service_url(host, port),
-                    "log_path": str(settings.data_dir / "server.log"),
+                    "url": running_url_from_log(log_path)
+                    or service_url(host, port),
+                    "requested_url": service_url(host, port),
+                    "log_path": str(log_path),
                 }
             pid_path.unlink(missing_ok=True)
 
-    log_path = settings.data_dir / "server.log"
     environment = os.environ.copy()
     environment["AGENTCHATROOM_DATA_DIR"] = str(settings.data_dir)
     if getattr(sys, "frozen", False):

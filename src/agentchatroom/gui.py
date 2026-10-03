@@ -29,24 +29,30 @@ from .cli import (
     start_detached_server,
     stop_detached_server,
 )
-from .config import Settings, default_data_dir, load_settings, rewrite_config_text
+from .config import (
+    Settings,
+    default_data_dir,
+    load_settings,
+    parse_service_url,
+    rewrite_config_text,
+)
 from .errors import DomainError
 from .gui_autostart import GuiInstanceGuard, LoginStartup
 from .gui_event_log import RoomEventTail, format_service_line, sanitize_gui_text
+from .runtime_log import running_url_from_log as _running_url_from_log
 from .runtime_log import tail_text_lines
 
 MIN_PORT = 1
 MAX_PORT = 65535
 _DIGITS_ONLY = re.compile(r"\A[0-9]+\Z")
-_RUNNING_URL = re.compile(r"running on (https?://\S+)")
 
 # The detached service appends to ``server.log`` forever and nothing rotates
 # it (a live checkout log measured 23 MB), and the address lookup runs on the
-# Tk thread from the 2 second poll. The reverse tail is therefore bounded twice
-# over: a line window for the common case and a byte cap for pathological
-# lines, so one lookup can never cost more than that cap.
-RUNNING_URL_TAIL_LINES = 400
-RUNNING_URL_TAIL_BYTES = 256 * 1024
+# Tk thread from the 2 second poll, so the reverse tail it reads is bounded
+# twice over. The pattern and the bounds live in ``runtime_log`` so the CLI
+# resolves an already-running service the same way; they are re-exported here
+# because they are part of this module's contract about that bounded read.
+from .runtime_log import RUNNING_URL_TAIL_BYTES, RUNNING_URL_TAIL_LINES  # noqa: F401
 
 # Mirrors the server config rule: only loopback targets may bind without
 # management authentication.
@@ -188,21 +194,13 @@ def running_url_from_log(log_path: Path) -> str | None:
     Reads through the shared bounded reverse tail used by ``agentchatroom
     logs`` and the admin runtime panel: the previous full ``read_text`` cost
     tens of megabytes on the Tk thread every two seconds.
+
+    The implementation lives in ``runtime_log`` so the CLI's
+    already-running branch reads the same address from the same place;
+    ``tail_text_lines`` is passed in so this module keeps its own injection
+    point for the bounded-read assertion.
     """
-    try:
-        lines, _truncated = tail_text_lines(
-            Path(log_path),
-            RUNNING_URL_TAIL_LINES,
-            max_scan_bytes=RUNNING_URL_TAIL_BYTES,
-        )
-    except OSError:
-        return None
-    found: str | None = None
-    for line in lines:
-        match = _RUNNING_URL.search(line)
-        if match:
-            found = match.group(1)
-    return found
+    return _running_url_from_log(log_path, tail_reader=tail_text_lines)
 
 
 def config_file_path(settings: Settings) -> Path:
@@ -398,15 +396,27 @@ def run_start_worker(
             return
         result = start_fn(host, port)
         sink.put(("started", result))
-        if host != settings.host or port != settings.port:
+        # The address to remember is the one the service reports, not the one
+        # that was requested: on the already-running path nothing was bound
+        # here, and writing the request back would cache a port this service
+        # does not listen on. A URL that carries no port is not trusted, and
+        # nothing is written for it.
+        probe_host, probe_port = parse_service_url(result.get("url") or "")
+        if probe_port and (
+            probe_host != settings.host
+            or int(probe_port) != settings.port
+            or (host, port) != (settings.host, settings.port)
+        ):
+            config_host = probe_host or host
+            config_port = int(probe_port)
             try:
                 update_config_values(
-                    config_file_path(settings), host=host, port=port
+                    config_file_path(settings), host=config_host, port=config_port
                 )
                 sink.put(
                     (
                         "log",
-                        f"{host}:{port} 已写入配置，后续启动将使用该配置。",
+                        f"{config_host}:{config_port} 已写入配置，后续启动将使用该配置。",
                     )
                 )
             except (OSError, TypeError, ValueError, DomainError) as error:
