@@ -660,6 +660,37 @@ def _project_scope(
     return ("path", os.path.normcase(str(git_root.resolve())), logical_path.casefold())
 
 
+def canonical_workspace_key(value: str) -> str:
+    """The identity a workspace path is stored and matched under.
+
+    A registered path is a key, not a display string: the row is looked up by
+    it and sessions bind to whichever row they hit. Storing the raw text means
+    the same checkout written with different case, mixed separators or a
+    trailing slash becomes three workspaces; sessions then bind to different
+    rows, and ``_trusted_worktree`` validates an Agent-reported worktree
+    against a different root each time - so the git evidence comes from no
+    consistent anchor.
+
+    Resolution is best-effort: a path that cannot be resolved (a remote or
+    temporarily unavailable mount) still normalises by separator and case
+    rather than raising, because refusing to register it would be a worse
+    answer than registering a slightly coarser key.
+    """
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    try:
+        text = str(Path(text).expanduser().resolve(strict=False))
+    except (OSError, ValueError, RuntimeError):
+        pass
+    # normcase is a no-op off Windows, so separators are folded separately:
+    # a client on one OS registering a path for another must still match.
+    text = text.replace("\\", "/")
+    while len(text) > 1 and text.endswith("/"):
+        text = text[:-1]
+    return os.path.normcase(text)
+
+
 def _stored_project_scope(project: Mapping[str, Any]) -> tuple[str, str, str]:
     """The stored row's scope, from the same implementation the registration and
     bootstrap paths use, so no second copy can drift again."""
@@ -3866,7 +3897,7 @@ class AgentChatRoomService:
             }
 
     @staticmethod
-    def _validate_workspace_path(field: str, value: str) -> str:
+    def _validate_workspace_path(field: str, value: str, *, canonical: bool = False) -> str:
         """Reject malformed workspace paths before they poison git evidence.
 
         Control characters (C0 and DEL) in a registered path silently break
@@ -3874,6 +3905,11 @@ class AgentChatRoomService:
         report from sessions bound to that workspace with an unrelated
         invalid_commit_hash error. Relative paths are equally meaningless for
         a host-anchored workspace registration.
+
+        ``canonical`` is for the path that identifies a workspace, so that one
+        checkout cannot be registered three times over separators and case. It
+        is off by default: a descriptive field like worktree is re-resolved
+        before every comparison and reads better as its caller typed it.
         """
         text = value.strip()
         if any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in text):
@@ -3894,7 +3930,7 @@ class AgentChatRoomService:
                 "invalid_workspace",
                 f"{field} must be an absolute path",
             )
-        return text
+        return canonical_workspace_key(text) if canonical else text
 
     def register_workspace(
         self,
@@ -3914,11 +3950,19 @@ class AgentChatRoomService:
                 "invalid_workspace",
                 "Host key, Host name, and local workspace path are required",
             )
-        local_path = self._validate_workspace_path("local_path", local_path)
-        if str(worktree or "").strip():
-            worktree = self._validate_workspace_path("worktree", worktree)
-        else:
-            worktree = ""
+        # The registered path is a key, so it is canonicalised; the text the
+        # caller typed is kept beside it for display. Storing the raw string
+        # made one checkout three workspaces depending on separators and case.
+        # Only local_path is an identity - it is the half of the UNIQUE key - so
+        # only local_path is canonicalised. worktree is descriptive and is
+        # re-resolved before every comparison anyway.
+        display_local_path = str(local_path or "").strip()
+        local_path = self._validate_workspace_path(
+            "local_path", local_path, canonical=True
+        )
+        worktree = self._validate_workspace_path("worktree", worktree) if str(
+            worktree or ""
+        ).strip() else ""
         now = iso_now()
         with self.database.connect(write=True) as connection:
             self._require_project(connection, project_id)
@@ -3966,7 +4010,7 @@ class AgentChatRoomService:
                 SELECT * FROM workspaces
                 WHERE project_id = ? AND host_id = ? AND local_path = ?
                 """,
-                (project_id, host_id, local_path.strip()),
+                (project_id, host_id, local_path),
             ).fetchone()
             workspace_created = workspace is None
             if workspace is None:
@@ -3974,15 +4018,17 @@ class AgentChatRoomService:
                 connection.execute(
                     """
                     INSERT INTO workspaces(
-                        id, project_id, host_id, local_path, branch, worktree,
-                        git_remote, metadata_json, created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        id, project_id, host_id, local_path, display_path,
+                        branch, worktree, git_remote, metadata_json,
+                        created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         workspace_id,
                         project_id,
                         host_id,
-                        local_path.strip(),
+                        local_path,
+                        display_local_path,
                         branch.strip(),
                         worktree.strip(),
                         git_remote.strip(),
@@ -3996,11 +4042,12 @@ class AgentChatRoomService:
                 connection.execute(
                     """
                     UPDATE workspaces
-                    SET branch = ?, worktree = ?, git_remote = ?,
-                        metadata_json = ?, updated_at = ?
+                    SET display_path = ?, branch = ?, worktree = ?,
+                        git_remote = ?, metadata_json = ?, updated_at = ?
                     WHERE id = ?
                     """,
                     (
+                        display_local_path,
                         branch.strip(),
                         worktree.strip(),
                         git_remote.strip(),

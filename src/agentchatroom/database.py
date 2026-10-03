@@ -15,7 +15,7 @@ if TYPE_CHECKING:
     from .config import Settings
 
 
-SCHEMA_VERSION = 25
+SCHEMA_VERSION = 26
 # One source for both the connect timeout and the busy timeout: a writer that
 # loses the race waits this long before the contention is reported.
 SQLITE_BUSY_TIMEOUT_SECONDS = 10
@@ -115,6 +115,7 @@ CREATE TABLE IF NOT EXISTS workspaces (
     project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
     host_id TEXT NOT NULL REFERENCES hosts(id) ON DELETE CASCADE,
     local_path TEXT NOT NULL,
+    display_path TEXT NOT NULL DEFAULT '',
     branch TEXT NOT NULL DEFAULT '',
     worktree TEXT NOT NULL DEFAULT '',
     git_remote TEXT NOT NULL DEFAULT '',
@@ -864,7 +865,35 @@ MIGRATIONS = {
     25: """
         SELECT 1;
     """,
+    26: """
+        SELECT 1;
+    """,
 }
+
+
+def migrate_workspace_display_path(connection: Any) -> None:
+    """Add ``workspaces.display_path`` without repeating it (#255).
+
+    ``ALTER TABLE ... ADD COLUMN`` is not reentrant, and initialize runs inside
+    one transaction precisely so a failure cannot leave the version ahead of the
+    schema - but a database that was already half migrated before that
+    guarantee existed still replays this statement, and a bare ADD COLUMN then
+    fails with "duplicate column name" and refuses to start. Checking first
+    costs one pragma and makes the migration replayable.
+
+    The backfill is separate from the ADD so an existing row is never left with
+    an empty display string, which would silently hide the path it came from.
+    """
+    columns = {
+        row[1] for row in connection.execute("PRAGMA table_info(workspaces)")
+    }
+    if "display_path" not in columns:
+        connection.execute(
+            "ALTER TABLE workspaces ADD COLUMN display_path TEXT NOT NULL DEFAULT ''"
+        )
+    connection.execute(
+        "UPDATE workspaces SET display_path = local_path WHERE display_path = ''"
+    )
 
 
 def migrate_knowledge_source_event_ids(connection: Any) -> None:
@@ -1230,6 +1259,10 @@ class Database:
             # After the member_id / agent_key columns are backfilled, so the
             # index statements below can never reference a missing column.
             ensure_member_lookup_indexes(connection)
+            # Idempotent by construction, so it belongs with the other ensures
+            # rather than in the version replay loop: a database already stamped
+            # at the current version still needs it (#255).
+            migrate_workspace_display_path(connection)
             version = read_schema_version(connection)
             if version is None:
                 write_schema_version(connection, SCHEMA_VERSION)

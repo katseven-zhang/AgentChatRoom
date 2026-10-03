@@ -13,6 +13,12 @@ def _schema_without_v9_reliability() -> str:
         "    last_heartbeat TEXT NOT NULL,\n    left_at TEXT\n",
         "    last_heartbeat TEXT NOT NULL\n",
     ).replace(
+        # #255 added display_path in schema 26. Every historical schema here is
+        # derived from the current one, so the column has to come back off or
+        # the migration that introduces it fails on a table that already has it.
+        "    local_path TEXT NOT NULL,\n    display_path TEXT NOT NULL DEFAULT '',\n",
+        "    local_path TEXT NOT NULL,\n",
+    ).replace(
         """CREATE TABLE IF NOT EXISTS idempotency_records (
     scope TEXT NOT NULL,
     request_id TEXT NOT NULL,
@@ -669,3 +675,48 @@ def test_concurrent_initialization_converges(tmp_path):
 
     assert _scalar(path, "SELECT version FROM schema_meta") == SCHEMA_VERSION
     assert _scalar(path, "SELECT COUNT(*) FROM schema_meta") == 1
+
+
+def test_the_display_path_migration_can_be_replayed(settings):
+    """#255: a half-migrated database must still start.
+
+    ALTER TABLE ... ADD COLUMN is not reentrant. initialize wraps its migration
+    loop in one transaction so this cannot happen any more, but a database that
+    was already half migrated by an older build replays the same statement, and
+    a bare ADD COLUMN then aborts the start with "duplicate column name".
+    """
+    settings.data_dir.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(settings.database_path) as connection:
+        connection.executescript(SCHEMA)
+        connection.execute("INSERT INTO schema_meta(version) VALUES (26)")
+        # A previous attempt got the column in and stopped before the backfill.
+        connection.execute(
+            """
+            INSERT INTO hosts(id, host_key, name, created_at, updated_at, last_seen_at)
+            VALUES ('host_r', 'r', 'R', '2026-01-01T00:00:00Z',
+                    '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO workspaces(
+                id, project_id, host_id, local_path, display_path,
+                branch, worktree, git_remote, metadata_json, created_at, updated_at
+            ) VALUES ('ws_r', 'p_r', 'host_r', '/srv/app', '/srv/app',
+                      '', '', '', '{}', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')
+            """
+        )
+        connection.execute("UPDATE workspaces SET display_path = ''")
+
+    Database(settings.database_path).initialize()
+
+    with sqlite3.connect(settings.database_path) as connection:
+        columns = {
+            row[1] for row in connection.execute("PRAGMA table_info(workspaces)")
+        }
+        row = connection.execute(
+            "SELECT local_path, display_path FROM workspaces WHERE id = 'ws_r'"
+        ).fetchone()
+    assert "display_path" in columns
+    # The backfill runs even when the column was already there.
+    assert row[1] == row[0]

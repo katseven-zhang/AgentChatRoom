@@ -184,8 +184,12 @@ def test_bundle_project_name_must_match_advertised_workspace_roots(service, tmp_
     )
     assert matched.binding is not None
     assert matched.binding.project_id == project_b["id"]
-    assert service.list_workspaces(project_b["id"])[0]["local_path"] == str(
-        root_b.resolve()
+    # local_path is the identity key and therefore canonicalised (#255); the
+    # text the caller typed stays in display_path.
+    from agentchatroom.services import canonical_workspace_key
+
+    assert service.list_workspaces(project_b["id"])[0]["local_path"] == (
+        canonical_workspace_key(str(root_b.resolve()))
     )
 
     no_roots = _boot(
@@ -200,7 +204,8 @@ def test_bundle_project_name_must_match_advertised_workspace_roots(service, tmp_
     assert no_roots.binding is not None
     assert no_roots.binding.project_id == project_a["id"]
     workspace = service.list_workspaces(project_a["id"])[0]
-    assert workspace["local_path"] == str(root_a.resolve())
+    assert workspace["local_path"] == canonical_workspace_key(str(root_a.resolve()))
+    assert workspace["display_path"] == str(root_a)
     assert no_roots.public["notices"][0]["code"] == "server_project_root_registered"
 
 

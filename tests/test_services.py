@@ -4,6 +4,7 @@ from __future__ import annotations
 import subprocess
 import threading
 from datetime import timedelta
+from pathlib import Path
 
 import pytest
 
@@ -744,7 +745,7 @@ def test_agent_token_host_workspace_and_remote_session_flow(service, project):
     assert joined["agent"]["credential_id"] == credential["id"]
     assert joined["agent"]["host_id"] == first_workspace["host"]["id"]
     assert joined["agent"]["workspace_id"] == first_workspace["workspace"]["id"]
-    assert joined["workspace"]["local_path"] == "D:/work/project"
+    assert joined["workspace"]["display_path"] == "D:/work/project"
 
     listed_tokens = service.list_agent_tokens(project["id"])
     assert listed_tokens[0]["id"] == credential["id"]
@@ -4112,7 +4113,7 @@ def test_register_workspace_rejects_control_characters_and_relative_paths(
         local_path=str(tmp_path),
         worktree=str(tmp_path),
     )
-    assert registered["workspace"]["local_path"] == str(tmp_path)
+    assert registered["workspace"]["display_path"] == str(tmp_path)
 
 
 def test_register_workspace_accepts_cross_platform_absolute_paths(
@@ -4122,13 +4123,18 @@ def test_register_workspace_accepts_cross_platform_absolute_paths(
     reg_win = service.register_workspace(
         project["id"], host_key="win_host", host_name="WinHost", local_path=windows_path
     )
-    assert reg_win["workspace"]["local_path"] == windows_path
+    # local_path is the identity, so it is canonicalised; the text the caller
+    # typed stays readable in display_path (#255).
+    from agentchatroom.services import canonical_workspace_key
+
+    assert reg_win["workspace"]["local_path"] == canonical_workspace_key(windows_path)
+    assert reg_win["workspace"]["display_path"] == windows_path
 
     posix_path = "/home/agent/workspace"
     reg_posix = service.register_workspace(
         project["id"], host_key="posix_host", host_name="PosixHost", local_path=posix_path
     )
-    assert reg_posix["workspace"]["local_path"] == posix_path
+    assert reg_posix["workspace"]["display_path"] == posix_path
 
 
 def test_update_task_optimistic_lock_rejects_concurrent_changes(service, project):
@@ -4266,3 +4272,70 @@ def test_create_task_without_operator_is_rejected(service, project):
             "SELECT COUNT(*) AS n FROM events WHERE event_type = 'task.created'"
         ).fetchone()["n"]
     assert created_events == 0
+
+
+def test_three_spellings_of_one_checkout_register_one_workspace(service, project):
+    """#255: a registered path is a key, not a display string.
+
+    Storing the raw text made ``D://claw//repo``, ``d:/claw/repo`` and
+    ``D://claw//repo//`` three workspaces for one checkout. Sessions bound to
+    different rows, and the git evidence had no consistent anchor.
+    """
+    from agentchatroom.services import canonical_workspace_key
+
+    base = canonical_workspace_key(str(Path(project["root_path"])))
+    spellings = [
+        base,
+        base.replace("/", "\\"),
+        base.upper() if base.islower() else base.lower(),
+        base + "/",
+    ]
+
+    first = service.register_workspace(
+        project["id"], host_key="dup", host_name="Dup", local_path=spellings[0]
+    )
+    for spelling in spellings[1:]:
+        again = service.register_workspace(
+            project["id"], host_key="dup", host_name="Dup", local_path=spelling
+        )
+        assert again["workspace"]["id"] == first["workspace"]["id"], (
+            f"{spelling!r} registered a second workspace"
+        )
+
+    rows = [
+        row
+        for row in service.list_workspaces(project["id"])
+        if row["host_key"] == "dup"
+    ]
+    assert len(rows) == 1, rows
+
+
+def test_a_session_binds_to_the_same_workspace_across_spellings(service, project):
+    """The duplicate row was the real damage: bindings disagreed."""
+    from agentchatroom.services import canonical_workspace_key
+
+    token = service.issue_agent_token(project["id"], name="ws-agent")
+    credential_id = token["credential"]["id"]
+    base = canonical_workspace_key(str(Path(project["root_path"])))
+
+    service.register_workspace(
+        project["id"], host_key="dup", host_name="Dup", local_path=base
+    )
+    service.join_room(
+        project["id"],
+        software_key="wsclient",
+        name="WS",
+        client="pytest",
+        model="unknown",
+        credential_id=credential_id,
+        worktree=base.replace("/", "\\"),
+    )
+    # The join bound to the one row every spelling resolves to, and the worktree
+    # it reported is still spelled the way the Agent spelled it.
+    bound = [
+        row
+        for row in service.list_workspaces(project["id"])
+        if row["host_key"] == "dup"
+    ]
+    assert len(bound) == 1
+    assert bound[0]["local_path"] == base
