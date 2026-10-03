@@ -335,7 +335,18 @@ def request_payload_for_hash(value: Any, *, field_name: str = "") -> Any:
     return str(value)
 
 
-def idempotent_write(operation: str):
+def idempotent_write(operation: str, *, replay_guard: str | None = None):
+    """Deduplicate a write by request id, and optionally refuse a stale replay.
+
+    ``replay_guard`` names a method on the service. It receives the recorded
+    response and returns False when the effect it describes has lapsed, which
+    must be decided from live state: a lease deadline stored in the record is
+    the snapshot from when it was granted and says nothing about now. A lease
+    or a heartbeat is only protected until its deadline, so replaying the
+    recorded "acquired" answer told the Agent it still held the file while
+    nothing was holding it. For those operations the record is dropped and the
+    action runs again, handing back a live effect instead of a stale success.
+    """
     def decorate(callable_):
         call_signature = inspect.signature(callable_)
 
@@ -358,11 +369,33 @@ def idempotent_write(operation: str):
                 operation=operation,
                 request_payload=payload,
                 action=lambda: callable_(self, *args, **kwargs),
+                replay_guard=getattr(self, replay_guard) if replay_guard else None,
             )
 
         return wrapped
 
     return decorate
+
+
+def _iter_deadlines(value: Any, depth: int = 0):
+    """Yield every ``*expires_at`` string in a recorded response.
+
+    The deadline is nested differently per operation - a lease answers
+    ``{"lease": {"expires_at": ...}}`` while a heartbeat puts
+    ``token_expires_at`` at the top level - so the guard cannot assume a key.
+    """
+    if depth > 4:
+        return
+    if isinstance(value, dict):
+        for key, item in value.items():
+            if isinstance(key, str) and key.endswith("expires_at"):
+                if isinstance(item, str) and item:
+                    yield item
+            else:
+                yield from _iter_deadlines(item, depth + 1)
+    elif isinstance(value, list):
+        for item in value:
+            yield from _iter_deadlines(item, depth + 1)
 
 
 def row_dict(row: Mapping[str, Any] | None) -> dict[str, Any] | None:
@@ -934,6 +967,7 @@ class AgentChatRoomService:
         operation: str,
         request_payload: dict[str, Any],
         action: Callable[[], dict[str, Any]],
+        replay_guard: Callable[[dict], bool] | None = None,
     ) -> dict[str, Any]:
         clean_request_id = request_id.strip()
         if not REQUEST_ID_PATTERN.fullmatch(clean_request_id):
@@ -982,11 +1016,26 @@ class AgentChatRoomService:
                         details={"request_id": clean_request_id},
                     )
                 replay = json_load(existing["response_json"], {})
-                return {
-                    **replay,
-                    "request_id": clean_request_id,
-                    "idempotent_replay": True,
-                }
+                if replay_guard is not None and not replay_guard(replay):
+                    # The recorded effect has expired (a lapsed lease, a
+                    # heartbeat that stopped keeping the Session alive).
+                    # Replaying it would report success for protection the
+                    # caller no longer has, so drop the record and run the
+                    # action again to produce a live effect.
+                    connection.execute(
+                        """
+                        DELETE FROM idempotency_records
+                        WHERE scope = ? AND request_id = ?
+                        """,
+                        (scope, clean_request_id),
+                    )
+                    existing = None
+                else:
+                    return {
+                        **replay,
+                        "request_id": clean_request_id,
+                        "idempotent_replay": True,
+                    }
 
             now = iso_now()
             connection.execute(
@@ -1020,11 +1069,73 @@ class AgentChatRoomService:
                 """,
                 (json_dump(result), iso_now(), scope, clean_request_id),
             )
+        # Writing is the only thing that makes the table grow, so a write is
+        # the right place to sweep it. Without this the records accumulated
+        # for the whole process lifetime whenever nobody read the audit log.
+        # The sweep is throttled internally by a monotonic deadline.
+        self.enforce_idempotency_retention()
         return {
             **result,
             "request_id": clean_request_id,
             "idempotent_replay": False,
         }
+
+    def _lease_replay_is_live(self, response: Mapping[str, Any]) -> bool:
+        """True while the recorded lease still exists unreleased and unexpired.
+
+        The stored response only carries the deadline as of the moment it was
+        granted, so liveness has to be read back from the row: an Agent that
+        replays after the lease lapsed must get a fresh one, not a success
+        describing protection that is gone.
+        """
+        lease = response.get("lease")
+        lease_id = lease.get("id") if isinstance(lease, dict) else None
+        if not lease_id:
+            return True
+        with self.database.connect() as connection:
+            row = connection.execute(
+                """
+                SELECT released_at, expires_at FROM file_leases WHERE id = ?
+                """,
+                (lease_id,),
+            ).fetchone()
+        if row is None:
+            return False
+        if row["released_at"] is not None:
+            return False
+        try:
+            return parse_time(str(row["expires_at"])) > utc_now()
+        except ValueError:
+            return False
+
+    def _session_replay_is_live(self, response: Mapping[str, Any]) -> bool:
+        """True while the recorded Session token has not expired.
+
+        A heartbeat replayed past its token deadline would keep reporting an
+        online Session that the service has already expired, so the check reads
+        the row rather than the stored timestamp.
+        """
+        session_id = response.get("id") or response.get("session_id")
+        if not session_id:
+            return True
+        with self.database.connect() as connection:
+            row = connection.execute(
+                """
+                SELECT token_expires_at, left_at FROM agent_sessions WHERE id = ?
+                """,
+                (session_id,),
+            ).fetchone()
+        if row is None:
+            return False
+        if row["left_at"] is not None:
+            return False
+        raw = row["token_expires_at"]
+        if not raw:
+            return True
+        try:
+            return parse_time(str(raw)) > utc_now()
+        except ValueError:
+            return False
 
     def _release_idempotency_reservation(self, scope: str, request_id: str) -> None:
         try:
@@ -4438,7 +4549,7 @@ class AgentChatRoomService:
         )
         return {"credential": credential, **registered, **joined}
 
-    @idempotent_write("session.heartbeat")
+    @idempotent_write("session.heartbeat", replay_guard="_session_replay_is_live")
     def heartbeat(
         self,
         project_id: str,
@@ -8104,7 +8215,7 @@ class AgentChatRoomService:
                 "cursor": event_id,
             }
 
-    @idempotent_write("lease.acquire")
+    @idempotent_write("lease.acquire", replay_guard="_lease_replay_is_live")
     def acquire_lease(
         self,
         project_id: str,

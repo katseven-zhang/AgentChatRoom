@@ -262,11 +262,15 @@ class RequestIdASGIMiddleware:
             return
 
         request = Request(scope, receive)
-        supplied = (
-            request.headers.get("idempotency-key")
-            or request.headers.get("x-request-id")
-            or ""
-        ).strip()
+        # Idempotency and correlation are different keys and must not share
+        # one: X-Request-ID is a correlation header that gateways commonly
+        # reuse across a whole connection, so treating it as an idempotency
+        # key made two genuinely different writes collide with
+        # idempotency_conflict 409 for the whole retention window. Only an
+        # explicit Idempotency-Key deduplicates a write.
+        idempotency_key = (request.headers.get("idempotency-key") or "").strip()
+        correlation_id = (request.headers.get("x-request-id") or "").strip()
+        supplied = idempotency_key or correlation_id
         request_id = supplied or new_id("request")
         if not REQUEST_ID_PATTERN.fullmatch(request_id):
             await JSONResponse(
@@ -280,10 +284,26 @@ class RequestIdASGIMiddleware:
                 },
             )(scope, receive, send)
             return
+        if idempotency_key and not REQUEST_ID_PATTERN.fullmatch(idempotency_key):
+            await JSONResponse(
+                status_code=400,
+                content={
+                    "error": {
+                        "code": "invalid_request_id",
+                        "message": (
+                            "Idempotency-Key must be 1-128 safe ASCII characters"
+                        ),
+                        "details": {},
+                    }
+                },
+            )(scope, receive, send)
+            return
 
         state = scope.setdefault("state", {})
         state["request_id"] = request_id
-        state["idempotency_request_id"] = supplied or None
+        # Every write routes on this, not on request_id: only an explicit
+        # Idempotency-Key makes a write replayable.
+        state["idempotency_request_id"] = idempotency_key or None
 
         async def send_with_request_id(message: dict[str, Any]) -> None:
             if message.get("type") == "http.response.start":
@@ -1865,7 +1885,7 @@ def create_app(
             project_id,
             **body.model_dump(),
             management_authorized=True,
-            request_id=request.state.request_id,
+            request_id=request.state.idempotency_request_id,
         )
 
     @app.patch("/api/v1/projects/{project_id}/members/{member_id}")
@@ -1887,7 +1907,7 @@ def create_app(
             member_id,
             **payload,
             management_authorized=management,
-            request_id=request.state.request_id,
+            request_id=request.state.idempotency_request_id,
         )
 
     @app.delete("/api/v1/projects/{project_id}/members/{member_id}")
@@ -1901,7 +1921,7 @@ def create_app(
             project_id,
             member_id,
             management_authorized=True,
-            request_id=request.state.request_id,
+            request_id=request.state.idempotency_request_id,
         )
 
     @app.get("/api/v1/projects/{project_id}/events")
@@ -2227,7 +2247,7 @@ def create_app(
             project_id,
             session_id,
             body.token,
-            request_id=request.state.request_id,
+            request_id=request.state.idempotency_request_id,
         )
 
     @app.post("/api/v1/projects/{project_id}/sync")
@@ -2241,7 +2261,7 @@ def create_app(
         return service.post_message(
             project_id,
             **body.model_dump(),
-            request_id=request.state.request_id,
+            request_id=request.state.idempotency_request_id,
         )
 
     @app.post("/api/v1/projects/{project_id}/events/{event_id}/acknowledge")
@@ -2256,7 +2276,7 @@ def create_app(
             event_id,
             body.session_id,
             body.token,
-            request_id=request.state.request_id,
+            request_id=request.state.idempotency_request_id,
         )
 
     @app.get("/api/v1/projects/{project_id}/tasks")
@@ -2324,7 +2344,7 @@ def create_app(
         return service.submit_task_intake(
             project_id,
             **body.model_dump(),
-            request_id=request.state.request_id,
+            request_id=request.state.idempotency_request_id,
         )
 
     @app.post("/api/v1/projects/{project_id}/task-intakes/{intake_id}/acknowledge")
@@ -2338,7 +2358,7 @@ def create_app(
             project_id,
             intake_id,
             **body.model_dump(),
-            request_id=request.state.request_id,
+            request_id=request.state.idempotency_request_id,
         )
 
     @app.post("/api/v1/projects/{project_id}/task-intakes/{intake_id}/reassign")
@@ -2360,7 +2380,7 @@ def create_app(
             intake_id,
             **payload,
             management_authorized=management,
-            request_id=request.state.request_id,
+            request_id=request.state.idempotency_request_id,
         )
 
     @app.post("/api/v1/projects/{project_id}/task-intakes/{intake_id}/define", status_code=201)
@@ -2374,7 +2394,7 @@ def create_app(
             project_id,
             intake_id,
             **body.model_dump(),
-            request_id=request.state.request_id,
+            request_id=request.state.idempotency_request_id,
         )
 
     @app.post("/api/v1/projects/{project_id}/tasks", status_code=201)
@@ -2384,7 +2404,7 @@ def create_app(
         return service.create_task(
             project_id,
             **body.model_dump(),
-            request_id=request.state.request_id,
+            request_id=request.state.idempotency_request_id,
         )
 
     @app.post("/api/v1/projects/{project_id}/tasks/{task_id}/claim")
@@ -2401,7 +2421,7 @@ def create_app(
             body.token,
             reclaim=body.reclaim,
             takeover=body.takeover,
-            request_id=request.state.request_id,
+            request_id=request.state.idempotency_request_id,
         )
 
     @app.post("/api/v1/projects/{project_id}/tasks/{task_id}/release")
@@ -2423,7 +2443,7 @@ def create_app(
             task_id,
             **payload,
             management_authorized=management,
-            request_id=request.state.request_id,
+            request_id=request.state.idempotency_request_id,
         )
 
     @app.post(
@@ -2445,7 +2465,7 @@ def create_app(
             task_id,
             **payload,
             management_authorized=management,
-            request_id=request.state.request_id,
+            request_id=request.state.idempotency_request_id,
         )
 
     @app.post(
@@ -2464,7 +2484,7 @@ def create_app(
             task_id,
             assignment_id,
             **body.model_dump(),
-            request_id=request.state.request_id,
+            request_id=request.state.idempotency_request_id,
         )
 
     @app.post(
@@ -2490,7 +2510,7 @@ def create_app(
             task_id,
             **payload,
             management_authorized=management,
-            request_id=request.state.request_id,
+            request_id=request.state.idempotency_request_id,
         )
 
     @app.post(
@@ -2509,7 +2529,7 @@ def create_app(
             task_id,
             handoff_id,
             **body.model_dump(),
-            request_id=request.state.request_id,
+            request_id=request.state.idempotency_request_id,
         )
 
     @app.patch("/api/v1/projects/{project_id}/tasks/{task_id}")
@@ -2529,7 +2549,7 @@ def create_app(
             task_id,
             **payload,
             management_authorized=management,
-            request_id=request.state.request_id,
+            request_id=request.state.idempotency_request_id,
         )
 
     @app.get("/api/v1/projects/{project_id}/leases")
@@ -2543,7 +2563,7 @@ def create_app(
         return service.acquire_lease(
             project_id,
             **body.model_dump(),
-            request_id=request.state.request_id,
+            request_id=request.state.idempotency_request_id,
         )
 
     @app.post("/api/v1/projects/{project_id}/leases/check")
@@ -2563,7 +2583,7 @@ def create_app(
             lease_id,
             body.session_id,
             body.token,
-            request_id=request.state.request_id,
+            request_id=request.state.idempotency_request_id,
         )
 
     @app.post("/api/v1/projects/{project_id}/tasks/{task_id}/reports", status_code=201)
@@ -2577,7 +2597,7 @@ def create_app(
             project_id,
             task_id,
             **body.model_dump(),
-            request_id=request.state.request_id,
+            request_id=request.state.idempotency_request_id,
         )
 
     @app.post("/api/v1/projects/{project_id}/tasks/{task_id}/reviews", status_code=201)
@@ -2591,7 +2611,7 @@ def create_app(
             project_id,
             task_id,
             **body.model_dump(),
-            request_id=request.state.request_id,
+            request_id=request.state.idempotency_request_id,
         )
 
     @app.post(
@@ -2616,7 +2636,7 @@ def create_app(
             task_id,
             **payload,
             management_authorized=management,
-            request_id=request.state.request_id,
+            request_id=request.state.idempotency_request_id,
         )
 
     @app.get("/api/v1/projects/{project_id}/knowledge/assets")
@@ -2644,7 +2664,7 @@ def create_app(
         return service.submit_knowledge_candidate(
             project_id,
             **body.model_dump(),
-            request_id=request.state.request_id,
+            request_id=request.state.idempotency_request_id,
         )
 
     @app.get("/api/v1/projects/{project_id}/knowledge/assets/{asset_id}")
@@ -2667,7 +2687,7 @@ def create_app(
             project_id,
             asset_id,
             **body.model_dump(),
-            request_id=request.state.request_id,
+            request_id=request.state.idempotency_request_id,
         )
 
     @app.post(
@@ -2683,7 +2703,7 @@ def create_app(
             project_id,
             asset_id,
             **body.model_dump(),
-            request_id=request.state.request_id,
+            request_id=request.state.idempotency_request_id,
         )
 
     @app.post("/api/v1/projects/{project_id}/knowledge/assets/{asset_id}/archive")
@@ -2697,7 +2717,7 @@ def create_app(
             project_id,
             asset_id,
             **body.model_dump(),
-            request_id=request.state.request_id,
+            request_id=request.state.idempotency_request_id,
         )
 
     web_dir = Path(__file__).with_name("web")
