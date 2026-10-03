@@ -118,7 +118,7 @@ def test_export_contains_every_report_and_review(tmp_path):
         f"report_{index}" for index in range(ROWS)
     ]
     assert len(exported["reviews"]) == ROWS
-    assert exported["export_schema_version"] == 2
+    assert exported["export_schema_version"] == 3
 
 
 def test_export_contains_every_acknowledgement(tmp_path):

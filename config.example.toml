@@ -79,6 +79,15 @@ test_entry_notes_max_length = 4000
 project_document_max_bytes = 262144
 # room_sync/Web snapshot reports/reviews/acks recent window (#183).
 snapshot_recent_limit = 200
+# Snapshot "right now" lists are bounded rather than paged: newest window first,
+# and the snapshot says so in lease_page_info/session_page_info (#359).
+snapshot_session_limit = 200
+snapshot_lease_limit = 200
+# Standalone lease listing bound; export ignores it (an archive keeps every row).
+lease_list_limit = 500
+# export_project returns at most this many events and declares the window under
+# window.events (#359).
+export_event_limit = 5000
 # Idempotency record retention in days; 0 = keep forever (#200).
 idempotency_retention_days = 30
 retention_sweep_interval_seconds = 3600.0
