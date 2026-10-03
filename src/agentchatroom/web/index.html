@@ -456,7 +456,7 @@
             <option value="advisory">提示并记录</option>
             <option value="pre_commit_block">提交前阻断</option>
           </select>
-          <small class="form-hint">生效时机：保存后立即生效 · 对谁生效：本项目的文件租约提交前检查（Agent 与管理端均适用）</small></label>
+          <small class="form-hint">生效时机：保存后立即生效 · 对谁生效：本项目的文件租约提交前检查（经 <code>POST /leases/check</code>，供管理端与接入方在提交前自查；MCP 工具面未暴露该检查）</small></label>
         <label>默认任务优先级
           <select id="settings-default-priority" title="创建任务时未显式指定优先级时使用的默认值。">
             <option value="0">P0 · 紧急</option>
