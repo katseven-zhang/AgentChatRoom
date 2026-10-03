@@ -487,6 +487,7 @@ function eventLabel(type) {
     "task.updated": "更新了任务", "task.blocked": "阻塞了任务",
     "task.intake_submitted": "提交了任务意图", "task.intake_acknowledged": "受理了任务意图",
     "task.intake_reassigned": "改派了任务意图", "task.intake_defined": "正式定义了任务",
+    "task.intake_cancelled": "撤销了任务意图",
     "task.unblocked": "解除了任务阻塞", "task.released": "释放了任务",
     "task.cancelled": "取消了任务", "lease.acquired": "占用了文件范围",
     "lease.released": "释放了文件范围", "lease.conflict": "检测到文件冲突",
@@ -787,14 +788,26 @@ function resetProjectFilters() {
 }
 
 function taskReleaseVisible(task) {
-  // 释放按钮只在可释放的执行阶段显示；终态与待验收阶段不换执行者。
-  return ["claimed", "in_progress", "blocked"].includes(task.execution_status);
+  // 释放只在领域判定为可释放时显示：服务端的 task_release 只接受
+  // claimed / in_progress / blocked 三个执行阶段。
+  return taskActionAvailable(task, "release", ["claimed", "in_progress", "blocked"].includes(task.execution_status));
 }
 
 function taskCancelVisible(task) {
-  // 取消入口与服务端状态转换表一致：done 是终态不可取消，已取消无需重复取消。
+  // 取消入口取服务端判定：done 是终态不可取消，已取消无需重复取消。
   const phase = taskView(task).phase;
-  return phase !== "done" && phase !== "cancelled";
+  return taskActionAvailable(task, "cancel", phase !== "done" && phase !== "cancelled");
+}
+
+// Which actions the service will accept for this task. The server publishes
+// `available_actions` per task; the local fallbacks only apply to a task
+// object that predates that field, so a stale snapshot can never hide a
+// control the domain actually accepts. Declared here (function declarations
+// hoist) so it travels with the two visibility rules it serves.
+function taskActionAvailable(task, action, fallback) {
+  const published = task?.available_actions;
+  if (Array.isArray(published)) return published.includes(action);
+  return fallback;
 }
 
 async function cancelTask(task) {
@@ -1621,10 +1634,13 @@ function taskNavigationEntries(tasks) {
     if (view.needs_attention) attentionIds.add(task.id);
   }
   counts.attention = attentionIds.size;
+  // 常驻导航组来自服务端发布的 groups；unclassified 只在有数据时追加，
+  // 因此这里显式排除它，而不是让前端的数组顺序决定谁常驻。
+  const residentGroups = (config?.groups || []).filter((group) => group !== "unclassified");
   const entries = [
     { key: "", label: "全部任务", count: tasks.length, kind: "reset" },
     { key: "attention", label: config?.attention_label || "需要处理", count: counts.attention || 0, kind: "attention" },
-    ...["claimable", "active", "review", "integration", "done", "cancelled"]
+    ...residentGroups
       .map((group) => ({ key: group, label: viewGroupLabel(group), count: counts[group] || 0, kind: "group" })),
   ];
   const unclassified = counts.unclassified || 0;
@@ -1643,11 +1659,13 @@ function activeSubgroupRank(phase) {
 function sortForEntry(tasks, entry) {
   const sorted = [...tasks];
   if (entry.key === "attention") {
-    const phaseOrder = { integration_failed: 0, changes_requested: 1, blocked: 2 };
+    // 收件箱排序用服务端发布的 attention_phases，顺序即其发布顺序。
+    const attentionOrder = taskViewConfig()?.attention_phase_order || ["integration_failed", "changes_requested", "blocked"];
+    const phaseOrder = Object.fromEntries(attentionOrder.map((phase, index) => [phase, index]));
     sorted.sort((left, right) => {
       const leftPhase = taskView(left).phase;
       const rightPhase = taskView(right).phase;
-      return (phaseOrder[leftPhase] ?? 9) - (phaseOrder[rightPhase] ?? 9);
+      return (phaseOrder[leftPhase] ?? 99) - (phaseOrder[rightPhase] ?? 99);
     });
     return sorted;
   }
@@ -1762,14 +1780,15 @@ function renderTaskExpertFilters(tasks) {
     .map((code) => `<option value="${escapeHtml(code)}" ${expert.phase === code ? "selected" : ""}>${escapeHtml(viewLabel(code))} (${phaseCounts[code] || 0})</option>`)
     .join("");
   const phases = taskViewConfig()?.phases || [];
-  const executionCodes = taskViewConfig()?.phases
-    ? ["todo", "claimed", "in_progress", "blocked", "completed", "cancelled"]
-    : [];
+  // 三个状态面的候选值取自服务端发布的标签表键集，顺序即发布顺序；
+  // 优先级区间同样由服务端发布，前端不再自己数 0..4。
+  const faceCodes = (kind) => Object.keys(taskViewConfig()?.[`${kind}_labels`] || {});
+  const priorityRange = taskViewConfig()?.task_priority_range || [];
   container.innerHTML = `
-    <label>执行<select data-expert="execution"><option value="">全部</option>${options("execution", executionCodes)}</select></label>
-    <label>验收<select data-expert="verification"><option value="">全部</option>${options("verification", ["not_required", "pending", "changes_requested", "approved"])}</select></label>
-    <label>集成<select data-expert="integration"><option value="">全部</option>${options("integration", ["pending", "done", "failed"])}</select></label>
-    <label>优先级<select data-expert="priority"><option value="">全部</option>${[0, 1, 2, 3, 4].map((value) => `<option value="${value}" ${expert.priority !== "" && String(expert.priority) === String(value) ? "selected" : ""}>P${value}</option>`).join("")}</select></label>
+    <label>执行<select data-expert="execution"><option value="">全部</option>${options("execution", faceCodes("execution"))}</select></label>
+    <label>验收<select data-expert="verification"><option value="">全部</option>${options("verification", faceCodes("verification"))}</select></label>
+    <label>集成<select data-expert="integration"><option value="">全部</option>${options("integration", faceCodes("integration"))}</select></label>
+    <label>优先级<select data-expert="priority"><option value="">全部</option>${priorityRange.map((value) => `<option value="${value}" ${expert.priority !== "" && String(expert.priority) === String(value) ? "selected" : ""}>P${value}</option>`).join("")}</select></label>
     <label>负责人<select data-expert="owner"><option value="">全部</option>${owners}</select></label>
     <label>任务号<input type="search" inputmode="numeric" placeholder="#号" data-expert="number" value="${escapeHtml(expert.number)}"></label>
     ${phases.length ? `<label>精确状态<select data-expert="phase"><option value="">全部</option>${phaseOptions(phases)}</select></label>` : ""}`;
@@ -1848,11 +1867,33 @@ function intakeTargetName(intake) {
   return target?.name || intake.target_member_id || "未指定 Agent";
 }
 
+function taskIntakeConfig() {
+  return state.config?.domain?.task_intake || null;
+}
+
 function taskIntakeStatus(status) {
-  return {
-    pending: "待 Agent 受理", accepted: "已受理待定义", defined: "已正式定义",
-    declined: "Agent 已拒绝", blocked: "受理受阻", cancelled: "已取消",
-  }[status] || status;
+  const labels = taskIntakeConfig()?.status_labels || {};
+  return labels[status] || status;
+}
+
+function taskIntakeActiveStatuses() {
+  const published = taskIntakeConfig()?.active_statuses;
+  return Array.isArray(published) ? published : ["pending", "accepted"];
+}
+
+// `cancelled` 是已发布的状态与服务端转移，但此前没有任何入口能写入它：
+// 一个目标 Agent 永不受理的意图会永远停在 pending。撤销入口按服务端转移
+// 表判定；`cancelled` 的自环只是幂等语义，不构成「仍可撤销」，所以已经
+// 撤销或已定义的条目不再显示入口。
+function taskIntakeCancellable(intake) {
+  if (intake.status === "cancelled") return false;
+  const transitions = taskIntakeConfig()?.transitions || {};
+  return (transitions[intake.status] || []).includes("cancelled");
+}
+
+function taskIntakeCancelButton(intake) {
+  if (!taskIntakeCancellable(intake)) return "";
+  return `<button type="button" class="link-button" data-intake-cancel-id="${escapeHtml(intake.id)}">撤销意图</button>`;
 }
 
 function taskIntakeTaskReference(intake) {
@@ -1865,12 +1906,12 @@ function taskIntakeTaskReference(intake) {
 }
 
 function renderTaskIntakes() {
-  const activeStatuses = new Set(["pending", "accepted"]);
+  const activeStatuses = new Set(taskIntakeActiveStatuses());
   const active = state.taskIntakes.filter((intake) => activeStatuses.has(intake.status));
   const archived = state.taskIntakes.filter((intake) => !activeStatuses.has(intake.status));
   const renderItem = (intake) => `
       <article class="task-intake-item">
-        <div class="task-intake-meta"><span class="status-badge ${escapeHtml(intake.status)}">${escapeHtml(taskIntakeStatus(intake.status))}</span><span class="secondary-text">受理 Agent：${escapeHtml(intakeTargetName(intake))}</span></div>
+        <div class="task-intake-meta"><span class="status-badge ${escapeHtml(intake.status)}">${escapeHtml(taskIntakeStatus(intake.status))}</span><span class="secondary-text">受理 Agent：${escapeHtml(intakeTargetName(intake))}</span>${taskIntakeCancelButton(intake)}</div>
         <p>${escapeHtml(intake.raw_description)}</p>
         ${intake.note ? `<small>${escapeHtml(intake.note)}</small>` : ""}
         ${taskIntakeTaskReference(intake)}
@@ -2730,6 +2771,25 @@ elements["task-cancel-button"].addEventListener("click", () => {
   cancelTask(task);
 });
 
+// 释放原因码与文案由服务端版本化配置给出；配置未到达时保留空占位，
+// 提交前的非空校验会拦住，不会发出一个服务端必然拒绝的原因码。
+function renderReleaseReasonOptions() {
+  const select = elements["task-release-reason"];
+  if (!select) return;
+  const labels = state.config?.domain?.task_release_reason_labels || {};
+  const codes = state.config?.domain?.task_release_reason_codes || [];
+  if (!codes.length) return;
+  const signature = codes.join("|");
+  if (select.dataset.reasonSignature === signature) return;
+  select.dataset.reasonSignature = signature;
+  select.innerHTML = [
+    '<option value="">选择原因…</option>',
+    ...codes.map(
+      (code) => `<option value="${escapeHtml(code)}">${escapeHtml(labels[code] || code)}</option>`,
+    ),
+  ].join("");
+}
+
 elements["task-release-button"].addEventListener("click", () => {
   const task = state.snapshot?.tasks.find((item) => item.id === state.editingTaskId);
   if (!task || !state.projectId) return;
@@ -2974,6 +3034,11 @@ elements["task-table"].addEventListener("click", (event) => {
 });
 
 elements["task-intake-list"].addEventListener("click", (event) => {
+  const cancelButton = event.target.closest("[data-intake-cancel-id]");
+  if (cancelButton) {
+    cancelTaskIntake(cancelButton.dataset.intakeCancelId).catch(handleError);
+    return;
+  }
   const button = event.target.closest("[data-task-id]");
   if (button) openTaskDetails(button.dataset.taskId).catch(handleError);
 });
@@ -3337,6 +3402,22 @@ elements["settings-form"].addEventListener("submit", async (event) => {
     if (submit) submit.disabled = false;
   }
 });
+
+async function cancelTaskIntake(intakeId) {
+  if (!state.projectId || !intakeId) return;
+  const intake = state.taskIntakes.find((item) => item.id === intakeId);
+  const confirmed = window.confirm(
+    "撤销后该任务意图不再进入受理流程，历史记录保留。确定要撤销吗？"
+    + (intake?.raw_description ? `\n\n${intake.raw_description}` : ""),
+  );
+  if (!confirmed) return;
+  await api(
+    `/api/v1/projects/${state.projectId}/task-intakes/${encodeURIComponent(intakeId)}/cancel`,
+    { method: "POST", body: JSON.stringify({}) },
+  );
+  await refreshTaskIntakeData();
+  showToast("任务意图已撤销");
+}
 
 elements["task-form"].addEventListener("submit", async (event) => {
   event.preventDefault();
@@ -4305,7 +4386,13 @@ async function openTaskDetails(taskId, options = {}) {
   }
   renderTaskContract(task);
   renderTaskAssignments(task);
-  elements["task-assign-button"].disabled = ["done", "cancelled"].includes(taskView(task).phase);
+  // 指派可用性取服务端 available_actions（服务端按 execution_status 拒绝
+  // completed / cancelled），不再按 phase 猜测。没有该字段的旧快照退回
+  // 与领域守卫同口径的本地判定。
+  const assignable = Array.isArray(task.available_actions)
+    ? task.available_actions.includes("assign")
+    : !["completed", "cancelled"].includes(task.execution_status);
+  elements["task-assign-button"].disabled = !assignable;
   elements["task-release-button"].classList.toggle("is-hidden", !taskReleaseVisible(task));
   elements["task-cancel-button"].classList.toggle("is-hidden", !taskCancelVisible(task));
   // showModal throws InvalidStateError when the dialog is already open.
@@ -4816,6 +4903,7 @@ function initializeAppearance() {
 
 function applyPublicConfig() {
   applyAppearanceTheme();
+  renderReleaseReasonOptions();
   elements["product-name"].textContent = state.config.product_name;
   document.title = state.config.product_name;
   const folderPickerEnabled = Boolean(state.config.capabilities?.local_folder_picker);

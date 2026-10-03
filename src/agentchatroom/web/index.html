@@ -424,12 +424,9 @@
         <p class="form-hint">释放将把任务退回待认领池，保留进度和证据，但清除当前所有权和活跃文件租约。</p>
         <label>释放原因
           <select id="task-release-reason" required>
+            <!-- 原因码与文案由服务端版本化配置渲染（见 renderReleaseReasonOptions），
+                 这里只保留空值占位以维持 required 的「必须选一项」语义。 -->
             <option value="">选择原因…</option>
-            <option value="quota_exhausted">额度耗尽</option>
-            <option value="agent_unavailable">Agent 不可用</option>
-            <option value="user_requested">用户请求</option>
-            <option value="reassignment_needed">需要改派</option>
-            <option value="other">其他</option>
           </select>
         </label>
         <label>详细说明 <textarea id="task-release-reason-text" rows="2" placeholder="可选，说明情况"></textarea></label>

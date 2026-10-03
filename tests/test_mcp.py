@@ -62,6 +62,7 @@ def test_mcp_exposes_standard_tool_set():
         "task_intake_get",
         "task_intake_acknowledge",
         "task_intake_reassign",
+        "task_intake_cancel",
         "task_define_from_intake",
         "audit_query",
         "member_list",

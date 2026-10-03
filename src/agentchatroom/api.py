@@ -64,14 +64,21 @@ from .contracts import (
     MODEL_DISPLAY_NAME_MAX_LENGTH,
     PROJECT_MEMBER_SCHEMA_VERSION,
     PROJECT_MEMBER_STATUSES,
+    TASK_ACTION_CODES,
     TASK_EXECUTION_STATUSES,
     TASK_INTEGRATION_STATUSES,
     TASK_INTAKE_STATUSES,
     TASK_INTAKE_TRANSITIONS,
     TASK_PHASES,
     TASK_PHASE_COMMANDS,
+    TASK_PRIORITY_MAX,
+    TASK_PRIORITY_MIN,
+    TASK_PRIORITY_RANGE,
+    TASK_RELEASE_EXECUTION_STATUSES,
+    TASK_RELEASE_REASON_CODES,
     TASK_VIEW_ALL_PHASES,
     TASK_VIEW_ATTENTION_PHASES,
+    TASK_VIEW_ATTENTION_PHASE_ORDER,
     TASK_VIEW_GROUP_CODES,
     TASK_VIEW_SCHEMA_VERSION,
     TASK_VERIFICATION_STATUSES,
@@ -191,6 +198,35 @@ TASK_VIEW_INTEGRATION_LABELS = {
     "done": "已集成",
     "failed": "集成失败",
 }
+# Action button wording for the codes contracts.task_available_actions emits.
+# Localized text belongs to this adapter, not to the domain projection.
+TASK_ACTION_BUTTON_LABELS = {
+    "assign": "指定 Agent",
+    "cancel": "取消任务",
+    "release": "释放任务",
+}
+# Intake status wording. Published next to the status codes so a client never
+# has to keep its own map for a vocabulary the service owns.
+TASK_INTAKE_LABELS = {
+    "pending": "待 Agent 受理",
+    "accepted": "已受理待定义",
+    "defining": "正在定义正式任务",
+    "defined": "已正式定义",
+    "declined": "Agent 已拒绝",
+    "blocked": "受理受阻",
+    "cancelled": "已取消",
+}
+# Intakes in these states still await the target Agent and belong in the
+# working list; the rest is archive.
+TASK_INTAKE_ACTIVE_STATUSES = ("pending", "accepted")
+# Release reason wording for TASK_RELEASE_REASON_CODES.
+TASK_RELEASE_REASON_LABELS = {
+    "quota_exhausted": "额度耗尽",
+    "agent_unavailable": "Agent 不可用",
+    "user_requested": "用户请求",
+    "reassignment_needed": "需要改派",
+    "other": "其他",
+}
 
 
 def task_view_presentation_config() -> dict[str, Any]:
@@ -202,11 +238,31 @@ def task_view_presentation_config() -> dict[str, Any]:
         "group_labels": dict(TASK_VIEW_GROUP_LABELS),
         "active_subgroup_order": list(TASK_VIEW_ACTIVE_SUBGROUP_ORDER),
         "attention_phases": sorted(TASK_VIEW_ATTENTION_PHASES),
-        "attention_label": TASK_VIEW_ATTENTION_LABEL,
+        # Severity order for the attention inbox, which is not alphabetical:
+        # an integration failure outranks a returned review, which outranks a
+        # plain block. Published separately so a client cannot have to
+        # re-derive the ranking the service already decided.
+        "attention_phase_order": list(TASK_VIEW_ATTENTION_PHASE_ORDER),        "attention_label": TASK_VIEW_ATTENTION_LABEL,
         "execution_labels": dict(TASK_VIEW_EXECUTION_LABELS),
         "verification_labels": dict(TASK_VIEW_VERIFICATION_LABELS),
         "integration_labels": dict(TASK_VIEW_INTEGRATION_LABELS),
         "status_labels": dict(TASK_VIEW_LEGACY_STATUS_LABELS),
+        "task_priority_range": list(TASK_PRIORITY_RANGE),
+        "action_codes": list(TASK_ACTION_CODES),
+        "action_labels": dict(TASK_ACTION_BUTTON_LABELS),
+    }
+
+
+def task_intake_presentation_config() -> dict[str, Any]:
+    return {
+        "statuses": sorted(TASK_INTAKE_STATUSES),
+        "status_labels": dict(TASK_INTAKE_LABELS),
+        "active_statuses": list(TASK_INTAKE_ACTIVE_STATUSES),
+        "transitions": {
+            status: sorted(next_states)
+            for status, next_states in TASK_INTAKE_TRANSITIONS.items()
+        },
+        "cancel_action": "task_intake_cancel",
     }
 
 
@@ -733,7 +789,9 @@ class MessageCreate(StrictModel):
     mentions: list[str] = Field(default_factory=list)
     files: list[str] = Field(default_factory=list)
     requires_ack: bool = False
-    priority: int = Field(default=2, ge=0, le=4)
+    priority: int = Field(
+        default=2, ge=TASK_PRIORITY_MIN, le=TASK_PRIORITY_MAX
+    )
     channel: Literal["public", "task", "review", "system"] = "public"
 
 
@@ -775,6 +833,12 @@ class TaskIntakeReassign(StrictModel):
     token: str | None = None
 
 
+class TaskIntakeCancel(StrictModel):
+    reason: str = ""
+    session_id: str | None = None
+    token: str | None = None
+
+
 class TaskIntakeDefine(StrictModel):
     session_id: str
     token: str
@@ -782,7 +846,9 @@ class TaskIntakeDefine(StrictModel):
     description: str = ""
     acceptance_criteria: list[str] = Field(default_factory=list)
     depends_on: list[str] = Field(default_factory=list)
-    priority: int = Field(default=2, ge=0, le=4)
+    priority: int = Field(
+        default=2, ge=TASK_PRIORITY_MIN, le=TASK_PRIORITY_MAX
+    )
     note: str = ""
 
 
@@ -1650,6 +1716,12 @@ def create_app(
                 "task_view": task_view_presentation_config(),
                 "task_history_schema_version": TASK_HISTORY_SCHEMA_VERSION,
                 "task_intake_statuses": sorted(TASK_INTAKE_STATUSES),
+                "task_intake": task_intake_presentation_config(),
+                "task_release_reason_codes": sorted(TASK_RELEASE_REASON_CODES),
+                "task_release_reason_labels": dict(TASK_RELEASE_REASON_LABELS),
+                "task_release_execution_statuses": sorted(
+                    TASK_RELEASE_EXECUTION_STATUSES
+                ),
                 "bootstrap_schema_version": BOOTSTRAP_SCHEMA_VERSION,
                 "bootstrap_states": list(BOOTSTRAP_STATES),
                 "bootstrap_required_actions": dict(REQUIRED_ACTIONS),
@@ -2468,6 +2540,28 @@ def create_app(
         if management:
             _require_management(request)
         return service.reassign_task_intake(
+            project_id,
+            intake_id,
+            **payload,
+            management_authorized=management,
+            request_id=request.state.idempotency_request_id,
+        )
+
+    @app.post("/api/v1/projects/{project_id}/task-intakes/{intake_id}/cancel")
+    def cancel_task_intake(
+        request: Request,
+        project_id: str,
+        intake_id: str,
+        body: TaskIntakeCancel,
+    ) -> dict[str, Any]:
+        _reject_credentials_in_query(request)
+        payload = body.model_dump()
+        # Same authority rule as reassign: withdrawing an intake is a
+        # management surface unless a real Session credential is presented.
+        management = not str(payload.get("session_id") or "").strip()
+        if management:
+            _require_management(request)
+        return service.cancel_task_intake(
             project_id,
             intake_id,
             **payload,

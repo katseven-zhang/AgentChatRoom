@@ -1024,9 +1024,28 @@ def test_web_task_view_harness_covers_state_triple_samples(tmp_path):
             "integration": "待集成", "done": "已完成", "cancelled": "已取消",
             "unclassified": "未归类",
         },
+        "groups": [
+            "claimable", "active", "review", "integration", "done", "cancelled",
+            "unclassified",
+        ],
         "attention_phases": ["blocked", "changes_requested", "integration_failed"],
+        "attention_phase_order": ["integration_failed", "changes_requested", "blocked"],
         "attention_label": "需要处理",
         "active_subgroup_order": ["changes_requested", "blocked", "in_progress", "claimed"],
+        "task_priority_range": [0, 1, 2, 3, 4],
+        "execution_labels": {
+            "todo": "\u5f85\u5f00\u59cb", "claimed": "\u5df2\u8ba4\u9886",
+            "in_progress": "\u6267\u884c\u4e2d", "blocked": "\u963b\u585e",
+            "completed": "\u6267\u884c\u5b8c\u6210", "cancelled": "\u5df2\u53d6\u6d88",
+        },
+        "verification_labels": {
+            "not_required": "\u65e0\u9700\u9a8c\u8bc1", "pending": "\u5f85\u9a8c\u8bc1",
+            "changes_requested": "\u9700\u4fee\u6539", "approved": "\u5df2\u901a\u8fc7",
+        },
+        "integration_labels": {
+            "pending": "\u5f85\u96c6\u6210", "done": "\u5df2\u96c6\u6210",
+            "failed": "\u96c6\u6210\u5931\u8d25",
+        },
     }
 
     sample_triples = [
@@ -1829,9 +1848,28 @@ def test_web_task_events_synchronize_navigation_and_table_counts(tmp_path):
                     "claimable": "待认领", "active": "进行中", "review": "待验收", "integration": "待集成",
                     "done": "已完成", "cancelled": "已取消", "unclassified": "未归类",
                 },
+                "groups": [
+                    "claimable", "active", "review", "integration", "done", "cancelled",
+                    "unclassified",
+                ],
                 "attention_phases": ["blocked", "changes_requested", "integration_failed"],
+                "attention_phase_order": ["integration_failed", "changes_requested", "blocked"],
                 "attention_label": "需要处理",
                 "active_subgroup_order": ["changes_requested", "blocked", "in_progress", "claimed"],
+                "task_priority_range": [0, 1, 2, 3, 4],
+                "execution_labels": {
+                    "todo": "\u5f85\u5f00\u59cb", "claimed": "\u5df2\u8ba4\u9886",
+                    "in_progress": "\u6267\u884c\u4e2d", "blocked": "\u963b\u585e",
+                    "completed": "\u6267\u884c\u5b8c\u6210", "cancelled": "\u5df2\u53d6\u6d88",
+                },
+                "verification_labels": {
+                    "not_required": "\u65e0\u9700\u9a8c\u8bc1", "pending": "\u5f85\u9a8c\u8bc1",
+                    "changes_requested": "\u9700\u4fee\u6539", "approved": "\u5df2\u901a\u8fc7",
+                },
+                "integration_labels": {
+                    "pending": "\u5f85\u96c6\u6210", "done": "\u5df2\u96c6\u6210",
+                    "failed": "\u96c6\u6210\u5931\u8d25",
+                },
             }
         }
     }
