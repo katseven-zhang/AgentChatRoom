@@ -28,7 +28,17 @@ def _paths(tmp_path: Path) -> serverctl.DeploymentPaths:
         "AGENTCHATROOM_EXTERNAL_BASE_URL=https://room.internal\n",
         encoding="utf-8",
     )
-    (deploy / "compose.yaml").write_text("services: {}\n", encoding="utf-8")
+    # The config mount is what backup/restore address by container path, so a
+    # fixture without it is not a realistic deployment (#326).
+    (deploy / "compose.yaml").write_text(
+        "services://n"
+        "  room://n"
+        "    environment://n"
+        f"      AGENTCHATROOM_CONFIG: {serverctl.CONTAINER_CONFIG_PATH}\n"
+        "    volumes://n"
+        f"      - ./config.server.toml:{serverctl.CONTAINER_CONFIG_PATH}:ro\n",
+        encoding="utf-8",
+    )
     (deploy / "config.server.toml").write_text("[application]\n", encoding="utf-8")
     return serverctl.resolve_paths(repo_root=tmp_path)
 
