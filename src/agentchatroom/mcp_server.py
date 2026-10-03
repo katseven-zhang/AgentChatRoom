@@ -1604,7 +1604,12 @@ def message_post(
     channel: str = "public",
     request_id: str = "",
 ) -> dict[str, Any]:
-    """Post a message with the client-visible model used for this response."""
+    """Post a message with the client-visible model used for this response.
+
+    kind is one of message, decision or blocker. The system kind is reserved for
+    the operator: it never enters an Agent's context, so an Agent may not
+    choose it and hide a message from its peers.
+    """
     try:
         _authorize_remote(project_id, "message:write")
     except DomainError as error:

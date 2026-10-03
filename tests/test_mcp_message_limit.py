@@ -111,14 +111,13 @@ def test_mcp_context_filtering_and_boundaries(service, project, joined_agents):
         token=executor["token"],
     )
 
-    # 4. Add system message
+    # 4. An operator notice on the system channel. An Agent may not post this
+    # kind (it would be invisible to every peer), so it goes through the
+    # operator path, which carries no Agent Session.
     service.post_message(
         project["id"],
         body="System broadcast",
         kind="system",
-        session_id=executor["agent"]["id"],
-        token=executor["token"],
-        model_display_name="system",
     )
 
     # 5. Add 12 valid agent messages of mixed types
@@ -246,6 +245,91 @@ def test_mcp_cursor_and_repeated_sync(service, project, joined_agents):
     )
     assert len(third_sync["events"]) == 2
     assert [ev["project_seq"] for ev in third_sync["events"]] == [new_msg1["event_id"], new_msg2["event_id"]]
+
+
+def test_an_agent_may_not_post_a_kind_its_peers_can_never_see(
+    service, project, joined_agents
+):
+    """`system` is reserved for the operator, so no Agent can hide a message.
+
+    `system` is not in MCP_CONTEXT_EVENT_TYPES, so a message posted under that
+    kind reaches the audit log but no other Agent's context window, ever. Any
+    Agent could therefore post a blocker or a warning that the rest of the room
+    silently never receives. The kinds an Agent may use are exactly the ones
+    every other Agent can read, which is what makes the refusal below correct
+    rather than merely restrictive.
+    """
+    executor, reviewer = joined_agents
+    with pytest.raises(DomainError) as refused:
+        service.post_message(
+            project["id"],
+            body="BLOCKER: stop merging, production is down",
+            kind="system",
+            session_id=executor["agent"]["id"],
+            token=executor["token"],
+            model_display_name="test-model",
+        )
+    assert refused.value.code == "agent_may_not_post_system_message"
+    # The refusal names the alternative, so a client can recover without
+    # guessing, and it lists exactly the kinds that are peer-visible.
+    assert refused.value.details["agent_visible_kinds"] == [
+        "blocker",
+        "decision",
+        "message",
+    ]
+    assert refused.value.details["required_action"] == "post_message_decision_or_blocker"
+
+    # Nothing was written: a refused post must not leave a trace that reads as
+    # if the warning had been delivered.
+    assert not any(
+        event["event_type"] == "message.system"
+        and "production is down" in ((event.get("payload") or {}).get("body") or "")
+        for event in service.list_events(project["id"], after=0)["events"]
+    )
+
+    # A blocker - the kind the refused post should have used - is accepted and
+    # does reach the other Agent's context. This is the half that proves the
+    # rule keeps the legitimate path open.
+    blocker = service.post_message(
+        project["id"],
+        body="BLOCKER: stop merging, production is down",
+        kind="blocker",
+        session_id=executor["agent"]["id"],
+        token=executor["token"],
+        model_display_name="test-model",
+    )
+    seen = service.room_sync(
+        project["id"],
+        session_id=reviewer["agent"]["id"],
+        token=reviewer["token"],
+        mcp_context=True,
+        initial_inject=True,
+    )
+    assert any(event["id"] == blocker["event_id"] for event in seen["events"])
+
+
+def test_the_operator_may_still_post_the_system_kind(service, project):
+    """The operator path is unchanged: it posts without an Agent Session.
+
+    The reservation is about accountability, not about removing the kind. An
+    operator post is attributable to the deployment rather than to a peer
+    Session that any Agent could speak as, so it stays allowed - and it lands
+    on the system channel, out of the Agent context window by design.
+    """
+    posted = service.post_message(
+        project["id"],
+        body="Operator maintenance window at 22:00",
+        kind="system",
+    )
+    event = next(
+        item
+        for item in service.list_events(project["id"], after=0)["events"]
+        if item["id"] == posted["event_id"]
+    )
+    assert event["event_type"] == "message.system"
+    assert event["channel"] == "system"
+    # No Agent Session is behind it, so no Agent can be the author.
+    assert event["actor_session_id"] is None
 
 
 def test_configuration_precedence(monkeypatch, tmp_path, service, project, joined_agents):
@@ -412,14 +496,12 @@ def test_room_bootstrap_message_projection(monkeypatch, service, project_dir):
         model="test-model",
     )
 
-    # Post system message and 8 agent messages
+    # Post an operator system message and 8 agent messages. The system kind is
+    # operator-only, so it carries no Agent Session.
     service.post_message(
         project["id"],
         body="System warning",
         kind="system",
-        session_id=joined["agent"]["id"],
-        token=joined["token"],
-        model_display_name="system",
     )
     for i in range(8):
         service.post_message(

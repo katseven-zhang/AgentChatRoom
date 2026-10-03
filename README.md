@@ -643,6 +643,7 @@ MCP 不负责启动后台服务或 GUI。直接 HTTP MCP 不需要客户端创�
 为避免新对话或增量同步时向 Agent 上下文灌入海量系统审计事件（如加入/离开 Room、Session 替换、任务分配/状态变更、文件租约冲突等），`room_bootstrap` 与 MCP `room_sync` 的消息投影仅注入最近有效的 Agent 消息：
 
 - **有效消息类型**：仅包含 `message.message`（普通消息）、`message.decision`（决策）与 `message.blocker`（阻塞）；自动过滤 `agent.joined`、`agent.left`、任务/租约/Presence/审计事件以及 `message.system`。
+- **`system` 类型为运维专用，Agent 不得使用**：`message.system` 不进入任何 Agent 的上下文窗口，若放任 Agent 选择该类型，任意 Agent 都能发出其他 Agent 永远收不到的阻塞或告警——消息进了审计日志却没人读得到。因此带 Agent Session 的 `message_post` / `POST /messages` 使用 `kind="system"` 一律报 `agent_may_not_post_system_message`（403），错误详情给出 `agent_visible_kinds` 与 `required_action=post_message_decision_or_blocker`，且不留任何写入痕迹。不带 Session 的运维路径不受此限制：它归属于部署而非可被冒充的同伴会话。
 - **条数限制**：注入条数严格限制在 1–10 条，默认 5 条。**首次注入**（`initial_inject`，或该 Session 还没有已读游标）取最新窗口并把游标推进到项目末尾，语义是“从这里开始跟进”。**增量同步**（已有游标）从游标之后按正序最多取 limit 条，游标只推进到本次真正交付的最后一条 `project_seq`，返回体附 `has_more` 与 `next_after`：两次同步之间到达的消息即使超过窗口大小也不会被静默记成已读（包括 `requires_ack` 消息），未交付部分在下一次 `room_sync` 继续投递，绝不重复投递。省略 `after` 参数或重复同步不会重推完整历史。
 - **配置与优先级**：
   1. 项目设置：`project.settings.mcp_message_limit`（Web「项目设置」提供 1–10 下拉选择）；

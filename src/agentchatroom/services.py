@@ -5406,6 +5406,30 @@ class AgentChatRoomService:
     ) -> dict[str, Any]:
         if kind not in MESSAGE_KINDS:
             raise DomainError("invalid_message_kind", "Unsupported message kind")
+        if kind == "system" and session_id:
+            # `system` never enters an Agent's context window
+            # (MCP_CONTEXT_EVENT_TYPES), so letting an Agent choose it lets any
+            # Agent write a message the rest of the room can never see - a
+            # blocker or a warning that silently reaches nobody. The kind is
+            # reserved for the operator path, which posts without an Agent
+            # Session and is accountable to the deployment rather than to a
+            # peer that can be impersonated.
+            raise DomainError(
+                "agent_may_not_post_system_message",
+                "The system kind is reserved for the operator; Agents post "
+                "message, decision or blocker, all of which every other Agent "
+                "can see",
+                status_code=403,
+                details={
+                    "requested_kind": kind,
+                    "agent_visible_kinds": sorted(
+                        kind
+                        for kind in MESSAGE_KINDS
+                        if kind != "system"
+                    ),
+                    "required_action": "post_message_decision_or_blocker",
+                },
+            )
         if not body.strip():
             raise DomainError("empty_message", "Message body is required")
         if len(body) > self.settings.message_max_body_length:
