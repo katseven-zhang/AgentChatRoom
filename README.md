@@ -430,6 +430,10 @@ HTTP 同一路径匹配多个项目或多个 roots 中混有无法解析的路�
 
 `--client` 的取值直接来自 `integrations.MCP_CLIENT_PROFILES`，与 `GET /api/v1/integrations/mcp` 返回的 `profiles` 同源：新增一个客户端只需加一个 profile，CLI 与页面下拉都会自动出现，不必各自维护一份名字表。`--client` 在 `local-stdio`、`remote-bridge`、`streamable-http` 三种 transport 下都打印该客户端 profile 自己的配置（`local_config_text` / `remote_bridge_config_text` / `streamable_http_config_text`），并按该客户端自己的格式输出（JSON 或 TOML），产物可直接解析。旧的 `--format workbuddy-json|grok-toml|codex-toml` 作为 `--client` 的别名保留，输出逐字节相同。其中 `AGENTCHATROOM_SOFTWARE_KEY`、`AGENTCHATROOM_SOFTWARE_NAME`、`AGENTCHATROOM_SOFTWARE_CLIENT` 是这个 profile 的真实身份，不以 `<` 开头，因此写进客户端后可以被 `room_bootstrap` 接受。它们不再走带占位身份的顶层 `generic_json` / `codex_toml` / `grok_toml`：顶层的 `codex_toml` 与 `grok_toml` 是同一份通用 TOML 模板（等同 `generic_toml_text`），并非各客户端的真实产物，真实产物只在 `profiles[*]` 下。`generic-json` 仍是待填写的通用模板，身份占位符必须换成用户确认的名称后才能连接。远程 Bridge 与 HTTP 配置里的项目凭据位置仍然是待粘贴的凭据槽，因为 `mcp-config` 执行时还没有签发凭据。
 
+接入提示词由服务端单一生成器产出（`integrations.build_onboarding_prompt` 与 `integrations.build_issued_credential_prompt`），Web 只负责把本次签发的真实凭据包提交给 `POST /projects/{id}/integrations/mcp/issued-prompt` 并原样显示，不在浏览器里再拼一份——两份副本曾导致 `service_unavailable` 约束只存在于其中一份。
+
+占位符指引按槽位类型区分：软件身份占位符（`<stable-software-key>` / `<Software name>` / `<software-client-code>`）才提示替换为用户确认的显示名称；凭据占位符 `<paste-issued-project-credential-bundle>` 提示替换为本次签发的完整凭据包（`acrb.v1.*`），并明确不能替换为显示名称。写成 `Bearer WorkBuddy` 时客户端侧无从发现（`bootstrap` 只拒绝以 `<` 开头的身份值，值本身合法），只会陷入一个不可读的 401 循环。提示词中的配置位置是解析后的真实路径（复用本机配置助手的同一套 root+parts 解析），不是留给 Agent 自行展开的 `%APPDATA%` 模式串；stdio 迁移提示词的第 3 步也改用与其它 HTTP 提示词一致的 `room_bootstrap(project_name=...)` 变体，而不是无参形式。
+
 开发期 stdio 入口推荐：
 
 ```powershell

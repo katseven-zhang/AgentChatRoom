@@ -53,7 +53,12 @@ def test_web_add_project_issues_without_pasting_raw_config():
     # 提交路径不再读取粘贴文本：增量分支仅限加入本项目。
     assert "请粘贴客户端当前使用的 agentchatroom HTTP 配置" not in javascript
     assert ".required = isAddProject" not in javascript
-    assert "incrementalHttpPrompt(" in javascript
+    # #358: the incremental prompt comes from the server generator, so the
+    # browser only has to name the mode and pass the freshly issued bundle.
+    assert "loadIssuedServerPrompt(" in javascript
+    assert 'loadIssuedServerPrompt(setup, profileId, "add_project")' in javascript
+    assert "function incrementalHttpPrompt(" not in javascript
+    assert "integrations/mcp/issued-prompt" in javascript
     assert "incremental: true" in javascript
     assert 'if (setup.mode !== "add_project") {' in javascript
 
@@ -400,8 +405,16 @@ def test_web_bootstrap_and_phase_one_local_agent_hooks_are_complete():
     assert 'id="token-config-value"' in markup
     assert "签发并生成接入提示词" in markup
     assert '<section class="integration-section onboarding-section" hidden>' in markup
-    assert "project_name_${index + 1}" in javascript
-    assert "project_token_${index + 1}" in javascript
+    # #358: the per-Project mapping is built by the generator, which is also
+    # where the credentials are encoded; the browser sends them as data.
+    integrations_source = (WEB_DIR.parent / "integrations.py").read_text(
+        encoding="utf-8"
+    )
+    assert "project_name_{index}=" in integrations_source
+    assert "project_token_{index}=" in integrations_source
+    assert "project_credentials: validateProjectCredentials(setup.projectCredentials)" in (
+        javascript
+    )
     # #143：占位配置复述与冗余禁令从提示词移除。
     assert "不要命名为 agentchatroom-stdio" not in javascript
     assert 'payload.host_key = "<stable-host-key>"' not in javascript
@@ -798,8 +811,13 @@ def test_web_supports_human_reading_and_guided_interactions():
     assert "Token 未更换" in javascript
     assert "不关联；首次连接时按下面填写的显示名称自动创建成员" in javascript
     assert 'elements["token-agent-name"].value' in javascript
-    # #143：提示词 3 步结构与放大的结果展示。
-    assert "重启或重新加载客户端 MCP" in javascript
+    # #143：提示词 3 步结构与放大的结果展示。#358：结构由服务端生成器保证，
+    # 浏览器原样显示服务端返回的文本。
+    integrations_source = (WEB_DIR.parent / "integrations.py").read_text(
+        encoding="utf-8"
+    )
+    assert "2. 写入后重启或重新加载客户端 MCP，使配置生效。" in integrations_source
+    assert 'elements["token-config-value"].textContent = result.prompt;' in javascript
     assert "本工作区固定 bootstrap 参数" not in javascript
     assert 'id="token-config-value" class="code-block secret-block"' in markup
     assert 'class="primary-button integration-cta copy-button" type="button" data-copy-target="token-config-value"' in markup

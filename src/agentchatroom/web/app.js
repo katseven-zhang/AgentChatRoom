@@ -4,6 +4,7 @@ const state = {
   integrationFormat: "generic",
   integrationOnboardingMode: "first_setup",
   integrationTransport: "http",
+  issuedPromptRequest: 0,
   pendingHttpSetup: null,
   issuedHttpSetup: null,
   integrationLocalPlan: null,
@@ -3772,9 +3773,14 @@ function showIssuedHttpResult(setup) {
   if (!elements["token-secret-dialog"].open) elements["token-secret-dialog"].showModal();
 }
 
-function renderIssuedHttpConfig() {
+// 签发后的提示词由服务端单一生成器产出（integrations
+// .build_issued_credential_prompt）。Web 只负责把本次签发的真实凭据包传上去，
+// 并把结果原样显示：两份手写副本曾导致 service_unavailable 约束只存在于其中
+// 一份，且把凭据槽描述成"替换为显示名称"。
+async function renderIssuedHttpConfig() {
   const setup = state.issuedHttpSetup;
-  const profile = setup?.profiles?.[elements["token-config-format"].value];
+  const profileId = elements["token-config-format"].value;
+  const profile = setup?.profiles?.[profileId];
   if (!profile) return;
   if (setup.mode === "reconnect") {
     elements["token-config-heading"].textContent = "恢复连接提示词";
@@ -3792,20 +3798,51 @@ function renderIssuedHttpConfig() {
     elements["token-config-heading"].textContent = "增量接入提示词（交给已配置的 Agent）";
     elements["token-config-copy"].textContent = "复制增量提示词";
     elements["token-config-hint"].textContent = "包含新 Project Token 明文，只整体复制给已配置过 agentchatroom 的那个 Agent；Agent 会在客户端本地保留旧配置并自行合并，不要发送到 Room、日志或仓库。";
-    elements["token-config-value"].textContent = incrementalHttpPrompt(profile, setup);
-    elements["token-config-path"].textContent = `${profile.config_path_hint || "客户端 MCP 配置"}；MCP Server 标准名称：agentchatroom（Agent 更新现有条目，不新增）`;
+    elements["token-config-value"].textContent = "正在生成接入提示词…";
+    elements["token-config-path"].textContent = `${profile.resolved_config_path || profile.config_path_hint || "客户端 MCP 配置"}；MCP Server 标准名称：agentchatroom（Agent 更新现有条目，不新增）`;
     elements["token-config-projects"].textContent = setup.projectPath
       ? `目标 Project：${setup.projectName}（工作区：${setup.projectPath}）；客户端原有 Project 凭据由 Agent 在本地保留`
       : `目标 Project：${setup.projectName}；客户端原有 Project 凭据由 Agent 在本地保留`;
+    await loadIssuedServerPrompt(setup, profileId, "add_project");
     return;
   }
   elements["token-config-heading"].textContent = "完整 HTTP 接入提示词";
   elements["token-config-copy"].textContent = "复制完整提示词";
   elements["token-config-hint"].textContent = "内容包含 Project 与 Token 的明文对应关系，只交给负责配置该客户端的 Agent；不要发送到 Room、日志或仓库。";
-  elements["token-config-value"].textContent = issuedHttpPrompt(profile, setup);
-  elements["token-config-path"].textContent = `${profile.config_path_hint || "客户端 MCP 配置"}；MCP Server 标准名称：agentchatroom`;
+  elements["token-config-value"].textContent = "正在生成接入提示词…";
+  elements["token-config-path"].textContent = `${profile.resolved_config_path || profile.config_path_hint || "客户端 MCP 配置"}；MCP Server 标准名称：agentchatroom`;
   const projectPathHint = setup.projectPath ? `（当前工作区：${setup.projectPath}）` : "";
   elements["token-config-projects"].textContent = `已包含 ${setup.projectCredentials.length} 个 Project：${setup.projectCredentials.map((item) => item.name).join("、")}${projectPathHint}`;
+  await loadIssuedServerPrompt(setup, profileId, "first_setup");
+}
+
+// 提示词请求带代次校验：切换客户端或关闭弹窗后到达的旧响应整份丢弃，不会把
+// 上一个客户端的提示词显示到当前对话框里。
+async function loadIssuedServerPrompt(setup, profileId, mode) {
+  const projectId = setup?.projectId || state.projectId;
+  const requestId = ++state.issuedPromptRequest;
+  try {
+    const result = await api(`/api/v1/projects/${projectId}/integrations/mcp/issued-prompt`, {
+      method: "POST",
+      body: JSON.stringify({
+        profile_id: profileId,
+        mode,
+        project_name: setup.projectName || "",
+        project_credentials: validateProjectCredentials(setup.projectCredentials),
+        software_identity: normalizedSoftwareIdentity(setup.softwareIdentity),
+        linked_member_name: setup.member?.name || "",
+      }),
+    });
+    if (requestId !== state.issuedPromptRequest) return;
+    if (elements["token-config-format"].value !== profileId) return;
+    elements["token-config-value"].textContent = result.prompt;
+    state.issuedHttpSetup.generatedConfigText = result.config_text;
+  } catch (error) {
+    if (requestId !== state.issuedPromptRequest) return;
+    elements["token-config-value"].textContent =
+      "接入提示词生成失败，请重新签发或更新服务后重试。未生成任何配置。";
+    handleError(error);
+  }
 }
 
 const PROJECT_CREDENTIAL_BUNDLE_PREFIX = "acrb.v1.";
@@ -4002,121 +4039,6 @@ function mergeProjectCredentials(existing, added) {
   const merged = existing.filter((item) => item.name.toLocaleLowerCase() !== incoming.name.toLocaleLowerCase());
   merged.push(incoming);
   return validateProjectCredentials(merged);
-}
-
-function issuedHttpPrompt(profile, setup) {
-  const projectCredentials = validateProjectCredentials(setup.projectCredentials);
-  const config = issuedHttpConfig(profile, projectCredentials, setup.softwareIdentity);
-  const mode = setup.mode === "add_project" ? "add_project" : "first_setup";
-  const bootstrapProjectName = String(setup.projectName || "").trim();
-  const projectPath = String(setup.projectPath || "").trim();
-  const modeLabel = mode === "add_project" ? "已配置软件，加入本项目" : "首次配置软件";
-  const mapping = projectCredentials.flatMap((item, index) => [
-    `project_name_${index + 1}=${JSON.stringify(item.name)}`,
-    `project_token_${index + 1}=${JSON.stringify(item.token)}`,
-  ]).join("\n");
-  const targetProjectLine = projectPath
-    ? `目标 Project：${bootstrapProjectName}（本地工作区根目录 root_path: ${projectPath}）`
-    : `目标 Project：${bootstrapProjectName}`;
-  const verifyStep = projectPath
-    ? `3. 在目标 Project 本地工作区（${projectPath}）中调用 room_bootstrap(project_name=${JSON.stringify(bootstrapProjectName)})，核对返回的 Project 名称与 root_path 与当前工作区一致，再执行写操作。`
-    : `3. 调用 room_bootstrap(project_name=${JSON.stringify(bootstrapProjectName)})，核对返回的 Project 名称与 root_path 与当前工作区一致，再执行写操作。`;
-  // #143：极简 3 步结构——写入配置 -> 重启/重载 MCP -> bootstrap 核对。
-  return [
-    `请完成 AgentChatRoom HTTP MCP 接入（${modeLabel}）。${targetProjectLine}。`,
-    "",
-    "Project 与 Token 对应关系（按名称保留，不得混用）：",
-    mapping,
-    "",
-    "1. 把下面的 MCP 配置写入客户端（服务器名固定 agentchatroom；客户端格式不同时只转换语法，保留 URL、Authorization 与软件身份字段）：",
-    "",
-    config,
-    "",
-    "2. 写入后重启或重新加载客户端 MCP，使配置生效。",
-    verifyStep,
-    "",
-    "不要把 Token 发布到 Room、日志或仓库。",
-  ].join("\n");
-}
-
-function incrementalHttpPrompt(profile, setup) {
-  const credential = validateProjectCredentials(setup.projectCredentials)[0];
-  const projectName = String(setup.projectName || credential.name).trim();
-  const projectPath = String(setup.projectPath || "").trim();
-  const configHint = profile.config_path_hint || "客户端 MCP 配置文件";
-  const linkedIdentity = setup.member
-    ? normalizedSoftwareIdentity(setup.softwareIdentity)
-    : null;
-  const identityLine = linkedIdentity
-    ? `本次 Token 已关联成员 ${JSON.stringify(setup.member.name)}：现有配置的软件身份 Header 若存在，三字段必须与 Key=${JSON.stringify(linkedIdentity.softwareKey)} 的身份一致。`
-    : "本次 Token 未关联成员：原样保留客户端现有的软件身份三字段。";
-  const targetProjectLine = projectPath
-    ? `目标 Project：${projectName}（本地工作区根目录 root_path: ${projectPath}）`
-    : `目标 Project：${projectName}`;
-  const verifyStep = projectPath
-    ? `3. 在目标 Project 本地工作区（${projectPath}）中调用 room_bootstrap(project_name=${JSON.stringify(projectName)})，核对返回的 Project 名称与 root_path 与当前工作区一致，再执行写操作；无法读取本地配置时停止并向用户报告。`
-    : `3. 调用 room_bootstrap(project_name=${JSON.stringify(projectName)})，核对返回的 Project 名称与 root_path 与当前工作区一致，再执行写操作；无法读取本地配置时停止并向用户报告。`;
-  // #143：极简 3 步——合并凭据 -> 重启/重载 MCP -> bootstrap 核对。
-  return [
-    "该客户端已配置过 agentchatroom HTTP MCP。请把本次签发的新 Project 凭据增量合并进现有配置；不新建第二个 agentchatroom 连接器。",
-    "",
-    targetProjectLine,
-    "",
-    "本次签发凭据：",
-    `project_name_1=${JSON.stringify(credential.name)}`,
-    `project_token_1=${JSON.stringify(credential.token)}`,
-    `合并条目：{"name": ${JSON.stringify(credential.name)}, "token": ${JSON.stringify(credential.token)}}`,
-    "",
-    identityLine,
-    "",
-    `1. 打开客户端现有 agentchatroom 条目（配置位置参考：${configHint}），保留其 url、Authorization 凭据包与软件身份字段，把上面的 {"name":...,"token":...} 合并进 acrb.v1 凭据包后写回同一条目。`,
-    "2. 保存后重启或重新加载客户端 MCP。",
-    verifyStep,
-    "",
-    "不要把 Token 发布到 Room、日志或仓库。",
-  ].join("\n");
-}
-
-function issuedHttpConfig(profile, projectCredentials, softwareIdentity) {
-  let config = profile.streamable_http_config_text || "";
-  const bundle = encodeProjectCredentialBundle(projectCredentials);
-  const identity = normalizedSoftwareIdentity(softwareIdentity);
-  if (!identity) throw new Error("HTTP 接入配置缺少软件身份");
-  // Only the one-time result dialog receives this text. It is never stored in
-  // shared integration state, browser storage, Room messages, or logs.
-  if (profile.format === "json") {
-    const parsed = JSON.parse(config);
-    for (const server of Object.values(parsed.mcpServers || {})) {
-      server.headers.Authorization = `Bearer ${bundle}`;
-      server.headers["X-AgentChatRoom-Software-Key"] = encodeHttpIdentityHeaderValue(identity.softwareKey);
-      server.headers["X-AgentChatRoom-Software-Name"] = encodeHttpIdentityHeaderValue(identity.softwareName);
-      server.headers["X-AgentChatRoom-Software-Client"] = encodeHttpIdentityHeaderValue(identity.softwareClient);
-    }
-    return JSON.stringify(parsed, null, 2);
-  }
-  const authorization = `Authorization = ${JSON.stringify(`Bearer ${bundle}`)}`;
-  const identityHeaders = {"X-AgentChatRoom-Software-Key": encodeHttpIdentityHeaderValue(identity.softwareKey),
-    "X-AgentChatRoom-Software-Name": encodeHttpIdentityHeaderValue(identity.softwareName),
-    "X-AgentChatRoom-Software-Client": encodeHttpIdentityHeaderValue(identity.softwareClient)};
-  for (const [key, value] of Object.entries(identityHeaders)) {
-      const line = `${key} = ${JSON.stringify(value)}`;
-      const existing = new RegExp(`^${key} = .*$`, "m");
-      if (existing.test(config)) {
-        config = config.replace(existing, () => line);
-      } else {
-        config = config.replace(
-          /(\[mcp_servers\.[^\]\n]+\.(?:http_headers|headers)\])/,
-          `$1\n${line}`,
-        );
-      }
-  }
-  config = config.replace(/^bearer_token_env_var = .*\r?\n/gm, "");
-  if (/^Authorization = /m.test(config)) {
-    config = config.replace(/^Authorization = .*$/m, () => authorization);
-  } else {
-    config = config.replace(/(\[mcp_servers\.[^\]\n]+\.(?:http_headers|headers)\])/, `$1\n${authorization}`);
-  }
-  return config;
 }
 
 function handleError(error) {

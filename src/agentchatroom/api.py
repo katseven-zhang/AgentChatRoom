@@ -28,7 +28,7 @@ from .config import Settings, build_service_base_url, load_settings, rewrite_con
 from .database import create_database
 from .desktop import DirectoryPickerUnavailable, pick_directory
 from .errors import DomainError
-from .integrations import build_mcp_integration
+from .integrations import build_issued_credential_prompt, build_mcp_integration
 from .local_mcp import LocalMcpConfigurator
 from .runtime_log import tail_text_lines
 from .mcp_server import (
@@ -831,6 +831,22 @@ class TaskIntakeReassign(StrictModel):
     note: str = ""
     session_id: str | None = None
     token: str | None = None
+
+
+class McpIssuedPrompt(StrictModel):
+    """Body for the post-issuance handoff prompt.
+
+    Carries the freshly issued secrets, so this is a management-only,
+    write-audit-free read: nothing here is persisted, and the caller displays
+    the result exactly once.
+    """
+
+    profile_id: str
+    mode: str = "first_setup"
+    project_name: str = ""
+    project_credentials: list[dict[str, str]]
+    software_identity: dict[str, str]
+    linked_member_name: str = ""
 
 
 class TaskIntakeCancel(StrictModel):
@@ -1761,6 +1777,40 @@ def create_app(
         return build_mcp_integration(
             resolved,
             project=service.get_project(project_id),
+        )
+
+    @app.post("/api/v1/projects/{project_id}/integrations/mcp/issued-prompt")
+    def issued_mcp_prompt(
+        request: Request, project_id: str, body: McpIssuedPrompt
+    ) -> dict[str, Any]:
+        """Generate the handoff prompt for freshly issued Project credentials.
+
+        The single generator for every prompt handed out after issuance. The
+        browser used to assemble its own copy, which is how the
+        `service_unavailable` constraint ended up in one prompt and not the
+        other, and how the credential slot came to be described as a display
+        name in one of them. Issued secrets stay in this response: nothing is
+        persisted, and the caller shows it once.
+        """
+        _require_management(request)
+        project = service.get_project(project_id)
+        integration = build_mcp_integration(resolved, project=project)
+        profile = integration["profiles"].get(body.profile_id)
+        if profile is None:
+            raise DomainError(
+                "mcp_profile_unknown",
+                "The requested MCP client profile does not exist",
+                status_code=404,
+            )
+        return build_issued_credential_prompt(
+            body.profile_id,
+            profile,
+            mode=body.mode,
+            project_name=body.project_name or str(project.get("name") or ""),
+            root_path=str(project.get("root_path") or ""),
+            project_credentials=body.project_credentials,
+            software_identity=body.software_identity,
+            linked_member_name=body.linked_member_name,
         )
 
     def local_mcp_profile(
