@@ -447,7 +447,7 @@ HTTP 同一路径匹配多个项目或多个 roots 中混有无法解析的路�
 
 Agent Session Token 与 access token 只能放在 JSON 请求体、`Authorization: Bearer` 头，或客户端本地安全配置 / 环境变量中。不得把这些凭据放进 URL 路径、查询参数、Referer、access log、代理日志、消息正文、项目规则或 Git。`release_lease` 等敏感操作必须走请求体或请求头，不能把 `session_id` 或 `token` 拼进查询字符串。服务端 access log 会对 `token=`、`Bearer`、`Authorization` 和 Cookie 值脱敏；脱敏不能替代正确的传输方式。未来使用的远程 Token 同样只允许放在客户端安全配置或环境变量中。
 
-**脱敏只有一套策略。** `agentchatroom.redaction` 是唯一来源：敏感键名并集、唯一替换标记 `[REDACTED]`、文本模式与结构遍历器都在这里。此前 API 日志过滤、GUI 日志尾窗、任务历史投影、运行时绑定转储、请求字段守卫与 PostgreSQL 工具包装各有一套，键名互不包含（9 / 10 / 7 条，无一为超集）且替换标记大小写不一，同一个秘密在不同入口渲染成 `[redacted]` 与 `[REDACTED]`，无法统一断言或过滤。现 `services.SENSITIVE_REQUEST_FIELDS` 别名共享键集，`bootstrap` 与 `task_history` 共用同一遍历器。
+**脱敏只有一套策略。** `agentchatroom.redaction` 是唯一来源：敏感键名并集、唯一替换标记 `[REDACTED]`、文本模式与结构遍历器都在这里。此前 API 日志过滤、GUI 日志尾窗、任务历史投影、运行时绑定转储、请求字段守卫与 PostgreSQL 工具包装各有一套，键名互不包含（9 / 10 / 7 条，无一为超集）且替换标记大小写不一，同一个秘密在不同入口渲染成 `[redacted]` 与 `[REDACTED]`，无法统一断言或过滤。现 `services.SENSITIVE_REQUEST_FIELDS` 别名共享键集，`bootstrap` 与 `task_history` 共用同一遍历器。**落盘脱敏挂在 handler 上，不只挂在具名 logger。** Python 只在「记录来源 logger」上执行 `Logger.filters`，子 logger（`agentchatroom.api`、`agentchatroom.services`）向父级 handler 传递时不会重跑父级 filter——所以应用自身的记录（尤其是 `.exception()` 带出的连接串 traceback）曾原文写入 `server.log`，而管理页另有展示层脱敏兜底，造成「屏上安全、盘上不安全」。现在过滤器同时挂在写盘 handler 与 root logger 上（handler 是所有记录的必经关口），并额外处理 `exc_info`：`logger.exception` 的正文不在 `msg` 里而在 `exc_text`，只改 `msg` 覆盖不到。脱敏本身**收敛**：已替换的 `[REDACTED]` 在规则运行期间被停靠为哨兵，各规则写出哨兵而非标记本身，因此不会出现第二条规则匹配到第一条的输出、也不会重复追加标记（GUI 会重渲染历史日志行，无界的追加会把它保护的文件撑大）。
 
 **两种文本强度是刻意保留的，不要合并**：
 

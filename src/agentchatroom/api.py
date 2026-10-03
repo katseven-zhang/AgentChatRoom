@@ -12,6 +12,7 @@ import re
 import secrets
 import threading
 import time
+import traceback
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, Callable, Literal, Mapping
@@ -404,7 +405,16 @@ class BackupRestoreRequest(StrictModel):
     allow_data_loss: bool = False
 
 
-_CREDENTIAL_VALUE = r"[^\s,;}\]&\"']+"
+# A credential value: any run of characters that is not whitespace, a
+# separator, a closing bracket, a quote, or the "[" that opens this policy's
+# own marker. Excluding "[" is what makes redaction idempotent - without it a
+# value that already reads "[REDACTED]" is matched again and the trailing "]"
+# is left behind as "[REDACTED]]".
+_CREDENTIAL_VALUE = r"[^\s,;}\]&\"'\[]+"
+
+# Stand-in for the marker while the rules run. It contains a NUL, which no
+# rule's value class accepts, so a rule cannot match another rule's output.
+_REDACTION_SENTINEL = "\x00redacted\x00"
 
 
 def redact_log_line(line: str) -> str:
@@ -413,49 +423,68 @@ def redact_log_line(line: str) -> str:
     Keeps operational context while masking authorization/bearer/cookie/token
     assignments, provider API keys (sk-/ghp_/gho_/xox*), and bare ``acr.*``
     Agent Token literals so server.log, admin_runtime, and GUI tails match.
+
+    Redaction is idempotent: a value this policy already replaced is left
+    alone, because the assignment rules would otherwise read
+    "token=[REDACTED]" as a fresh value and append another "[REDACTED]".
+    Existing markers are parked before the rules run and restored after, so a
+    line mixing an already-masked value with a real secret still has the
+    secret masked.
     """
+    # Everything this policy already replaced is parked behind a sentinel for
+    # the duration, and every rule below writes the sentinel rather than the
+    # marker itself. Two rules can then never see each other's output: the
+    # second cookie rule used to fire on what the first one had just produced,
+    # yielding "cookie:[REDACTED][REDACTED]".
+    # Only the marker is parked, never the blanks in front of it: a value
+    # pattern starting at the space in "cookie: [REDACTED]" would consume the
+    # separator and rewrite the line as "cookie:[REDACTED]" on every pass.
+    redacted = line.replace("[REDACTED]", _REDACTION_SENTINEL)
     redacted = re.sub(
-        r"(?i)(authorization\s*[:=]\s*)[^\r\n]+",
-        r"\1[REDACTED]",
-        line,
-    )
-    redacted = re.sub(
-        r"(?i)(bearer\s+)" + _CREDENTIAL_VALUE,
-        r"\1[REDACTED]",
+        r"(?i)(authorization[ \t]*[:=][ \t]*)[^\r\n\x00]+",
+        r"\1" + _REDACTION_SENTINEL,
         redacted,
     )
     redacted = re.sub(
-        r"(?i)(cookie\s*[:=]\s*)[^\r\n]+",
-        r"\1[REDACTED]",
+        r"(?i)(bearer\s+)" + _CREDENTIAL_VALUE,
+        r"\1" + _REDACTION_SENTINEL,
+        redacted,
+    )
+    redacted = re.sub(
+        r"(?i)(cookie[ \t]*[:=][ \t]*)[^\r\n\x00]+",
+        r"\1" + _REDACTION_SENTINEL,
         redacted,
     )
     redacted = re.sub(
         r"(?i)((?:^|[;,\s])[a-z0-9_-]*cookie[a-z0-9_-]*\s*[:=]\s*)"
         + _CREDENTIAL_VALUE,
-        r"\1[REDACTED]",
+        r"\1" + _REDACTION_SENTINEL,
         redacted,
     )
     redacted = re.sub(
         r"(?i)(token|secret|password|api[_-]?key)(\s*[:=]\s*)" + _CREDENTIAL_VALUE,
-        r"\1\2[REDACTED]",
+        r"\1\2" + _REDACTION_SENTINEL,
         redacted,
     )
     redacted = re.sub(
         r"\bsk-(?:proj-|svcacct-)?[A-Za-z0-9_-]{8,}\b",
-        "[REDACTED]",
+        _REDACTION_SENTINEL,
         redacted,
     )
     redacted = re.sub(
         r"\b(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{20,}\b",
-        "[REDACTED]",
+        _REDACTION_SENTINEL,
         redacted,
     )
     redacted = re.sub(
         r"\bxox[baprs]-[A-Za-z0-9-]{10,}\b",
-        "[REDACTED]",
+        _REDACTION_SENTINEL,
         redacted,
     )
-    return re.sub(r"\bacr\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b", "[REDACTED]", redacted)
+    redacted = re.sub(
+        r"\bacr\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b", _REDACTION_SENTINEL, redacted
+    )
+    return redacted.replace(_REDACTION_SENTINEL, "[REDACTED]")
 
 
 # Internal alias so existing call sites and tests keep one name while the
@@ -480,11 +509,53 @@ class CredentialRedactingLogFilter(logging.Filter):
                     key: _redact_log_line(value) if isinstance(value, str) else value
                     for key, value in record.args.items()
                 }
+        self._redact_exception(record)
         return True
+
+    @staticmethod
+    def _redact_exception(record: logging.LogRecord) -> None:
+        """Redact a formatted traceback attached to the record.
+
+        ``logger.exception(...)`` keeps the text out of ``msg`` and puts it in
+        ``exc_info``; the handler formats that only when it emits. A failing
+        database call is exactly where a connection string ends up in the
+        traceback, and it is only ever seen here - no ``msg`` rewrite reaches
+        it. The redacted text is pushed back onto the record so the formatter
+        uses it instead of the original.
+        """
+        exc_info = getattr(record, "exc_info", None)
+        if not exc_info:
+            return
+        # Already handled by a filter upstream: the tuple is gone, and
+        # re-formatting would append a second traceback.
+        if not isinstance(exc_info, tuple):
+            return
+        try:
+            text = "".join(traceback.format_exception(*exc_info))
+        except Exception:
+            # Never let redaction break logging itself.
+            return
+        if not text:
+            return
+        record.exc_text = _redact_log_line(text)
 
 
 def install_credential_log_redaction() -> None:
-    """Attach credential redaction to server loggers once per process."""
+    """Redact credentials on the way to every handler that writes server.log.
+
+    A filter attached to a *logger* only runs for records logged through that
+    exact logger. The application logs through ``agentchatroom.api`` and
+    ``agentchatroom.services``, which are children of ``agentchatroom``: their
+    records reach a parent handler without the parent's ``Logger.filters``
+    being consulted, so a traceback carrying a connection string landed in
+    server.log verbatim. The display path had its own redaction, which is why
+    this stayed invisible on screen and unsafe on disk.
+
+    Handlers are the choke point every record passes on its way to a file, so
+    that is where redaction belongs. The named loggers are kept as well: a
+    logger without a handler of its own has no other place to apply this, and
+    keeping them costs one extra pass on an already-redacted message.
+    """
     log_filter = CredentialRedactingLogFilter()
     for name in ("uvicorn", "uvicorn.access", "uvicorn.error", "agentchatroom"):
         logger = logging.getLogger(name)
@@ -493,6 +564,27 @@ def install_credential_log_redaction() -> None:
             for existing in logger.filters
         ):
             logger.addFilter(log_filter)
+        for handler in logger.handlers:
+            _attach_redaction(handler, log_filter)
+    # A record can reach the root logger's handlers with none of the above
+    # filters on its own logger, which is the case for a library logging under
+    # its own namespace. Redact there too rather than trust the caller.
+    _attach_redaction(logging.getLogger(), log_filter)
+
+
+def _attach_redaction(
+    handler: logging.Handler, log_filter: CredentialRedactingLogFilter
+) -> None:
+    """Add the redacting filter to one handler, once per handler."""
+    if any(
+        isinstance(existing, CredentialRedactingLogFilter)
+        for existing in handler.filters
+    ):
+        return
+    # handler filters run last, after the record is fully formatted, so they
+    # see exception tracebacks and %-style args that a logger-level filter
+    # can miss.
+    handler.addFilter(log_filter)
 
 
 def _reject_credentials_in_query(request: Request) -> None:
