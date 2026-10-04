@@ -13,7 +13,13 @@ def test_packaged_mcp_failure_exits_without_visible_error_window():
     from pathlib import Path
     root = Path(__file__).resolve().parents[1]
     executable = Path(os.environ.get('AGENTCHATROOM_TEST_EXE', str(root / 'dist/agentchatroom/agentchatroom.exe')))
-    if not executable.is_file():
+    probe_script = root / 'evidence/probe_packaged_mcp.py'
+    # The probe lives under evidence/, which is untracked by design (#311/#370:
+    # local acceptance artefacts stay out of the repository). A checkout can
+    # therefore have the packaged executable without the probe; without this
+    # guard the skip never fired and the test failed on the missing script
+    # instead of reporting "not runnable here".
+    if not executable.is_file() or not probe_script.is_file():
         pytest.skip('Packaged executable not available')
     result = subprocess.run(
         [sys.executable, str(root / 'evidence/probe_packaged_mcp.py'), str(executable)],

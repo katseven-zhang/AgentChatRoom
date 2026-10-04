@@ -29,7 +29,15 @@ SECRET = "acr.credential_abc123def456.SECRETVALUE"
 
 @pytest.fixture()
 def sink():
-    """A file-like handler that records exactly what would hit server.log."""
+    """A file-like handler that records exactly what would hit server.log.
+
+    The tests below deliberately rewire the ``agentchatroom.services`` logger
+    (propagate off, this handler on) and add a filter to its parent. Loggers
+    are process-global singletons, so every mutation is restored on teardown —
+    otherwise later tests in the same run silently lose that logger's records
+    (``test_task_view``'s caplog assertion saw zero warnings under the .venv
+    pytest because propagation stayed off).
+    """
     buffer = io.StringIO()
 
     class Capture(logging.Handler):
@@ -39,7 +47,15 @@ def sink():
     handler = Capture()
     handler.setFormatter(logging.Formatter("%(message)s"))
     handler.addFilter(CredentialRedactingLogFilter())
-    return handler, buffer
+    child = logging.getLogger("agentchatroom.services")
+    parent = logging.getLogger("agentchatroom")
+    child_state = (child.propagate, list(child.handlers), child.level)
+    parent_filters = list(parent.filters)
+    yield handler, buffer
+    child.propagate, saved_handlers, saved_level = child_state
+    child.handlers = list(saved_handlers)
+    child.setLevel(saved_level)
+    parent.filters = list(parent_filters)
 
 
 def test_a_child_logger_record_is_redacted_on_the_way_out(sink):
