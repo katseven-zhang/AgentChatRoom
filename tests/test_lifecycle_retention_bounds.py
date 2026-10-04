@@ -588,5 +588,7 @@ def test_the_workspace_itself_is_still_written_for_a_refused_rename(
         local_path=str(tmp_path / "beta"),
     )
 
-    paths = {entry["local_path"] for entry in service.list_workspaces(second["id"])}
+    # #255: local_path is the canonical identity key; the caller-typed text
+    # the rename test cares about lives in display_path.
+    paths = {entry["display_path"] for entry in service.list_workspaces(second["id"])}
     assert paths == {str(tmp_path / "beta")}

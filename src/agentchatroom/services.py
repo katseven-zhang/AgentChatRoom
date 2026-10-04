@@ -2341,13 +2341,6 @@ class AgentChatRoomService:
     def _workspace_dict(self, row: Mapping[str, Any]) -> dict[str, Any]:
         data = dict(row)
         data["metadata"] = json_load(data.pop("metadata_json"), {})
-        # The stored local_path is the canonical identity key (#255); the string
-        # the caller typed is what listings and the API have always shown, so the
-        # projection swaps the display form back in and exposes the key beside it.
-        display = str(data.pop("display_path", "") or "")
-        if display:
-            data["path_key"] = str(data.get("local_path", ""))
-            data["local_path"] = display
         return data
 
     def _task_intake_dict(self, row: Mapping[str, Any]) -> dict[str, Any]:

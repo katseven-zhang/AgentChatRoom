@@ -1283,7 +1283,9 @@ def test_api_manages_agent_tokens_and_workspaces(settings, project_dir):
         )
         assert registered.status_code == 201
         assert registered.json()["host"]["host_key"] == "desktop-fingerprint"
-        assert registered.json()["workspace"]["local_path"] == "D:/work/project"
+        workspace = registered.json()["workspace"]
+        assert workspace["local_path"] == "d:\work\project"
+        assert workspace["display_path"] == "D:/work/project"
         workspaces = client.get(
             f"/api/v1/projects/{project['id']}/workspaces"
         ).json()["workspaces"]
