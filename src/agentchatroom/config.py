@@ -71,6 +71,10 @@ CONFIG_FILE_SCHEMA: dict[str, dict[str, tuple[type, ...]]] = {
         "test_entry_notes_max_length": (int,),
         "project_document_max_bytes": (int,),
         "snapshot_recent_limit": (int,),
+        "snapshot_session_limit": (int,),
+        "snapshot_lease_limit": (int,),
+        "lease_list_limit": (int,),
+        "export_event_limit": (int,),
         "idempotency_retention_days": (int,),
         "retention_sweep_interval_seconds": (int, float),
     },
@@ -296,6 +300,17 @@ class Settings:
     test_entry_notes_max_length: int = 4000
     project_document_max_bytes: int = 262144
     snapshot_recent_limit: int = 200
+    # The snapshot's "what is true right now" lists are bounded too: a Project
+    # accumulates one Session per agent process and one lease row per release
+    # forever, so an unbounded read of either only ever grew.
+    snapshot_session_limit: int = 200
+    snapshot_lease_limit: int = 200
+    # Standalone lease listing (REST/MCP) bound for the same reason; the export
+    # deliberately ignores it because an archive must include released leases.
+    lease_list_limit: int = 500
+    # export_project returns at most this many events and declares the window it
+    # actually returned under `window.events`.
+    export_event_limit: int = 5000
     idempotency_retention_days: int = 30
     retention_sweep_interval_seconds: float = 3600.0
 
@@ -448,6 +463,14 @@ def _merge_toml(path: Path) -> dict[str, Any]:
         "snapshot_recent_limit": raw.get("coordination", {}).get(
             "snapshot_recent_limit"
         ),
+        "snapshot_session_limit": raw.get("coordination", {}).get(
+            "snapshot_session_limit"
+        ),
+        "snapshot_lease_limit": raw.get("coordination", {}).get(
+            "snapshot_lease_limit"
+        ),
+        "lease_list_limit": raw.get("coordination", {}).get("lease_list_limit"),
+        "export_event_limit": raw.get("coordination", {}).get("export_event_limit"),
         "idempotency_retention_days": raw.get("coordination", {}).get(
             "idempotency_retention_days"
         ),
@@ -843,6 +866,30 @@ def load_settings(
                 file_values.get("snapshot_recent_limit", 200),
             )
         ),
+        "snapshot_session_limit": int(
+            os.getenv(
+                "AGENTCHATROOM_SNAPSHOT_SESSION_LIMIT",
+                file_values.get("snapshot_session_limit", 200),
+            )
+        ),
+        "snapshot_lease_limit": int(
+            os.getenv(
+                "AGENTCHATROOM_SNAPSHOT_LEASE_LIMIT",
+                file_values.get("snapshot_lease_limit", 200),
+            )
+        ),
+        "lease_list_limit": int(
+            os.getenv(
+                "AGENTCHATROOM_LEASE_LIST_LIMIT",
+                file_values.get("lease_list_limit", 500),
+            )
+        ),
+        "export_event_limit": int(
+            os.getenv(
+                "AGENTCHATROOM_EXPORT_EVENT_LIMIT",
+                file_values.get("export_event_limit", 5000),
+            )
+        ),
         "idempotency_retention_days": int(
             os.getenv(
                 "AGENTCHATROOM_IDEMPOTENCY_RETENTION_DAYS",
@@ -868,6 +915,14 @@ def load_settings(
         raise ValueError("project_document_max_bytes must be positive")
     if values["snapshot_recent_limit"] <= 0:
         raise ValueError("snapshot_recent_limit must be positive")
+    for bounded_lease_read in (
+        "snapshot_session_limit",
+        "snapshot_lease_limit",
+        "lease_list_limit",
+        "export_event_limit",
+    ):
+        if values[bounded_lease_read] <= 0:
+            raise ValueError(f"{bounded_lease_read} must be positive")
     if values["idempotency_retention_days"] < 0:
         raise ValueError("idempotency_retention_days must be >= 0")
     if values["retention_sweep_interval_seconds"] < 1:

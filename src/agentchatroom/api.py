@@ -28,6 +28,7 @@ from .config import Settings, build_service_base_url, load_settings, rewrite_con
 from .database import create_database
 from .desktop import DirectoryPickerUnavailable, pick_directory
 from .errors import DomainError
+from .event_hub import CLOSED, TIMEOUT, ProjectEventHub
 from .integrations import build_mcp_integration
 from .local_mcp import LocalMcpConfigurator
 from .runtime_log import tail_text_lines
@@ -191,6 +192,15 @@ TASK_VIEW_INTEGRATION_LABELS = {
     "done": "已集成",
     "failed": "集成失败",
 }
+# Snapshot page cursors are `created_at|id` (`created_at|event_id|session_id`
+# for acknowledgements), so three bounded segments fit comfortably. The query
+# string is length-checked before it reaches the domain so an oversized cursor
+# is a 422 like any other malformed one, instead of an unbounded string walked
+# segment by segment.
+SNAPSHOT_CURSOR_MAX_LENGTH = 256
+# An idle Room still has to prove the connection is alive to proxies and to the
+# browser's EventSource, so a stream with nothing new says so on this interval.
+SSE_HEARTBEAT_SECONDS = 15.0
 
 
 def task_view_presentation_config() -> dict[str, Any]:
@@ -1301,6 +1311,7 @@ def create_app(
                         yield
         finally:
             http_presence_manager.stop()
+            event_hub.stop()
             auto_backup_stop.set()
             if auto_backup_worker is not None:
                 auto_backup_worker.join(timeout=5)
@@ -1451,6 +1462,15 @@ def create_app(
     sse_limiter = SSELimiter(
         max_per_project=resolved.max_sse_clients_per_project,
         max_per_ip=resolved.sse_per_ip_limit,
+    )
+    # One poller per Project behind every SSE connection (#359). The fetch runs
+    # on the hub's own thread, so sync SQLite never lands on the event loop —
+    # the same rule as the per-connection poller this replaces (#184).
+    event_hub = ProjectEventHub(
+        lambda project_id, after, limit: service.list_events(
+            project_id, after=after, limit=limit
+        ),
+        poll_interval_seconds=lambda: resolved.sse_poll_interval_seconds,
     )
     login_rate_limiter = LoginRateLimiter(
         max_failures=resolved.management_login_max_failures,
@@ -1920,9 +1940,14 @@ def create_app(
         return result
 
     @app.get("/api/v1/projects/{project_id}/export")
-    def export_project(project_id: str) -> JSONResponse:
+    def export_project(
+        project_id: str,
+        # Bounded window, declared rather than silent: the payload carries
+        # window.events with the total and whether anything was left out (#359).
+        event_limit: int | None = Query(None, ge=1, le=1_000_000),
+    ) -> JSONResponse:
         return JSONResponse(
-            service.export_project(project_id),
+            service.export_project(project_id, event_limit=event_limit),
             headers={
                 "Content-Disposition": (
                     f'attachment; filename="agentchatroom-{project_id}.json"'
@@ -1934,12 +1959,16 @@ def create_app(
     def project_snapshot(
         project_id: str,
         response: Response,
-        reports_before: str | None = Query(None),
-        reports_after: str | None = Query(None),
-        reviews_before: str | None = Query(None),
-        reviews_after: str | None = Query(None),
-        acknowledgements_before: str | None = Query(None),
-        acknowledgements_after: str | None = Query(None),
+        reports_before: str | None = Query(None, max_length=SNAPSHOT_CURSOR_MAX_LENGTH),
+        reports_after: str | None = Query(None, max_length=SNAPSHOT_CURSOR_MAX_LENGTH),
+        reviews_before: str | None = Query(None, max_length=SNAPSHOT_CURSOR_MAX_LENGTH),
+        reviews_after: str | None = Query(None, max_length=SNAPSHOT_CURSOR_MAX_LENGTH),
+        acknowledgements_before: str | None = Query(
+            None, max_length=SNAPSHOT_CURSOR_MAX_LENGTH
+        ),
+        acknowledgements_after: str | None = Query(
+            None, max_length=SNAPSHOT_CURSOR_MAX_LENGTH
+        ),
     ) -> dict[str, Any]:
         response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
         response.headers["Pragma"] = "no-cache"
@@ -2059,30 +2088,45 @@ def create_app(
 
         async def event_stream():
             cursor = after
-            idle_ticks = 0
+            idle_seconds = 0.0
+            # One poller per Project, not per connection (#359). The hub reads
+            # the event log once per interval and hands the result to every
+            # live subscriber, so 64 EventSources cost one SELECT instead of 64.
+            subscriber = event_hub.subscribe(project_id, after)
             try:
                 yield ": connected\n\n"
+                interval = max(0.01, resolved.sse_poll_interval_seconds)
                 while not await request.is_disconnected():
-                    # Sync SQLite must not run on the event loop (#184).
-                    result = await asyncio.to_thread(
-                        service.list_events, project_id, after=cursor, limit=200
-                    )
-                    if result["events"]:
-                        for event in result["events"]:
-                            # SSE id / Last-Event-ID use project_seq (same space as ?after=).
-                            cursor = event["project_seq"]
-                            payload = json.dumps(
-                                event, ensure_ascii=False, separators=(",", ":")
-                            )
-                            yield f"id: {cursor}\nevent: room_event\ndata: {payload}\n\n"
-                        idle_ticks = 0
-                    else:
-                        idle_ticks += 1
-                        if idle_ticks * resolved.sse_poll_interval_seconds >= 15:
+                    item = subscriber.get(interval)
+                    if item is CLOSED:
+                        break
+                    if item is TIMEOUT:
+                        # Nothing new. The heartbeat keeps proxies and the
+                        # browser from treating an idle Room as a dead one.
+                        idle_seconds += interval
+                        if idle_seconds >= SSE_HEARTBEAT_SECONDS:
                             yield ": heartbeat\n\n"
-                            idle_ticks = 0
-                    await asyncio.sleep(resolved.sse_poll_interval_seconds)
+                            idle_seconds = 0.0
+                        await asyncio.sleep(0)
+                        continue
+                    idle_seconds = 0.0
+                    if subscriber.dropped:
+                        # Fell too far behind to hold the backlog. End the
+                        # stream so the client reconnects with Last-Event-ID,
+                        # rather than skipping events it never got to read.
+                        yield ": resync\n\n"
+                        break
+                    # SSE id / Last-Event-ID use project_seq (same space as
+                    # ?after=), so a reconnect resumes exactly where this
+                    # stream stopped.
+                    cursor = int(item["project_seq"])
+                    payload = json.dumps(
+                        item, ensure_ascii=False, separators=(",", ":")
+                    )
+                    yield f"id: {cursor}\nevent: room_event\ndata: {payload}\n\n"
+                    await asyncio.sleep(0)
             finally:
+                event_hub.unsubscribe(subscriber)
                 release_slot()
 
         class _EnsureCloseStreamingResponse(StreamingResponse):

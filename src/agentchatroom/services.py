@@ -202,6 +202,60 @@ def _sql_placeholders(count: int) -> str:
     return ",".join("?" for _ in range(count))
 
 
+# SQLite's default SQLITE_MAX_VARIABLE_NUMBER is 999; batching an ``IN`` list
+# under that cap keeps the same statement working on both backends.
+_SQL_PARAMETER_CHUNK = 400
+
+
+# Snapshot page cursors are `created_at|id` (`created_at|event_id|session_id`
+# for acknowledgements). Each segment is bounded and shape-checked before it
+# reaches SQL or `int()`: the cursor arrives from a query string, and a segment
+# count alone let `<ts>|x|y` through to a ValueError inside the projection.
+_PAGE_CURSOR_MAX_PART_LENGTH = 64
+_PAGE_CURSOR_TIMESTAMP_LENGTH = 32
+_PAGE_CURSOR_SEQ_LENGTH = 19
+_PAGE_CURSOR_IDENTIFIER_CHARS = frozenset(
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-."
+)
+_DECIMAL_DIGITS = frozenset("0123456789")
+
+
+def _invalid_page_cursor(cursor: str) -> DomainError:
+    return DomainError(
+        "invalid_page_cursor",
+        "Snapshot page cursor must be created_at|id (acks add event_id|session_id)",
+        status_code=422,
+        details={"cursor": cursor[:256]},
+    )
+
+
+def _page_cursor_part_ok(part: str, kind: str) -> bool:
+    """Whether one cursor segment matches the shape its position is used with."""
+    if kind == "timestamp":
+        # Stored created_at is iso_now(), so the cursor carries an ISO instant.
+        # It is compared as text, but it must also be a real instant: a garbage
+        # timestamp silently pages from a boundary that never existed.
+        if len(part) > _PAGE_CURSOR_TIMESTAMP_LENGTH:
+            return False
+        try:
+            parse_time(part)
+        except (ValueError, TypeError):
+            return False
+        return True
+    if kind == "seq":
+        # project_seq is a non-negative integer, and `_fetch_ack_page` compares
+        # it numerically after `int()`.
+        if not part or len(part) > _PAGE_CURSOR_SEQ_LENGTH:
+            return False
+        return set(part) <= _DECIMAL_DIGITS
+    # identifier: an opaque row/session key. It is compared for equality, so the
+    # only requirements are that it is a bounded token free of `|` (guaranteed
+    # by the split), whitespace and control characters.
+    if not part or len(part) > _PAGE_CURSOR_MAX_PART_LENGTH:
+        return False
+    return set(part) <= _PAGE_CURSOR_IDENTIFIER_CHARS
+
+
 class TokenTouchBuffer:
     """Queue last_used_at updates so token verification stays on a read path."""
 
@@ -1498,17 +1552,52 @@ class AgentChatRoomService:
         # 对外事件编号统一为 project_seq；物理主键 id 仅作存储内部标识。
         return int(row["project_seq"])
 
-    def _event_dict(
-        self, row: Mapping[str, Any], connection: Any | None = None
-    ) -> dict[str, Any]:
-        data = dict(row)
-        data["payload"] = json_load(data.pop("payload_json"), {})
-        if connection is not None and data.get("task_id"):
-            task = connection.execute(
-                "SELECT task_number FROM tasks WHERE id = ?",
-                (data["task_id"],),
-            ).fetchone()
-            data["task_number"] = int(task["task_number"]) if task else None
+    def _project_events(
+        self, connection: Any, rows: Iterable[Mapping[str, Any]]
+    ) -> list[dict[str, Any]]:
+        """Project a page of event rows, reading task numbers in one query.
+
+        ``_event_dict`` issued one ``SELECT task_number`` per event carrying a
+        ``task_id``, so a page cost 200 round trips: every SSE poll, every
+        ``room_sync``, every audit page and the whole export paid it again. The
+        same ``IN`` batch the task relations already use collapses the page to a
+        single lookup, and a task that no longer exists still projects as
+        ``task_number=None`` exactly as the per-event read did.
+        """
+        materialized = [dict(row) for row in rows]
+        if not materialized:
+            return []
+        task_ids = sorted(
+            {
+                str(row["task_id"])
+                for row in materialized
+                if row.get("task_id")
+            }
+        )
+        task_numbers: dict[str, int] = {}
+        if task_ids:
+            # Chunked so a page larger than the backend's parameter cap (SQLite
+            # defaults to 999) still projects instead of raising.
+            for start in range(0, len(task_ids), _SQL_PARAMETER_CHUNK):
+                chunk = task_ids[start : start + _SQL_PARAMETER_CHUNK]
+                for task in connection.execute(
+                    f"SELECT id, task_number FROM tasks "
+                    f"WHERE id IN ({_sql_placeholders(len(chunk))})",
+                    chunk,
+                ).fetchall():
+                    task_numbers[str(task["id"])] = int(task["task_number"])
+        events: list[dict[str, Any]] = []
+        for data in materialized:
+            data["payload"] = json_load(data.pop("payload_json"), {})
+            if data.get("task_id"):
+                data["task_number"] = task_numbers.get(str(data["task_id"]))
+            self._decorate_event_channel(data)
+            events.append(data)
+        return events
+
+    @staticmethod
+    def _decorate_event_channel(data: dict[str, Any]) -> None:
+        """Derive the default channel and rewrite the public event number."""
         if data["event_type"].startswith("review."):
             default_channel = "review"
         elif data["task_id"]:
@@ -1526,7 +1615,6 @@ class AgentChatRoomService:
         if seq is not None:
             data["id"] = int(seq)
             data["project_seq"] = int(seq)
-        return data
 
     def _project_dict(
         self,
@@ -4799,7 +4887,7 @@ class AgentChatRoomService:
             """,
             (project_id, after, limit),
         ).fetchall()
-        events = [self._event_dict(row, connection) for row in rows]
+        events = self._project_events(connection, rows)
         cursor = events[-1]["project_seq"] if events else after
         latest = connection.execute(
             "SELECT COALESCE(MAX(project_seq), 0) AS cursor FROM events WHERE project_id = ?",
@@ -4914,10 +5002,7 @@ class AgentChatRoomService:
             params = (project_id, *MCP_CONTEXT_EVENT_TYPES, limit)
 
         rows = connection.execute(query, params).fetchall()
-        events = [
-            self._event_dict(row, connection)
-            for row in (rows if incremental else reversed(rows))
-        ]
+        events = self._project_events(connection, rows if incremental else reversed(rows))
         latest = connection.execute(
             "SELECT COALESCE(MAX(project_seq), 0) AS cursor FROM events WHERE project_id = ?",
             (project_id,),
@@ -5027,7 +5112,7 @@ class AgentChatRoomService:
                     [*parameters, after, limit],
                 ).fetchall()
                 older_where, older_params = forward_where, [*parameters, after]
-            events = [self._event_dict(row, connection) for row in rows]
+            events = self._project_events(connection, rows)
             cursor = events[-1]["project_seq"] if events else after
             first_id = events[0]["project_seq"] if events else None
             has_newer = False
@@ -5142,7 +5227,7 @@ class AgentChatRoomService:
                 """,
                 page_parameters,
             ).fetchall()
-            events = [self._event_dict(row, connection) for row in rows]
+            events = self._project_events(connection, rows)
             if order == "DESC":
                 events.reverse()
             items = self._project_task_history_items(connection, events)
@@ -8592,20 +8677,56 @@ class AgentChatRoomService:
             )
         return result
 
+    def _list_leases(
+        self,
+        connection: Any,
+        project_id: str,
+        *,
+        include_inactive: bool = False,
+        limit: int | None = None,
+    ) -> list[dict[str, Any]]:
+        """Read leases for one Project.
+
+        Nothing ever deletes a released lease row, so this table only grows: the
+        active listing used to read every row the Project ever wrote and then
+        decide liveness in Python, which made each poll cost more than the last
+        and left a permanently growing scan behind it. The active listing now
+        states the same predicate in SQL — released, or expired — against the
+        existing ``idx_file_leases_active`` index, and is bounded. The full
+        history read (``include_inactive``) is what export needs, so it keeps
+        reading everything.
+        """
+        params: list[Any] = [project_id]
+        where = ["l.project_id = ?"]
+        if not include_inactive:
+            where.append("l.released_at IS NULL")
+            where.append("l.expires_at > ?")
+            params.append(iso_now())
+        statement = (
+            "SELECT l.*, a.last_heartbeat AS owner_last_heartbeat "
+            "FROM file_leases l "
+            "JOIN agent_sessions a ON a.id = l.session_id "
+            f"WHERE {' AND '.join(where)} ORDER BY l.created_at DESC"
+        )
+        if limit is not None and not include_inactive:
+            params.append(max(1, int(limit)))
+            statement += " LIMIT ?"
+        rows = connection.execute(statement, params).fetchall()
+        return [self._lease_dict(row) for row in rows]
+
     def list_leases(self, project_id: str, *, include_inactive: bool = False) -> list[dict[str, Any]]:
         with self.database.connect() as connection:
             self._require_project(connection, project_id)
-            rows = connection.execute(
-                """
-                SELECT l.*, a.last_heartbeat AS owner_last_heartbeat
-                FROM file_leases l
-                JOIN agent_sessions a ON a.id = l.session_id
-                WHERE l.project_id = ? ORDER BY l.created_at DESC
-                """,
-                (project_id,),
-            ).fetchall()
-            leases = [self._lease_dict(row) for row in rows]
-            return leases if include_inactive else [lease for lease in leases if lease["active"]]
+            return self._list_leases(
+                connection,
+                project_id,
+                include_inactive=include_inactive,
+                limit=(
+                    None
+                    if include_inactive
+                    else int(getattr(self.settings, "lease_list_limit", 500))
+                ),
+            )
 
     def check_leases(
         self,
@@ -10382,18 +10503,46 @@ class AgentChatRoomService:
         return "|".join(str(row.get(field) or "") for field in fields)
 
     @staticmethod
-    def _decode_page_cursor(cursor: str | None, expected_parts: int) -> list[str] | None:
+    def _decode_page_cursor(
+        cursor: str | None,
+        expected_parts: int,
+        part_kinds: tuple[str, ...] = (),
+    ) -> list[str] | None:
+        """Split and shape-check one snapshot page cursor.
+
+        The segment count and a non-empty check are not enough. A cursor is a
+        client-supplied string that reaches SQL comparison and, for the
+        acknowledgement page, ``int()``: ``acknowledgements_before=<ts>|x|y``
+        counted three segments and then raised ValueError out of the projection,
+        so the documented 422 `invalid_page_cursor` surfaced as a 500 (README
+        promises 422 for a malformed cursor). Each segment is therefore checked
+        against the shape its position is actually compared with:
+        ``timestamp`` must parse as an ISO instant, ``seq`` must be a
+        non-negative decimal integer, and ``identifier`` must be a short opaque
+        token without separators, control characters or whitespace.
+        """
         if not cursor:
             return None
         parts = cursor.split("|")
-        if len(parts) != expected_parts or any(not part for part in parts):
-            raise DomainError(
-                "invalid_page_cursor",
-                "Snapshot page cursor must be created_at|id (acks add event_id|session_id)",
-                status_code=422,
-                details={"cursor": cursor},
-            )
+        if len(parts) != expected_parts:
+            raise _invalid_page_cursor(cursor)
+        kinds = part_kinds or ("identifier",) * expected_parts
+        if len(kinds) != expected_parts:
+            raise _invalid_page_cursor(cursor)
+        for part, kind in zip(parts, kinds):
+            if not _page_cursor_part_ok(part, kind):
+                raise _invalid_page_cursor(cursor)
         return parts
+
+    @staticmethod
+    def _page_cursor_seq(parts: list[str], index: int) -> int:
+        """The already-validated ``seq`` segment at ``index``.
+
+        Reached only for a cursor that ``_decode_page_cursor`` accepted, so the
+        conversion cannot raise; kept separate so the projection never repeats
+        the unchecked ``int()`` the cursor guard replaced.
+        """
+        return int(parts[index])
 
     def list_session_presence(self, project_id: str) -> list[dict[str, Any]]:
         """Presence fields for one project's Sessions, without the Room projection.
@@ -10407,20 +10556,11 @@ class AgentChatRoomService:
         """
         with self.database.connect() as connection:
             self._require_project(connection, project_id)
-            rows = connection.execute(
-                """
-                SELECT a.*, (
-                    SELECT MAX(e.created_at)
-                    FROM events e
-                    WHERE e.project_id = a.project_id
-                      AND e.actor_session_id = a.id
-                ) AS last_activity_at
-                FROM agent_sessions a
-                WHERE a.project_id = ?
-                ORDER BY a.created_at
-                """,
-                (project_id,),
-            ).fetchall()
+            rows, _total = self._session_activity_rows(
+                connection,
+                project_id,
+                limit=int(getattr(self.settings, "snapshot_session_limit", 200)),
+            )
         return [
             {
                 "id": str(agent["id"]),
@@ -10454,6 +10594,57 @@ class AgentChatRoomService:
         stored = str(dict(row).get("agent_key") or "").strip()
         return stored or str(session_id)
 
+    def _session_activity_rows(
+        self, connection: Any, project_id: str, *, limit: int | None = None
+    ) -> tuple[list[dict[str, Any]], int]:
+        """Sessions for one Project with activity/unread counters attached.
+
+        Both counters used to be correlated subqueries in the ``SELECT`` list,
+        so the statement was evaluated once per Session row and every snapshot
+        or presence poll paid Sessions x 2 extra event scans. They are now two
+        grouped aggregates joined onto the Session row, and the Session list is
+        bounded newest-first: a Project accumulates one Session per agent
+        process for its whole life, so an unbounded read only ever grew.
+        Returns ``(rows, total_sessions)`` so a truncated read can say so.
+        """
+        total = int(
+            connection.execute(
+                "SELECT COUNT(*) AS c FROM agent_sessions WHERE project_id = ?",
+                (project_id,),
+            ).fetchone()["c"]
+        )
+        statement = """
+            SELECT a.*, activity.last_activity_at, unread.unread_count
+            FROM agent_sessions a
+            LEFT JOIN (
+                SELECT actor_session_id, MAX(created_at) AS last_activity_at
+                FROM events
+                WHERE project_id = ? AND actor_session_id IS NOT NULL
+                GROUP BY actor_session_id
+            ) activity ON activity.actor_session_id = a.id
+            LEFT JOIN (
+                SELECT a2.id AS session_id, COUNT(e.id) AS unread_count
+                FROM agent_sessions a2
+                LEFT JOIN events e
+                  ON e.project_id = a2.project_id
+                 AND e.project_seq > a2.last_read_cursor
+                WHERE a2.project_id = ?
+                GROUP BY a2.id
+            ) unread ON unread.session_id = a.id
+            WHERE a.project_id = ?
+            ORDER BY a.created_at DESC, a.id DESC
+        """
+        params: list[Any] = [project_id, project_id, project_id]
+        if limit is not None:
+            params.append(max(1, int(limit)))
+            statement += " LIMIT ?"
+        rows = [dict(row) for row in connection.execute(statement, params).fetchall()]
+        for row in rows:
+            # The grouped join yields NULL for a Session with no events, which
+            # is what the correlated MAX() subquery yielded too.
+            row["unread_count"] = int(row.get("unread_count") or 0)
+        return rows, total
+
     def _snapshot(
         self,
         connection: Any,
@@ -10467,31 +10658,11 @@ class AgentChatRoomService:
         acknowledgements_after: str | None = None,
     ) -> dict[str, Any]:
             project = self._project_dict(self._require_project(connection, project_id))
-            agent_rows = connection.execute(
-                """
-                SELECT a.*, (
-                    SELECT MAX(e.created_at)
-                    FROM events e
-                    WHERE e.project_id = a.project_id
-                      AND e.actor_session_id = a.id
-                ) AS last_activity_at,
-                (
-                    SELECT COUNT(*)
-                    FROM events e
-                    WHERE e.project_id = a.project_id
-                      AND e.project_seq > a.last_read_cursor
-                ) AS unread_count
-                FROM agent_sessions a
-                WHERE a.project_id = ?
-                ORDER BY a.created_at
-                """,
-                (project_id,),
-            ).fetchall()
-            agents = []
-            for row in agent_rows:
-                agent = self._agent_dict(row)
-                agent["unread_count"] = int(row["unread_count"] or 0)
-                agents.append(agent)
+            session_limit = int(getattr(self.settings, "snapshot_session_limit", 200))
+            agent_rows, session_total = self._session_activity_rows(
+                connection, project_id, limit=session_limit
+            )
+            agents = [self._agent_dict(row) for row in agent_rows]
             tasks = self._tasks_with_relations(
                 connection,
                 connection.execute(
@@ -10501,22 +10672,10 @@ class AgentChatRoomService:
             )
             members = self._list_project_members(connection, project_id)
             recent_limit = int(getattr(self.settings, "snapshot_recent_limit", 200))
-            leases = [
-                lease
-                for lease in (
-                    self._lease_dict(row)
-                    for row in connection.execute(
-                        """
-                        SELECT l.*, a.last_heartbeat AS owner_last_heartbeat
-                        FROM file_leases l
-                        JOIN agent_sessions a ON a.id = l.session_id
-                        WHERE l.project_id = ? ORDER BY l.created_at DESC
-                        """,
-                        (project_id,),
-                    ).fetchall()
-                )
-                if lease["active"]
-            ]
+            lease_limit = int(getattr(self.settings, "snapshot_lease_limit", 200))
+            leases = self._list_leases(
+                connection, project_id, limit=lease_limit
+            )
 
             def _fetch_tied_page(
                 table: str,
@@ -10542,7 +10701,9 @@ class AgentChatRoomService:
                 params: list[Any] = [project_id]
                 order_time = "DESC"
                 order_id = "DESC"
-                cursor_parts = self._decode_page_cursor(before or after, 2)
+                cursor_parts = self._decode_page_cursor(
+                    before or after, 2, ("timestamp", "identifier")
+                )
                 if cursor_parts is not None:
                     created_at, row_id = cursor_parts
                     if before:
@@ -10606,11 +10767,16 @@ class AgentChatRoomService:
                 order_time = "DESC"
                 order_seq = "DESC"
                 order_session = "DESC"
-                cursor_parts = self._decode_page_cursor(before or after, 3)
+                cursor_parts = self._decode_page_cursor(
+                    before or after, 3, ("timestamp", "seq", "identifier")
+                )
                 if cursor_parts is not None:
                     created_at, event_seq, session_id = cursor_parts
                     # Cursor encodes project_seq; compare project_seq (not e.id).
-                    seq_value = int(event_seq)
+                    # The seq segment was shape-checked as a non-negative
+                    # integer by _decode_page_cursor, so this cannot raise the
+                    # ValueError that used to surface as a 500.
+                    seq_value = self._page_cursor_seq(cursor_parts, 1)
                     if before:
                         where.append(
                             "(a.created_at < ? OR (a.created_at = ? AND "
@@ -10783,6 +10949,29 @@ class AgentChatRoomService:
             )
             acks_info["total"] = totals["acknowledgements"]
 
+            # The lease and Session projections are bounded rather than
+            # paged: both are "what is true right now" lists, so they answer
+            # with the newest window and say plainly that they did.
+            lease_total = int(
+                connection.execute(
+                    "SELECT COUNT(*) AS c FROM file_leases "
+                    "WHERE project_id = ? AND released_at IS NULL AND expires_at > ?",
+                    (project_id, iso_now()),
+                ).fetchone()["c"]
+            )
+            lease_info = {
+                "returned": len(leases),
+                "limit": lease_limit,
+                "total": lease_total,
+                "truncated": len(leases) < lease_total,
+            }
+            session_info = {
+                "returned": len(agents_payload),
+                "limit": session_limit,
+                "total": session_total,
+                "truncated": len(agents_payload) < session_total,
+            }
+
             return {
                 "project": project,
                 "members": members,
@@ -10796,6 +10985,8 @@ class AgentChatRoomService:
                 "documents": self.list_project_documents(project_id)["documents"],
                 "cursor": cursor,
                 "totals": totals,
+                "lease_page_info": lease_info,
+                "session_page_info": session_info,
                 "page_info": {
                     "limit": recent_limit,
                     "reports": reports_info,
@@ -10897,25 +11088,86 @@ class AgentChatRoomService:
                 assets.append(asset)
             return assets
 
-    def export_project(self, project_id: str) -> dict[str, Any]:
+    def _export_events(
+        self, project_id: str, cursor: int, limit: int
+    ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+        """Newest ``limit`` events at or below ``cursor``, with a window receipt.
+
+        The export used to walk the project's whole history one 1000-row page at
+        a time and hold every event in memory to serialize once, so cost grew
+        with the age of the Project rather than with the archive the caller
+        asked for. It now returns a declared window: the newest ``limit`` events
+        plus a receipt stating the total, the retained range, and whether
+        anything was left out. Truncation is never silent — an archive that
+        quietly dropped the beginning of a Project's history would be worse than
+        one that says where its window starts.
+        """
+        with self.database.connect() as connection:
+            self._require_project(connection, project_id)
+            total = int(
+                connection.execute(
+                    "SELECT COUNT(*) AS c FROM events "
+                    "WHERE project_id = ? AND project_seq <= ?",
+                    (project_id, cursor),
+                ).fetchone()["c"]
+            )
+            boundary = connection.execute(
+                """
+                SELECT MIN(project_seq) AS oldest FROM (
+                    SELECT project_seq FROM events
+                    WHERE project_id = ? AND project_seq <= ?
+                    ORDER BY project_seq DESC LIMIT ?
+                )
+                """,
+                (project_id, cursor, max(1, int(limit))),
+            ).fetchone()
+            oldest_retained = int(boundary["oldest"] or 0)
+            if oldest_retained:
+                rows = connection.execute(
+                    "SELECT * FROM events "
+                    "WHERE project_id = ? AND project_seq >= ? AND project_seq <= ? "
+                    "ORDER BY project_seq ASC",
+                    (project_id, oldest_retained, cursor),
+                ).fetchall()
+                events = self._project_events(connection, rows)
+            else:
+                events = []
+        window = {
+            "limit": int(limit),
+            "returned": len(events),
+            "total": total,
+            "truncated": bool(total and len(events) < total),
+            "first_project_seq": events[0]["project_seq"] if events else None,
+            "last_project_seq": events[-1]["project_seq"] if events else None,
+            "oldest_retained_project_seq": oldest_retained or None,
+        }
+        if window["truncated"]:
+            window["required_action"] = "narrow_the_window_with_export_before"
+        return events, window
+
+    def export_project(
+        self, project_id: str, *, event_limit: int | None = None
+    ) -> dict[str, Any]:
         snapshot = self.snapshot(project_id)
         cursor = snapshot["cursor"]
-        events: list[dict[str, Any]] = []
-        after = 0
-        while after < cursor:
-            batch = self.list_events(project_id, after=after, limit=1000)
-            current = [
-                event for event in batch["events"] if event["project_seq"] <= cursor
-            ]
-            if not current:
-                break
-            events.extend(current)
-            after = current[-1]["project_seq"]
+        limit = (
+            int(event_limit)
+            if event_limit is not None
+            else int(getattr(self.settings, "export_event_limit", 5000))
+        )
+        if limit <= 0:
+            raise DomainError(
+                "invalid_export_event_limit",
+                "export event limit must be positive",
+                status_code=422,
+                details={"field": "event_limit"},
+            )
+        events, event_window = self._export_events(project_id, cursor, limit)
         writes = self._export_room_writes(project_id, cursor)
         leases = self.list_leases(project_id, include_inactive=True)
         assets = self._export_knowledge_assets(project_id)
         return {
-            "export_schema_version": 2,
+            "export_schema_version": 3,
             "exported_at": iso_now(),
             "project": snapshot["project"],
             "members": snapshot["members"],
@@ -10928,6 +11180,7 @@ class AgentChatRoomService:
             "acknowledgements": writes["acknowledgements"],
             "knowledge_assets": assets,
             "events": events,
+            "window": {"events": event_window},
             "counts": {
                 "members": len(snapshot["members"]),
                 "agents": len(snapshot["agents"]),

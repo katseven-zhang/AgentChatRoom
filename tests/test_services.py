@@ -2559,7 +2559,7 @@ def test_project_settings_are_validated_updated_and_exported(
         project["id"], lease["id"], executor["agent"]["id"], executor["token"]
     )
     exported = service.export_project(project["id"])
-    assert exported["export_schema_version"] == 2
+    assert exported["export_schema_version"] == 3
     assert exported["counts"]["reports"] == len(exported["reports"])
     assert exported["cursor"] == exported["events"][-1]["id"]
     assert exported["leases"][0]["active"] is False

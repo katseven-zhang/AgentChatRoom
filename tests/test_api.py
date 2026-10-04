@@ -2874,13 +2874,20 @@ def test_management_auth_successful_login_unaffected_by_defaults(monkeypatch, se
 
 
 def test_sse_list_events_runs_off_event_loop(settings, project_dir):
-    """#184: list_events must be awaited via asyncio.to_thread (source + live spy)."""
+    """#184: list_events must never run on the event loop thread.
+
+    #359 moved the poll off the per-connection loop entirely, so the SSE route
+    no longer hops to a thread per poll — the ProjectEventHub worker owns the
+    read. That is a strictly stronger form of the #184 rule, and this still
+    pins it: the observed calls must happen off the loop, and the route must
+    read its events through the hub rather than through the loop itself.
+    """
     import inspect as _inspect
 
     from agentchatroom import api as _api_mod
 
     source = _inspect.getsource(_api_mod)
-    assert "asyncio.to_thread" in source
+    assert "ProjectEventHub" in source
     assert "service.list_events" in source
 
     limited = replace(settings, sse_poll_interval_seconds=0.01)
@@ -2895,21 +2902,40 @@ def test_sse_list_events_runs_off_event_loop(settings, project_dir):
     )
     auth = _sse_auth_headers(joined)
     path = f"/api/v1/projects/{project['id']}/events/stream"
-    app = create_app(limited)
-    service = app.state.service
-    call_sites: list[bool] = []
-    original = service.list_events
 
-    def spy(project_id, *, after=0, limit=200):
+    call_sites: list[bool] = []
+    # The hub captures its fetch callable when the app is built, so the spy must
+    # wrap the unbound method before create_app binds it.
+    real_fetch = AgentChatRoomService.list_events
+
+    def spy(self, project_id, *, after=0, limit=200):
         try:
             asyncio.get_running_loop()
             on_loop = True
         except RuntimeError:
             on_loop = False
         call_sites.append(on_loop)
-        return original(project_id, after=after, limit=limit)
+        return real_fetch(self, project_id, after=after, limit=limit)
 
-    service.list_events = spy
+    AgentChatRoomService.list_events = spy
+    try:
+        app = create_app(limited)
+        _run_sse_off_loop_probe(app, path, auth, call_sites)
+    finally:
+        AgentChatRoomService.list_events = real_fetch
+    assert call_sites, "SSE must poll list_events"
+    assert not any(call_sites), "list_events must not run on the event loop thread"
+
+
+def _run_sse_off_loop_probe(app, path, auth, call_sites) -> None:
+    """Drive one SSE stream until the hub has read at least once.
+
+    The stream stays connected until a poll is observed rather than for a fixed
+    window: with the shared hub the generator only writes a chunk when there is
+    something to send, so "wait for a body chunk after the first poll" is no
+    longer a usable signal.
+    """
+    import asyncio
 
     async def run() -> None:
         lifespan_rx: asyncio.Queue = asyncio.Queue()
@@ -2929,33 +2955,34 @@ def test_sse_list_events_runs_off_event_loop(settings, project_dir):
         try:
             scope = _sse_asgi_scope(path, auth)
             request_sent = False
-            body = bytearray()
-            got_connected = asyncio.Event()
-            got_poll = asyncio.Event()
+            disconnect = asyncio.Event()
 
             async def receive():
                 nonlocal request_sent
                 if not request_sent:
                     request_sent = True
                     return {"type": "http.request", "body": b"", "more_body": False}
-                await asyncio.sleep(0.05)
+                await disconnect.wait()
                 return {"type": "http.disconnect"}
 
             async def send(message):
-                if message["type"] == "http.response.body":
-                    body.extend(message.get("body") or b"")
-                    if b"connected" in body:
-                        got_connected.set()
-                    if call_sites:
-                        got_poll.set()
-                        raise asyncio.CancelledError("got list_events poll")
+                # The response must actually start, otherwise the body
+                # generator never runs and nothing ever subscribes.
+                return None
 
+            handler = asyncio.create_task(app(scope, receive, send))
+            # Give the hub's worker a moment to poll this Project once.
+            for _ in range(500):
+                if call_sites:
+                    break
+                await asyncio.sleep(0.01)
+            disconnect.set()
+            handler.cancel()
             try:
-                await app(scope, receive, send)
-            except asyncio.CancelledError:
+                await handler
+            except (asyncio.CancelledError, Exception):
                 pass
-            await asyncio.wait_for(got_connected.wait(), timeout=5)
-            await asyncio.wait_for(got_poll.wait(), timeout=5)
+            assert call_sites, "the shared hub must poll this Project"
         finally:
             await lifespan_rx.put({"type": "lifespan.shutdown"})
             try:
@@ -2969,8 +2996,6 @@ def test_sse_list_events_runs_off_event_loop(settings, project_dir):
                 pass
 
     asyncio.run(run())
-    assert call_sites, "SSE must poll list_events"
-    assert not any(call_sites), "list_events must not run on the event loop thread"
 
 
 def test_sse_polling_does_not_block_health_under_slow_queries(
