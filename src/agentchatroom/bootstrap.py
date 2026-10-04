@@ -712,16 +712,8 @@ def bootstrap_local_room(
         except DomainError:
             pass
         try:
-            # The registration of a monorepo subproject is stored under its
-            # derived ``logical_path``, so the self-heal lookup has to ask for
-            # that same key.  Looking it up with the empty default never
-            # matches, which rewrote project.json on every bootstrap and paid
-            # two extra git probes for it.
-            expected_scope = checkout_scope(checkout)
-            reg = load_checkout_registration(
-                checkout,
-                logical_path=str(expected_scope.get("logical_path", "") or ""),
-            )
+            reg = load_checkout_registration(checkout, logical_path=logical_path)
+            expected_scope = checkout_scope(checkout, logical_path=logical_path)
             if reg is None or reg.get("scope") != expected_scope:
                 register_checkout_project(checkout, project, replace_existing=True)
                 file_notices.append(
@@ -755,19 +747,12 @@ def bootstrap_local_room(
             )
             if restored_outcome is not None:
                 if credential_id and restored_outcome.binding is not None:
-                    # Ask the domain service for the authenticated row instead
-                    # of issuing a project-unfiltered SELECT here: the Session
-                    # token is already in hand, and verify_session keeps the
-                    # lookup bound to this Project.
-                    try:
-                        verified = service.verify_session(
-                            project["id"],
-                            restored_outcome.binding.session_id,
-                            restored_outcome.binding.token,
-                        )
-                    except DomainError:
-                        verified = {}
-                    member_id = str(verified.get("member_id") or "")
+                    agent = service.verify_session(
+                        str(project["id"]),
+                        restored_outcome.binding.session_id,
+                        restored_outcome.binding.token,
+                    )
+                    member_id = str(agent.get("member_id") or "")
                     if member_id:
                         # A credential already pinned to another member is a
                         # real identity mismatch, not a recoverable naming
@@ -879,7 +864,9 @@ def bootstrap_local_room(
         else None
     )
     notices = [ignored_notice] if ignored_notice is not None else []
-    notices.extend(file_notices)
+    # The root-registration notice stays ahead of the file-housekeeping ones, as
+    # it was before those existed. It is the one that says which workspace this
+    # Session bound to, and a caller reads the notices in order.
     if used_selected_project_root:
         notices.append(
             {
@@ -890,6 +877,7 @@ def bootstrap_local_room(
                 ),
             }
         )
+    notices.extend(file_notices)
     return _ready_outcome(
         project=project,
         session_id=str(joined["agent"]["id"]),

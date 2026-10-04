@@ -13,6 +13,8 @@ from agentchatroom.project_registration import (
     project_registration_path,
     register_checkout_project,
 )
+from agentchatroom.services import DEFAULT_AGENT_PERMISSIONS
+from mcp.server.auth.middleware.auth_context import auth_context_var
 
 
 def _boot(service, root, **extra):
@@ -152,23 +154,42 @@ def test_http_identity_mismatch_omits_workspace_root_advice(monkeypatch, service
     member = service.create_project_member(
         project["id"], member_key="opencode", name="OpenCode"
     )["member"]
-    credential = service.issue_agent_token(
+    issued = service.issue_agent_token(
         project["id"], name="Linked", member_id=member["id"]
-    )["credential"]
+    )
+    credential = issued["credential"]
     provider = mcp_server._bound_service_provider.set(lambda: service)
     roots = mcp_server._bootstrap_workspace_roots.set([project_dir])
     identity = mcp_server._bootstrap_http_identity.set(
         ("impostor", "Impostor", "impostor")
     )
     monkeypatch.setattr(mcp_server, "service", service)
-    monkeypatch.setattr(
-        mcp_server,
-        "get_access_token",
-        lambda: SimpleNamespace(claims={"credential_id": credential["id"]}),
+    # An HTTP access token reaches the tool at the auth-context layer, and it
+    # has to name the Project it was issued for: _authorize_remote refuses an
+    # unnamed one with agent_token_project_forbidden before any identity is
+    # compared. A stub shaped as a bare claims dict therefore tests the wrong
+    # refusal - it never gets as far as the mismatch this test is about.
+    auth = auth_context_var.set(
+        SimpleNamespace(
+            access_token=SimpleNamespace(
+                token=issued["token"],
+                client_id="linked-test",
+                scopes=sorted(DEFAULT_AGENT_PERMISSIONS),
+                claims={
+                    "project_id": project["id"],
+                    "credential_id": credential["id"],
+                    "software_key": "impostor",
+                    "software_name": "Impostor",
+                    "software_client": "impostor",
+                },
+            )
+        )
     )
     try:
         result = mcp_server.room_bootstrap()
     finally:
+        mcp_server.clear_runtime_binding()
+        auth_context_var.reset(auth)
         mcp_server._bound_service_provider.reset(provider)
         mcp_server._bootstrap_workspace_roots.reset(roots)
         mcp_server._bootstrap_http_identity.reset(identity)
