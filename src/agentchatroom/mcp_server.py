@@ -2013,6 +2013,37 @@ def task_intake_reassign(
 
 
 @mcp.tool()
+def task_intake_cancel(
+    project_id: str = "",
+    intake_id: str = "",
+    reason: str = "",
+    request_id: str = "",
+    session_id: str = "",
+    token: str = "",
+) -> dict[str, Any]:
+    """Retire a user task intake that will not become a formal task.
+
+    Cancelling another identity's intake is a management action, so it needs
+    either the target Session's own credentials or an authenticated management
+    request; an unauthenticated caller is refused by the domain layer exactly
+    as it is for task_intake_reassign.
+    """
+    try:
+        _authorize_remote(project_id, "task:write")
+    except DomainError as error:
+        return {"ok": False, **error.as_dict()}
+    return _tool_result(
+        get_service().cancel_task_intake,
+        project_id,
+        intake_id,
+        reason=reason,
+        session_id=session_id or None,
+        token=token or None,
+        request_id=_mcp_request_id(request_id),
+    )
+
+
+@mcp.tool()
 def task_define_from_intake(
     project_id: str = "",
     intake_id: str = "",

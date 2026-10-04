@@ -424,12 +424,9 @@
         <p class="form-hint">释放将把任务退回待认领池，保留进度和证据，但清除当前所有权和活跃文件租约。</p>
         <label>释放原因
           <select id="task-release-reason" required>
+            <!-- 原因码与文案由服务端版本化配置渲染（见 renderReleaseReasonOptions），
+                 这里只保留空值占位以维持 required 的「必须选一项」语义。 -->
             <option value="">选择原因…</option>
-            <option value="quota_exhausted">额度耗尽</option>
-            <option value="agent_unavailable">Agent 不可用</option>
-            <option value="user_requested">用户请求</option>
-            <option value="reassignment_needed">需要改派</option>
-            <option value="other">其他</option>
           </select>
         </label>
         <label>详细说明 <textarea id="task-release-reason-text" rows="2" placeholder="可选，说明情况"></textarea></label>
@@ -603,10 +600,18 @@
             <p class="secondary-text">已有旧连接器时用生成的同名 HTTP 配置替换，不删除 Room 数据。</p>
           </div>
           <div>
+            <label for="integration-client-profile">目标客户端</label>
+            <select id="integration-client-profile"></select>
+            <p class="secondary-text" id="integration-client-profile-hint">具名客户端的预设配置带真实软件身份，通用模板的身份位需要先填写。</p>
+          </div>
+          <div>
             <p class="integration-choice-label">连接方式</p>
-            <div class="segmented-control integration-transport-tabs" id="integration-transport-tabs" role="group" aria-label="连接方式（仅 HTTP）">
+            <div class="segmented-control integration-transport-tabs" id="integration-transport-tabs" role="group" aria-label="连接方式">
               <button type="button" class="is-active" data-integration-transport="http">HTTP 直连</button>
+              <button type="button" data-integration-transport="local">本机 stdio</button>
+              <button type="button" data-integration-transport="remote">远程 Bridge</button>
             </div>
+            <p class="secondary-text" id="integration-transport-hint">HTTP 直连是主路径：共用一个服务，不为每条连接拉起适配器进程。</p>
           </div>
         </section>
 

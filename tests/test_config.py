@@ -27,6 +27,7 @@ port = 9100
 mcp_http_json_response = false
 mcp_http_session_idle_timeout_seconds = 90
 mcp_bridge_command = "python-from-file"
+mcp_bridge_args = ["-m", "agentchatroom.mcp_bridge"]
 
 [database]
 backend = "postgresql"
@@ -464,6 +465,7 @@ def test_every_config_file_schema_key_maps_into_settings(monkeypatch, tmp_path):
             "mcp_http_tombstone_limit": 32,
             "mcp_http_tombstone_ttl_seconds": 3600.0,
             "mcp_bridge_command": "python3",
+            "mcp_bridge_args": ["-m", "agentchatroom.mcp_bridge"],
             "external_base_url": "",
             "trusted_proxy_headers": False,
             "trusted_proxy_ips": "10.0.0.9",

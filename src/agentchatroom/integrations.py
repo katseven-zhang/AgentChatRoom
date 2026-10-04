@@ -1,17 +1,24 @@
 from __future__ import annotations
 
 import json
+import os
+import re
 import sys
 from pathlib import Path
 from typing import Any, Mapping
 
 from .config import Settings, build_service_base_url
+from .credential_bundle import encode_project_credential_bundle
 from .http_identity import encode_http_identity_value
 
 
 MCP_SERVER_NAME = "agentchatroom"
 MCP_MODULE = "agentchatroom.mcp_server"
 MCP_BRIDGE_MODULE = "agentchatroom.mcp_bridge"
+# Subcommand the packaged exe dispatches to the Bridge, mirroring how it
+# already dispatches `mcp` for the local stdio server.
+MCP_BRIDGE_SUBCOMMAND = "mcp-bridge"
+
 AGENT_TOKEN_PLACEHOLDER = "<paste-issued-project-credential-bundle>"
 AGENT_TOKEN_ENV_VAR = "AGENTCHATROOM_AGENT_TOKEN"
 SOFTWARE_KEY_ENV_VAR = "AGENTCHATROOM_SOFTWARE_KEY"
@@ -21,6 +28,31 @@ PROJECT_PATH_ENV_VAR = "AGENTCHATROOM_PROJECT_PATH"
 SOFTWARE_KEY_HEADER = "X-AgentChatRoom-Software-Key"
 SOFTWARE_NAME_HEADER = "X-AgentChatRoom-Software-Name"
 SOFTWARE_CLIENT_HEADER = "X-AgentChatRoom-Software-Client"
+
+
+def resolve_bridge_launcher(
+    settings: Settings, *, frozen: bool | None = None
+) -> tuple[str, list[str]]:
+    """Return the (command, args) a client should use to start the Bridge.
+
+    A packaged build ships one exe and no interpreter, so the only launcher
+    that can work is the exe itself plus a subcommand; a configured
+    `mcp_bridge_command` still wins, because an operator who set it knows where
+    a real interpreter or bridge launcher lives. In source mode the configured
+    command with `mcp_bridge_args` is used verbatim, which defaults to
+    `python -m agentchatroom.mcp_bridge` -- there `-m` is consumed by the
+    interpreter, so it never reaches the Bridge's own strict argparse.
+    """
+    is_frozen = bool(getattr(sys, "frozen", False)) if frozen is None else frozen
+    configured_command = str(settings.mcp_bridge_command or "").strip()
+    configured_args = [str(item) for item in (settings.mcp_bridge_args or [])]
+    if is_frozen and configured_command == "python":
+        # The default only makes sense next to an interpreter.
+        return str(Path(sys.executable).resolve()), [MCP_BRIDGE_SUBCOMMAND]
+    if not configured_args:
+        return configured_command, ["-m", MCP_BRIDGE_MODULE]
+    return configured_command, configured_args
+
 
 # Client-specific details live at the integration boundary. The MCP server and
 # its domain model remain vendor-neutral; adding a client only adds a profile.
@@ -206,6 +238,64 @@ def _build_streamable_http_toml(
     return "\n".join(lines) + "\n"
 
 
+# Placeholder values written into a client config for the three software
+# identity fields. They are recognizable by name, which is what lets the
+# onboarding prompt tell an identity placeholder apart from the credential
+# placeholder: the two need different replacements, and guessing wrong writes
+# an unusable config.
+SOFTWARE_IDENTITY_PLACEHOLDERS = (
+    "<stable-software-key>",
+    "<Software name>",
+    "<software-client-code>",
+)
+
+
+def _identity_placeholders(config_text: str) -> list[str]:
+    """Which software-identity placeholders this config still carries."""
+    return [
+        placeholder
+        for placeholder in SOFTWARE_IDENTITY_PLACEHOLDERS
+        if placeholder in config_text
+    ]
+
+
+def resolve_config_path_hint(profile: Mapping[str, Any]) -> str:
+    """A config location an Agent can act on, not a pattern to interpret.
+
+    A hint like `%APPDATA%/TRAE SOLO CN/User/mcp.json` is written for a human
+    reading a README; an Agent handed it has to guess what `%APPDATA%` expands
+    to on the machine it is running on, and a wrong guess produces a config
+    the client never reads. The same resolution the local config assistant
+    already performs (root + parts) is applied here, and the unresolvable
+    fallback keeps the original text rather than inventing a path.
+    """
+    hint = str(profile.get("config_path_hint") or "").strip()
+    local_config = profile.get("local_config")
+    candidates = (
+        local_config.get("candidates")
+        if isinstance(local_config, Mapping)
+        else None
+    )
+    if isinstance(candidates, list) and candidates:
+        first = candidates[0]
+        if isinstance(first, Mapping):
+            parts = [str(item) for item in (first.get("parts") or []) if item]
+            if parts:
+                root = _config_hint_root(str(first.get("root") or ""))
+                if root is not None:
+                    return str(root.joinpath(*parts))
+    return hint or "客户端 MCP 设置"
+
+
+def _config_hint_root(root_name: str) -> Path | None:
+    if root_name == "home":
+        return Path.home()
+    if root_name == "appdata":
+        appdata = os.getenv("APPDATA", "").strip()
+        return Path(appdata) if appdata else None
+    return None
+
+
 def build_onboarding_prompt(
     *,
     profile_id: str,
@@ -289,24 +379,44 @@ def build_onboarding_prompt(
         )
 
     if mode == "migrate_http":
-        config_hint = str(profile.get("config_path_hint") or "客户端 MCP 设置")
+        config_hint = resolve_config_path_hint(profile)
         return (
             f"把 {client_label} 的 agentchatroom 连接器从本机 stdio 切换为直接 HTTP MCP。\n\n"
             f"1. 用下面的 HTTP 配置替换客户端中名为 `{MCP_SERVER_NAME}` 的旧条目"
             f"（配置位置：{config_hint}），删除 `command`、`args`、`cwd`、`env` 等 stdio 字段：\n\n"
             f"{config_text.rstrip()}\n\n"
             f"{reload_step}\n"
-            "3. 调用 `room_bootstrap`，核对返回的 Project 名称与 root_path 与目标工作区一致；"
+            f"3. 调用 {bootstrap_call}，核对返回的 Project 名称与 root_path 与目标工作区一致；"
             "HTTP 稳定后再移除旧 stdio 备份，稳定软件身份保持不变。\n\n"
             f"{unavailable_line}\n{security_line}"
         )
 
     placeholder_note = ""
-    if "<" in config_text and ">" in config_text:
-        placeholder_note = (
-            "配置中的软件身份占位符必须替换为用户确认的实际接入端显示名称"
-            "（如 Hermes、Grok）；接入格式标签与占位符原文都不能充当名称。\n"
-        )
+    identity_placeholders = _identity_placeholders(config_text)
+    credential_placeholders = AGENT_TOKEN_PLACEHOLDER in config_text
+    if identity_placeholders or credential_placeholders:
+        # The two placeholder kinds need different instructions. Telling an
+        # agent to replace the bearer slot with a display name (the only
+        # angle-bracket string in an HTTP config is the credential bundle)
+        # produces `Bearer WorkBuddy`, which is an unreadable 401 loop:
+        # bootstrap only rejects an identity value that *starts* with `<`, so
+        # the request is made and fails at the server instead of being caught.
+        parts = []
+        if identity_placeholders:
+            parts.append(
+                "配置中的软件身份占位符（"
+                + "、".join(identity_placeholders)
+                + "）必须替换为用户确认的实际接入端显示名称"
+                "（如 Hermes、Grok）；接入格式标签与占位符原文都不能充当名称。"
+            )
+        if credential_placeholders:
+            parts.append(
+                "配置中的凭据占位符 "
+                f"`{AGENT_TOKEN_PLACEHOLDER}` 必须替换为本次签发的完整凭据包"
+                "（`acrb.v1.*`，含各 Project 的 name/token 映射），"
+                "不能替换为显示名称、Agent 名或任何短字符串。"
+            )
+        placeholder_note = "".join(parts) + "\n"
     pin_note = ""
     if transport == "local" and PROJECT_PATH_ENV_VAR in config_text:
         pin_note = (
@@ -328,9 +438,9 @@ def _profile_identity_environment(
 ) -> dict[str, str]:
     if profile_id == "generic":
         return {
-            SOFTWARE_KEY_ENV_VAR: "<stable-software-key>",
-            SOFTWARE_NAME_ENV_VAR: "<Software name>",
-            SOFTWARE_CLIENT_ENV_VAR: "<software-client-code>",
+            SOFTWARE_KEY_ENV_VAR: SOFTWARE_IDENTITY_PLACEHOLDERS[0],
+            SOFTWARE_NAME_ENV_VAR: SOFTWARE_IDENTITY_PLACEHOLDERS[1],
+            SOFTWARE_CLIENT_ENV_VAR: SOFTWARE_IDENTITY_PLACEHOLDERS[2],
         }
     return {
         SOFTWARE_KEY_ENV_VAR: profile_id.replace("_", "-"),
@@ -354,6 +464,9 @@ def build_mcp_integration(
     else:
         command = str(Path(python_executable or sys.executable).resolve())
         server_args = ["-m", MCP_MODULE]
+    bridge_command, bridge_args = resolve_bridge_launcher(
+        settings, frozen=bool(getattr(sys, "frozen", False))
+    )
     environment = {
         "AGENTCHATROOM_DATA_DIR": str(settings.data_dir),
         "AGENTCHATROOM_PRESENCE_KEEPALIVE_ENABLED": str(
@@ -401,8 +514,16 @@ def build_mcp_integration(
         # The remote Bridge runs on the Agent computer, not on the center.
         # Keep its launcher independently configurable instead of leaking the
         # center's Python absolute path into a client configuration.
-        "command": settings.mcp_bridge_command,
-        "args": ["-m", MCP_BRIDGE_MODULE],
+        #
+        # Frozen builds ship one exe and no interpreter, so the launcher becomes
+        # the exe itself plus a subcommand. The local stdio branch above
+        # already does this for `mcp`; the Bridge needs the same treatment or a
+        # packaged center hands every remote client a config that can never
+        # start. `-m <module>` is only correct when a Python interpreter is
+        # actually the command -- there it is consumed by the interpreter and
+        # never reaches the Bridge's own argparse.
+        "command": bridge_command,
+        "args": list(bridge_args),
         "env": bridge_environment,
     }
     remote_bridge_json = {"mcpServers": {MCP_SERVER_NAME: bridge_server}}
@@ -483,8 +604,8 @@ def build_mcp_integration(
             _profile_identity_environment(profile_id, profile)
         )
         profile_bridge_server = {
-            "command": settings.mcp_bridge_command,
-            "args": ["-m", MCP_BRIDGE_MODULE],
+            "command": bridge_command,
+            "args": list(bridge_args),
             "env": profile_bridge_environment,
         }
         profile_bridge_json = {
@@ -527,6 +648,9 @@ def build_mcp_integration(
             "server_name": MCP_SERVER_NAME,
             "config": local_json if profile["format"] == "json" else config_text,
             "config_text": config_text,
+            # The resolved location, so a client never has to interpret a
+            # `%APPDATA%`-style pattern on the machine it runs on.
+            "resolved_config_path": resolve_config_path_hint(profile),
             "local_config_text": config_text,
             "remote_bridge_config_text": remote_config_text,
             "streamable_http_config_text": http_config_text,
@@ -591,6 +715,11 @@ def build_mcp_integration(
         "env": environment,
         "generic_json": generic_json,
         "generic_json_text": generic_json_text,
+        # The generic TOML template. `codex_toml` and `grok_toml` below are
+        # retained compatibility aliases for exactly this string: they used to
+        # be distinct per-client artifacts in name only, and a client that
+        # needs its own format should read profiles[*] instead.
+        "generic_toml_text": toml_text,
         "codex_toml": toml_text,
         "grok_toml": toml_text,
         "onboarding_prompt": (
@@ -633,4 +762,193 @@ def build_mcp_integration(
             "log_path": str(settings.data_dir / "server.log"),
             "mcp_http_url": remote_url,
         },
+    }
+
+
+# The three facts a handoff prompt must carry whatever produced it: the service
+# is started by a human, the credential slot takes a bundle rather than a name,
+# and a secret never goes to the Room. Kept as constants so the onboarding
+# prompt and the issued-credential prompt cannot drift apart on them.
+SERVICE_UNAVAILABLE_LINE = (
+    "AgentChatRoom 服务由用户显式启动；未启动时调用会返回 service_unavailable，"
+    "此时停止并报告，不要自动启动服务或搜索 EXE。"
+)
+SECRET_HANDLING_LINE = "不要把 Token 发布到 Room、日志或仓库；失败时停止并报告原因，不循环重试。"
+
+
+def issued_http_config_text(
+    profile: Mapping[str, Any],
+    *,
+    project_credentials: list[Mapping[str, Any]],
+    software_identity: Mapping[str, str],
+) -> str:
+    """The HTTP config for a specific client with real credentials in it.
+
+    Same operation the browser used to perform by hand: substitute the encoded
+    credential bundle for the placeholder and write the caller's confirmed
+    software identity. Doing it here means the bytes an Agent is told to write
+    are the bytes this service will actually accept.
+    """
+    bundle = encode_project_credential_bundle(project_credentials)
+    key = encode_http_identity_value(str(software_identity.get("software_key") or ""))
+    name = encode_http_identity_value(str(software_identity.get("software_name") or ""))
+    client = encode_http_identity_value(
+        str(software_identity.get("software_client") or "")
+    )
+    authorization = f"Bearer {bundle}"
+    template = str(profile.get("streamable_http_config_text") or "")
+    if str(profile.get("format")) == "json":
+        parsed = json.loads(template)
+        for server in (parsed.get("mcpServers") or {}).values():
+            headers = server.setdefault("headers", {})
+            headers["Authorization"] = authorization
+            headers[SOFTWARE_KEY_HEADER] = key
+            headers[SOFTWARE_NAME_HEADER] = name
+            headers[SOFTWARE_CLIENT_HEADER] = client
+        return json.dumps(parsed, ensure_ascii=False, indent=2) + "\n"
+
+    def set_or_insert(text: str, header: str, value: str) -> str:
+        line = f"{header} = {json.dumps(value)}"
+        existing = re.compile(rf"^{re.escape(header)} = .*$", re.MULTILINE)
+        if existing.search(text):
+            return existing.sub(lambda _: line, text)
+        # Neither shape carries the header yet, so add it to whichever
+        # table the template used.
+        return re.sub(
+            r"(\[mcp_servers\.[^\]\n]+\.(?:http_headers|headers)\])",
+            lambda match: f"{match.group(1)}\n{line}",
+            text,
+            count=1,
+        )
+
+    # Both TOML shapes point at the environment variable; the one-time result
+    # has no environment to point at, so the token is written literally and the
+    # indirection is dropped.
+    text = re.sub(r"^bearer_token_env_var = .*$\n?", "", template, flags=re.MULTILINE)
+    text = set_or_insert(text, "Authorization", authorization)
+    for header, value in (
+        (SOFTWARE_KEY_HEADER, key),
+        (SOFTWARE_NAME_HEADER, name),
+        (SOFTWARE_CLIENT_HEADER, client),
+    ):
+        text = set_or_insert(text, header, value)
+    return text
+
+
+def build_issued_credential_prompt(
+    profile_id: str,
+    profile: Mapping[str, Any],
+    *,
+    mode: str,
+    project_name: str,
+    root_path: str = "",
+    project_credentials: list[Mapping[str, Any]],
+    software_identity: Mapping[str, str],
+    linked_member_name: str = "",
+) -> dict[str, Any]:
+    """The single generator for every prompt handed out after a token is issued.
+
+    The browser used to keep its own copy of this text. Two copies meant the
+    `service_unavailable` constraint existed in one and not the other, and the
+    credential slot was described by name replacement in one and by bundle
+    substitution in the other -- the mistake that produces `Bearer WorkBuddy`
+    and an unreadable 401 loop, because bootstrap only rejects an identity value
+    that starts with `<`.
+    """
+    if mode not in {"first_setup", "add_project"}:
+        raise ValueError("issued-credential prompts cover first_setup and add_project")
+    client_label = str(profile.get("label", profile_id)).strip() or profile_id
+    config_hint = resolve_config_path_hint(profile)
+    config_text = issued_http_config_text(
+        profile,
+        project_credentials=project_credentials,
+        software_identity=software_identity,
+    )
+    target_line = (
+        f"目标 Project：{project_name}（本地工作区根目录 root_path: {root_path}）"
+        if root_path
+        else f"目标 Project：{project_name}"
+    )
+    bootstrap_call = f"room_bootstrap(project_name={json.dumps(project_name, ensure_ascii=False)})"
+    verify_step = (
+        f"3. 在目标 Project 本地工作区（{root_path}）中调用 {bootstrap_call}，"
+        "核对返回的 Project 名称与 root_path 与当前工作区一致，再执行写操作。"
+        if root_path
+        else f"3. 调用 {bootstrap_call}，核对返回的 Project 名称与 root_path "
+        "与当前工作区一致，再执行写操作。"
+    )
+    reload_step = "2. 写入后重启或重新加载客户端 MCP，使配置生效。"
+
+    if mode == "add_project":
+        credential = project_credentials[0]
+        linked_identity_line = (
+            f"本次 Token 已关联成员 {json.dumps(linked_member_name, ensure_ascii=False)}："
+            "现有配置的软件身份 Header 若存在，三字段必须与 "
+            f"Key={json.dumps(str(software_identity.get('software_key') or ''), ensure_ascii=False)} "
+            "的身份一致。"
+            if linked_member_name
+            else "本次 Token 未关联成员：原样保留客户端现有的软件身份三字段。"
+        )
+        entry = json.dumps(
+            {"name": credential["name"], "token": credential["token"]},
+            ensure_ascii=False,
+        )
+        return {
+            "config_text": config_text,
+            "prompt": "\n".join(
+                [
+                    "该客户端已配置过 agentchatroom HTTP MCP。请把本次签发的新 Project "
+                    "凭据增量合并进现有配置；不新建第二个 agentchatroom 连接器。",
+                    "",
+                    target_line,
+                    "",
+                    "本次签发凭据（合并进 acrb.v1 凭据包，不要整体替换）：",
+                    f"project_name_1={json.dumps(credential['name'], ensure_ascii=False)}",
+                    f"project_token_1={json.dumps(credential['token'], ensure_ascii=False)}",
+                    f"合并条目：{entry}",
+                    "",
+                    linked_identity_line,
+                    "",
+                    f"1. 打开客户端现有 agentchatroom 条目（配置位置：{config_hint}），"
+                    "保留其 url、Authorization 凭据包与软件身份字段，把上面的 "
+                    f"{entry} 合并进 acrb.v1 凭据包后写回同一条目。",
+                    reload_step,
+                    verify_step + "无法读取本地配置时停止并向用户报告。",
+                    "",
+                    SERVICE_UNAVAILABLE_LINE,
+                    SECRET_HANDLING_LINE,
+                ]
+            ),
+        }
+
+    mapping = "\n".join(
+        line
+        for index, item in enumerate(project_credentials, start=1)
+        for line in (
+            f"project_name_{index}={json.dumps(item['name'], ensure_ascii=False)}",
+            f"project_token_{index}={json.dumps(item['token'], ensure_ascii=False)}",
+        )
+    )
+    mode_label = "已配置软件，加入本项目" if mode == "add_project" else "首次配置软件"
+    return {
+        "config_text": config_text,
+        "prompt": "\n".join(
+            [
+                f"请完成 AgentChatRoom HTTP MCP 接入（{mode_label}）。{target_line}。",
+                "",
+                "Project 与 Token 对应关系（按名称保留，不得混用）：",
+                mapping,
+                "",
+                "1. 把下面的 MCP 配置写入客户端（服务器名固定 agentchatroom；"
+                "客户端格式不同时只转换语法，保留 URL、Authorization 与软件身份字段）：",
+                "",
+                config_text.rstrip(),
+                "",
+                reload_step,
+                verify_step,
+                "",
+                SERVICE_UNAVAILABLE_LINE,
+                SECRET_HANDLING_LINE,
+            ]
+        ),
     }

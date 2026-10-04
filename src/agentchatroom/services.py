@@ -55,6 +55,8 @@ from .contracts import (
     TASK_INTEGRATION_STATUSES,
     TASK_INTAKE_STATUSES,
     TASK_INTAKE_TRANSITIONS,
+    TASK_PRIORITY_MAX,
+    TASK_PRIORITY_MIN,
     TASK_RELEASE_COMPAT_REASON_CODE,
     TASK_RELEASE_EXECUTION_STATUSES,
     TASK_RELEASE_REASON_CODES,
@@ -62,6 +64,7 @@ from .contracts import (
     TASK_VIEW_ATTENTION_PHASES,
     TASK_VIEW_SCHEMA_VERSION,
     TASK_VIEW_UNCLASSIFIED_PHASE,
+    task_available_actions,
     task_contract,
     task_state_for_legacy_status,
     task_view,
@@ -525,10 +528,15 @@ def normalize_project_settings(settings: dict[str, Any] | None) -> dict[str, Any
         "default_task_priority",
         PROJECT_SETTINGS_DEFAULTS["default_task_priority"],
     )
-    if not isinstance(default_priority, int) or isinstance(default_priority, bool) or not 0 <= default_priority <= 4:
+    if (
+        not isinstance(default_priority, int)
+        or isinstance(default_priority, bool)
+        or not TASK_PRIORITY_MIN <= default_priority <= TASK_PRIORITY_MAX
+    ):
         raise DomainError(
             "invalid_project_settings",
-            "default_task_priority must be an integer between 0 and 4",
+            "default_task_priority must be an integer between "
+            f"{TASK_PRIORITY_MIN} and {TASK_PRIORITY_MAX}",
         )
     retention = values.get(
         "audit_retention_days",
@@ -2309,6 +2317,11 @@ class AgentChatRoomService:
             legacy_status=data["status"],
         )
         data["state_view"] = task_view(
+            execution_status=data["execution_status"],
+            verification_status=data["verification_status"],
+            integration_status=data["integration_status"],
+        )
+        data["available_actions"] = task_available_actions(
             execution_status=data["execution_status"],
             verification_status=data["verification_status"],
             integration_status=data["integration_status"],
@@ -5702,8 +5715,12 @@ class AgentChatRoomService:
                 f"({self.settings.message_max_body_length})",
                 details={"limit": self.settings.message_max_body_length},
             )
-        if not 0 <= priority <= 4:
-            raise DomainError("invalid_priority", "Priority must be between 0 and 4")
+        if not TASK_PRIORITY_MIN <= priority <= TASK_PRIORITY_MAX:
+            raise DomainError(
+                "invalid_priority",
+                "Priority must be between "
+                f"{TASK_PRIORITY_MIN} and {TASK_PRIORITY_MAX}",
+            )
         if channel not in MESSAGE_CHANNELS:
             raise DomainError("invalid_message_channel", "Unsupported message channel")
         clean_model_display_name = str(model_display_name or "").strip()
@@ -6184,6 +6201,90 @@ class AgentChatRoomService:
                 "cursor": event_id,
             }
 
+    @idempotent_write("task.intake.cancel")
+    def cancel_task_intake(
+        self,
+        project_id: str,
+        intake_id: str,
+        *,
+        session_id: str | None = None,
+        token: str | None = None,
+        reason: str = "",
+        management_authorized: bool = False,
+    ) -> dict[str, Any]:
+        """Retire an intake that will not become a formal task.
+
+        `cancelled` was a declared destination of the intake state machine and
+        a published vocabulary value, but nothing could write it: an intake
+        whose target never accepts it, or that the user no longer wants, had
+        to sit in `pending` forever. This is the missing write path.
+
+        Authorization mirrors task intake reassignment: withdrawing work
+        recorded against someone else's identity needs a real actor, so an
+        authenticated Session or an authenticated management request, never an
+        anonymous caller.
+        """
+        clean_reason = reason.strip()
+        with self.database.connect(write=True) as connection:
+            actor_session_id: str | None = None
+            if session_id or token:
+                agent = self._authenticate(
+                    connection, project_id, str(session_id or ""), str(token or "")
+                )
+                actor_session_id = str(agent["id"])
+            elif not management_authorized:
+                raise _management_authorization_required("cancel a task intake")
+            intake = self._require_task_intake(connection, project_id, intake_id)
+            if intake["status"] == "cancelled":
+                # Repeating a cancel is idempotent: no second event, same row.
+                return {
+                    "intake": self._task_intake_dict(intake),
+                    "event_id": None,
+                    "cursor": self.latest_cursor(connection, project_id),
+                }
+            if intake["status"] == "defined":
+                raise DomainError(
+                    "task_intake_already_defined",
+                    "A defined intake must be cancelled through its formal task",
+                    status_code=409,
+                )
+            previous_status = str(intake["status"])
+            self._transition_task_intake(connection, previous_status, "cancelled")
+            now = iso_now()
+            updated_rows = connection.execute(
+                """
+                UPDATE task_intakes
+                SET status = 'cancelled', note = ?, updated_at = ?
+                WHERE id = ? AND project_id = ? AND status = ?
+                """,
+                (clean_reason, now, intake_id, project_id, previous_status),
+            ).rowcount
+            if updated_rows != 1:
+                raise DomainError(
+                    "task_modified_concurrently",
+                    "The task intake changed while it was being cancelled",
+                    status_code=409,
+                )
+            event_id = self._emit(
+                connection,
+                project_id,
+                "task.intake_cancelled",
+                actor_session_id=actor_session_id,
+                payload={
+                    "intake_id": intake_id,
+                    "previous_status": previous_status,
+                    "status": "cancelled",
+                    "reason": clean_reason,
+                    "target_member_id": str(intake["target_member_id"]),
+                },
+            )
+            updated = self._require_task_intake(connection, project_id, intake_id)
+            return {
+                "intake": self._task_intake_dict(updated),
+                "event_id": event_id,
+                "cursor": event_id,
+            }
+
     @idempotent_write("task.intake.define")
     def define_task_from_intake(
         self,
@@ -6315,7 +6416,7 @@ class AgentChatRoomService:
                     details={"field": field_name, "limit": text_limit},
                 )
         priority = require_int_field(priority, "priority")
-        if priority is not None and not 0 <= priority <= 4:
+        if priority is not None and not TASK_PRIORITY_MIN <= priority <= TASK_PRIORITY_MAX:
             raise DomainError("invalid_priority", "Priority must be between 0 and 4")
         list_limit = int(getattr(self.settings, "list_input_max_count", 100))
         criteria = self._require_list_input_limit(
@@ -6354,7 +6455,7 @@ class AgentChatRoomService:
                         PROJECT_SETTINGS_DEFAULTS["default_task_priority"],
                     )
                 )
-                if not 0 <= priority <= 4:
+                if not TASK_PRIORITY_MIN <= priority <= TASK_PRIORITY_MAX:
                     priority = PROJECT_SETTINGS_DEFAULTS["default_task_priority"]
             if not actor_session_id:
                 # 正式任务必须能追溯到创建者；无操作者的创建一律显式拒绝，
@@ -8317,7 +8418,7 @@ class AgentChatRoomService:
             )
             priority = require_int_field(priority, "priority")
             progress_percent = require_int_field(progress_percent, "progress_percent")
-            if priority is not None and not 0 <= priority <= 4:
+            if priority is not None and not TASK_PRIORITY_MIN <= priority <= TASK_PRIORITY_MAX:
                 raise DomainError("invalid_priority", "Priority must be between 0 and 4")
             if progress_percent is not None and not 0 <= progress_percent <= 100:
                 raise DomainError(

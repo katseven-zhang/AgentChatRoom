@@ -4,6 +4,7 @@ const state = {
   integrationFormat: "generic",
   integrationOnboardingMode: "first_setup",
   integrationTransport: "http",
+  issuedPromptRequest: 0,
   pendingHttpSetup: null,
   issuedHttpSetup: null,
   integrationLocalPlan: null,
@@ -88,6 +89,8 @@ const elements = Object.fromEntries(
     "integration-local-reload", "integration-local-facts", "integration-local-backup",
     "integration-local-refresh", "integration-local-apply",
     "integration-transport-tabs", "integration-http-token-guide", "integration-open-token-button",
+    "integration-client-profile", "integration-client-profile-hint",
+    "integration-transport-hint",
     "integration-http-action-title", "integration-http-action-description", "integration-http-action-steps",
     "integration-target-project",
     "member-list", "refresh-audit-button", "audit-event-filter",
@@ -487,6 +490,7 @@ function eventLabel(type) {
     "task.updated": "更新了任务", "task.blocked": "阻塞了任务",
     "task.intake_submitted": "提交了任务意图", "task.intake_acknowledged": "受理了任务意图",
     "task.intake_reassigned": "改派了任务意图", "task.intake_defined": "正式定义了任务",
+    "task.intake_cancelled": "撤销了任务意图",
     "task.unblocked": "解除了任务阻塞", "task.released": "释放了任务",
     "task.cancelled": "取消了任务", "lease.acquired": "占用了文件范围",
     "lease.released": "释放了文件范围", "lease.conflict": "检测到文件冲突",
@@ -787,14 +791,26 @@ function resetProjectFilters() {
 }
 
 function taskReleaseVisible(task) {
-  // 释放按钮只在可释放的执行阶段显示；终态与待验收阶段不换执行者。
-  return ["claimed", "in_progress", "blocked"].includes(task.execution_status);
+  // 释放只在领域判定为可释放时显示：服务端的 task_release 只接受
+  // claimed / in_progress / blocked 三个执行阶段。
+  return taskActionAvailable(task, "release", ["claimed", "in_progress", "blocked"].includes(task.execution_status));
 }
 
 function taskCancelVisible(task) {
-  // 取消入口与服务端状态转换表一致：done 是终态不可取消，已取消无需重复取消。
+  // 取消入口取服务端判定：done 是终态不可取消，已取消无需重复取消。
   const phase = taskView(task).phase;
-  return phase !== "done" && phase !== "cancelled";
+  return taskActionAvailable(task, "cancel", phase !== "done" && phase !== "cancelled");
+}
+
+// Which actions the service will accept for this task. The server publishes
+// `available_actions` per task; the local fallbacks only apply to a task
+// object that predates that field, so a stale snapshot can never hide a
+// control the domain actually accepts. Declared here (function declarations
+// hoist) so it travels with the two visibility rules it serves.
+function taskActionAvailable(task, action, fallback) {
+  const published = task?.available_actions;
+  if (Array.isArray(published)) return published.includes(action);
+  return fallback;
 }
 
 async function cancelTask(task) {
@@ -1621,10 +1637,13 @@ function taskNavigationEntries(tasks) {
     if (view.needs_attention) attentionIds.add(task.id);
   }
   counts.attention = attentionIds.size;
+  // 常驻导航组来自服务端发布的 groups；unclassified 只在有数据时追加，
+  // 因此这里显式排除它，而不是让前端的数组顺序决定谁常驻。
+  const residentGroups = (config?.groups || []).filter((group) => group !== "unclassified");
   const entries = [
     { key: "", label: "全部任务", count: tasks.length, kind: "reset" },
     { key: "attention", label: config?.attention_label || "需要处理", count: counts.attention || 0, kind: "attention" },
-    ...["claimable", "active", "review", "integration", "done", "cancelled"]
+    ...residentGroups
       .map((group) => ({ key: group, label: viewGroupLabel(group), count: counts[group] || 0, kind: "group" })),
   ];
   const unclassified = counts.unclassified || 0;
@@ -1643,11 +1662,13 @@ function activeSubgroupRank(phase) {
 function sortForEntry(tasks, entry) {
   const sorted = [...tasks];
   if (entry.key === "attention") {
-    const phaseOrder = { integration_failed: 0, changes_requested: 1, blocked: 2 };
+    // 收件箱排序用服务端发布的 attention_phases，顺序即其发布顺序。
+    const attentionOrder = taskViewConfig()?.attention_phase_order || ["integration_failed", "changes_requested", "blocked"];
+    const phaseOrder = Object.fromEntries(attentionOrder.map((phase, index) => [phase, index]));
     sorted.sort((left, right) => {
       const leftPhase = taskView(left).phase;
       const rightPhase = taskView(right).phase;
-      return (phaseOrder[leftPhase] ?? 9) - (phaseOrder[rightPhase] ?? 9);
+      return (phaseOrder[leftPhase] ?? 99) - (phaseOrder[rightPhase] ?? 99);
     });
     return sorted;
   }
@@ -1762,14 +1783,15 @@ function renderTaskExpertFilters(tasks) {
     .map((code) => `<option value="${escapeHtml(code)}" ${expert.phase === code ? "selected" : ""}>${escapeHtml(viewLabel(code))} (${phaseCounts[code] || 0})</option>`)
     .join("");
   const phases = taskViewConfig()?.phases || [];
-  const executionCodes = taskViewConfig()?.phases
-    ? ["todo", "claimed", "in_progress", "blocked", "completed", "cancelled"]
-    : [];
+  // 三个状态面的候选值取自服务端发布的标签表键集，顺序即发布顺序；
+  // 优先级区间同样由服务端发布，前端不再自己数 0..4。
+  const faceCodes = (kind) => Object.keys(taskViewConfig()?.[`${kind}_labels`] || {});
+  const priorityRange = taskViewConfig()?.task_priority_range || [];
   container.innerHTML = `
-    <label>执行<select data-expert="execution"><option value="">全部</option>${options("execution", executionCodes)}</select></label>
-    <label>验收<select data-expert="verification"><option value="">全部</option>${options("verification", ["not_required", "pending", "changes_requested", "approved"])}</select></label>
-    <label>集成<select data-expert="integration"><option value="">全部</option>${options("integration", ["pending", "done", "failed"])}</select></label>
-    <label>优先级<select data-expert="priority"><option value="">全部</option>${[0, 1, 2, 3, 4].map((value) => `<option value="${value}" ${expert.priority !== "" && String(expert.priority) === String(value) ? "selected" : ""}>P${value}</option>`).join("")}</select></label>
+    <label>执行<select data-expert="execution"><option value="">全部</option>${options("execution", faceCodes("execution"))}</select></label>
+    <label>验收<select data-expert="verification"><option value="">全部</option>${options("verification", faceCodes("verification"))}</select></label>
+    <label>集成<select data-expert="integration"><option value="">全部</option>${options("integration", faceCodes("integration"))}</select></label>
+    <label>优先级<select data-expert="priority"><option value="">全部</option>${priorityRange.map((value) => `<option value="${value}" ${expert.priority !== "" && String(expert.priority) === String(value) ? "selected" : ""}>P${value}</option>`).join("")}</select></label>
     <label>负责人<select data-expert="owner"><option value="">全部</option>${owners}</select></label>
     <label>任务号<input type="search" inputmode="numeric" placeholder="#号" data-expert="number" value="${escapeHtml(expert.number)}"></label>
     ${phases.length ? `<label>精确状态<select data-expert="phase"><option value="">全部</option>${phaseOptions(phases)}</select></label>` : ""}`;
@@ -1848,11 +1870,33 @@ function intakeTargetName(intake) {
   return target?.name || intake.target_member_id || "未指定 Agent";
 }
 
+function taskIntakeConfig() {
+  return state.config?.domain?.task_intake || null;
+}
+
 function taskIntakeStatus(status) {
-  return {
-    pending: "待 Agent 受理", accepted: "已受理待定义", defined: "已正式定义",
-    declined: "Agent 已拒绝", blocked: "受理受阻", cancelled: "已取消",
-  }[status] || status;
+  const labels = taskIntakeConfig()?.status_labels || {};
+  return labels[status] || status;
+}
+
+function taskIntakeActiveStatuses() {
+  const published = taskIntakeConfig()?.active_statuses;
+  return Array.isArray(published) ? published : ["pending", "accepted"];
+}
+
+// `cancelled` 是已发布的状态与服务端转移，但此前没有任何入口能写入它：
+// 一个目标 Agent 永不受理的意图会永远停在 pending。撤销入口按服务端转移
+// 表判定；`cancelled` 的自环只是幂等语义，不构成「仍可撤销」，所以已经
+// 撤销或已定义的条目不再显示入口。
+function taskIntakeCancellable(intake) {
+  if (intake.status === "cancelled") return false;
+  const transitions = taskIntakeConfig()?.transitions || {};
+  return (transitions[intake.status] || []).includes("cancelled");
+}
+
+function taskIntakeCancelButton(intake) {
+  if (!taskIntakeCancellable(intake)) return "";
+  return `<button type="button" class="link-button" data-intake-cancel-id="${escapeHtml(intake.id)}">撤销意图</button>`;
 }
 
 function taskIntakeTaskReference(intake) {
@@ -1865,12 +1909,12 @@ function taskIntakeTaskReference(intake) {
 }
 
 function renderTaskIntakes() {
-  const activeStatuses = new Set(["pending", "accepted"]);
+  const activeStatuses = new Set(taskIntakeActiveStatuses());
   const active = state.taskIntakes.filter((intake) => activeStatuses.has(intake.status));
   const archived = state.taskIntakes.filter((intake) => !activeStatuses.has(intake.status));
   const renderItem = (intake) => `
       <article class="task-intake-item">
-        <div class="task-intake-meta"><span class="status-badge ${escapeHtml(intake.status)}">${escapeHtml(taskIntakeStatus(intake.status))}</span><span class="secondary-text">受理 Agent：${escapeHtml(intakeTargetName(intake))}</span></div>
+        <div class="task-intake-meta"><span class="status-badge ${escapeHtml(intake.status)}">${escapeHtml(taskIntakeStatus(intake.status))}</span><span class="secondary-text">受理 Agent：${escapeHtml(intakeTargetName(intake))}</span>${taskIntakeCancelButton(intake)}</div>
         <p>${escapeHtml(intake.raw_description)}</p>
         ${intake.note ? `<small>${escapeHtml(intake.note)}</small>` : ""}
         ${taskIntakeTaskReference(intake)}
@@ -2730,6 +2774,25 @@ elements["task-cancel-button"].addEventListener("click", () => {
   cancelTask(task);
 });
 
+// 释放原因码与文案由服务端版本化配置给出；配置未到达时保留空占位，
+// 提交前的非空校验会拦住，不会发出一个服务端必然拒绝的原因码。
+function renderReleaseReasonOptions() {
+  const select = elements["task-release-reason"];
+  if (!select) return;
+  const labels = state.config?.domain?.task_release_reason_labels || {};
+  const codes = state.config?.domain?.task_release_reason_codes || [];
+  if (!codes.length) return;
+  const signature = codes.join("|");
+  if (select.dataset.reasonSignature === signature) return;
+  select.dataset.reasonSignature = signature;
+  select.innerHTML = [
+    '<option value="">选择原因…</option>',
+    ...codes.map(
+      (code) => `<option value="${escapeHtml(code)}">${escapeHtml(labels[code] || code)}</option>`,
+    ),
+  ].join("");
+}
+
 elements["task-release-button"].addEventListener("click", () => {
   const task = state.snapshot?.tasks.find((item) => item.id === state.editingTaskId);
   if (!task || !state.projectId) return;
@@ -2830,13 +2893,29 @@ document.getElementById("integration-onboarding-mode").addEventListener("change"
   if (state.integrationOnboardingMode === "first_setup") void refreshLocalMcpPlan();
 });
 
+elements["integration-client-profile"].addEventListener("change", (event) => {
+  if (!state.integration?.profiles?.[event.target.value]) return;
+  state.integrationFormat = event.target.value;
+  // A profile switch invalidates any detection result: the plan is per profile.
+  state.integrationLocalRequest += 1;
+  state.integrationLocalPlan = null;
+  state.integrationLocalApplyResult = null;
+  renderIntegrationTabs();
+  renderIntegrationConfig();
+  renderOnboardingPrompt();
+  renderHttpTokenGuide();
+  renderLocalMcpPlan();
+  if (state.integrationTransport === "local") void refreshLocalMcpPlan();
+});
+
 elements["integration-transport-tabs"].addEventListener("click", (event) => {
   const button = event.target.closest("[data-integration-transport]");
-  if (!button) return;
+  if (!button || button.hidden) return;
   state.integrationTransport = button.dataset.integrationTransport;
   document.querySelectorAll("[data-integration-transport]").forEach((item) => {
     item.classList.toggle("is-active", item === button);
   });
+  renderIntegrationTransportHint();
   renderIntegrationConfig();
   renderOnboardingPrompt();
   state.integrationLocalPlan = null;
@@ -2974,6 +3053,11 @@ elements["task-table"].addEventListener("click", (event) => {
 });
 
 elements["task-intake-list"].addEventListener("click", (event) => {
+  const cancelButton = event.target.closest("[data-intake-cancel-id]");
+  if (cancelButton) {
+    cancelTaskIntake(cancelButton.dataset.intakeCancelId).catch(handleError);
+    return;
+  }
   const button = event.target.closest("[data-task-id]");
   if (button) openTaskDetails(button.dataset.taskId).catch(handleError);
 });
@@ -3338,6 +3422,22 @@ elements["settings-form"].addEventListener("submit", async (event) => {
   }
 });
 
+async function cancelTaskIntake(intakeId) {
+  if (!state.projectId || !intakeId) return;
+  const intake = state.taskIntakes.find((item) => item.id === intakeId);
+  const confirmed = window.confirm(
+    "撤销后该任务意图不再进入受理流程，历史记录保留。确定要撤销吗？"
+    + (intake?.raw_description ? `\n\n${intake.raw_description}` : ""),
+  );
+  if (!confirmed) return;
+  await api(
+    `/api/v1/projects/${state.projectId}/task-intakes/${encodeURIComponent(intakeId)}/cancel`,
+    { method: "POST", body: JSON.stringify({}) },
+  );
+  await refreshTaskIntakeData();
+  showToast("任务意图已撤销");
+}
+
 elements["task-form"].addEventListener("submit", async (event) => {
   event.preventDefault();
   if (!state.projectId) return;
@@ -3673,9 +3773,14 @@ function showIssuedHttpResult(setup) {
   if (!elements["token-secret-dialog"].open) elements["token-secret-dialog"].showModal();
 }
 
-function renderIssuedHttpConfig() {
+// 签发后的提示词由服务端单一生成器产出（integrations
+// .build_issued_credential_prompt）。Web 只负责把本次签发的真实凭据包传上去，
+// 并把结果原样显示：两份手写副本曾导致 service_unavailable 约束只存在于其中
+// 一份，且把凭据槽描述成"替换为显示名称"。
+async function renderIssuedHttpConfig() {
   const setup = state.issuedHttpSetup;
-  const profile = setup?.profiles?.[elements["token-config-format"].value];
+  const profileId = elements["token-config-format"].value;
+  const profile = setup?.profiles?.[profileId];
   if (!profile) return;
   if (setup.mode === "reconnect") {
     elements["token-config-heading"].textContent = "恢复连接提示词";
@@ -3693,20 +3798,51 @@ function renderIssuedHttpConfig() {
     elements["token-config-heading"].textContent = "增量接入提示词（交给已配置的 Agent）";
     elements["token-config-copy"].textContent = "复制增量提示词";
     elements["token-config-hint"].textContent = "包含新 Project Token 明文，只整体复制给已配置过 agentchatroom 的那个 Agent；Agent 会在客户端本地保留旧配置并自行合并，不要发送到 Room、日志或仓库。";
-    elements["token-config-value"].textContent = incrementalHttpPrompt(profile, setup);
-    elements["token-config-path"].textContent = `${profile.config_path_hint || "客户端 MCP 配置"}；MCP Server 标准名称：agentchatroom（Agent 更新现有条目，不新增）`;
+    elements["token-config-value"].textContent = "正在生成接入提示词…";
+    elements["token-config-path"].textContent = `${profile.resolved_config_path || profile.config_path_hint || "客户端 MCP 配置"}；MCP Server 标准名称：agentchatroom（Agent 更新现有条目，不新增）`;
     elements["token-config-projects"].textContent = setup.projectPath
       ? `目标 Project：${setup.projectName}（工作区：${setup.projectPath}）；客户端原有 Project 凭据由 Agent 在本地保留`
       : `目标 Project：${setup.projectName}；客户端原有 Project 凭据由 Agent 在本地保留`;
+    await loadIssuedServerPrompt(setup, profileId, "add_project");
     return;
   }
   elements["token-config-heading"].textContent = "完整 HTTP 接入提示词";
   elements["token-config-copy"].textContent = "复制完整提示词";
   elements["token-config-hint"].textContent = "内容包含 Project 与 Token 的明文对应关系，只交给负责配置该客户端的 Agent；不要发送到 Room、日志或仓库。";
-  elements["token-config-value"].textContent = issuedHttpPrompt(profile, setup);
-  elements["token-config-path"].textContent = `${profile.config_path_hint || "客户端 MCP 配置"}；MCP Server 标准名称：agentchatroom`;
+  elements["token-config-value"].textContent = "正在生成接入提示词…";
+  elements["token-config-path"].textContent = `${profile.resolved_config_path || profile.config_path_hint || "客户端 MCP 配置"}；MCP Server 标准名称：agentchatroom`;
   const projectPathHint = setup.projectPath ? `（当前工作区：${setup.projectPath}）` : "";
   elements["token-config-projects"].textContent = `已包含 ${setup.projectCredentials.length} 个 Project：${setup.projectCredentials.map((item) => item.name).join("、")}${projectPathHint}`;
+  await loadIssuedServerPrompt(setup, profileId, "first_setup");
+}
+
+// 提示词请求带代次校验：切换客户端或关闭弹窗后到达的旧响应整份丢弃，不会把
+// 上一个客户端的提示词显示到当前对话框里。
+async function loadIssuedServerPrompt(setup, profileId, mode) {
+  const projectId = setup?.projectId || state.projectId;
+  const requestId = ++state.issuedPromptRequest;
+  try {
+    const result = await api(`/api/v1/projects/${projectId}/integrations/mcp/issued-prompt`, {
+      method: "POST",
+      body: JSON.stringify({
+        profile_id: profileId,
+        mode,
+        project_name: setup.projectName || "",
+        project_credentials: validateProjectCredentials(setup.projectCredentials),
+        software_identity: normalizedSoftwareIdentity(setup.softwareIdentity),
+        linked_member_name: setup.member?.name || "",
+      }),
+    });
+    if (requestId !== state.issuedPromptRequest) return;
+    if (elements["token-config-format"].value !== profileId) return;
+    elements["token-config-value"].textContent = result.prompt;
+    state.issuedHttpSetup.generatedConfigText = result.config_text;
+  } catch (error) {
+    if (requestId !== state.issuedPromptRequest) return;
+    elements["token-config-value"].textContent =
+      "接入提示词生成失败，请重新签发或更新服务后重试。未生成任何配置。";
+    handleError(error);
+  }
 }
 
 const PROJECT_CREDENTIAL_BUNDLE_PREFIX = "acrb.v1.";
@@ -3903,121 +4039,6 @@ function mergeProjectCredentials(existing, added) {
   const merged = existing.filter((item) => item.name.toLocaleLowerCase() !== incoming.name.toLocaleLowerCase());
   merged.push(incoming);
   return validateProjectCredentials(merged);
-}
-
-function issuedHttpPrompt(profile, setup) {
-  const projectCredentials = validateProjectCredentials(setup.projectCredentials);
-  const config = issuedHttpConfig(profile, projectCredentials, setup.softwareIdentity);
-  const mode = setup.mode === "add_project" ? "add_project" : "first_setup";
-  const bootstrapProjectName = String(setup.projectName || "").trim();
-  const projectPath = String(setup.projectPath || "").trim();
-  const modeLabel = mode === "add_project" ? "已配置软件，加入本项目" : "首次配置软件";
-  const mapping = projectCredentials.flatMap((item, index) => [
-    `project_name_${index + 1}=${JSON.stringify(item.name)}`,
-    `project_token_${index + 1}=${JSON.stringify(item.token)}`,
-  ]).join("\n");
-  const targetProjectLine = projectPath
-    ? `目标 Project：${bootstrapProjectName}（本地工作区根目录 root_path: ${projectPath}）`
-    : `目标 Project：${bootstrapProjectName}`;
-  const verifyStep = projectPath
-    ? `3. 在目标 Project 本地工作区（${projectPath}）中调用 room_bootstrap(project_name=${JSON.stringify(bootstrapProjectName)})，核对返回的 Project 名称与 root_path 与当前工作区一致，再执行写操作。`
-    : `3. 调用 room_bootstrap(project_name=${JSON.stringify(bootstrapProjectName)})，核对返回的 Project 名称与 root_path 与当前工作区一致，再执行写操作。`;
-  // #143：极简 3 步结构——写入配置 -> 重启/重载 MCP -> bootstrap 核对。
-  return [
-    `请完成 AgentChatRoom HTTP MCP 接入（${modeLabel}）。${targetProjectLine}。`,
-    "",
-    "Project 与 Token 对应关系（按名称保留，不得混用）：",
-    mapping,
-    "",
-    "1. 把下面的 MCP 配置写入客户端（服务器名固定 agentchatroom；客户端格式不同时只转换语法，保留 URL、Authorization 与软件身份字段）：",
-    "",
-    config,
-    "",
-    "2. 写入后重启或重新加载客户端 MCP，使配置生效。",
-    verifyStep,
-    "",
-    "不要把 Token 发布到 Room、日志或仓库。",
-  ].join("\n");
-}
-
-function incrementalHttpPrompt(profile, setup) {
-  const credential = validateProjectCredentials(setup.projectCredentials)[0];
-  const projectName = String(setup.projectName || credential.name).trim();
-  const projectPath = String(setup.projectPath || "").trim();
-  const configHint = profile.config_path_hint || "客户端 MCP 配置文件";
-  const linkedIdentity = setup.member
-    ? normalizedSoftwareIdentity(setup.softwareIdentity)
-    : null;
-  const identityLine = linkedIdentity
-    ? `本次 Token 已关联成员 ${JSON.stringify(setup.member.name)}：现有配置的软件身份 Header 若存在，三字段必须与 Key=${JSON.stringify(linkedIdentity.softwareKey)} 的身份一致。`
-    : "本次 Token 未关联成员：原样保留客户端现有的软件身份三字段。";
-  const targetProjectLine = projectPath
-    ? `目标 Project：${projectName}（本地工作区根目录 root_path: ${projectPath}）`
-    : `目标 Project：${projectName}`;
-  const verifyStep = projectPath
-    ? `3. 在目标 Project 本地工作区（${projectPath}）中调用 room_bootstrap(project_name=${JSON.stringify(projectName)})，核对返回的 Project 名称与 root_path 与当前工作区一致，再执行写操作；无法读取本地配置时停止并向用户报告。`
-    : `3. 调用 room_bootstrap(project_name=${JSON.stringify(projectName)})，核对返回的 Project 名称与 root_path 与当前工作区一致，再执行写操作；无法读取本地配置时停止并向用户报告。`;
-  // #143：极简 3 步——合并凭据 -> 重启/重载 MCP -> bootstrap 核对。
-  return [
-    "该客户端已配置过 agentchatroom HTTP MCP。请把本次签发的新 Project 凭据增量合并进现有配置；不新建第二个 agentchatroom 连接器。",
-    "",
-    targetProjectLine,
-    "",
-    "本次签发凭据：",
-    `project_name_1=${JSON.stringify(credential.name)}`,
-    `project_token_1=${JSON.stringify(credential.token)}`,
-    `合并条目：{"name": ${JSON.stringify(credential.name)}, "token": ${JSON.stringify(credential.token)}}`,
-    "",
-    identityLine,
-    "",
-    `1. 打开客户端现有 agentchatroom 条目（配置位置参考：${configHint}），保留其 url、Authorization 凭据包与软件身份字段，把上面的 {"name":...,"token":...} 合并进 acrb.v1 凭据包后写回同一条目。`,
-    "2. 保存后重启或重新加载客户端 MCP。",
-    verifyStep,
-    "",
-    "不要把 Token 发布到 Room、日志或仓库。",
-  ].join("\n");
-}
-
-function issuedHttpConfig(profile, projectCredentials, softwareIdentity) {
-  let config = profile.streamable_http_config_text || "";
-  const bundle = encodeProjectCredentialBundle(projectCredentials);
-  const identity = normalizedSoftwareIdentity(softwareIdentity);
-  if (!identity) throw new Error("HTTP 接入配置缺少软件身份");
-  // Only the one-time result dialog receives this text. It is never stored in
-  // shared integration state, browser storage, Room messages, or logs.
-  if (profile.format === "json") {
-    const parsed = JSON.parse(config);
-    for (const server of Object.values(parsed.mcpServers || {})) {
-      server.headers.Authorization = `Bearer ${bundle}`;
-      server.headers["X-AgentChatRoom-Software-Key"] = encodeHttpIdentityHeaderValue(identity.softwareKey);
-      server.headers["X-AgentChatRoom-Software-Name"] = encodeHttpIdentityHeaderValue(identity.softwareName);
-      server.headers["X-AgentChatRoom-Software-Client"] = encodeHttpIdentityHeaderValue(identity.softwareClient);
-    }
-    return JSON.stringify(parsed, null, 2);
-  }
-  const authorization = `Authorization = ${JSON.stringify(`Bearer ${bundle}`)}`;
-  const identityHeaders = {"X-AgentChatRoom-Software-Key": encodeHttpIdentityHeaderValue(identity.softwareKey),
-    "X-AgentChatRoom-Software-Name": encodeHttpIdentityHeaderValue(identity.softwareName),
-    "X-AgentChatRoom-Software-Client": encodeHttpIdentityHeaderValue(identity.softwareClient)};
-  for (const [key, value] of Object.entries(identityHeaders)) {
-      const line = `${key} = ${JSON.stringify(value)}`;
-      const existing = new RegExp(`^${key} = .*$`, "m");
-      if (existing.test(config)) {
-        config = config.replace(existing, () => line);
-      } else {
-        config = config.replace(
-          /(\[mcp_servers\.[^\]\n]+\.(?:http_headers|headers)\])/,
-          `$1\n${line}`,
-        );
-      }
-  }
-  config = config.replace(/^bearer_token_env_var = .*\r?\n/gm, "");
-  if (/^Authorization = /m.test(config)) {
-    config = config.replace(/^Authorization = .*$/m, () => authorization);
-  } else {
-    config = config.replace(/(\[mcp_servers\.[^\]\n]+\.(?:http_headers|headers)\])/, `$1\n${authorization}`);
-  }
-  return config;
 }
 
 function handleError(error) {
@@ -4305,7 +4326,13 @@ async function openTaskDetails(taskId, options = {}) {
   }
   renderTaskContract(task);
   renderTaskAssignments(task);
-  elements["task-assign-button"].disabled = ["done", "cancelled"].includes(taskView(task).phase);
+  // 指派可用性取服务端 available_actions（服务端按 execution_status 拒绝
+  // completed / cancelled），不再按 phase 猜测。没有该字段的旧快照退回
+  // 与领域守卫同口径的本地判定。
+  const assignable = Array.isArray(task.available_actions)
+    ? task.available_actions.includes("assign")
+    : !["completed", "cancelled"].includes(task.execution_status);
+  elements["task-assign-button"].disabled = !assignable;
   elements["task-release-button"].classList.toggle("is-hidden", !taskReleaseVisible(task));
   elements["task-cancel-button"].classList.toggle("is-hidden", !taskCancelVisible(task));
   // showModal throws InvalidStateError when the dialog is already open.
@@ -4425,13 +4452,66 @@ async function downloadProjectExport() {
   showToast("审计数据已导出 (JSON)");
 }
 
-function renderIntegrationTabs() {
-  // 配置助手只保留通用标准 MCP 接入（具名客户端预设仅在后端 CLI 里），
-  // 单一选项不再渲染切换行；profile 仍经 state.integrationFormat 使用。
-  if (!state.integration?.profiles) return;
-  if (!Object.keys(state.integration.profiles).includes(state.integrationFormat)) {
+// 目标客户端选择器。profile 列表来自服务端发布的 integrations.profiles，
+// 顺序即发布顺序；带 local_config 的客户端才有本机配置助手。
+function renderIntegrationProfileOptions() {
+  const select = elements["integration-client-profile"];
+  if (!select || !state.integration?.profiles) return;
+  const profiles = state.integration.profiles;
+  if (!Object.keys(profiles).includes(state.integrationFormat)) {
     state.integrationFormat = "generic";
   }
+  const signature = Object.keys(profiles).join("|");
+  if (select.dataset.profileSignature !== signature) {
+    select.dataset.profileSignature = signature;
+    select.innerHTML = Object.entries(profiles).map(([profileId, profile]) => {
+      const managed = profile.local_config ? "（支持本机配置助手）" : "";
+      return `<option value="${escapeHtml(profileId)}">${escapeHtml(profile.label || profileId)}${escapeHtml(managed)}</option>`;
+    }).join("");
+  }
+  select.value = state.integrationFormat;
+  const profile = profiles[state.integrationFormat] || {};
+  const hint = elements["integration-client-profile-hint"];
+  if (hint) {
+    hint.textContent = profile.local_config
+      ? `${profile.config_path_hint || ""}该客户端支持由服务端检测并写入本机配置。`.trim()
+      : `${profile.config_path_hint || ""}该客户端没有可托管的本机配置文件路径，本机 stdio 需手动写入。`.trim();
+  }
+}
+
+function renderIntegrationTabs() {
+  renderIntegrationProfileOptions();
+  const transports = state.integration?.transports || {};
+  // 传输方式的可用性由服务端发布，冻结 EXE 也据此隐藏用不了的入口。
+  const available = [
+    ["http", transports.streamable_http?.enabled !== false],
+    ["local", true],
+    ["remote", transports.remote_stdio_bridge?.enabled !== false],
+  ].filter(([, enabled]) => enabled).map(([transport]) => transport);
+  document.querySelectorAll("[data-integration-transport]").forEach((item) => {
+    item.hidden = !available.includes(item.dataset.integrationTransport);
+  });
+  if (!available.includes(state.integrationTransport)) {
+    state.integrationTransport = available[0] || "http";
+  }
+  document.querySelectorAll("[data-integration-transport]").forEach((item) => {
+    item.classList.toggle("is-active", item.dataset.integrationTransport === state.integrationTransport);
+  });
+  renderIntegrationTransportHint();
+}
+
+function renderIntegrationTransportHint() {
+  const hint = elements["integration-transport-hint"];
+  if (!hint) return;
+  const profile = state.integration?.profiles?.[state.integrationFormat] || {};
+  const text = {
+    http: "HTTP 直连是主路径：共用一个服务，不为每条连接拉起适配器进程。",
+    local: profile.local_config
+      ? "本机 stdio 由本进程拉起适配器；该客户端的配置文件可由服务端检测、备份后写入。"
+      : "本机 stdio 由本进程拉起适配器；该客户端没有可托管的配置路径，需按下方配置手动写入。",
+    remote: "远程 Bridge 在 Agent 计算机上把本地 stdio 转发到中心，只适合客户端只能拉起本地进程的场景。",
+  };
+  hint.textContent = text[state.integrationTransport] || text.http;
 }
 
 function localMcpAssistantSupported() {
@@ -4816,6 +4896,7 @@ function initializeAppearance() {
 
 function applyPublicConfig() {
   applyAppearanceTheme();
+  renderReleaseReasonOptions();
   elements["product-name"].textContent = state.config.product_name;
   document.title = state.config.product_name;
   const folderPickerEnabled = Boolean(state.config.capabilities?.local_folder_picker);

@@ -14,8 +14,9 @@ from datetime import datetime
 from queue import Queue
 from typing import Any
 
-from .api import redact_log_line
+from .api import redact_log_line, task_view_presentation_config
 from .config import Settings
+from .contracts import task_view
 from .database import create_database
 from .errors import DomainError
 from .services import AgentChatRoomService
@@ -36,12 +37,41 @@ _SESSION_LABEL = re.compile(
 )
 _HTTP_STATUS = re.compile(r"HTTP/\d(?:\.\d)?[\s\"]+([1-5]\d\d)\b", re.IGNORECASE)
 _QUIET_EVENTS = frozenset({"session.heartbeat", "message.acknowledged"})
-_STATUS_ZH = {
-    "todo": "待开始", "claimed": "已认领", "in_progress": "进行中",
-    "blocked": "阻塞", "completed": "执行完成", "awaiting_review": "待独立验收",
-    "verified": "验收通过", "changes_requested": "要求修改",
-    "pending_integration": "待集成", "done": "已集成", "cancelled": "已取消",
-}
+
+
+def _event_status_label(data: Mapping[str, Any]) -> str:
+    """Wording for an event's task state, taken from the published config.
+
+    The GUI used to keep its own `_STATUS_ZH` map keyed by the legacy status.
+    That map drifted from the served vocabulary: it spelled
+    `changes_requested` "要求修改" where the projection says "已退回", and it
+    had no entry at all for `integration_failed` or `unclassified`, so those
+    events fell through to a raw English code. The projection is the single
+    source of the code, and the versioned config is the single source of the
+    wording, so both are read from here instead of restated.
+
+    The projection is only applied when the event carries all three faces.
+    Filling in a missing face would invent a phase (an event with
+    ``execution_status`` alone says nothing about verification), so a partial
+    payload resolves through the published legacy/execution label tables
+    instead.
+    """
+    config = task_view_presentation_config()
+    execution = str(data.get("execution_status") or "")
+    verification = str(data.get("verification_status") or "")
+    integration = str(data.get("integration_status") or "")
+    if execution and verification and integration:
+        phase = task_view(
+            execution_status=execution,
+            verification_status=verification,
+            integration_status=integration,
+        )["phase"]
+        return config["phase_labels"].get(phase, phase)
+    raw_status = execution or str(data.get("status") or "")
+    if not raw_status:
+        return ""
+    labels = {**config["status_labels"], **config["execution_labels"]}
+    return labels.get(raw_status) or _safe(raw_status, limit=32)
 
 
 def sanitize_gui_text(value: Any, *, limit: int = 500) -> str:
@@ -135,8 +165,7 @@ def format_room_event(
     title = _safe(task_title or data.get("title"), limit=100)
     if title:
         task += f"「{title}」"
-    raw_status = str(data.get("status") or data.get("execution_status") or "")
-    status = _STATUS_ZH.get(raw_status, _safe(raw_status, limit=32))
+    status = _event_status_label(data)
     reason = _safe(data.get("blocker_reason") or data.get("reason") or data.get("notes"), limit=160)
     progress = data.get("progress_percent")
     progress_note = f"，进度 {progress}%" if isinstance(progress, int) and 0 <= progress <= 100 else ""
@@ -153,6 +182,7 @@ def format_room_event(
         "task.intake_submitted": f"{name} 提交了任务需求",
         "task.intake_defined": f"任务需求已整理为正式{task}",
         "task.intake_reassigned": "任务需求已重新分派",
+        "task.intake_cancelled": "任务需求已撤销",
         "task.intake_acknowledged": "任务需求已确认",
         "task.claimed": f"{name} 认领了{task}",
         "task.reclaimed": (

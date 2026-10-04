@@ -2223,6 +2223,21 @@ button.event-id {
   border-color: var(--amber-border);
 }
 
+/* todo and defined are real badge values (the task phase "todo" and the
+   intake status "defined") that had no rule at all, so both rendered as the
+   unstyled base chip and were told apart by their text alone. */
+.status-badge.todo {
+  background: var(--surface-muted);
+  color: var(--text-muted);
+  border-color: var(--border-strong);
+}
+
+.status-badge.defined {
+  background: var(--primary-soft);
+  color: var(--primary);
+  border-color: var(--primary-border);
+}
+
 .status-badge.in_progress,
 .status-badge.claimed {
   background: var(--blue-soft);
@@ -3615,8 +3630,15 @@ dialog > .toast-region .toast.error {
   color: var(--red);
 }
 
+/* An integration failure is the one phase that needs a glance to be readable:
+   red text on the neutral base read as a normal chip. Give it the danger fill
+   and a solid border so it is distinguishable without relying on the label. */
 .status-badge.integration_failed {
+  background: var(--red-soft);
   color: var(--red);
+  border-color: var(--red-border);
+  border-style: solid;
+  font-weight: var(--weight-bold);
 }
 
 .status-badge.pending_integration {

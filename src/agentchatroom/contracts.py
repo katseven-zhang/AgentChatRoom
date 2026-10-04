@@ -8,6 +8,12 @@ from typing_extensions import NotRequired, TypedDict
 DOMAIN_SCHEMA_VERSION = 7
 PROJECT_MEMBER_SCHEMA_VERSION = 1
 KNOWLEDGE_SCHEMA_VERSION = 1
+# Inclusive priority bounds. Declared once because the same 0..4 range was
+# re-typed at five separate guards and in the adapter request models; a
+# published range lets a client render the filter without counting to four.
+TASK_PRIORITY_MIN = 0
+TASK_PRIORITY_MAX = 4
+TASK_PRIORITY_RANGE = tuple(range(TASK_PRIORITY_MIN, TASK_PRIORITY_MAX + 1))
 MODEL_DISPLAY_NAME_MAX_LENGTH = 160
 MCP_CONTEXT_EVENT_TYPES = ("message.message", "message.decision", "message.blocker")
 
@@ -109,6 +115,13 @@ TASK_VIEW_GROUP_CODES = (
 # Inbox semantics: exactly the three anomaly phases ("something is wrong").
 # todo stays out because 待认领 already has its own navigation entry.
 TASK_VIEW_ATTENTION_PHASES = {"changes_requested", "blocked", "integration_failed"}
+# Severity order inside the inbox. A set has no order, so the ranking the
+# service decided is declared here once instead of being re-guessed per client.
+TASK_VIEW_ATTENTION_PHASE_ORDER = (
+    "integration_failed",
+    "changes_requested",
+    "blocked",
+)
 
 # "修改中" also covers released-after-review tasks returning to the pool as
 # (todo, changes_requested, pending) — contract of task #43.
@@ -258,6 +271,49 @@ TASK_RELEASE_REASON_CODES = {
 }
 TASK_RELEASE_EXECUTION_STATUSES = {"claimed", "in_progress", "blocked"}
 TASK_RELEASE_COMPAT_REASON_CODE = "other"
+
+# Action vocabulary an adapter may offer on a task. The codes are the contract;
+# the localized button wording is published as versioned config by the REST
+# adapter. Which actions a task actually accepts is projected from the same
+# domain state the write path enforces, so a client can never render an action
+# the service is going to refuse.
+TASK_ACTION_CODES = ("assign", "cancel", "release")
+# assign_task refuses a task whose execution face is closed, independently of
+# the phase projection: a completed-but-unintegrated task still reads as
+# "pending_integration" yet already rejects a new assignment.
+_TASK_ASSIGN_BLOCKED_EXECUTION_STATUSES = {"completed", "cancelled"}
+# Cancellation is refused for the two closed phases: "done" is the only
+# finished state and "cancelled" is terminal (task_update rejects a reopen).
+_TASK_CANCEL_BLOCKED_PHASES = {"done", "cancelled"}
+
+
+def task_available_actions(
+    *,
+    execution_status: str,
+    verification_status: str,
+    integration_status: str,
+) -> list[str]:
+    """Project the action codes a task currently accepts.
+
+    A pure function of the same three state faces `task_view` consumes, kept
+    beside it so the two projections cannot drift. Every rule mirrors one
+    write-path guard in the service layer: an action is offered if and only if
+    the corresponding command would not be refused for state reasons.
+    """
+    execution = str(execution_status)
+    actions = []
+    if execution not in _TASK_ASSIGN_BLOCKED_EXECUTION_STATUSES:
+        actions.append("assign")
+    if task_view(
+        execution_status=execution,
+        verification_status=verification_status,
+        integration_status=integration_status,
+    )["phase"] not in _TASK_CANCEL_BLOCKED_PHASES:
+        actions.append("cancel")
+    if execution in TASK_RELEASE_EXECUTION_STATUSES:
+        actions.append("release")
+    return actions
+
 
 ASSIGNMENT_STATUSES = {"pending", "accepted", "declined", "blocked", "cancelled"}
 ASSIGNMENT_RESPONSES = {"accepted", "declined", "blocked"}

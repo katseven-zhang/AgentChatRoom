@@ -53,7 +53,12 @@ def test_web_add_project_issues_without_pasting_raw_config():
     # 提交路径不再读取粘贴文本：增量分支仅限加入本项目。
     assert "请粘贴客户端当前使用的 agentchatroom HTTP 配置" not in javascript
     assert ".required = isAddProject" not in javascript
-    assert "incrementalHttpPrompt(" in javascript
+    # #358: the incremental prompt comes from the server generator, so the
+    # browser only has to name the mode and pass the freshly issued bundle.
+    assert "loadIssuedServerPrompt(" in javascript
+    assert 'loadIssuedServerPrompt(setup, profileId, "add_project")' in javascript
+    assert "function incrementalHttpPrompt(" not in javascript
+    assert "integrations/mcp/issued-prompt" in javascript
     assert "incremental: true" in javascript
     assert 'if (setup.mode !== "add_project") {' in javascript
 
@@ -267,12 +272,30 @@ assert.notEqual(generic.softwareKey, 'standard-mcp-');
     assert "沿用现有身份合并接入" in javascript
 
 
-def test_frontend_exposes_only_http_while_backend_keeps_migration_support():
+def test_frontend_exposes_every_reachable_transport_and_client_profile():
+    """#357: every advertised transport must be selectable and usable.
+
+    The transport tabs used to ship HTTP only while `localMcpAssistantSupported`
+    required `integrationTransport === "local"` and a profile carrying
+    `local_config`. The assistant was therefore unreachable, and
+    `local_mcp_profile_unsupported` was the only reachable outcome, yet
+    /api/v1/config/public still advertised `local_mcp_config_assistant`.
+    """
     markup = (WEB_DIR / "index.html").read_text(encoding="utf-8")
     javascript = (WEB_DIR / "app.js").read_text(encoding="utf-8")
     assert '<option value="migrate_http">' not in markup
-    assert 'data-integration-transport="local"' not in markup
-    assert 'data-integration-transport="remote"' not in markup
+    for transport in ("http", "local", "remote"):
+        assert f'data-integration-transport="{transport}"' in markup, transport
+    # A per-client profile selector, or the local assistant stays unreachable.
+    assert 'id="integration-client-profile"' in markup
+    assert "function renderIntegrationProfileOptions()" in javascript
+    assert "state.integration.profiles" in javascript
+    # Transport availability is served, not hard-coded.
+    assert "transports.streamable_http" in javascript
+    assert "transports.remote_stdio_bridge" in javascript
+    # Selecting a client that has no managed path must say so rather than
+    # offering an apply button that would 404.
+    assert "local_config" in javascript
     assert 'state.integrationOnboardingMode === "migrate_http"' in javascript
     assert 'item.dataset.integrationTransport === "http"' in javascript
 
@@ -375,15 +398,23 @@ def test_web_bootstrap_and_phase_one_local_agent_hooks_are_complete():
     assert 'autocomplete="current-password"' in markup
     assert "function renderIntegrationJoin()" in javascript
     assert 'data-integration-transport="http"' in markup
-    assert 'data-integration-transport="local"' not in markup
-    assert 'data-integration-transport="remote"' not in markup
+    assert 'data-integration-transport="local"' in markup
+    assert 'data-integration-transport="remote"' in markup
     assert "streamable_http_config_text" in javascript
     assert "remote_bridge_config_text" in javascript
     assert 'id="token-config-value"' in markup
     assert "签发并生成接入提示词" in markup
     assert '<section class="integration-section onboarding-section" hidden>' in markup
-    assert "project_name_${index + 1}" in javascript
-    assert "project_token_${index + 1}" in javascript
+    # #358: the per-Project mapping is built by the generator, which is also
+    # where the credentials are encoded; the browser sends them as data.
+    integrations_source = (WEB_DIR.parent / "integrations.py").read_text(
+        encoding="utf-8"
+    )
+    assert "project_name_{index}=" in integrations_source
+    assert "project_token_{index}=" in integrations_source
+    assert "project_credentials: validateProjectCredentials(setup.projectCredentials)" in (
+        javascript
+    )
     # #143：占位配置复述与冗余禁令从提示词移除。
     assert "不要命名为 agentchatroom-stdio" not in javascript
     assert 'payload.host_key = "<stable-host-key>"' not in javascript
@@ -780,8 +811,13 @@ def test_web_supports_human_reading_and_guided_interactions():
     assert "Token 未更换" in javascript
     assert "不关联；首次连接时按下面填写的显示名称自动创建成员" in javascript
     assert 'elements["token-agent-name"].value' in javascript
-    # #143：提示词 3 步结构与放大的结果展示。
-    assert "重启或重新加载客户端 MCP" in javascript
+    # #143：提示词 3 步结构与放大的结果展示。#358：结构由服务端生成器保证，
+    # 浏览器原样显示服务端返回的文本。
+    integrations_source = (WEB_DIR.parent / "integrations.py").read_text(
+        encoding="utf-8"
+    )
+    assert "2. 写入后重启或重新加载客户端 MCP，使配置生效。" in integrations_source
+    assert 'elements["token-config-value"].textContent = result.prompt;' in javascript
     assert "本工作区固定 bootstrap 参数" not in javascript
     assert 'id="token-config-value" class="code-block secret-block"' in markup
     assert 'class="primary-button integration-cta copy-button" type="button" data-copy-target="token-config-value"' in markup
@@ -892,8 +928,8 @@ def test_web_local_mcp_assistant_separates_write_reload_and_presence_states():
     assert '>接入 Agent</button>' in markup
     assert '<h2 id="integration-dialog-title">接入 Agent</h2>' in markup
     assert 'data-integration-transport="http"' in markup
-    assert 'data-integration-transport="local"' not in markup
-    assert 'data-integration-transport="remote"' not in markup
+    assert 'data-integration-transport="local"' in markup
+    assert 'data-integration-transport="remote"' in markup
     assert '连接方式' in markup
     assert 'id="integration-http-token-guide"' in markup
     assert 'id="integration-open-token-button"' in markup
@@ -1024,9 +1060,28 @@ def test_web_task_view_harness_covers_state_triple_samples(tmp_path):
             "integration": "待集成", "done": "已完成", "cancelled": "已取消",
             "unclassified": "未归类",
         },
+        "groups": [
+            "claimable", "active", "review", "integration", "done", "cancelled",
+            "unclassified",
+        ],
         "attention_phases": ["blocked", "changes_requested", "integration_failed"],
+        "attention_phase_order": ["integration_failed", "changes_requested", "blocked"],
         "attention_label": "需要处理",
         "active_subgroup_order": ["changes_requested", "blocked", "in_progress", "claimed"],
+        "task_priority_range": [0, 1, 2, 3, 4],
+        "execution_labels": {
+            "todo": "\u5f85\u5f00\u59cb", "claimed": "\u5df2\u8ba4\u9886",
+            "in_progress": "\u6267\u884c\u4e2d", "blocked": "\u963b\u585e",
+            "completed": "\u6267\u884c\u5b8c\u6210", "cancelled": "\u5df2\u53d6\u6d88",
+        },
+        "verification_labels": {
+            "not_required": "\u65e0\u9700\u9a8c\u8bc1", "pending": "\u5f85\u9a8c\u8bc1",
+            "changes_requested": "\u9700\u4fee\u6539", "approved": "\u5df2\u901a\u8fc7",
+        },
+        "integration_labels": {
+            "pending": "\u5f85\u96c6\u6210", "done": "\u5df2\u96c6\u6210",
+            "failed": "\u96c6\u6210\u5931\u8d25",
+        },
     }
 
     sample_triples = [
@@ -1829,9 +1884,28 @@ def test_web_task_events_synchronize_navigation_and_table_counts(tmp_path):
                     "claimable": "待认领", "active": "进行中", "review": "待验收", "integration": "待集成",
                     "done": "已完成", "cancelled": "已取消", "unclassified": "未归类",
                 },
+                "groups": [
+                    "claimable", "active", "review", "integration", "done", "cancelled",
+                    "unclassified",
+                ],
                 "attention_phases": ["blocked", "changes_requested", "integration_failed"],
+                "attention_phase_order": ["integration_failed", "changes_requested", "blocked"],
                 "attention_label": "需要处理",
                 "active_subgroup_order": ["changes_requested", "blocked", "in_progress", "claimed"],
+                "task_priority_range": [0, 1, 2, 3, 4],
+                "execution_labels": {
+                    "todo": "\u5f85\u5f00\u59cb", "claimed": "\u5df2\u8ba4\u9886",
+                    "in_progress": "\u6267\u884c\u4e2d", "blocked": "\u963b\u585e",
+                    "completed": "\u6267\u884c\u5b8c\u6210", "cancelled": "\u5df2\u53d6\u6d88",
+                },
+                "verification_labels": {
+                    "not_required": "\u65e0\u9700\u9a8c\u8bc1", "pending": "\u5f85\u9a8c\u8bc1",
+                    "changes_requested": "\u9700\u4fee\u6539", "approved": "\u5df2\u901a\u8fc7",
+                },
+                "integration_labels": {
+                    "pending": "\u5f85\u96c6\u6210", "done": "\u5df2\u96c6\u6210",
+                    "failed": "\u96c6\u6210\u5931\u8d25",
+                },
             }
         }
     }
