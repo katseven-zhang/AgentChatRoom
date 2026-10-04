@@ -201,6 +201,7 @@ class TolerantSessionAdoptionMiddleware:
         is_active: Callable[[str], bool] | None = None,
         lookup_binding: Callable[[str, str], Any] | None = None,
         adopt_binding: Callable[[str, Any], None] | None = None,
+        note_terminated: Callable[[str], None] | None = None,
         map_limit: int = ADOPTION_MAP_LIMIT,
         map_ttl_seconds: float = ADOPTION_MAP_TTL_SECONDS,
         handshake_timeout_seconds: float = ADOPTION_HANDSHAKE_TIMEOUT_SECONDS,
@@ -213,6 +214,7 @@ class TolerantSessionAdoptionMiddleware:
         self._is_active = is_active
         self._lookup_binding = lookup_binding
         self._adopt_binding = adopt_binding
+        self._note_terminated = note_terminated
         self._map_limit = max(1, int(map_limit))
         self._map_ttl_seconds = float(map_ttl_seconds)
         self._handshake_timeout_seconds = float(handshake_timeout_seconds)
@@ -247,6 +249,14 @@ class TolerantSessionAdoptionMiddleware:
         method = str(scope.get("method") or "GET").upper()
         if method == "DELETE":
             # An explicit session teardown for an unknown id stays a no-op 404.
+            # Either way the client stated it will not replay this id, so the
+            # transport must not be retained as an adoption tombstone: the
+            # server-side reaper would otherwise turn every deliberate
+            # teardown (a Bridge that opens one transport per call does this on
+            # every request) into LRU pressure that evicts bookmarks a client
+            # may still come back to replay.
+            if self._note_terminated is not None:
+                self._note_terminated(_scope_header(scope, MCP_SESSION_ID_HEADER))
             await self.app(scope, receive, send)
             return
         session_id = _scope_header(scope, MCP_SESSION_ID_HEADER)
@@ -646,6 +656,7 @@ def with_session_adoption(
     is_active: Callable[[str], bool] | None = None,
     lookup_binding: Callable[[str, str], Any] | None = None,
     adopt_binding: Callable[[str, Any], None] | None = None,
+    note_terminated: Callable[[str], None] | None = None,
     map_limit: int = ADOPTION_MAP_LIMIT,
     map_ttl_seconds: float = ADOPTION_MAP_TTL_SECONDS,
     max_parked_handshakes: int = 32,
@@ -659,6 +670,7 @@ def with_session_adoption(
         is_active=is_active,
         lookup_binding=lookup_binding,
         adopt_binding=adopt_binding,
+        note_terminated=note_terminated,
         map_limit=map_limit,
         map_ttl_seconds=map_ttl_seconds,
         max_parked_handshakes=max_parked_handshakes,

@@ -4868,6 +4868,23 @@ class AgentChatRoomService:
                 self._authenticate(connection, project_id, session_id, token)
             )
 
+    def session_active(self, project_id: str, session_id: str) -> bool:
+        """Report whether a Room Session still exists in this Project and has
+        not left.
+
+        Read-only and Project-scoped, so a transport-liveness caller can tell a
+        tombstone that is still worth replaying from one whose Session is gone.
+        """
+        with self.database.connect(write=False) as connection:
+            row = connection.execute(
+                """
+                SELECT left_at FROM agent_sessions
+                WHERE project_id = ? AND id = ?
+                """,
+                (project_id, session_id),
+            ).fetchone()
+        return row is not None and row["left_at"] is None
+
     def query_audit(
         self,
         project_id: str,
