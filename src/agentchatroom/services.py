@@ -9392,6 +9392,15 @@ class AgentChatRoomService:
                     )
                 revision = True
                 previous_version_id = asset["current_version_id"]
+                # MAX(version)+1 is a read-modify-write. Both shipped backends
+                # happen to serialize writers (SQLite by BEGIN IMMEDIATE,
+                # PostgreSQL by the pg_advisory_xact_lock every connect(write=True)
+                # takes), so today no two revisions can read the same MAX. That
+                # safety is borrowed from a lock one layer down, though: any
+                # future backend without it turns the UNIQUE(asset_id, version)
+                # below into a raw driver error and an HTTP 500. The INSERT is
+                # therefore the authority on which number won, and a lost race
+                # is reported as the retryable conflict it is.
                 next_version_number = int(
                     connection.execute(
                         "SELECT COALESCE(MAX(version), 0) AS latest FROM knowledge_asset_versions WHERE asset_id = ?",
@@ -9462,37 +9471,60 @@ class AgentChatRoomService:
                         now,
                     ),
                 )
-            connection.execute(
-                """
-                INSERT INTO knowledge_asset_versions(
-                    id, project_id, asset_id, version, title, body, summary,
-                    content_hash, tags_json, source_type, source_task_id,
-                    source_report_id, source_review_id, source_integration_id,
-                    source_event_ids_json, created_by_session_id,
-                    supersedes_version_id, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    version_id,
-                    project_id,
-                    new_asset_id,
-                    next_version_number,
-                    clean_title,
-                    clean_body,
-                    clean_summary,
-                    content_hash,
-                    json_dump(clean_tags),
-                    clean_source_type,
-                    clean_task_id or None,
-                    clean_report_id or None,
-                    clean_review_id or None,
-                    clean_integration_id or None,
-                    json_dump({"v": 1, "space": "project_seq", "ids": clean_event_ids}),
-                    session_id,
-                    previous_version_id,
-                    now,
-                ),
-            )
+            try:
+                connection.execute(
+                    """
+                    INSERT INTO knowledge_asset_versions(
+                        id, project_id, asset_id, version, title, body, summary,
+                        content_hash, tags_json, source_type, source_task_id,
+                        source_report_id, source_review_id, source_integration_id,
+                        source_event_ids_json, created_by_session_id,
+                        supersedes_version_id, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        version_id,
+                        project_id,
+                        new_asset_id,
+                        next_version_number,
+                        clean_title,
+                        clean_body,
+                        clean_summary,
+                        content_hash,
+                        json_dump(clean_tags),
+                        clean_source_type,
+                        clean_task_id or None,
+                        clean_report_id or None,
+                        clean_review_id or None,
+                        clean_integration_id or None,
+                        json_dump(
+                            {"v": 1, "space": "project_seq", "ids": clean_event_ids}
+                        ),
+                        session_id,
+                        previous_version_id,
+                        now,
+                    ),
+                )
+            except Exception as error:
+                # Losing the MAX(version)+1 race lands here as a UNIQUE
+                # violation on (asset_id, version). It is a conflict the caller
+                # can retry, not a server fault, so it must not escape as a
+                # driver traceback and an HTTP 500. The status compare-and-set
+                # below cannot catch it: the two writers saw the same previous
+                # status, so both updates legitimately match one row.
+                if not _is_unique_constraint_error(error):
+                    raise
+                raise DomainError(
+                    "knowledge_version_conflict",
+                    "Another revision of this knowledge asset was recorded "
+                    "concurrently; retry to append the next version",
+                    status_code=409,
+                    details={
+                        "asset_id": new_asset_id,
+                        "retry_after_seconds": 1,
+                        "required_action": "retry_the_revision",
+                    },
+                ) from error
             connection.execute(
                 """
                 UPDATE knowledge_assets
