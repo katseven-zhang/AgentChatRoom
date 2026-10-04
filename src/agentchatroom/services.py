@@ -123,6 +123,15 @@ PROJECT_SETTINGS_DEFAULTS: dict[str, Any] = {
     "mcp_message_context_limit": 5,
 }
 SOFTWARE_MEMBER_PREFIX = "software:"
+# Whether the server confirmed that a registered workspace path really belongs
+# to the Project. A remote join sends the path in the request body, so it is
+# caller-asserted; the local MCP branch validates the scope before registering
+# and marks its own. Server-side git evidence is only ever collected from a
+# verified root, because an asserted path lets a client aim the server's
+# `git -C` at any repository the process can read.
+WORKSPACE_EVIDENCE_SOURCE_KEY = "agentchatroom_evidence_source"
+WORKSPACE_EVIDENCE_SERVER_VERIFIED = "server_verified"
+WORKSPACE_EVIDENCE_CLIENT_ASSERTED = "client_asserted"
 # One vocabulary for "this Project credential can no longer open a Session", so
 # REST, MCP and CLI report the same failure instead of three different ones.
 # The internal agent_token_* codes stay for token management operations.
@@ -3866,6 +3875,37 @@ class AgentChatRoomService:
             }
 
     @staticmethod
+    def _workspace_evidence_metadata(
+        workspace_metadata: dict[str, Any] | None,
+        *,
+        server_verified: bool,
+    ) -> dict[str, Any]:
+        """Stamp the evidence-provenance key, refusing to let a caller set it.
+
+        The key is the only record of whether the server confirmed the
+        registered path, and ``_trusted_worktree`` reads it to decide if
+        server-side git may run there. A caller that could write it could
+        promote its own asserted path to a trusted root, so the value is always
+        taken from the registration argument and a supplied value is an error
+        rather than something to overwrite silently.
+        """
+        metadata = dict(workspace_metadata or {})
+        if WORKSPACE_EVIDENCE_SOURCE_KEY in metadata:
+            raise DomainError(
+                "reserved_workspace_metadata_key",
+                f"{WORKSPACE_EVIDENCE_SOURCE_KEY} is set by the server and cannot "
+                "be supplied by a caller",
+                status_code=422,
+                details={"reserved_key": WORKSPACE_EVIDENCE_SOURCE_KEY},
+            )
+        metadata[WORKSPACE_EVIDENCE_SOURCE_KEY] = (
+            WORKSPACE_EVIDENCE_SERVER_VERIFIED
+            if server_verified
+            else WORKSPACE_EVIDENCE_CLIENT_ASSERTED
+        )
+        return metadata
+
+    @staticmethod
     def _validate_workspace_path(field: str, value: str) -> str:
         """Reject malformed workspace paths before they poison git evidence.
 
@@ -3908,7 +3948,23 @@ class AgentChatRoomService:
         git_remote: str = "",
         host_metadata: dict[str, Any] | None = None,
         workspace_metadata: dict[str, Any] | None = None,
+        server_verified: bool = True,
     ) -> dict[str, Any]:
+        """Register a host workspace, recording where its path came from.
+
+        ``server_verified`` states that the server may read git from this path.
+        It defaults to true because every other caller is a server-side or
+        operator-authenticated path: the local MCP branch resolves the Project
+        from the checkout and validates the scope first, and the REST endpoint
+        sits behind management authentication. A remote join is the one caller
+        whose path arrives in an Agent-Token request body, so it passes false
+        and the path it registers is recorded as asserted.
+
+        Recording the difference is what lets server-side git evidence tell a
+        verified root from an asserted one: an asserted path would otherwise let
+        any valid Agent Token aim the server's `git -C` at a repository the
+        process can read and publish its branch, HEAD and dirty-file list.
+        """
         if not host_key.strip() or not host_name.strip() or not local_path.strip():
             raise DomainError(
                 "invalid_workspace",
@@ -3919,6 +3975,9 @@ class AgentChatRoomService:
             worktree = self._validate_workspace_path("worktree", worktree)
         else:
             worktree = ""
+        workspace_metadata = self._workspace_evidence_metadata(
+            workspace_metadata, server_verified=server_verified
+        )
         now = iso_now()
         with self.database.connect(write=True) as connection:
             self._require_project(connection, project_id)
@@ -4538,6 +4597,10 @@ class AgentChatRoomService:
             branch=branch,
             worktree=worktree,
             git_remote=git_remote,
+            # The path arrived in the request body. The server has no way to
+            # confirm it names a repository belonging to this Project, so it is
+            # recorded as asserted and stays ineligible for server-side git.
+            server_verified=False,
         )
         # The credential is the trust boundary for a remote join: a member it
         # is linked to pins the durable identity, and its display fields are
@@ -8684,10 +8747,26 @@ class AgentChatRoomService:
                     "Task is not in a state that accepts a work report",
                     status_code=409,
                 )
-            worktree = self._trusted_worktree(connection, project, agent)
-        system_evidence = self._collect_git_evidence_from_worktree(
-            worktree, commit_hash
-        )
+            worktree, evidence_source = self._trusted_worktree(
+                connection, project, agent
+            )
+        if evidence_source == WORKSPACE_EVIDENCE_SERVER_VERIFIED:
+            system_evidence = self._collect_git_evidence_from_worktree(
+                worktree, commit_hash
+            )
+        else:
+            # A client-asserted root is not a licence to run git on the server, so
+            # no evidence is read from it. The report is still accepted - the
+            # agent did the work - but it is recorded as carrying no server
+            # evidence, and a commit_hash cannot be verified against it.
+            system_evidence = {
+                "captured": False,
+                "reason": "workspace_evidence_untrusted",
+                "worktree": "",
+                "reported_commit_exists": False,
+                "commit_hash": "",
+                "evidence_source": WORKSPACE_EVIDENCE_CLIENT_ASSERTED,
+            }
         stored_commit = str(system_evidence.get("commit_hash") or "")
         if commit_hash.strip() and (
             not system_evidence.get("captured")
@@ -8704,7 +8783,17 @@ class AgentChatRoomService:
                     payload={
                         "commit_hash": "unknown",
                         "reported_commit_hash": commit_hash.strip(),
-                        "worktree": str(worktree),
+                        # Only a server-verified root may be named here. A
+                        # client-asserted path is the caller's own text, and
+                        # echoing it into the Room would republish the very
+                        # server-local path the evidence rules exist to keep
+                        # private.
+                        "worktree": (
+                            str(worktree)
+                            if evidence_source == WORKSPACE_EVIDENCE_SERVER_VERIFIED
+                            else ""
+                        ),
+                        "evidence_source": evidence_source,
                         "captured": bool(system_evidence.get("captured")),
                         "reported_commit_exists": system_evidence.get(
                             "reported_commit_exists"
@@ -10095,12 +10184,35 @@ class AgentChatRoomService:
             ).fetchall()
             return [self._knowledge_asset_dict(connection, row) for row in rows]
 
+    def _workspace_evidence_source(self, workspace: Mapping[str, Any]) -> str:
+        """How this workspace's path was established, defaulting to unverified.
+
+        A row written before this key existed, or one whose metadata was edited
+        outside registration, is treated as client-asserted. Defaulting the
+        other way would let every pre-existing remote registration - exactly the
+        rows this guards - keep its server-side git evidence.
+        """
+        metadata = json_load(workspace["metadata_json"], {})
+        source = str(metadata.get(WORKSPACE_EVIDENCE_SOURCE_KEY) or "").strip()
+        if source == WORKSPACE_EVIDENCE_SERVER_VERIFIED:
+            return WORKSPACE_EVIDENCE_SERVER_VERIFIED
+        return WORKSPACE_EVIDENCE_CLIENT_ASSERTED
+
     def _trusted_worktree(
         self,
         connection: Any,
         project: Mapping[str, Any],
         agent: Mapping[str, Any],
-    ) -> Path:
+    ) -> tuple[Path, str]:
+        """Resolve the worktree to inspect, and say where its root came from.
+
+        Returns the resolved path together with the workspace's evidence source
+        so the caller can decide whether running git on it is justified. The
+        containment check below is retained for verified roots; for a
+        client-asserted one it proves only that the caller stayed inside the
+        directory it itself named, so the path is returned unverified and the
+        caller must not read git from it.
+        """
         workspace = None
         agent_data = dict(agent)
         workspace_id = str(agent_data.get("workspace_id") or "").strip()
@@ -10118,6 +10230,7 @@ class AgentChatRoomService:
                 "未登记工作区: the Agent has no registered workspace",
                 status_code=409,
             )
+        evidence_source = self._workspace_evidence_source(workspace)
         root = Path(str(workspace["local_path"])).expanduser().resolve(strict=False)
         reported_raw = str(agent_data.get("worktree") or "").strip()
         if not reported_raw:
@@ -10140,7 +10253,7 @@ class AgentChatRoomService:
                 status_code=403,
                 details={"workspace_id": workspace["id"]},
             ) from error
-        return reported
+        return reported, evidence_source
 
     def _collect_git_status(self, worktree: Path) -> dict[str, Any]:
         return self._collect_git_evidence_from_worktree(worktree, "")
