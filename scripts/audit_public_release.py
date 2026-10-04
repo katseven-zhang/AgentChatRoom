@@ -428,10 +428,36 @@ def main() -> int:
     )
     parser.add_argument("--history", action="store_true", help="scan all Git blobs")
     parser.add_argument("--json", action="store_true")
+    parser.add_argument(
+        "--max-findings",
+        type=int,
+        default=0,
+        help=(
+            "Fail when the finding count exceeds this baseline. 0 means no "
+            "ceiling. Use it to gate a scan whose existing findings cannot be "
+            "cleared yet: a leak that raises the count is blocked, while the "
+            "known noise does not block everything on its own."
+        ),
+    )
     args = parser.parse_args()
 
     findings = audit_history(ROOT) if args.history else audit_working_tree(ROOT)
     _print_findings(findings, as_json=args.json)
+    if args.max_findings:
+        # A ceiling replaces the verdict rather than adding to it: under the
+        # baseline the known backlog is reported and tolerated, over it the run
+        # fails. Returning "1 if findings" as well would make the flag inert.
+        if len(findings) > args.max_findings:
+            print(
+                f"finding count {len(findings)} exceeds the baseline "
+                f"{args.max_findings}; a new leak is not the cleanup backlog"
+            )
+            return 1
+        print(
+            f"{len(findings)} findings, at or under the baseline "
+            f"{args.max_findings}"
+        )
+        return 0
     return 1 if findings else 0
 
 

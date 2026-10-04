@@ -29,6 +29,13 @@ REQUIRED_ENV_KEYS = (
 )
 PLACEHOLDER_MARKERS = ("replace-with", "change-me", "room.example.com")
 
+# Where the config lands inside the container. compose.yaml mounts
+# ./config.server.toml here and passes the same path as AGENTCHATROOM_CONFIG,
+# so this value is the only place the serverctl commands may name it: a second
+# literal drifts the moment the mount moves, and backup/restore then silently
+# read the wrong file inside the container.
+CONTAINER_CONFIG_PATH = "/app/config.server.toml"
+
 
 class DeploymentError(RuntimeError):
     """Raised for a deployment preflight or command construction failure."""
@@ -210,7 +217,30 @@ def _require_preflight(paths: DeploymentPaths) -> dict[str, Any]:
         raise DeploymentError(json.dumps(result, ensure_ascii=False, indent=2))
     _validate_application_config(paths, parse_env_file(paths.env_file))
     _validate_proxy_config(paths, parse_env_file(paths.env_file))
+    _validate_container_config_mount(paths)
     return result
+
+
+def _validate_container_config_mount(paths: DeploymentPaths) -> None:
+    """Refuse to run when compose mounts the config somewhere else.
+
+    backup and restore address the file by container path. If the compose mount
+    moves, those commands still "succeed" while reading a path that holds
+    nothing, so the mismatch has to be an error rather than a warning.
+    """
+    try:
+        compose_text = paths.compose_file.read_text(encoding="utf-8")
+    except OSError as error:
+        raise DeploymentError(
+            f"cannot read compose file {paths.compose_file}: {error}"
+        ) from error
+    if CONTAINER_CONFIG_PATH not in compose_text:
+        raise DeploymentError(
+            f"compose file {paths.compose_file} does not mount the config at "
+            f"{CONTAINER_CONFIG_PATH}; backup/restore would address a path the "
+            "container does not have. Update the mount or "
+            "CONTAINER_CONFIG_PATH so they agree."
+        )
 
 
 def _validate_application_config(
@@ -369,7 +399,7 @@ def run_action(
                 "agentchatroom",
                 "backup",
                 "--config",
-                "/app/config.server.toml",
+                CONTAINER_CONFIG_PATH,
                 "--output",
                 output or "",
             ]
@@ -392,7 +422,7 @@ def run_action(
                     "agentchatroom",
                     "restore",
                     "--config",
-                    "/app/config.server.toml",
+                    CONTAINER_CONFIG_PATH,
                     "--input",
                     input_path or "",
                     "--confirm",
