@@ -1,3 +1,4 @@
+# audit-allow-file:windows_absolute_path
 from __future__ import annotations
 
 import json
@@ -40,8 +41,19 @@ def test_onboarding_modes_separate_configuration_from_existing_connections(tmp_p
         assert '从本机 stdio 切换为直接 HTTP MCP' in migration
         assert '删除 `command`、`args`、`cwd`、`env` 等 stdio 字段' in migration
         assert '重启或重新加载客户端 MCP' in migration
-        assert '`room_bootstrap`' in migration
+        # #358: the migration target is HTTP, so step 3 uses the same computed
+        # variant as every other HTTP prompt. A bare `room_bootstrap` would let
+        # the Agent bind whatever Project it happened to select.
+        assert '`room_bootstrap`' not in migration
+        assert 'room_bootstrap(project_name=' in migration
         assert 'do-not-copy' not in migration and 'private-key' not in migration
+        http_config = profile['streamable_http_config_text'].strip()
+        assert http_config
+        assert http_config in migration
+        assert 'url' in http_config
+        if profile['format'] == 'json':
+            assert '"mcpServers"' in migration
+            assert 'Bearer' in migration
 
 
 def test_invalid_onboarding_mode_is_rejected():

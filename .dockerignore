@@ -1,0 +1,37 @@
+# The compose build context is the repository root (deploy/compose.yaml has
+# `context: ..`), so everything not listed here is uploaded to the daemon on every
+# build. Local Room data must never be part of that: .agentchatroom/ holds the
+# SQLite Room database (live Session tokens, message bodies, absolute machine
+# paths), and docs/, evidence/ and .workbuddy/ hold local notes and verification
+# output. The rest is either build output the image creates itself or repository
+# tooling the image never reads.
+#
+# Kept deliberately because deploy/Dockerfile COPYs them: pyproject.toml,
+# README.md, LICENSE, requirements-docker.txt, src/, deploy/config.server.example.toml.
+# uv.lock is kept too: it is the source these requirement files are generated from.
+.agentchatroom/
+docs/
+evidence/
+.workbuddy/
+.git/
+.gitignore
+.gitattributes
+.github/
+.venv/
+venv/
+build/
+dist/
+packaging/
+python/
+scripts/
+tests/
+*.egg-info/
+__pycache__/
+*.pyc
+*.log
+*.db
+*.db-wal
+*.db-shm
+.env
+.pytest_cache/
+coverage*

@@ -23,6 +23,7 @@ connect_timeout_seconds = 10.0
 
 [coordination]
 mcp_roots_timeout_seconds = 5.0
+git_scope_recheck_ttl_seconds = 30.0
 heartbeat_timeout_seconds = 45
 presence_keepalive_enabled = true
 presence_keepalive_interval_seconds = 15.0
@@ -30,7 +31,7 @@ session_token_ttl_seconds = 43200
 default_lease_ttl_seconds = 1800
 max_lease_ttl_seconds = 86400
 sse_poll_interval_seconds = 0.5
-presence_refresh_interval_seconds = 1.0
+presence_refresh_interval_seconds = 5.0
 max_sse_clients_per_project = 64
 sse_per_ip_limit = 16
 audit_window_size = 100
@@ -51,6 +52,7 @@ inject_max_chars = 12000
 [security]
 agent_token_ttl_seconds = 2592000
 max_agent_token_ttl_seconds = 31536000
+min_agent_token_ttl_seconds = 300
 mcp_http_auth_required = true
 management_auth_required = true
 management_token_env = "AGENTCHATROOM_ADMIN_TOKEN"

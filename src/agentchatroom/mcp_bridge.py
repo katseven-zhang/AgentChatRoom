@@ -21,6 +21,18 @@ from mcp.server.lowlevel import NotificationOptions, Server
 from mcp.server.stdio import stdio_server
 
 from . import __version__
+from .bootstrap import (
+    SOFTWARE_CLIENT_ENV,
+    SOFTWARE_KEY_ENV,
+    SOFTWARE_NAME_ENV,
+)
+from .integrations import (
+    SOFTWARE_CLIENT_HEADER,
+    SOFTWARE_KEY_HEADER,
+    SOFTWARE_NAME_HEADER,
+    encode_http_identity_value,
+)
+from .contracts import PRESENCE_DROP_ERROR_CODES
 from .mcp_http_recovery import (
     DIRECT_CLIENT_RECONNECT_HINT,
     MCP_SESSION_EXPIRED_CODE,
@@ -37,6 +49,9 @@ BRIDGE_INSTANCE_ID = uuid.uuid4().hex
 class BridgeSettings:
     server_url: str
     agent_token: str = ""
+    software_key: str = ""
+    software_name: str = ""
+    software_client: str = ""
     ca_file: Path | None = None
     timeout_seconds: float = 30.0
     retry_attempts: int = 3
@@ -58,6 +73,14 @@ AUTO_IDEMPOTENCY_TOOL_NAMES = frozenset(
         "task_handoff",
         "task_handoff_acknowledge",
         "task_update",
+        "task_intake_submit",
+        "task_intake_acknowledge",
+        "task_intake_reassign",
+        "task_define_from_intake",
+        "project_document_upsert",
+        "member_create",
+        "member_update",
+        "member_revoke",
         "lease_acquire",
         "lease_release",
         "work_report",
@@ -68,6 +91,15 @@ AUTO_IDEMPOTENCY_TOOL_NAMES = frozenset(
         "knowledge_supersede",
         "knowledge_archive",
     }
+)
+# Every other tool that advertises request_id is covered above. Presence is the
+# one deliberate exception: a replayed heartbeat must not be answered from the
+# idempotency cache, or the connection would stop looking alive.
+# task_intake_cancel is deliberately idempotent in the domain (a repeated
+# cancel of the same intake writes nothing new), so the bridge gains nothing
+# from replaying a cached response for it.
+AUTO_IDEMPOTENCY_EXCLUDED_TOOL_NAMES = frozenset(
+    {"session_heartbeat", "task_intake_cancel"}
 )
 ResultT = TypeVar("ResultT")
 RETRYABLE_HTTP_STATUS_CODES = frozenset({408, 425, 429, 500, 502, 503, 504})
@@ -153,6 +185,9 @@ def parse_bridge_settings(argv: list[str] | None = None) -> BridgeSettings:
     return BridgeSettings(
         server_url=url,
         agent_token=os.getenv("AGENTCHATROOM_AGENT_TOKEN", "").strip(),
+        software_key=os.getenv(SOFTWARE_KEY_ENV, "").strip(),
+        software_name=os.getenv(SOFTWARE_NAME_ENV, "").strip(),
+        software_client=os.getenv(SOFTWARE_CLIENT_ENV, "").strip(),
         ca_file=ca_file,
         timeout_seconds=args.timeout,
         retry_attempts=args.retry_attempts,
@@ -427,7 +462,14 @@ class BridgePresenceManager:
                     "token": token,
                 }
         elif name == "session_leave":
-            self.sessions.pop(str(arguments.get("session_id", "")), None)
+            # The protocol does not require a client to name its own Session: the
+            # center fills session_id from the credential binding. So trust the
+            # Session the leave actually closed, or the one the caller named, and
+            # never an empty key -- popping "" left a closed Session heartbeating
+            # forever, one refused upstream write per cycle.
+            left = (payload.get("result") or {}).get("agent") or {}
+            session_id = str(left.get("id") or arguments.get("session_id") or "")
+            self.sessions.pop(session_id, None)
 
     async def heartbeat_once(self) -> None:
         for session_id, session in list(self.sessions.items()):
@@ -439,7 +481,7 @@ class BridgePresenceManager:
                 payload = tool_payload(result)
                 if payload and not payload.get("ok") and payload.get("error", {}).get(
                     "code"
-                ) in {"session_not_found", "invalid_session_token"}:
+                ) in PRESENCE_DROP_ERROR_CODES:
                     self.sessions.pop(session_id, None)
             except Exception as error:
                 logger.warning(
@@ -458,6 +500,17 @@ async def run_bridge(settings: BridgeSettings) -> None:
     headers = {}
     if settings.agent_token:
         headers["Authorization"] = f"Bearer {settings.agent_token}"
+    # The center resolves the durable software identity from these headers when
+    # the credential is not already linked to a member. Forwarding them keeps a
+    # single identity across reconnects instead of letting the center guess one
+    # from whatever the request happens to look like.
+    for header, value in (
+        (SOFTWARE_KEY_HEADER, settings.software_key),
+        (SOFTWARE_NAME_HEADER, settings.software_name),
+        (SOFTWARE_CLIENT_HEADER, settings.software_client),
+    ):
+        if value.strip():
+            headers[header] = encode_http_identity_value(value.strip())
     verify: bool | str = str(settings.ca_file) if settings.ca_file else True
     upstream = ReconnectingUpstream(settings, headers=headers, verify=verify)
     presence = BridgePresenceManager(upstream, settings)

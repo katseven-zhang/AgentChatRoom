@@ -20,7 +20,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
 
-from .config import Settings, load_settings
+from .config import Settings, build_service_base_url, load_settings
 
 
 class TargetError(ValueError):
@@ -66,7 +66,15 @@ class ServerTarget:
         if not text:
             raise TargetError("Server target URL cannot be empty")
         if "://" not in text:
-            text = f"http://{text}"
+            # A bare IPv6 literal needs brackets before a port can be told
+            # apart from the address, so bracket the authority the same way
+            # build_service_base_url does. Splitting first would misread
+            # "::1:8765" as scheme "::" and reject a valid loopback target.
+            head, separator, rest = text.rpartition(":")
+            if separator and head and rest.isdigit() and ":" in head:
+                text = f"http://[{head}]:{rest}"
+            else:
+                text = f"http://{text}"
         parsed = urllib.parse.urlsplit(text)
         if parsed.scheme not in ("http", "https"):
             raise TargetError(f"Unsupported URL scheme: {parsed.scheme}")
@@ -214,6 +222,5 @@ def resolve_server_target(
 
     # Local mode: resolve from settings and effective port
     port = effective_port or settings.port
-    host = "127.0.0.1" if settings.host in {"0.0.0.0", "::"} else settings.host
-    base_url = f"http://{host}:{port}"
+    base_url = build_service_base_url(settings.host, port)
     return ServerTarget.local(base_url)

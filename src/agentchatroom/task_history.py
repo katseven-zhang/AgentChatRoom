@@ -1,56 +1,12 @@
 from __future__ import annotations
 
-import re
 from typing import Any, Mapping
 
-_TOKEN_KEYS = {
-    "token",
-    "agent_token",
-    "admin_token",
-    "session_token",
-    "access_token",
-    "secret",
-    "password",
-    "authorization",
-    "cookie",
-    "api_key",
-}
+from .redaction import REDACTED as _REDACTED
+from .redaction import SENSITIVE_KEYS as _TOKEN_KEYS
+from .redaction import redact_text, redact_value as redact_runtime_value
 
-# Value-pattern redaction: credentials embedded inside free-form text
-# (message bodies, notes, evidence) must not leak even when the *key* is
-# benign such as "body" or "summary" (review #44, criterion 12).
-_REDACT_TEXT_PATTERNS = (
-    re.compile(r"(?i)(authorization\s*[:=]\s*)(bearer\s+)?[^\s,;\"']+",),
-    re.compile(r"(?i)\b(bearer)\s+[a-z0-9._~+/=-]{8,}"),
-    re.compile(r"(?i)\b(token|api[_-]?key|secret|password|passwd|session[_-]?token|access[_-]?token)\b(\s*[=:]\s*)(\"[^\"]+\"|'[^']+'|[^\s,;\"']+)"),
-    re.compile(r"(?i)\b(sk-[a-z0-9]{16,}|ghp_[a-z0-9]{20,}|gho_[a-z0-9]{20,}|xox[baprs]-[a-z0-9-]{10,})"),
-)
-_REDACTED = "[redacted]"
-
-
-def redact_text(text: str) -> str:
-    """Redact credential-looking substrings inside free-form text."""
-    redacted = str(text)
-    for pattern in _REDACT_TEXT_PATTERNS:
-        redacted = pattern.sub(_REDACTED, redacted)
-    return redacted
-
-
-def redact_runtime_value(value: Any, *, key: str = "") -> Any:
-    if key.lower() in _TOKEN_KEYS:
-        return _REDACTED
-    if isinstance(value, Mapping):
-        return {
-            str(item_key): redact_runtime_value(item, key=str(item_key))
-            for item_key, item in value.items()
-            if str(item_key).lower() not in _TOKEN_KEYS
-        }
-    if isinstance(value, (list, tuple)):
-        return [redact_runtime_value(item) for item in value]
-    if isinstance(value, str):
-        return redact_text(value)
-    return value
-
+__all__ = ["redact_text", "redact_runtime_value"]
 
 TASK_HISTORY_SCHEMA_VERSION = 1
 TASK_HISTORY_LIMIT_MAX = 200
@@ -246,6 +202,13 @@ def evidence_sections(
         commit_hash = str(
             integration.get("commit_hash") or payload.get("commit_hash") or ""
         ).strip()
+        # An integration's commit is only system-proven when it matches the
+        # commit the approved Work Report verified against the trusted worktree;
+        # anything else must not be rendered as captured evidence (#335).
+        verified_flag = payload.get("commit_verified")
+        commit_captured = (
+            bool(commit_hash) if verified_flag is None else bool(verified_flag)
+        )
         sections.append(
             {
                 "kind": "git",
@@ -254,8 +217,17 @@ def evidence_sections(
                     {
                         "branch": "",
                         "head": commit_hash,
-                        "captured": bool(commit_hash),
-                        "reason": "" if commit_hash else "未采集",
+                        "captured": commit_captured,
+                        "self_reported": bool(payload.get("commit_self_reported")),
+                        "reason": (
+                            ""
+                            if commit_captured
+                            else (
+                                "未经 Work Report 校验（调用方自报）"
+                                if commit_hash
+                                else "未采集"
+                            )
+                        ),
                     }
                 ],
             }

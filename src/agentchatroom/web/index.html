@@ -289,12 +289,12 @@
       </aside>
     </div>
 
-    <dialog id="project-dialog">
+    <dialog id="project-dialog" aria-labelledby="project-dialog-title" aria-modal="true">
       <form method="dialog" class="dialog-form" id="project-form">
         <div class="dialog-header">
           <div>
             <p class="context-label">项目 Room</p>
-            <h2>添加本地项目</h2>
+            <h2 id="project-dialog-title">添加本地项目</h2>
           </div>
           <button type="button" class="icon-button dialog-close" title="关闭" aria-label="关闭">×</button>
         </div>
@@ -305,7 +305,11 @@
             <button id="project-folder-picker-button" type="button" class="secondary-button" disabled>选择文件夹</button>
           </span>
         </label>
-        <p class="form-hint">Git 仓库内的子文件夹会自动登记为该仓库的独立项目范围；普通目录按本地路径登记。</p>
+        <p class="form-hint">工作区可包含独立 Git 子仓库。检查后明确选择实际仓库；父目录及其他文件仍属于工作区。</p>
+        <button id="project-repository-inspect" type="button" class="secondary-button">检查 Git 仓库</button>
+        <label>实际仓库 <select id="project-repository-select" aria-label="选择实际仓库"><option value="__pending__">先检查项目文件夹</option></select></label>
+        <label>仓库相对路径 <input id="project-repository-input" autocomplete="off" placeholder="可手工填写更深层的仓库路径；留空保留本地目录"></label>
+        <p class="form-hint" id="project-repository-hint" aria-live="polite"></p>
         <p class="form-error" id="project-form-error" role="alert" hidden></p>
         <div class="dialog-actions">
           <button type="button" class="secondary-button dialog-close">取消</button>
@@ -314,12 +318,12 @@
       </form>
     </dialog>
 
-    <dialog id="task-dialog">
+    <dialog id="task-dialog" aria-labelledby="task-dialog-title" aria-modal="true">
       <form method="dialog" class="dialog-form" id="task-form">
         <div class="dialog-header">
           <div>
             <p class="context-label">交给 Agent 处理</p>
-            <h2>新建任务</h2>
+            <h2 id="task-dialog-title">新建任务</h2>
           </div>
           <button type="button" class="icon-button dialog-close" title="关闭" aria-label="关闭">×</button>
         </div>
@@ -338,7 +342,7 @@
       </form>
     </dialog>
 
-    <dialog id="task-edit-dialog" class="task-detail-dialog">
+    <dialog id="task-edit-dialog" class="task-detail-dialog" aria-labelledby="task-detail-heading" aria-modal="true">
       <div class="dialog-form" id="task-detail-view">
         <div class="dialog-header">
           <div>
@@ -389,7 +393,7 @@
       </div>
     </dialog>
 
-    <dialog id="task-assign-dialog">
+    <dialog id="task-assign-dialog" aria-labelledby="task-assign-title" aria-modal="true">
       <form method="dialog" class="dialog-form" id="task-assign-form">
         <div class="dialog-header">
           <div>
@@ -412,7 +416,7 @@
       </form>
     </dialog>
 
-    <dialog id="task-release-dialog">
+    <dialog id="task-release-dialog" aria-labelledby="task-release-title" aria-modal="true">
       <form method="dialog" class="dialog-form" id="task-release-form">
         <div class="dialog-header">
           <div>
@@ -424,12 +428,9 @@
         <p class="form-hint">释放将把任务退回待认领池，保留进度和证据，但清除当前所有权和活跃文件租约。</p>
         <label>释放原因
           <select id="task-release-reason" required>
+            <!-- 原因码与文案由服务端版本化配置渲染（见 renderReleaseReasonOptions），
+                 这里只保留空值占位以维持 required 的「必须选一项」语义。 -->
             <option value="">选择原因…</option>
-            <option value="quota_exhausted">额度耗尽</option>
-            <option value="agent_unavailable">Agent 不可用</option>
-            <option value="user_requested">用户请求</option>
-            <option value="reassignment_needed">需要改派</option>
-            <option value="other">其他</option>
           </select>
         </label>
         <label>详细说明 <textarea id="task-release-reason-text" rows="2" placeholder="可选，说明情况"></textarea></label>
@@ -440,23 +441,32 @@
       </form>
     </dialog>
 
-    <dialog id="settings-dialog">
+    <dialog id="settings-dialog" aria-labelledby="settings-dialog-title" aria-modal="true">
       <form method="dialog" class="dialog-form" id="settings-form">
         <div class="dialog-header">
           <div>
             <p class="context-label">Room 配置</p>
-            <h2>项目设置</h2>
+            <h2 id="settings-dialog-title">项目设置</h2>
           </div>
           <button type="button" class="icon-button dialog-close" title="关闭" aria-label="关闭">×</button>
         </div>
         <label>项目名称 <input id="settings-project-name" autocomplete="off" required>
           <small class="form-hint">生效时机：保存后立即生效 · 对谁生效：Room 内所有页面与导出数据</small></label>
+        <section>
+          <p class="form-hint" id="settings-workspace-root"></p>
+          <button id="settings-repository-inspect" type="button" class="secondary-button">重新检查 Git 仓库</button>
+          <label>实际仓库 <select id="settings-repository-select" aria-label="关联实际仓库"><option value="__pending__">点击重新检查</option></select></label>
+          <label>仓库相对路径 <input id="settings-repository-input" autocomplete="off" placeholder="父工作区内的实际 Git 仓库相对路径"></label>
+          <p class="form-hint" id="settings-repository-hint" aria-live="polite"></p>
+          <button id="settings-repository-save" type="button" class="secondary-button">确认关联此仓库</button>
+          <p class="form-error" id="settings-repository-error" role="alert" hidden></p>
+        </section>
         <label>租约冲突策略
           <select id="settings-lease-policy" title="作用于提交前检查（lease check）：「提示并记录」返回冲突清单由调用方决定；「提交前阻断」直接拒绝并写入审计事件。申请租约时的冲突始终拒绝，与本设置无关。">
             <option value="advisory">提示并记录</option>
             <option value="pre_commit_block">提交前阻断</option>
           </select>
-          <small class="form-hint">生效时机：保存后立即生效 · 对谁生效：本项目的文件租约提交前检查（Agent 与管理端均适用）</small></label>
+          <small class="form-hint">生效时机：保存后立即生效 · 对谁生效：本项目的文件租约提交前检查（经 <code>POST /leases/check</code>，供管理端与接入方在提交前自查；MCP 工具面未暴露该检查）</small></label>
         <label>默认任务优先级
           <select id="settings-default-priority" title="创建任务时未显式指定优先级时使用的默认值。">
             <option value="0">P0 · 紧急</option>
@@ -500,12 +510,12 @@
       </form>
     </dialog>
 
-    <dialog id="system-settings-dialog" class="wide-dialog">
+    <dialog id="system-settings-dialog" class="wide-dialog" aria-labelledby="system-settings-dialog-title" aria-modal="true">
       <div class="dialog-form">
         <div class="dialog-header">
           <div>
             <p class="context-label">全局配置（所有 Project 共用）</p>
-            <h2>系统设置</h2>
+            <h2 id="system-settings-dialog-title">系统设置</h2>
           </div>
           <button type="button" class="icon-button dialog-close" title="关闭" aria-label="关闭">×</button>
         </div>
@@ -563,12 +573,12 @@
       </div>
     </dialog>
 
-    <dialog id="archive-dialog">
+    <dialog id="archive-dialog" aria-labelledby="archive-dialog-title" aria-modal="true">
       <form method="dialog" class="dialog-form" id="archive-form">
         <div class="dialog-header">
           <div>
             <p class="context-label">项目管理</p>
-            <h2>归档项目</h2>
+            <h2 id="archive-dialog-title">归档项目</h2>
           </div>
           <button type="button" class="icon-button dialog-close" title="关闭" aria-label="关闭">×</button>
         </div>
@@ -583,12 +593,12 @@
       </form>
     </dialog>
 
-    <dialog id="integration-dialog" class="wide-dialog">
+    <dialog id="integration-dialog" class="wide-dialog" aria-labelledby="integration-dialog-title" aria-modal="true">
       <div class="dialog-form">
         <div class="dialog-header">
           <div>
             <p class="context-label">当前项目</p>
-            <h2>接入 Agent</h2>
+            <h2 id="integration-dialog-title">接入 Agent</h2>
           </div>
           <button type="button" class="icon-button dialog-close" title="关闭" aria-label="关闭">×</button>
         </div>
@@ -603,10 +613,18 @@
             <p class="secondary-text">已有旧连接器时用生成的同名 HTTP 配置替换，不删除 Room 数据。</p>
           </div>
           <div>
+            <label for="integration-client-profile">目标客户端</label>
+            <select id="integration-client-profile"></select>
+            <p class="secondary-text" id="integration-client-profile-hint">具名客户端的预设配置带真实软件身份，通用模板的身份位需要先填写。</p>
+          </div>
+          <div>
             <p class="integration-choice-label">连接方式</p>
-            <div class="segmented-control integration-transport-tabs" id="integration-transport-tabs" aria-label="连接方式（仅 HTTP）">
+            <div class="segmented-control integration-transport-tabs" id="integration-transport-tabs" role="group" aria-label="连接方式">
               <button type="button" class="is-active" data-integration-transport="http">HTTP 直连</button>
+              <button type="button" data-integration-transport="local">本机 stdio</button>
+              <button type="button" data-integration-transport="remote">远程 Bridge</button>
             </div>
+            <p class="secondary-text" id="integration-transport-hint">HTTP 直连是主路径：共用一个服务，不为每条连接拉起适配器进程。</p>
           </div>
         </section>
 
@@ -711,12 +729,12 @@
       </div>
     </dialog>
 
-    <dialog id="login-dialog" class="auth-dialog">
+    <dialog id="login-dialog" class="auth-dialog" aria-labelledby="login-dialog-title" aria-modal="true">
       <form method="dialog" class="dialog-form" id="login-form">
         <div class="dialog-header">
           <div>
             <p class="context-label">管理认证</p>
-            <h2>登录 AgentChatRoom</h2>
+            <h2 id="login-dialog-title">登录 AgentChatRoom</h2>
           </div>
         </div>
         <label>管理员 Secret <input id="login-token" type="password" autocomplete="current-password" required></label>
@@ -727,7 +745,7 @@
       </form>
     </dialog>
 
-    <dialog id="token-dialog">
+    <dialog id="token-dialog" aria-labelledby="token-dialog-title" aria-modal="true">
       <form method="dialog" class="dialog-form" id="token-form">
         <div class="dialog-header">
           <div>
@@ -762,7 +780,7 @@
       </form>
     </dialog>
 
-    <dialog id="token-permissions-dialog">
+    <dialog id="token-permissions-dialog" aria-labelledby="token-permissions-title" aria-modal="true">
       <form method="dialog" class="dialog-form" id="token-permissions-form">
         <div class="dialog-header">
           <div>
@@ -783,7 +801,7 @@
       </form>
     </dialog>
 
-    <dialog id="token-extend-dialog">
+    <dialog id="token-extend-dialog" aria-labelledby="token-extend-title" aria-modal="true">
       <form method="dialog" class="dialog-form" id="token-extend-form">
         <div class="dialog-header">
           <div>
@@ -804,7 +822,7 @@
       </form>
     </dialog>
 
-    <dialog id="token-secret-dialog">
+    <dialog id="token-secret-dialog" aria-labelledby="token-secret-title" aria-modal="true">
       <div class="dialog-form">
         <div class="dialog-header">
           <div>

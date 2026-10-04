@@ -77,6 +77,9 @@ def _submit_candidate(service, project, executor, **overrides):
 
 
 def _review_asset(service, project, reviewer, asset_id, verdict="approved", **overrides):
+    # An approval is bound to the version the reviewer actually read, so the
+    # helper pins the current one exactly as an Agent would via knowledge_get.
+    current = service.get_knowledge_asset(project["id"], asset_id)
     payload = {
         "reviewer_session_id": reviewer["agent"]["id"],
         "token": reviewer["token"],
@@ -85,9 +88,82 @@ def _review_asset(service, project, reviewer, asset_id, verdict="approved", **ov
             {"criterion": "Content is accurate", "status": "passed"},
             {"criterion": "Provenance is traceable", "status": "passed"},
         ],
+        "expected_version_id": current["current_version"]["version_id"],
     }
     payload.update(overrides)
     return service.submit_knowledge_review(project["id"], asset_id, **payload)
+
+
+def test_approval_is_bound_to_the_version_the_reviewer_read(
+    service, project, joined_agents
+):
+    """#336: a v2 submitted mid-review must not inherit a review written for v1."""
+    executor, reviewer = joined_agents
+    created = _submit_candidate(service, project, executor)
+    asset_id = created["asset"]["id"]
+    read_version_id = service.get_knowledge_asset(project["id"], asset_id)[
+        "current_version"
+    ]["version_id"]
+
+    # A second submission moves current_version_id to v2 while the reviewer is
+    # still holding the v1 they actually read.
+    _submit_candidate(
+        service,
+        project,
+        executor,
+        asset_id=asset_id,
+        title="Use SQLite WAL mode, revised",
+        body="Enable WAL mode and checkpoint before running concurrent tests.",
+        summary="WAL plus an explicit checkpoint avoids lock errors",
+        tags=["database", "testing", "revised"],
+    )
+    new_version_id = service.get_knowledge_asset(project["id"], asset_id)[
+        "current_version"
+    ]["version_id"]
+    assert new_version_id != read_version_id
+
+    with pytest.raises(DomainError) as stale:
+        _review_asset(
+            service,
+            project,
+            reviewer,
+            asset_id,
+            verdict="approved",
+            expected_version_id=read_version_id,
+        )
+    assert stale.value.code == "knowledge_version_stale"
+    assert stale.value.status_code == 409
+    assert stale.value.details["expected_version_id"] == read_version_id
+    assert stale.value.details["current_version_id"] == new_version_id
+
+    # The asset must not have been approved by a stale review.
+    assert service.get_knowledge_asset(project["id"], asset_id)["status"] == "candidate"
+
+    # Re-reading and re-pinning approves the content actually reviewed.
+    approved = _review_asset(
+        service, project, reviewer, asset_id, verdict="approved"
+    )
+    assert approved["status"] == "approved"
+    assert approved["review"]["version_id"] == new_version_id
+
+
+def test_approval_without_a_version_pin_is_refused(service, project, joined_agents):
+    """#336: approving without naming the reviewed version is the original hole."""
+    executor, reviewer = joined_agents
+    created = _submit_candidate(service, project, executor)
+    asset_id = created["asset"]["id"]
+
+    with pytest.raises(DomainError) as unpinned:
+        service.submit_knowledge_review(
+            project["id"],
+            asset_id,
+            reviewer_session_id=reviewer["agent"]["id"],
+            token=reviewer["token"],
+            verdict="approved",
+            criteria=[{"criterion": "ok", "status": "passed"}],
+        )
+    assert unpinned.value.code == "knowledge_version_pin_required"
+    assert unpinned.value.status_code == 422
 
 
 def test_candidate_creates_first_version_with_provenance(service, project, joined_agents):
@@ -343,6 +419,7 @@ def test_assets_are_isolated_per_project(
             token=other_executor["token"],
             verdict="approved",
             criteria=[{"criterion": "ok", "status": "passed"}],
+            expected_version_id=created["asset"]["current_version"]["version_id"],
         )
     assert cross_write.value.code == "knowledge_asset_not_found"
 
@@ -540,12 +617,18 @@ def test_rest_adapter_reuses_domain_service(settings, project_dir):
         assert listed.status_code == 200
         assert len(listed.json()["assets"]) == 1
 
+        pinned = client.get(
+            f"/api/v1/projects/{project_id}/knowledge/assets/{asset_id}"
+        ).json()
+        current_version_id = pinned["current_version"]["version_id"]
+
         reviewed = client.post(
             f"/api/v1/projects/{project_id}/knowledge/assets/{asset_id}/reviews",
             json={
                 "reviewer_session_id": reviewer["agent"]["id"],
                 "token": reviewer["token"],
                 "verdict": "approved",
+                "expected_version_id": current_version_id,
                 "criteria": [
                     {"criterion": "Accurate", "status": "passed"},
                     {"criterion": "Traceable", "status": "passed"},
@@ -599,8 +682,7 @@ def test_mcp_tools_reuse_domain_service(monkeypatch, service, project_dir):
     monkeypatch.setenv(mcp_server.SOFTWARE_NAME_ENV, "Mcp Builder")
     monkeypatch.setenv(mcp_server.SOFTWARE_CLIENT_ENV, "codex")
     executor = mcp_server.room_join(
-        project_path=str(project_dir), model="test-model",
-        agent_key="mcp-builder-main", agent_name="Mcp Builder", client="codex"
+        project_path=str(project_dir), model="test-model"
     )["result"]
     monkeypatch.setenv(mcp_server.SOFTWARE_KEY_ENV, "mcp-reviewer")
     monkeypatch.setenv(mcp_server.SOFTWARE_NAME_ENV, "Mcp Reviewer")
@@ -608,9 +690,6 @@ def test_mcp_tools_reuse_domain_service(monkeypatch, service, project_dir):
     reviewer = mcp_server.room_join(
         project_path=str(project_dir),
         model="test-model",
-        agent_key="mcp-reviewer-main",
-        agent_name="Mcp Reviewer",
-        client="qoder",
         role="reviewer",
     )["result"]
     project_id = executor["project"]["id"]
@@ -630,6 +709,9 @@ def test_mcp_tools_reuse_domain_service(monkeypatch, service, project_dir):
     listed = mcp_server.knowledge_list(project_id, status="candidate")
     assert listed["ok"] is True
     assert [asset["id"] for asset in listed["result"]] == [asset_id]
+    current_version_id = mcp_server.knowledge_get(
+        project_id, asset_id
+    )["result"]["current_version"]["version_id"]
 
     self_review = mcp_server.knowledge_review(
         project_id,
@@ -638,6 +720,7 @@ def test_mcp_tools_reuse_domain_service(monkeypatch, service, project_dir):
         executor["token"],
         verdict="approved",
         criteria=[{"criterion": "ok", "status": "passed"}],
+        expected_version_id=current_version_id,
     )
     assert self_review["ok"] is False
     assert self_review["error"]["code"] == "knowledge_reviewer_not_independent"
@@ -649,12 +732,19 @@ def test_mcp_tools_reuse_domain_service(monkeypatch, service, project_dir):
         reviewer["token"],
         verdict="approved",
         criteria=[{"criterion": "ok", "status": "passed"}],
+        expected_version_id=current_version_id,
     )
     assert reviewed["ok"] is True
     assert reviewed["result"]["status"] == "approved"
 
+    # A terminal write needs a reason (#355): it is the only record of why an
+    # irreversible removal happened.
     superseded = mcp_server.knowledge_supersede(
-        project_id, asset_id, executor["agent"]["id"], executor["token"]
+        project_id,
+        asset_id,
+        executor["agent"]["id"],
+        executor["token"],
+        reason="Replaced by a newer decision",
     )
     assert superseded["ok"] is True
     assert superseded["result"]["status"] == "superseded"

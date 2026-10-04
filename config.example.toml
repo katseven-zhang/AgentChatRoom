@@ -5,6 +5,10 @@ deployment_profile = "local"
 [server]
 host = "127.0.0.1"
 port = 8765
+# There is no url key. CLI commands derive the service URL from host, port,
+# and external_base_url (a wildcard host 0.0.0.0 or :: is addressed as
+# 127.0.0.1). Pass --url only to override that derivation.
+# AGENTCHATROOM_URL is not a configuration key.
 mcp_http_enabled = true
 mcp_http_path = "/mcp"
 mcp_http_stateless = false
@@ -29,6 +33,11 @@ mcp_http_tombstone_limit = 256
 mcp_http_tombstone_ttl_seconds = 86400.0
 # Command used by a remote stdio Bridge on each Agent computer.
 mcp_bridge_command = "python"
+# Argument vector for that Bridge. The default reaches the module through a
+# Python interpreter. A packaged build ships one exe and no interpreter, so it
+# passes ["mcp-bridge"] instead and this setting is left empty: the exe detects
+# that and substitutes its own path plus the subcommand.
+mcp_bridge_args = ["-m", "agentchatroom.mcp_bridge"]
 external_base_url = ""
 # Only trust forwarded headers from explicitly configured proxy addresses.
 trusted_proxy_headers = true
@@ -44,6 +53,7 @@ connect_timeout_seconds = 10.0
 [coordination]
 # MCP roots bind timeout (seconds); 0 is invalid, max 60.
 mcp_roots_timeout_seconds = 5.0
+git_scope_recheck_ttl_seconds = 30.0
 heartbeat_timeout_seconds = 45
 # Long-running local MCP and remote Bridge processes keep joined sessions alive.
 presence_keepalive_enabled = true
@@ -52,7 +62,7 @@ session_token_ttl_seconds = 43200
 default_lease_ttl_seconds = 1800
 max_lease_ttl_seconds = 86400
 sse_poll_interval_seconds = 0.5
-presence_refresh_interval_seconds = 1.0
+presence_refresh_interval_seconds = 5.0
 # SSE occupancy caps; over-limit streams return 429 sse_limit_exceeded.
 max_sse_clients_per_project = 64
 sse_per_ip_limit = 16
@@ -74,8 +84,23 @@ test_entry_notes_max_length = 4000
 project_document_max_bytes = 262144
 # room_sync/Web snapshot reports/reviews/acks recent window (#183).
 snapshot_recent_limit = 200
+# Snapshot "right now" lists are bounded rather than paged: newest window first,
+# and the snapshot says so in lease_page_info/session_page_info (#359).
+snapshot_session_limit = 200
+snapshot_lease_limit = 200
+# Standalone lease listing bound; export ignores it (an archive keeps every row).
+lease_list_limit = 500
+# export_project returns at most this many events and declares the window under
+# window.events (#359).
+export_event_limit = 5000
+repository_scan_max_depth = 3
+repository_scan_max_directories = 256
+repository_scan_timeout_seconds = 5.0
+repository_scan_excludes = [".git", ".agentchatroom", ".venv", "node_modules", "build", "dist"]
+repository_evidence_max_file_bytes = 8388608
 # Idempotency record retention in days; 0 = keep forever (#200).
 idempotency_retention_days = 30
+retention_sweep_interval_seconds = 3600.0
 
 [knowledge]
 # Knowledge Asset kinds enabled for this deployment. Each kind must match
@@ -100,6 +125,7 @@ inject_max_chars = 12000
 [security]
 agent_token_ttl_seconds = 2592000
 max_agent_token_ttl_seconds = 31536000
+min_agent_token_ttl_seconds = 300
 mcp_http_auth_required = true
 management_auth_required = false
 management_token_env = "AGENTCHATROOM_ADMIN_TOKEN"

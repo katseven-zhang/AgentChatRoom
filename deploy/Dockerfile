@@ -7,13 +7,15 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 WORKDIR /app
 
 COPY pyproject.toml README.md LICENSE ./
+COPY requirements-docker.txt ./
 COPY src ./src
 COPY deploy/config.server.example.toml ./deploy/config.server.example.toml
 
 RUN apt-get update \
     && apt-get install --no-install-recommends -y postgresql-client \
     && rm -rf /var/lib/apt/lists/* \
-    && pip install --no-cache-dir ".[postgresql]" \
+    && pip install --no-cache-dir --require-hashes -r requirements-docker.txt \
+    && pip install --no-cache-dir --no-deps . \
     && useradd --create-home --uid 10001 --shell /usr/sbin/nologin agentchatroom \
     && mkdir -p /var/lib/agentchatroom \
     && chown -R agentchatroom:agentchatroom /app /var/lib/agentchatroom

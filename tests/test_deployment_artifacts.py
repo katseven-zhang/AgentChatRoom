@@ -1,3 +1,4 @@
+# audit-allow-file:windows_absolute_path
 import os
 import subprocess
 import sys
@@ -31,7 +32,13 @@ def test_container_deployment_artifacts_are_present_and_secret_free() -> None:
     assert '"${AGENTCHATROOM_BIND_PORT:-8765}:8765"' not in compose
     assert "postgresql-client" in dockerfile
     assert "rm -rf /var/lib/apt/lists/*" in dockerfile
-    assert "pip install --no-cache-dir \".[postgresql]\"" in dockerfile
+    # The image installs the postgresql extra from uv.lock, hash-pinned (#325):
+    # an unpinned `.[postgresql]` resolve is exactly what this line used to allow.
+    assert (
+        "pip install --no-cache-dir --require-hashes -r requirements-docker.txt"
+        in dockerfile
+    )
+    assert "pip install --no-cache-dir --no-deps ." in dockerfile
     assert "replace-with" in env_example
     assert "room.example.com" in caddy
     assert "def deployment_preflight" in serverctl
@@ -137,7 +144,12 @@ def test_windows_package_workflow_builds_and_uploads_single_exe() -> None:
 
     assert "name: Package Windows EXE" in workflow
     assert "runs-on: windows-latest" in workflow
-    assert 'python -m pip install -e ".[dev,gui]"' in workflow
+    # Same contract for the EXE path: dev+gui come from uv.lock, hash-pinned,
+    # and the project itself is installed without re-resolving (#325).
+    assert (
+        "python -m pip install --require-hashes -r requirements-windows.txt" in workflow
+    )
+    assert "python -m pip install --no-deps -e ." in workflow
     assert 'python -m pip install "pyinstaller==6.22.2"' in workflow
     assert "python -m PyInstaller --clean --noconfirm agentchatroom.spec" in workflow
     assert "dist\\agentchatroom\\agentchatroom.exe" in workflow

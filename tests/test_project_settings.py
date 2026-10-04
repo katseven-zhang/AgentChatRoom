@@ -66,7 +66,9 @@ def test_audit_retention_purges_only_expired_and_audits(service, project):
 
     # 永久保留（默认）不清 anything。
     untouched = service.enforce_audit_retention(project["id"])
-    assert untouched == {"purged": 0, "retention_days": 0}
+    assert untouched["purged"] == 0
+    assert untouched["retention_days"] == 0
+    assert untouched["purged_before"] is None
 
     service.update_project(
         project["id"], settings={"audit_retention_days": 30}
@@ -84,6 +86,163 @@ def test_audit_retention_purges_only_expired_and_audits(service, project):
     purge_events = service.query_audit(project["id"], event_type="audit.purged")["events"]
     assert purge_events and purge_events[-1]["payload"]["deleted_events"] == 2
     assert purge_events[-1]["payload"]["retention_days"] == 30
+
+
+def _age_all_events(service, project_id, iso_timestamp):
+    """Backdate every event so a retention sweep has something to remove."""
+    with service.database.connect(write=True) as connection:
+        connection.execute(
+            "UPDATE events SET created_at = ? WHERE project_id = ?",
+            (iso_timestamp, project_id),
+        )
+
+
+def test_purge_receipt_survives_later_retention_windows(service, project):
+    """#339: the audit.purged receipt must not be purged by its own successor."""
+    service.update_project(project["id"], settings={"audit_retention_days": 30})
+    session = service.join_room(
+        project["id"], name="Worker", client="codex", model="unknown"
+    )
+    service.post_message(
+        project["id"],
+        body="first",
+        session_id=session["agent"]["id"],
+        token=session["token"],
+        model_display_name="test-model",
+    )
+
+    service._age_all_events = None  # guard against accidental reuse
+    _age_all_events(service, project["id"], "2000-01-01T00:00:00Z")
+    first = service.enforce_audit_retention(project["id"])
+    assert first["purged"] > 0
+    assert first["purged_before"] is not None
+
+    # A second window later must still leave the first receipt readable.
+    _age_all_events(service, project["id"], "2000-01-01T00:00:00Z")
+    second = service.enforce_audit_retention(project["id"])
+
+    receipts = service.query_audit(project["id"], event_type="audit.purged")["events"]
+    assert len(receipts) >= 1
+    assert first["purged_before"] in [r["payload"]["purged_before"] for r in receipts]
+    assert second["purged"] >= 0
+
+
+def test_purge_does_not_cascade_away_acknowledgements(service, project):
+    """#339: deleting an acknowledged event erased "who confirmed what, when"."""
+    service.update_project(project["id"], settings={"audit_retention_days": 30})
+    session = service.join_room(
+        project["id"], name="Worker", client="codex", model="unknown"
+    )
+    posted = service.post_message(
+        project["id"],
+        body="needs confirmation",
+        session_id=session["agent"]["id"],
+        token=session["token"],
+        model_display_name="test-model",
+        requires_ack=True,
+    )
+    event_seq = posted["event_id"]
+    service.acknowledge_event(
+        project["id"],
+        event_seq,
+        session_id=session["agent"]["id"],
+        token=session["token"],
+    )
+
+    _age_all_events(service, project["id"], "2000-01-01T00:00:00Z")
+    result = service.enforce_audit_retention(project["id"])
+    assert result["deferred_referenced"] >= 1
+
+    remaining = {
+        event["id"]
+        for event in service.query_audit(project["id"], limit=200)["events"]
+    }
+    assert event_seq in remaining, "the acknowledged event was purged"
+    # The acknowledgement row itself is the thing ON DELETE CASCADE would have
+    # destroyed, so assert on the row rather than on an API projection.
+    with service.database.connect() as connection:
+        acks = connection.execute(
+            "SELECT event_id FROM event_acknowledgements WHERE event_id = ?",
+            (event_seq,),
+        ).fetchall()
+    assert [int(row["event_id"]) for row in acks] == [int(event_seq)]
+
+
+def test_purge_defers_the_event_behind_a_task_spec_receipt(service, project, tmp_path):
+    """#339: purging the claimed event silently degraded spec_receipt to {}."""
+    worktree = tmp_path / "repo"
+    worktree.mkdir()
+    registered = service.register_workspace(
+        project["id"],
+        host_key="receipt-host",
+        host_name="Receipt Host",
+        local_path=str(worktree),
+    )
+    session = service.join_room(
+        project["id"],
+        name="Worker",
+        client="codex",
+        model="unknown",
+        worktree=str(worktree),
+        host_id=registered["host"]["id"],
+        workspace_id=registered["workspace"]["id"],
+    )
+    # The spec receipt is derived from the newest task.claimed that carries a
+    # project-documents snapshot, so a binding document must exist first.
+    service.upsert_project_document(
+        project["id"],
+        doc_key="standards",
+        kind="binding",
+        title="工程规范",
+        content="先取租约再改共享文件。",
+        actor="management",
+        management_authorized=True,
+    )
+    task = service.create_task(
+        project["id"],
+        title="Receipt holder",
+        acceptance_criteria=["bound documents are recorded"],
+        actor_session_id=session["agent"]["id"],
+        token=session["token"],
+    )["task"]
+    service.claim_task(
+        project["id"], task["id"], session["agent"]["id"], session["token"]
+    )
+    bound = service.get_task(project["id"], task["id"])
+    assert bound["spec_receipt"], "fixture did not record a spec receipt"
+
+    service.update_project(project["id"], settings={"audit_retention_days": 30})
+    _age_all_events(service, project["id"], "2000-01-01T00:00:00Z")
+    service.enforce_audit_retention(project["id"])
+
+    assert service.get_task(project["id"], task["id"])["spec_receipt"], (
+        "the spec receipt was destroyed by the retention purge"
+    )
+
+
+def test_read_paths_report_a_purged_before_marker(service, project):
+    """#339: a client holding an old cursor must be able to tell a hole from a start."""
+    service.update_project(project["id"], settings={"audit_retention_days": 30})
+    session = service.join_room(
+        project["id"], name="Worker", client="codex", model="unknown"
+    )
+    service.post_message(
+        project["id"],
+        body="before the purge",
+        session_id=session["agent"]["id"],
+        token=session["token"],
+        model_display_name="test-model",
+    )
+    _age_all_events(service, project["id"], "2000-01-01T00:00:00Z")
+    purged_before = service.enforce_audit_retention(project["id"])["purged_before"]
+    assert purged_before
+
+    listed = service.list_events(project["id"], after=0, limit=50)
+    assert listed["purged_before"] == purged_before
+    assert listed["cursor_is_purged"] is True
+
+    at_head = service.list_events(project["id"], after=purged_before, limit=50)
+    assert at_head["cursor_is_purged"] is False
 
 
 def test_audit_retention_policy_validation(service, project):

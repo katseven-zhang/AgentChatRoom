@@ -1,3 +1,4 @@
+# audit-allow-file:windows_absolute_path,private_lan_address
 from __future__ import annotations
 
 from dataclasses import replace
@@ -210,6 +211,35 @@ def test_windows_server_stop_falls_back_when_taskkill_is_rejected(monkeypatch):
     assert calls["kill"] == [(4321, signal.SIGTERM)]
 
 
+def test_stop_command_exit_code_matches_whether_the_process_stopped(
+    monkeypatch, capsys
+):
+    """#301: a live process that did not stop is a failed command."""
+    monkeypatch.setattr(cli, "load_settings", lambda *_args, **_kwargs: object())
+
+    monkeypatch.setattr(
+        cli,
+        "stop_detached_server",
+        lambda _settings: {"stopped": False, "reason": "timeout", "pid": 7},
+    )
+    with pytest.raises(SystemExit) as failed:
+        main(["stop"])
+    assert failed.value.code == 1
+    assert json.loads(capsys.readouterr().out) == {
+        "stopped": False,
+        "reason": "timeout",
+        "pid": 7,
+    }
+
+    monkeypatch.setattr(
+        cli,
+        "stop_detached_server",
+        lambda _settings: {"stopped": False, "reason": "not_running"},
+    )
+    main(["stop"])
+    assert json.loads(capsys.readouterr().out)["reason"] == "not_running"
+
+
 def test_stop_removes_stale_pid_file(settings):
     pid_path = settings.data_dir / "server.pid"
     settings.data_dir.mkdir(parents=True, exist_ok=True)
@@ -341,6 +371,42 @@ def test_mcp_config_prints_grok_toml(monkeypatch, tmp_path, capsys):
     assert "enabled = true" in output
 
 
+def test_named_mcp_config_formats_use_real_profile_identity(monkeypatch, tmp_path, capsys):
+    """#303: named clients must not emit placeholder software identity."""
+    monkeypatch.setenv("AGENTCHATROOM_DATA_DIR", str(tmp_path / "runtime"))
+    monkeypatch.setenv("AGENTCHATROOM_EXTERNAL_BASE_URL", "https://room.example.test")
+    expected = {
+        "workbuddy-json": ("workbuddy", "WorkBuddy", "workbuddy"),
+        "grok-toml": ("grok-build", "Grok Build", "grok-build"),
+        "codex-toml": ("codex", "Codex", "codex"),
+    }
+    placeholders = (
+        "<stable-software-key>",
+        "<Software name>",
+        "<software-client-code>",
+    )
+    for transport in ("local-stdio", "remote-bridge", "streamable-http"):
+        for fmt, identity in expected.items():
+            main(["mcp-config", "--format", fmt, "--transport", transport])
+            output = capsys.readouterr().out
+            for placeholder in placeholders:
+                assert placeholder not in output
+            key, name, client = identity
+            assert key in output
+            assert name in output
+            assert client in output
+            if transport == "streamable-http":
+                assert "X-AgentChatRoom-Software-Key" in output
+                assert "X-AgentChatRoom-Software-Name" in output
+                assert "X-AgentChatRoom-Software-Client" in output
+            else:
+                assert f'AGENTCHATROOM_SOFTWARE_KEY = "{key}"' in output or (
+                    f'"AGENTCHATROOM_SOFTWARE_KEY": "{key}"' in output
+                )
+                assert name in output
+                assert client in output
+
+
 def test_mcp_config_prints_streamable_http_codex_toml(monkeypatch, tmp_path, capsys):
     monkeypatch.setenv("AGENTCHATROOM_EXTERNAL_BASE_URL", "https://room.example.test")
 
@@ -456,6 +522,47 @@ def test_work_report_cli_allows_explicit_no_code_reason(monkeypatch, capsys):
         "No repository changes were required"
     )
     assert '"ok": true' in capsys.readouterr().out
+
+
+def test_http_commands_use_the_configured_port_without_an_explicit_url(
+    monkeypatch, tmp_path, capsys
+):
+    """#300: room-sync and task-* follow Settings, not a hardcoded port."""
+    config_path = tmp_path / "room.toml"
+    config_path.write_text(
+        '[server]\nhost = "0.0.0.0"\nport = 9000\n\n'
+        "[security]\nmanagement_auth_required = true\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("AGENTCHATROOM_CONFIG", str(config_path))
+    monkeypatch.delenv("AGENTCHATROOM_URL", raising=False)
+    monkeypatch.delenv("AGENTCHATROOM_PORT", raising=False)
+    monkeypatch.delenv("AGENTCHATROOM_HOST", raising=False)
+    monkeypatch.delenv("AGENTCHATROOM_EXTERNAL_BASE_URL", raising=False)
+    seen: list[str] = []
+
+    def fake_request_json(base, method, path, body=None, *, request_id=None):
+        seen.append(base)
+        if path.endswith("/sync"):
+            return {"events": [], "cursor": 0}
+        return {"tasks": []}
+
+    monkeypatch.setattr(cli, "request_json", fake_request_json)
+    main(["room-sync", "project_example"])
+    main(["task-list", "project_example"])
+    assert seen == ["http://127.0.0.1:9000", "http://127.0.0.1:9000"]
+
+    config_path.write_text(
+        '[server]\nhost = "0.0.0.0"\nport = 9000\n'
+        'external_base_url = "https://room.example.test"\n\n'
+        "[security]\nmanagement_auth_required = true\n",
+        encoding="utf-8",
+    )
+    main(["task-get", "project_example", "task_example"])
+    assert seen[-1] == "https://room.example.test"
+    main(["--url", "http://127.0.0.1:9100", "task-list", "project_example"])
+    assert seen[-1] == "http://127.0.0.1:9100"
+    assert "8765" not in capsys.readouterr().out
 
 
 def test_task_get_cli_uses_exact_task_endpoint(monkeypatch, capsys):
@@ -672,7 +779,10 @@ def test_room_bootstrap_cli_uses_shared_service_and_hides_token(
     monkeypatch.setenv(SOFTWARE_NAME_ENV, "CLI Boot")
     monkeypatch.setenv(SOFTWARE_CLIENT_ENV, "codex")
 
-    main(["room-bootstrap", "--cwd", str(project_dir), "--model", "unknown"])
+    from agentchatroom.service_lifetime import running_service
+
+    with running_service(settings):
+        main(["room-bootstrap", "--cwd", str(project_dir), "--model", "unknown"])
     ready = json.loads(capsys.readouterr().out)
     assert ready["status"] == "ready"
     assert ready["project"]["id"] == project["id"]
@@ -684,7 +794,84 @@ def test_room_bootstrap_cli_uses_shared_service_and_hides_token(
     online = [agent for agent in snapshot["agents"] if agent["status"] == "online"]
     assert len(online) == 1
     assert online[0]["id"] == ready["session"]["id"]
+    assert ready["connection"]["process_connected"] is True
+    assert len(ready["connection"]["service_generation"]) == 32
     assert "token" not in encoded
+
+
+def test_room_bootstrap_stops_before_any_write_when_the_service_is_down(
+    monkeypatch, tmp_path, capsys
+):
+    """#287: a stopped service is service_unavailable and does not touch the checkout."""
+    from agentchatroom.bootstrap import (
+        SOFTWARE_CLIENT_ENV,
+        SOFTWARE_KEY_ENV,
+        SOFTWARE_NAME_ENV,
+    )
+    from agentchatroom.config import load_settings
+
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    agents = checkout / "AGENTS.md"
+    agents.write_text("user rules\n", encoding="utf-8")
+    config_path = tmp_path / "room.toml"
+    config_path.write_text(
+        '[server]\nhost = "127.0.0.1"\nport = 9000\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("AGENTCHATROOM_DATA_DIR", str(data_dir))
+    monkeypatch.setenv("AGENTCHATROOM_CONFIG", str(config_path))
+    monkeypatch.setenv(SOFTWARE_KEY_ENV, "cli-boot")
+    monkeypatch.setenv(SOFTWARE_NAME_ENV, "CLI Boot")
+    monkeypatch.setenv(SOFTWARE_CLIENT_ENV, "codex")
+    settings = load_settings(config_path, data_dir=data_dir)
+
+    with pytest.raises(SystemExit) as excinfo:
+        main(["room-bootstrap", "--cwd", str(checkout), "--config", str(config_path)])
+
+    assert excinfo.value.code == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["status"] == "service_unavailable"
+    assert payload["required_action"] == "start_configured_service"
+    assert payload["connection"]["process_connected"] is False
+    assert not settings.database_path.exists()
+    assert agents.read_text(encoding="utf-8") == "user rules\n"
+    assert not (checkout / ".agentchatroom").exists()
+
+
+def test_room_bootstrap_rejects_postgresql_without_a_url_before_opening_a_database(
+    monkeypatch, tmp_path, capsys
+):
+    from agentchatroom.bootstrap import (
+        SOFTWARE_CLIENT_ENV,
+        SOFTWARE_KEY_ENV,
+        SOFTWARE_NAME_ENV,
+    )
+    from agentchatroom.config import load_settings
+
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    config_path = tmp_path / "room.toml"
+    config_path.write_text(
+        '[server]\nhost = "127.0.0.1"\nport = 9000\n\n'
+        '[database]\nbackend = "postgresql"\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("AGENTCHATROOM_DATA_DIR", str(data_dir))
+    monkeypatch.delenv("AGENTCHATROOM_DATABASE_URL", raising=False)
+    monkeypatch.setenv(SOFTWARE_KEY_ENV, "cli-boot")
+    monkeypatch.setenv(SOFTWARE_NAME_ENV, "CLI Boot")
+    monkeypatch.setenv(SOFTWARE_CLIENT_ENV, "codex")
+    settings = load_settings(config_path, data_dir=data_dir)
+
+    with pytest.raises(SystemExit) as excinfo:
+        main(["room-bootstrap", "--cwd", str(tmp_path), "--config", str(config_path)])
+
+    assert "AGENTCHATROOM_DATABASE_URL" in str(excinfo.value)
+    assert not settings.database_path.exists()
+    assert capsys.readouterr().out == ""
 
 
 def test_room_join_cli_forwards_stable_agent_key_and_model(monkeypatch, capsys):
@@ -961,3 +1148,109 @@ def test_task_claim_cli_passes_reclaim_flag(monkeypatch, capsys):
     assert captured[2]["body"]["reclaim"] is False
     assert captured[2]["body"]["takeover"] is False
     assert capsys.readouterr().out.count('"ok": true') == 3
+
+
+def test_cli_knowledge_review_pins_the_version_the_reviewer_read(
+    monkeypatch, settings, project_dir, capsys
+):
+    """#368: the CLI review call pins the version it read, and a newer one is stale."""
+    from fastapi.testclient import TestClient
+
+    from agentchatroom.api import create_app
+
+    app = create_app(settings)
+    service = app.state.service
+    project = service.create_project(root_path=str(project_dir), name="Knowledge CLI")
+    author = service.join_room(
+        project["id"], name="Author", client="author-cli", model="unknown"
+    )
+    reviewer = service.join_room(
+        project["id"], name="Reviewer", client="reviewer-cli", model="unknown"
+    )
+    created = service.submit_knowledge_candidate(
+        project["id"],
+        session_id=author["agent"]["id"],
+        token=author["token"],
+        title="Pin the reviewed version",
+        body="Version one.",
+        kind="decision",
+        summary="first",
+        tags=["cli"],
+        source_type="manual",
+    )
+    asset_id = created["asset"]["id"]
+    read_version_id = service.get_knowledge_asset(project["id"], asset_id)[
+        "current_version"
+    ]["version_id"]
+    service.submit_knowledge_candidate(
+        project["id"],
+        session_id=author["agent"]["id"],
+        token=author["token"],
+        asset_id=asset_id,
+        title="Pin the reviewed version",
+        body="Version two.",
+        kind="decision",
+        summary="second",
+        tags=["cli"],
+        source_type="manual",
+    )
+
+    with TestClient(app) as client:
+        def forward(base, method, path, payload=None, *, request_id=None):
+            response = client.request(method, path, json=payload)
+            if response.status_code >= 400:
+                raise SystemExit(response.text)
+            return response.json()
+
+        monkeypatch.setattr(cli, "request_json", forward)
+        with pytest.raises(SystemExit) as stale:
+            main(
+                [
+                    "--url",
+                    "http://cli.test",
+                    "knowledge-review",
+                    project["id"],
+                    asset_id,
+                    "--session-id",
+                    reviewer["agent"]["id"],
+                    "--token",
+                    reviewer["token"],
+                    "--verdict",
+                    "approved",
+                    "--criterion",
+                    "Content is accurate::passed",
+                    "--expected-version-id",
+                    read_version_id,
+                ]
+            )
+        assert json.loads(str(stale.value))["error"]["code"] == "knowledge_version_stale"
+        assert (
+            service.get_knowledge_asset(project["id"], asset_id)["status"] == "candidate"
+        )
+
+        current_version_id = service.get_knowledge_asset(project["id"], asset_id)[
+            "current_version"
+        ]["version_id"]
+        main(
+            [
+                "--url",
+                "http://cli.test",
+                "knowledge-review",
+                project["id"],
+                asset_id,
+                "--session-id",
+                reviewer["agent"]["id"],
+                "--token",
+                reviewer["token"],
+                "--verdict",
+                "approved",
+                "--criterion",
+                "Content is accurate::passed",
+                "--expected-version-id",
+                current_version_id,
+            ]
+        )
+
+    approved = json.loads(capsys.readouterr().out)
+    assert approved["status"] == "approved"
+    assert approved["review"]["version_id"] == current_version_id

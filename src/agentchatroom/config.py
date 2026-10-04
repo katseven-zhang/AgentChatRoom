@@ -2,13 +2,17 @@ from __future__ import annotations
 
 import os
 import sys
+import threading
 import tomllib
-from dataclasses import asdict, dataclass
+import uuid
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 from urllib.parse import urlparse
 
 from .contracts import KNOWLEDGE_DEFAULT_KINDS, KNOWLEDGE_KIND_PATTERN
+from .errors import DomainError
+from .service_lifetime import exclusive_file_lock
 
 
 CONFIG_FILE_SCHEMA: dict[str, dict[str, tuple[type, ...]]] = {
@@ -28,6 +32,7 @@ CONFIG_FILE_SCHEMA: dict[str, dict[str, tuple[type, ...]]] = {
         "mcp_http_tombstone_limit": (int,),
         "mcp_http_tombstone_ttl_seconds": (int, float),
         "mcp_bridge_command": (str,),
+        "mcp_bridge_args": (list, str),
         "external_base_url": (str,),
         "trusted_proxy_headers": (bool,),
         "trusted_proxy_ips": (str,),
@@ -44,7 +49,13 @@ CONFIG_FILE_SCHEMA: dict[str, dict[str, tuple[type, ...]]] = {
         "require_verified_task": (bool,),
     },
     "coordination": {
+        "repository_scan_max_depth": (int,),
+        "repository_scan_max_directories": (int,),
+        "repository_scan_timeout_seconds": (int, float),
+        "repository_scan_excludes": (list,),
+        "repository_evidence_max_file_bytes": (int,),
         "mcp_roots_timeout_seconds": (int, float),
+        "git_scope_recheck_ttl_seconds": (int, float),
         "heartbeat_timeout_seconds": (int,),
         "presence_keepalive_enabled": (bool,),
         "presence_keepalive_interval_seconds": (int, float),
@@ -66,11 +77,17 @@ CONFIG_FILE_SCHEMA: dict[str, dict[str, tuple[type, ...]]] = {
         "test_entry_notes_max_length": (int,),
         "project_document_max_bytes": (int,),
         "snapshot_recent_limit": (int,),
+        "snapshot_session_limit": (int,),
+        "snapshot_lease_limit": (int,),
+        "lease_list_limit": (int,),
+        "export_event_limit": (int,),
         "idempotency_retention_days": (int,),
+        "retention_sweep_interval_seconds": (int, float),
     },
     "security": {
         "agent_token_ttl_seconds": (int,),
         "max_agent_token_ttl_seconds": (int,),
+        "min_agent_token_ttl_seconds": (int,),
         "mcp_http_auth_required": (bool,),
         "management_auth_required": (bool,),
         "management_token_env": (str,),
@@ -156,6 +173,95 @@ def normalize_knowledge_kinds(values: Any) -> tuple[str, ...]:
     return unique
 
 
+WILDCARD_BIND_HOSTS = frozenset({"0.0.0.0", "::"})
+
+
+def format_host_for_url(host: str) -> str:
+    """Return ``host`` as it must appear inside a URL authority.
+
+    An IPv6 literal has to be bracketed: ``http://::1:8765`` is not a URL, and
+    the port ends up looking like part of the address. The rule is structural -
+    any host containing a colon is an IPv6 literal - so it does not depend on
+    enumerating the addresses a platform may hand out.
+    """
+    text = str(host).strip()
+    if ":" in text and not text.startswith("["):
+        return f"[{text}]"
+    return text
+
+
+DEFAULT_MCP_BRIDGE_ARGS = ["-m", "agentchatroom.mcp_bridge"]
+
+
+def _resolve_bridge_args(
+    environment_value: str | None, file_value: Any
+) -> list[str]:
+    """Normalize the Bridge argument vector from TOML or the environment.
+
+    An argv vector is a list, and a shell string would have to be re-split with
+    quoting rules that differ per platform. The environment override therefore
+    uses JSON, the one encoding both TOML and every shell agree on, and falls
+    back to the TOML list. The default keeps the source-mode
+    ``python -m agentchatroom.mcp_bridge`` launch, where ``-m`` is consumed by
+    the interpreter and never reaches the Bridge's own argparse.
+    """
+    import json
+
+    raw_environment = str(environment_value or "").strip()
+    if raw_environment:
+        try:
+            parsed = json.loads(raw_environment)
+        except ValueError as error:
+            raise ValueError(
+                "AGENTCHATROOM_MCP_BRIDGE_ARGS must be a JSON array of strings, "
+                'for example ["mcp-bridge"]'
+            ) from error
+        if not isinstance(parsed, list):
+            raise ValueError(
+                "AGENTCHATROOM_MCP_BRIDGE_ARGS must be a JSON array of strings"
+            )
+        return [str(item) for item in parsed]
+    if isinstance(file_value, str):
+        raw_file = file_value.strip()
+        if not raw_file:
+            raise ValueError("MCP Bridge args must not be empty")
+        return json.loads(raw_file)
+    if isinstance(file_value, list):
+        return [str(item) for item in file_value]
+    return list(DEFAULT_MCP_BRIDGE_ARGS)
+
+
+def parse_service_url(url: str) -> tuple[str, int | None]:
+    """Split a service base URL back into ``(host, port)``.
+
+    The inverse of ``build_service_base_url``: a caller that learns the
+    address at runtime needs the host and port back to record it, and the
+    host is unbracketed again so it can be stored as a listen address.
+    """
+    text = str(url or "").strip()
+    if not text:
+        return "", None
+    parsed = urlparse(text)
+    if not parsed.netloc:
+        return "", None
+    try:
+        return parsed.hostname or "", parsed.port
+    except ValueError:
+        return "", None
+
+
+def build_service_base_url(host: str, port: int) -> str:
+    """Build the ``http://host:port`` base URL a client on this machine opens.
+
+    A wildcard bind address is not connectable, so it becomes the IPv4
+    loopback. Every adapter (REST, MCP config, CLI, GUI) formats the service
+    address through here: four private copies of this rule meant a fix reached
+    only some of them, and the copies disagreed about IPv6.
+    """
+    browser_host = "127.0.0.1" if str(host).strip() in WILDCARD_BIND_HOSTS else host
+    return f"http://{format_host_for_url(browser_host)}:{int(port)}"
+
+
 @dataclass(frozen=True, slots=True)
 class Settings:
     data_dir: Path
@@ -184,6 +290,12 @@ class Settings:
     mcp_http_tombstone_limit: int = 256
     mcp_http_tombstone_ttl_seconds: float = 86400.0
     mcp_bridge_command: str = "python"
+    # Argument vector for the remote Bridge launcher. A list is required for the
+    # packaged exe, where the Bridge is the exe itself plus a subcommand; the
+    # default keeps the source-mode `python -m agentchatroom.mcp_bridge` form.
+    mcp_bridge_args: list[str] = field(
+        default_factory=lambda: ["-m", "agentchatroom.mcp_bridge"]
+    )
     external_base_url: str = ""
     trusted_proxy_headers: bool = True
     trusted_proxy_ips: str = "127.0.0.1"
@@ -194,6 +306,7 @@ class Settings:
     database_connect_timeout_seconds: float = 10.0
     agent_token_ttl_seconds: int = 2592000
     max_agent_token_ttl_seconds: int = 31536000
+    min_agent_token_ttl_seconds: int = 300
     mcp_http_auth_required: bool = True
     management_auth_required: bool = False
     management_token_env: str = "AGENTCHATROOM_ADMIN_TOKEN"
@@ -207,11 +320,12 @@ class Settings:
     presence_keepalive_enabled: bool = True
     presence_keepalive_interval_seconds: float = 15.0
     mcp_roots_timeout_seconds: float = 5.0
+    git_scope_recheck_ttl_seconds: float = 30.0
     session_token_ttl_seconds: int = 43200
     default_lease_ttl_seconds: int = 1800
     max_lease_ttl_seconds: int = 86400
     sse_poll_interval_seconds: float = 0.5
-    presence_refresh_interval_seconds: float = 1.0
+    presence_refresh_interval_seconds: float = 5.0
     max_sse_clients_per_project: int = 64
     sse_per_ip_limit: int = 16
     audit_window_size: int = 100
@@ -239,7 +353,26 @@ class Settings:
     test_entry_notes_max_length: int = 4000
     project_document_max_bytes: int = 262144
     snapshot_recent_limit: int = 200
+    # The snapshot's "what is true right now" lists are bounded too: a Project
+    # accumulates one Session per agent process and one lease row per release
+    # forever, so an unbounded read of either only ever grew.
+    snapshot_session_limit: int = 200
+    snapshot_lease_limit: int = 200
+    # Standalone lease listing (REST/MCP) bound for the same reason; the export
+    # deliberately ignores it because an archive must include released leases.
+    lease_list_limit: int = 500
+    # export_project returns at most this many events and declares the window it
+    # actually returned under `window.events`.
+    export_event_limit: int = 5000
     idempotency_retention_days: int = 30
+    retention_sweep_interval_seconds: float = 3600.0
+    repository_scan_max_depth: int = 3
+    repository_scan_max_directories: int = 256
+    repository_scan_timeout_seconds: float = 5.0
+    repository_scan_excludes: tuple[str, ...] = (
+        ".git", ".agentchatroom", ".venv", "node_modules", "build", "dist",
+    )
+    repository_evidence_max_file_bytes: int = 8388608
 
     @property
     def mcp_message_context_limit(self) -> int:
@@ -317,6 +450,7 @@ def _merge_toml(path: Path) -> dict[str, Any]:
             "mcp_http_tombstone_ttl_seconds"
         ),
         "mcp_bridge_command": raw.get("server", {}).get("mcp_bridge_command"),
+        "mcp_bridge_args": raw.get("server", {}).get("mcp_bridge_args"),
         "external_base_url": raw.get("server", {}).get("external_base_url"),
         "trusted_proxy_headers": raw.get("server", {}).get(
             "trusted_proxy_headers"
@@ -333,7 +467,15 @@ def _merge_toml(path: Path) -> dict[str, Any]:
         "knowledge_require_verified_task": raw.get("knowledge", {}).get(
             "require_verified_task"
         ),
+        "repository_scan_max_depth": raw.get("coordination", {}).get("repository_scan_max_depth"),
+        "repository_scan_max_directories": raw.get("coordination", {}).get("repository_scan_max_directories"),
+        "repository_scan_timeout_seconds": raw.get("coordination", {}).get("repository_scan_timeout_seconds"),
+        "repository_scan_excludes": raw.get("coordination", {}).get("repository_scan_excludes"),
+        "repository_evidence_max_file_bytes": raw.get("coordination", {}).get("repository_evidence_max_file_bytes"),
         "mcp_roots_timeout_seconds": raw.get("coordination", {}).get("mcp_roots_timeout_seconds"),
+        "git_scope_recheck_ttl_seconds": raw.get("coordination", {}).get(
+            "git_scope_recheck_ttl_seconds"
+        ),
         "heartbeat_timeout_seconds": raw.get("coordination", {}).get(
             "heartbeat_timeout_seconds"
         ),
@@ -387,8 +529,19 @@ def _merge_toml(path: Path) -> dict[str, Any]:
         "snapshot_recent_limit": raw.get("coordination", {}).get(
             "snapshot_recent_limit"
         ),
+        "snapshot_session_limit": raw.get("coordination", {}).get(
+            "snapshot_session_limit"
+        ),
+        "snapshot_lease_limit": raw.get("coordination", {}).get(
+            "snapshot_lease_limit"
+        ),
+        "lease_list_limit": raw.get("coordination", {}).get("lease_list_limit"),
+        "export_event_limit": raw.get("coordination", {}).get("export_event_limit"),
         "idempotency_retention_days": raw.get("coordination", {}).get(
             "idempotency_retention_days"
+        ),
+        "retention_sweep_interval_seconds": raw.get("coordination", {}).get(
+            "retention_sweep_interval_seconds"
         ),
         "mcp_message_limit": (
             raw.get("coordination", {}).get("mcp_message_limit")
@@ -406,6 +559,9 @@ def _merge_toml(path: Path) -> dict[str, Any]:
         ),
         "max_agent_token_ttl_seconds": raw.get("security", {}).get(
             "max_agent_token_ttl_seconds"
+        ),
+        "min_agent_token_ttl_seconds": raw.get("security", {}).get(
+            "min_agent_token_ttl_seconds"
         ),
         "mcp_http_auth_required": raw.get("security", {}).get(
             "mcp_http_auth_required"
@@ -515,6 +671,10 @@ def load_settings(
             "AGENTCHATROOM_MCP_BRIDGE_COMMAND",
             file_values.get("mcp_bridge_command", "python"),
         ).strip(),
+        "mcp_bridge_args": _resolve_bridge_args(
+            os.getenv("AGENTCHATROOM_MCP_BRIDGE_ARGS"),
+            file_values.get("mcp_bridge_args"),
+        ),
         "external_base_url": os.getenv(
             "AGENTCHATROOM_EXTERNAL_BASE_URL",
             file_values.get("external_base_url", ""),
@@ -563,6 +723,12 @@ def load_settings(
             os.getenv(
                 "AGENTCHATROOM_MAX_AGENT_TOKEN_TTL_SECONDS",
                 file_values.get("max_agent_token_ttl_seconds", 31536000),
+            )
+        ),
+        "min_agent_token_ttl_seconds": int(
+            os.getenv(
+                "AGENTCHATROOM_MIN_AGENT_TOKEN_TTL_SECONDS",
+                file_values.get("min_agent_token_ttl_seconds", 300),
             )
         ),
         "mcp_http_auth_required": environment_bool(
@@ -616,6 +782,12 @@ def load_settings(
             file_values.get("presence_keepalive_enabled", True),
         ),
         "mcp_roots_timeout_seconds": float(os.getenv("AGENTCHATROOM_MCP_ROOTS_TIMEOUT_SECONDS", file_values.get("mcp_roots_timeout_seconds", 5.0))),
+        "git_scope_recheck_ttl_seconds": float(
+            os.getenv(
+                "AGENTCHATROOM_GIT_SCOPE_RECHECK_TTL_SECONDS",
+                file_values.get("git_scope_recheck_ttl_seconds", 30.0),
+            )
+        ),
         "presence_keepalive_interval_seconds": float(
             os.getenv(
                 "AGENTCHATROOM_PRESENCE_KEEPALIVE_INTERVAL_SECONDS",
@@ -649,7 +821,7 @@ def load_settings(
         "presence_refresh_interval_seconds": float(
             os.getenv(
                 "AGENTCHATROOM_PRESENCE_REFRESH_INTERVAL_SECONDS",
-                file_values.get("presence_refresh_interval_seconds", 1.0),
+                file_values.get("presence_refresh_interval_seconds", 5.0),
             )
         ),
         "max_sse_clients_per_project": int(
@@ -764,13 +936,67 @@ def load_settings(
                 file_values.get("snapshot_recent_limit", 200),
             )
         ),
+        "snapshot_session_limit": int(
+            os.getenv(
+                "AGENTCHATROOM_SNAPSHOT_SESSION_LIMIT",
+                file_values.get("snapshot_session_limit", 200),
+            )
+        ),
+        "snapshot_lease_limit": int(
+            os.getenv(
+                "AGENTCHATROOM_SNAPSHOT_LEASE_LIMIT",
+                file_values.get("snapshot_lease_limit", 200),
+            )
+        ),
+        "lease_list_limit": int(
+            os.getenv(
+                "AGENTCHATROOM_LEASE_LIST_LIMIT",
+                file_values.get("lease_list_limit", 500),
+            )
+        ),
+        "export_event_limit": int(
+            os.getenv(
+                "AGENTCHATROOM_EXPORT_EVENT_LIMIT",
+                file_values.get("export_event_limit", 5000),
+            )
+        ),
         "idempotency_retention_days": int(
             os.getenv(
                 "AGENTCHATROOM_IDEMPOTENCY_RETENTION_DAYS",
                 file_values.get("idempotency_retention_days", 30),
             )
         ),
+        "retention_sweep_interval_seconds": float(
+            os.getenv(
+                "AGENTCHATROOM_RETENTION_SWEEP_INTERVAL_SECONDS",
+                file_values.get("retention_sweep_interval_seconds", 3600.0),
+            )
+        ),
     }
+    for key, default in (
+        ("repository_scan_max_depth", 3),
+        ("repository_scan_max_directories", 256),
+        ("repository_evidence_max_file_bytes", 8388608),
+    ):
+        values[key] = int(os.getenv(f"AGENTCHATROOM_{key.upper()}", file_values.get(key, default)))
+        if values[key] <= 0:
+            raise ValueError(f"{key} must be positive")
+    values["repository_scan_timeout_seconds"] = float(os.getenv(
+        "AGENTCHATROOM_REPOSITORY_SCAN_TIMEOUT_SECONDS",
+        file_values.get("repository_scan_timeout_seconds", 5.0),
+    ))
+    if not 0 < values["repository_scan_timeout_seconds"] <= 60:
+        raise ValueError("repository_scan_timeout_seconds must be between 0 and 60")
+    excludes = os.getenv("AGENTCHATROOM_REPOSITORY_SCAN_EXCLUDES")
+    excludes = excludes.split(",") if excludes is not None else file_values.get(
+        "repository_scan_excludes", [".git", ".agentchatroom", ".venv", "node_modules", "build", "dist"]
+    )
+    if not isinstance(excludes, list) or any(
+        not isinstance(value, str) or not value.strip() or "/" in value or "\\" in value
+        for value in excludes
+    ):
+        raise ValueError("repository_scan_excludes must contain directory names")
+    values["repository_scan_excludes"] = tuple(value.strip() for value in excludes)
     if values["message_max_body_length"] <= 0:
         raise ValueError("message_max_body_length must be positive")
     if values["task_text_max_length"] <= 0:
@@ -783,8 +1009,18 @@ def load_settings(
         raise ValueError("project_document_max_bytes must be positive")
     if values["snapshot_recent_limit"] <= 0:
         raise ValueError("snapshot_recent_limit must be positive")
+    for bounded_lease_read in (
+        "snapshot_session_limit",
+        "snapshot_lease_limit",
+        "lease_list_limit",
+        "export_event_limit",
+    ):
+        if values[bounded_lease_read] <= 0:
+            raise ValueError(f"{bounded_lease_read} must be positive")
     if values["idempotency_retention_days"] < 0:
         raise ValueError("idempotency_retention_days must be >= 0")
+    if values["retention_sweep_interval_seconds"] < 1:
+        raise ValueError("retention sweep interval must be at least 1 second")
     if not 1 <= values["port"] <= 65535:
         raise ValueError("port must be between 1 and 65535")
     if not str(values["host"]).strip():
@@ -797,6 +1033,15 @@ def load_settings(
         raise ValueError("MCP HTTP path must start with / and have no trailing /")
     if not str(values["mcp_bridge_command"]).strip():
         raise ValueError("MCP Bridge command must not be empty")
+    if not isinstance(values["mcp_bridge_args"], list) or not all(
+        isinstance(item, str) for item in values["mcp_bridge_args"]
+    ):
+        raise ValueError("MCP Bridge args must be a list of strings")
+    if not values["mcp_bridge_args"]:
+        raise ValueError(
+            "MCP Bridge args must not be empty: the Bridge is launched as "
+            "<command> <args...>, and an empty vector cannot reach the module"
+        )
     if values["mcp_http_session_idle_timeout_seconds"] <= 0:
         raise ValueError("MCP HTTP session idle timeout must be positive")
     if values["mcp_http_tombstone_limit"] <= 0:
@@ -835,6 +1080,10 @@ def load_settings(
         raise ValueError("heartbeat timeout must be at least 5 seconds")
     if not 0 < values["mcp_roots_timeout_seconds"] <= 60:
         raise ValueError("mcp roots timeout must be between 0 and 60 seconds")
+    if not 0 < values["git_scope_recheck_ttl_seconds"] <= 3600:
+        raise ValueError(
+            "git scope recheck ttl must be between 0 and 3600 seconds"
+        )
     if values["presence_keepalive_interval_seconds"] <= 0:
         raise ValueError("presence keepalive interval must be positive")
     if (
@@ -847,8 +1096,12 @@ def load_settings(
         )
     if values["session_token_ttl_seconds"] < values["heartbeat_timeout_seconds"]:
         raise ValueError("session token TTL must not be less than heartbeat timeout")
-    if values["agent_token_ttl_seconds"] < 300:
-        raise ValueError("Agent token TTL must be at least 300 seconds")
+    if values["min_agent_token_ttl_seconds"] < 1:
+        raise ValueError("minimum Agent token TTL must be at least 1 second")
+    if values["agent_token_ttl_seconds"] < values["min_agent_token_ttl_seconds"]:
+        raise ValueError(
+            "Agent token TTL must not be less than min_agent_token_ttl_seconds"
+        )
     if values["max_agent_token_ttl_seconds"] < values["agent_token_ttl_seconds"]:
         raise ValueError("max Agent token TTL must not be less than the default")
     if values["management_session_ttl_seconds"] < 300:
@@ -928,3 +1181,58 @@ def load_settings(
     if not 1 <= values["mcp_message_limit"] <= 10:
         raise ValueError("mcp_message_limit must be between 1 and 10")
     return Settings(**values)
+
+
+_THREAD_CONFIG_LOCKS: dict[str, threading.Lock] = {}
+_THREAD_CONFIG_LOCKS_GUARD = threading.Lock()
+
+
+def _thread_lock_for(path: Path) -> threading.Lock:
+    key = str(Path(path).resolve(strict=False))
+    with _THREAD_CONFIG_LOCKS_GUARD:
+        return _THREAD_CONFIG_LOCKS.setdefault(key, threading.Lock())
+
+
+def atomic_write_text(path: Path, text: str) -> None:
+    """Replace a file in one step so an interrupt cannot leave half of it."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
+    try:
+        with temporary.open("w", encoding="utf-8", newline="\n") as handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    except BaseException:
+        temporary.unlink(missing_ok=True)
+        raise
+
+
+def rewrite_config_text(path: Path, build: Callable[[str], str]) -> str:
+    """Read-modify-write a configuration file without a torn or lost update.
+
+    ``build`` receives the current text and returns the replacement, which is
+    parsed back before it may replace the real file: a generator bug or a
+    hand-corrupted config can then never persist a file the service cannot
+    start from.
+    """
+    path = Path(path)
+    with _thread_lock_for(path), exclusive_file_lock(path):
+        current = path.read_text(encoding="utf-8") if path.is_file() else ""
+        updated = build(current)
+        try:
+            tomllib.loads(updated)
+        except tomllib.TOMLDecodeError as error:
+            raise DomainError(
+                "config_file_unparsable",
+                "Refusing to save a configuration file that cannot be read back",
+                status_code=409,
+                details={
+                    "required_action": "fix_the_config_generator_or_restore_a_backup",
+                    "config_path": str(path),
+                    "toml_error": str(error),
+                },
+            ) from error
+        atomic_write_text(path, updated)
+    return updated

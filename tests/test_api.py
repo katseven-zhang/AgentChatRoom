@@ -1,3 +1,4 @@
+# audit-allow-file:windows_absolute_path,private_lan_address
 from __future__ import annotations
 
 import asyncio
@@ -29,6 +30,7 @@ from agentchatroom.project_registration import (
     PROJECT_INSTRUCTIONS_END,
     project_instructions_path,
 )
+from agentchatroom.services import canonical_workspace_key
 
 
 class _ExpectedProactorDisconnectHandle:
@@ -1282,7 +1284,11 @@ def test_api_manages_agent_tokens_and_workspaces(settings, project_dir):
         )
         assert registered.status_code == 201
         assert registered.json()["host"]["host_key"] == "desktop-fingerprint"
-        assert registered.json()["workspace"]["local_path"] == "D:/work/project"
+        # #255: local_path is the canonical identity key; the caller-typed text
+        # is preserved beside it and is what the API shows.
+        workspace = registered.json()["workspace"]
+        assert workspace["display_path"] == "D:/work/project"
+        assert workspace["local_path"] == canonical_workspace_key("D:/work/project")
         workspaces = client.get(
             f"/api/v1/projects/{project['id']}/workspaces"
         ).json()["workspaces"]
@@ -1346,7 +1352,7 @@ def test_api_returns_stable_domain_error(settings, project_dir):
             "error": {
                 "code": "invalid_session_token",
                 "message": "Agent session or token is invalid",
-                "details": {},
+                "details": {"required_action": "rejoin_the_room_for_a_fresh_session"},
             }
         }
 
@@ -1608,6 +1614,137 @@ def test_agent_join_generates_identity_key_and_requires_model(
         assert accepted.status_code == 201
         assert accepted.json()["agent"]["agent_key"] == accepted.json()["agent"]["member_id"]
         assert accepted.json()["agent"]["member_id"] == generated.json()["agent"]["member_id"]
+
+
+def test_join_refuses_a_revoked_credential(settings, project_dir):
+    """#333: revocation must block a new Session, not only authenticated calls."""
+    with TestClient(create_app(settings)) as client:
+        project = client.post(
+            "/api/v1/projects",
+            json={"root_path": str(project_dir), "name": "Revoked Join"},
+        ).json()
+        issued = client.post(
+            f"/api/v1/projects/{project['id']}/agent-tokens",
+            json={"name": "Revoked token"},
+        ).json()
+        credential_id = issued["credential"]["id"]
+        registered = _register_workspace(client, project)
+        revoked = client.delete(
+            f"/api/v1/projects/{project['id']}/agent-tokens/{credential_id}"
+        )
+        assert revoked.status_code == 200
+
+        response = client.post(
+            f"/api/v1/projects/{project['id']}/agents/join",
+            json={
+                "name": "Revoked Agent",
+                "client": "revoked-client",
+                "model": "unknown",
+                "credential_id": credential_id,
+                "host_id": registered["host"]["id"],
+                "workspace_id": registered["workspace"]["id"],
+            },
+        )
+
+        assert response.status_code == 401
+        error = response.json()["error"]
+        assert error["code"] == "project_credential_revoked"
+        assert error["details"]["required_action"] == (
+            "issue_new_project_token_and_update_bundle"
+        )
+        assert client.get(f"/api/v1/projects/{project['id']}/snapshot").json()["agents"] == []
+
+
+def test_join_refuses_unlinked_credential_naming_another_member(settings, project_dir):
+    """#267 review: REST join must not mint the victim's Session from an unlinked credential."""
+    with TestClient(create_app(settings)) as client:
+        project = client.post(
+            "/api/v1/projects",
+            json={"root_path": str(project_dir), "name": "Unlinked join"},
+        ).json()
+        victim = client.post(
+            f"/api/v1/projects/{project['id']}/agents/join",
+            json={
+                "name": "Victim",
+                "client": "victim-client",
+                "model": "unknown",
+            },
+        )
+        assert victim.status_code == 201
+        victim_member_id = victim.json()["agent"]["member_id"]
+        issued = client.post(
+            f"/api/v1/projects/{project['id']}/agent-tokens",
+            json={"name": "Unlinked token"},
+        ).json()
+        credential_id = issued["credential"]["id"]
+        assert not issued["credential"]["member_id"]
+
+        forged = client.post(
+            f"/api/v1/projects/{project['id']}/agents/join",
+            json={
+                "name": "Intruder",
+                "client": "intruder-client",
+                "model": "unknown",
+                "member_id": victim_member_id,
+                "credential_id": credential_id,
+            },
+        )
+
+        assert forged.status_code == 403
+        error = forged.json()["error"]
+        assert error["code"] == "software_identity_mismatch"
+        assert error["details"]["required_action"] == (
+            "restore_configured_software_identity_or_use_management_credential"
+        )
+        listed = client.get(f"/api/v1/projects/{project['id']}/agent-tokens").json()
+        credential = next(
+            item for item in listed["credentials"] if item["id"] == credential_id
+        )
+        assert not credential["member_id"]
+        agents = client.get(f"/api/v1/projects/{project['id']}/snapshot").json()["agents"]
+        assert [item["id"] for item in agents] == [victim.json()["agent"]["id"]]
+        assert agents[0]["client"] == "victim-client"
+
+
+def test_join_refuses_an_expired_credential(service, project_dir):
+    """#333: an expired credential must not open a new Session either."""
+    project = service.create_project(root_path=str(project_dir))
+    issued = service.issue_agent_token(project["id"], name="Expiring token")
+    credential_id = issued["credential"]["id"]
+    with service.database.connect(write=True) as connection:
+        connection.execute(
+            "UPDATE agent_credentials SET expires_at = ? WHERE id = ?",
+            ("2000-01-01T00:00:00Z", credential_id),
+        )
+
+    with pytest.raises(DomainError) as expired:
+        service.join_room(
+            project["id"],
+            name="Late Agent",
+            client="late-client",
+            model="unknown",
+            credential_id=credential_id,
+        )
+
+    assert expired.value.code == "project_credential_expired"
+    assert expired.value.status_code == 401
+    assert expired.value.details["required_action"] == "renew_project_token"
+    assert service.snapshot(project["id"])["agents"] == []
+
+
+def test_agent_token_listing_requires_management(monkeypatch, settings, project_dir):
+    """#333: the credential inventory is a manifest, not public metadata."""
+    guarded = replace(settings, management_auth_required=True)
+    monkeypatch.setenv(guarded.management_token_env, "t" * 32)
+    with TestClient(create_app(guarded)) as client:
+        anonymous = client.get("/api/v1/projects/any-project/agent-tokens")
+        authorized = client.get(
+            "/api/v1/projects/any-project/agent-tokens",
+            headers={"authorization": f"Bearer {'t' * 32}"},
+        )
+
+    assert anonymous.status_code in (401, 403)
+    assert authorized.status_code == 404
 
 
 def test_redact_log_line_covers_token_bearer_authorization_and_cookies():
@@ -1874,7 +2011,6 @@ def test_task_claim_reclaim_passes_through_rest_api(settings, project_dir):
         joined_a = _join_agent(
             client,
             project,
-            software_key="codex",
             name="Codex",
             client="codex",
             model="unknown",
@@ -1902,7 +2038,6 @@ def test_task_claim_reclaim_passes_through_rest_api(settings, project_dir):
         joined_b = _join_agent(
             client,
             project,
-            software_key="codex",
             name="Codex",
             client="codex",
             model="unknown",
@@ -1950,11 +2085,11 @@ def test_task_claim_explicit_live_takeover_passes_through_rest_api(
         assert created.status_code == 201
         project = created.json()
         owner = _join_agent(
-            client, project, software_key="codex", name="Codex",
+            client, project, name="Codex",
             client="codex", model="unknown", role="executor",
         )
         sibling = _join_agent(
-            client, project, software_key="codex", name="Codex",
+            client, project, name="Codex",
             client="codex", model="unknown", role="executor",
         )
         task = client.post(
@@ -2042,7 +2177,6 @@ def test_task_update_over_rest_requires_owner_credentials_or_management(
         owner = _join_agent(
             admin,
             project,
-            software_key="codex",
             name="Codex",
             client="codex",
             model="unknown",
@@ -2051,7 +2185,6 @@ def test_task_update_over_rest_requires_owner_credentials_or_management(
         intruder = _join_agent(
             admin,
             project,
-            software_key="grok-build",
             name="Grok Build",
             client="grok-build",
             model="unknown",

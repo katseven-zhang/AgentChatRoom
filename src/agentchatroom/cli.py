@@ -5,7 +5,6 @@ import base64
 import json
 import os
 import platform
-import re
 import signal
 import subprocess
 import sys
@@ -31,11 +30,20 @@ from .backup import (
     restore_postgresql,
     restore_sqlite,
 )
-from .config import load_settings
-from .integrations import build_mcp_integration
+from .config import build_service_base_url, load_settings
+from .integrations import MCP_CLIENT_PROFILES, build_mcp_integration
+from .runtime_log import running_url_from_log, tail_text_lines
 
 
 MUTATING_HTTP_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
+# The retired `--format` spellings, kept so existing scripts keep working.
+# `--client` is generated from MCP_CLIENT_PROFILES and does not need an entry
+# here, so adding a client no longer means editing the CLI.
+LEGACY_FORMAT_PROFILE_IDS = {
+    "workbuddy-json": "workbuddy",
+    "grok-toml": "grok_build",
+    "codex-toml": "codex",
+}
 _WINDOWS = os.name == "nt"
 
 
@@ -46,10 +54,13 @@ def request_json(
     payload: dict[str, Any] | None = None,
     *,
     request_id: str | None = None,
+    authorization: str | None = None,
 ) -> Any:
     normalized_method = method.upper()
     effective_request_id = request_id
     headers = {"Content-Type": "application/json"}
+    if authorization:
+        headers["Authorization"] = authorization
     if normalized_method in MUTATING_HTTP_METHODS:
         effective_request_id = request_id or f"cli_{uuid.uuid4().hex}"
         headers["Idempotency-Key"] = effective_request_id
@@ -84,8 +95,26 @@ def print_result(value: Any, compact: bool) -> None:
 
 
 def service_url(host: str, port: int) -> str:
-    browser_host = "127.0.0.1" if host in {"0.0.0.0", "::"} else host
-    return f"http://{browser_host}:{port}"
+    """Build the service base URL through the shared policy.
+
+    The construction lives in ``config.build_service_base_url`` so the CLI,
+    REST, MCP config and GUI cannot disagree about wildcard hosts or IPv6
+    brackets; this name is kept because it is the CLI's public spelling.
+    """
+    return build_service_base_url(host, port)
+
+
+def configured_service_url(settings) -> str:
+    """Derive the service URL from validated settings.
+
+    ``external_base_url`` wins. Otherwise map a wildcard bind address to the
+    loopback address a client on this machine can open, using the configured
+    port. There is no separate ``url`` setting and no ``AGENTCHATROOM_URL``.
+    """
+    external = str(getattr(settings, "external_base_url", "") or "").strip()
+    if external:
+        return external.rstrip("/")
+    return service_url(str(settings.host), int(settings.port))
 
 
 def print_server_log(settings, *, lines: int = 80, follow: bool = False) -> None:
@@ -93,12 +122,15 @@ def print_server_log(settings, *, lines: int = 80, follow: bool = False) -> None
     pid_path = settings.data_dir / "server.pid"
     if not log_path.exists():
         raise SystemExit(f"AgentChatRoom log does not exist yet: {log_path}")
+    tail, truncated = tail_text_lines(log_path, lines)
+    for line in tail:
+        print(line)
+    if truncated:
+        print("[older log lines were not scanned: the tail byte budget was reached]")
+    if not follow:
+        return
     with log_path.open("r", encoding="utf-8", errors="replace") as handle:
-        content = handle.readlines()
-        for line in content[-lines:]:
-            print(line, end="")
-        if not follow:
-            return
+        handle.seek(0, os.SEEK_END)
         while True:
             line = handle.readline()
             if line:
@@ -107,6 +139,39 @@ def print_server_log(settings, *, lines: int = 80, follow: bool = False) -> None
                 return
             else:
                 time.sleep(0.2)
+
+
+def _leave_session(
+    base_url: str,
+    project_id: str,
+    session_id: str,
+    token: str,
+    *,
+    quiet: bool = False,
+    authorization: str | None = None,
+) -> bool:
+    """Close a Session this command opened.
+
+    On the cleanup path the original failure matters more than the leave, so a
+    failed leave is reported on stderr instead of replacing that exit status.
+    """
+    try:
+        request_json(
+            base_url,
+            "POST",
+            f"/api/v1/projects/{project_id}/agents/{session_id}/leave",
+            {"token": token},
+            authorization=authorization,
+        )
+        return True
+    except BaseException as error:
+        if not quiet:
+            raise
+        print(
+            f"warning: session {session_id} may still be joined: {error}",
+            file=sys.stderr,
+        )
+        return False
 
 
 class SubmitError(Exception):
@@ -185,6 +250,64 @@ def _parse_test_specs(specs: list[str]) -> list[dict[str, Any]]:
     return parsed
 
 
+_SUBMIT_CREDENTIAL_CODES = frozenset({
+    "invalid_agent_token",
+    "agent_token_revoked",
+    "agent_token_expired",
+    "agent_token_not_found",
+    "agent_token_project_forbidden",
+})
+
+
+def _submit_error_from_http(error: SystemExit) -> SubmitError | None:
+    """Map a service error into a submit failure when the code is one we own."""
+    try:
+        detail = json.loads(str(error))
+    except json.JSONDecodeError:
+        return None
+    error_body = detail.get("error") or {}
+    code = str(error_body.get("code") or "")
+    message = str(error_body.get("message") or code)
+    details = error_body.get("details") or {}
+    required_action = str(details.get("required_action") or "")
+    if code in _SUBMIT_CREDENTIAL_CODES:
+        return SubmitError(
+            "submit_credential_invalid",
+            message or "The presented project credential is unknown, revoked, or expired",
+            required_action or "issue_new_project_token_and_update_bundle",
+        )
+    if code == "management_auth_required":
+        return SubmitError(
+            "management_auth_required",
+            message or "Management authentication is required for this endpoint",
+            required_action or "provide_management_token",
+        )
+    return None
+
+
+def _submit_request(
+    base_url: str,
+    method: str,
+    path: str,
+    payload: dict[str, Any] | None = None,
+    *,
+    authorization: str | None = None,
+) -> Any:
+    try:
+        return request_json(
+            base_url,
+            method,
+            path,
+            payload,
+            authorization=authorization,
+        )
+    except SystemExit as error:
+        mapped = _submit_error_from_http(error)
+        if mapped is not None:
+            raise mapped from error
+        raise
+
+
 def run_submit(args: argparse.Namespace, base_url: str) -> dict[str, Any]:
     """One-shot REST submission fallback for when the MCP transport is down.
 
@@ -211,23 +334,38 @@ def run_submit(args: argparse.Namespace, base_url: str) -> dict[str, Any]:
         )
     parsed_tests = _parse_test_specs(args.test)
 
-    projects = request_json(base_url, "GET", "/api/v1/projects")["projects"]
+    management_token = str(getattr(args, "management_token", "") or "").strip()
+    authorization = f"Bearer {management_token}" if management_token else None
+
+    projects = _submit_request(
+        base_url, "GET", "/api/v1/projects", authorization=authorization
+    )["projects"]
     wanted = str(args.project).strip()
-    project = next(
-        (
-            item
-            for item in projects
-            if item.get("id") == wanted
-            or str(item.get("name") or "").strip().casefold() == wanted.casefold()
-        ),
-        None,
-    )
-    if project is None:
+    # Names stay non-unique. A duplicate display name must fail closed here
+    # instead of adding a UNIQUE constraint that existing Rooms may already
+    # violate, and instead of silently taking the first row.
+    matches = [
+        item
+        for item in projects
+        if item.get("id") == wanted
+        or str(item.get("name") or "").strip().casefold() == wanted.casefold()
+    ]
+    if not matches:
         known = ", ".join(sorted(str(item.get("name") or "") for item in projects))
         raise SubmitError(
             "submit_project_not_found",
             f"Project {wanted!r} was not found on the service (known: {known})",
         )
+    if len(matches) > 1:
+        listed = "; ".join(
+            f"{item.get('id')} root_path={item.get('root_path')}" for item in matches
+        )
+        raise SubmitError(
+            "submit_project_ambiguous",
+            f"Project {wanted!r} matches more than one Project; pass --project <id>. {listed}",
+            "pass_project_id",
+        )
+    project = matches[0]
     project_id = str(project["id"])
     project_name = str(project.get("name") or "")
 
@@ -252,25 +390,11 @@ def run_submit(args: argparse.Namespace, base_url: str) -> dict[str, Any]:
             )
         token = entry["token"]
 
-    match = re.match(r"acr\.credential_([0-9a-f]+)\.", token)
-    if match is None:
+    if not token.startswith("acr."):
         raise SubmitError("submit_token_invalid", "The project credential is malformed")
-    credential_id = f"credential_{match.group(1)}"
-    credentials = request_json(
-        base_url, "GET", f"/api/v1/projects/{project_id}/agent-tokens"
-    )["credentials"]
-    credential = next(
-        (item for item in credentials if item.get("id") == credential_id), None
-    )
-    if credential is None or not credential.get("active"):
-        raise SubmitError(
-            "submit_credential_invalid",
-            "The presented project credential is unknown, revoked, or expired",
-            "issue_new_project_token_and_update_bundle",
-        )
 
     local_path = str(Path(args.cwd or os.getcwd()).resolve())
-    registered = request_json(
+    registered = _submit_request(
         base_url,
         "POST",
         f"/api/v1/projects/{project_id}/workspaces",
@@ -279,22 +403,17 @@ def run_submit(args: argparse.Namespace, base_url: str) -> dict[str, Any]:
             "host_name": platform.node(),
             "local_path": local_path,
         },
+        authorization=authorization,
     )
     workspace_id = str(registered.get("workspace", {}).get("id") or "")
     host_id = str(registered.get("host", {}).get("id") or "")
 
-    member_id = credential.get("member_id")
-    members = request_json(
-        base_url, "GET", f"/api/v1/projects/{project_id}/members"
-    ).get("members", [])
-    member = next(
-        (item for item in members if item.get("id") == member_id), None
-    ) if member_id else None
-    member_key = str((member or {}).get("member_key") or "").strip()
-    name = str(args.name or (member or {}).get("name") or "CLI submit").strip()
-    client = str(args.client or member_key.removeprefix("software:") or "cli-submit").strip()
+    # Display labels only. The server derives member_id and credential_id
+    # from the presented secret, so this command cannot name another member.
+    name = str(args.name or "CLI submit").strip()
+    client = str(args.client or "cli-submit").strip()
 
-    joined = request_json(
+    joined = _submit_request(
         base_url,
         "POST",
         f"/api/v1/projects/{project_id}/agents/join",
@@ -302,14 +421,15 @@ def run_submit(args: argparse.Namespace, base_url: str) -> dict[str, Any]:
             "name": name,
             "client": client,
             "model": str(args.model or "unknown"),
-            "credential_id": credential_id,
-            "member_id": member_id,
+            "token": token,
             "workspace_id": workspace_id,
             "host_id": host_id,
         },
+        authorization=authorization,
     )
     session_id = str(joined["agent"]["id"])
     session_token = str(joined.get("token") or joined.get("session_token") or "")
+    member_id = str((joined.get("identity") or {}).get("id") or "")
     result: dict[str, Any] = {
         "ok": True,
         "project": {"id": project_id, "name": project_name},
@@ -317,92 +437,118 @@ def run_submit(args: argparse.Namespace, base_url: str) -> dict[str, Any]:
         "workspace_id": workspace_id,
     }
 
-    if has_message:
-        posted = request_json(
-            base_url,
-            "POST",
-            f"/api/v1/projects/{project_id}/messages",
-            {
-                "body": str(args.message).strip(),
-                "session_id": session_id,
-                "token": session_token,
-                "model_display_name": str(
-                    args.model_display_name or args.model or "unknown"
-                ),
-            },
-        )
-        result["message_event_id"] = posted.get("event", {}).get("id") or posted.get(
-            "event_id"
-        )
-
-    if has_report:
-        task_ref = str(args.report_task).strip()
-        if task_ref.isdigit():
-            try:
-                task = request_json(
-                    base_url,
-                    "GET",
-                    f"/api/v1/projects/{project_id}/tasks/by-number/{task_ref}",
-                )
-            except SystemExit as error:
-                # A missing task number (404) or any other server error must
-                # surface to the caller: silently falling back to treating the
-                # number as a task UUID would only produce a more confusing
-                # failure later (task_not_found on claim/report).
-                raise SubmitError(
-                    "submit_task_not_resolved",
-                    f"Could not resolve task number {task_ref!r} via "
-                    "tasks/by-number; do not pass it on as a task id",
-                    detail=str(error),
-                )
-            task_id = str(task.get("task", {}).get("id") or task.get("id") or "")
-        else:
-            task_id = task_ref
-        # A dead transport usually means the task was claimed by the previous
-        # session of this same identity: reclaim it explicitly instead of
-        # failing the report with not_task_owner.
-        try:
-            request_json(
+    try:
+        if has_message:
+            posted = _submit_request(
                 base_url,
                 "POST",
-                f"/api/v1/projects/{project_id}/tasks/{task_id}/claim",
+                f"/api/v1/projects/{project_id}/messages",
+                {
+                    "body": str(args.message).strip(),
+                    "session_id": session_id,
+                    "token": session_token,
+                    "model_display_name": str(
+                        args.model_display_name or args.model or "unknown"
+                    ),
+                },
+                authorization=authorization,
+            )
+            result["message_event_id"] = posted.get("event", {}).get("id") or posted.get(
+                "event_id"
+            )
+
+        if has_report:
+            task_ref = str(args.report_task).strip()
+            if task_ref.isdigit():
+                try:
+                    task = _submit_request(
+                        base_url,
+                        "GET",
+                        f"/api/v1/projects/{project_id}/tasks/by-number/{task_ref}",
+                        authorization=authorization,
+                    )
+                except SystemExit as error:
+                    # A missing task number (404) or any other server error must
+                    # surface to the caller: silently falling back to treating the
+                    # number as a task UUID would only produce a more confusing
+                    # failure later (task_not_found on claim/report).
+                    raise SubmitError(
+                        "submit_task_not_resolved",
+                        f"Could not resolve task number {task_ref!r} via "
+                        "tasks/by-number; do not pass it on as a task id",
+                        detail=str(error),
+                    )
+                task_id = str(task.get("task", {}).get("id") or task.get("id") or "")
+            else:
+                task_id = task_ref
+            # A dead transport usually means the task was claimed by the previous
+            # session of this same identity: reclaim it explicitly instead of
+            # failing the report with not_task_owner.
+            try:
+                _submit_request(
+                    base_url,
+                    "POST",
+                    f"/api/v1/projects/{project_id}/tasks/{task_id}/claim",
+                    {
+                        "session_id": session_id,
+                        "token": session_token,
+                        "reclaim": True,
+                        "takeover": bool(args.takeover),
+                    },
+                    authorization=authorization,
+                )
+                result["task_reclaimed"] = True
+            except SystemExit:
+                result["task_reclaimed"] = False
+            tests: list[dict[str, Any]] = parsed_tests
+            report = _submit_request(
+                base_url,
+                "POST",
+                f"/api/v1/projects/{project_id}/tasks/{task_id}/reports",
                 {
                     "session_id": session_id,
                     "token": session_token,
-                    "reclaim": True,
-                    "takeover": bool(args.takeover),
+                    "summary": str(args.summary).strip(),
+                    "files": list(args.file),
+                    "tests": tests,
+                    "commit_hash": str(args.commit or ""),
+                    "no_code_change_reason": str(args.no_code_change or ""),
                 },
+                authorization=authorization,
             )
-            result["task_reclaimed"] = True
-        except SystemExit:
-            result["task_reclaimed"] = False
-        tests: list[dict[str, Any]] = parsed_tests
-        report = request_json(
+            result["report"] = {
+                "task_id": task_id,
+                "report_id": report.get("report", {}).get("id") or report.get("report_id"),
+                "task_status": report.get("task_status"),
+            }
+    except BaseException:
+        # A report that died half-way must not leave this identity joined:
+        # the Session would keep Presence and any task it just reclaimed.
+        if args.keep_session:
+            print(
+                f"note: session {session_id} was kept because --keep-session was given",
+                file=sys.stderr,
+            )
+        elif _leave_session(
             base_url,
-            "POST",
-            f"/api/v1/projects/{project_id}/tasks/{task_id}/reports",
-            {
-                "session_id": session_id,
-                "token": session_token,
-                "summary": str(args.summary).strip(),
-                "files": list(args.file),
-                "tests": tests,
-                "commit_hash": str(args.commit or ""),
-                "no_code_change_reason": str(args.no_code_change or ""),
-            },
-        )
-        result["report"] = {
-            "task_id": task_id,
-            "report_id": report.get("report", {}).get("id") or report.get("report_id"),
-            "task_status": report.get("task_status"),
-        }
-
+            project_id,
+            session_id,
+            session_token,
+            quiet=True,
+            authorization=authorization,
+        ):
+            print(
+                f"note: session {session_id} was closed after the failure",
+                file=sys.stderr,
+            )
+        raise
     if not args.keep_session:
-        request_json(
+        _leave_session(
             base_url,
-            "POST",
-            f"/api/v1/projects/{project_id}/agents/{session_id}/leave",
-            {"token": session_token},
+            project_id,
+            session_id,
+            session_token,
+            authorization=authorization,
         )
         result["left"] = True
     else:
@@ -672,6 +818,7 @@ def _start_detached_server_locked(
     config_path: str | None = None,
 ) -> dict[str, Any]:
     pid_path = settings.data_dir / "server.pid"
+    log_path = settings.data_dir / "server.log"
     if pid_path.exists():
         try:
             existing_pid = int(pid_path.read_text(encoding="ascii").strip())
@@ -679,16 +826,22 @@ def _start_detached_server_locked(
             pid_path.unlink(missing_ok=True)
         else:
             if process_is_running(existing_pid):
+                # The requested host/port is only what the caller asked for.
+                # The process that is actually running may have bound a
+                # different address, and echoing the request back as
+                # "already running at ..." sent the GUI to the wrong port and
+                # wrote that wrong address into config.toml.
                 return {
                     "started": False,
                     "already_running": True,
                     "pid": existing_pid,
-                    "url": service_url(host, port),
-                    "log_path": str(settings.data_dir / "server.log"),
+                    "url": running_url_from_log(log_path)
+                    or service_url(host, port),
+                    "requested_url": service_url(host, port),
+                    "log_path": str(log_path),
                 }
             pid_path.unlink(missing_ok=True)
 
-    log_path = settings.data_dir / "server.log"
     environment = os.environ.copy()
     environment["AGENTCHATROOM_DATA_DIR"] = str(settings.data_dir)
     if getattr(sys, "frozen", False):
@@ -825,8 +978,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="agentchatroom")
     parser.add_argument(
         "--url",
-        default=os.getenv("AGENTCHATROOM_URL", "http://127.0.0.1:8765"),
-        help="AgentChatRoom service URL",
+        default=None,
+        help=(
+            "Explicit AgentChatRoom service URL. When omitted, the URL is "
+            "derived from the configured host, port, and external_base_url."
+        ),
     )
     parser.add_argument("--json", action="store_true", help="Print compact JSON")
     parser.add_argument(
@@ -871,19 +1027,45 @@ def build_parser() -> argparse.ArgumentParser:
         help="Runtime data directory to embed in local stdio MCP configuration",
     )
     mcp_config.add_argument(
+        "--client",
+        choices=sorted(MCP_CLIENT_PROFILES),
+        help=(
+            "Print this client's own preset. The list comes from the same "
+            "MCP_CLIENT_PROFILES the service publishes, so a new client needs "
+            "no CLI change. Its software identity is a real value, not a "
+            "placeholder."
+        ),
+    )
+    mcp_config.add_argument(
         "--format",
         choices=["generic-json", "workbuddy-json", "grok-toml", "codex-toml"],
         default="generic-json",
+        help=(
+            "Legacy format alias. Retained so existing scripts keep working; "
+            "prefer --client, whose list is generated rather than restated."
+        ),
     )
     mcp_config.add_argument(
         "--transport",
         choices=["local-stdio", "streamable-http", "remote-bridge"],
         default="local-stdio",
     )
+    mcp_config.add_argument(
+        "--list-clients",
+        action="store_true",
+        help="List the client profiles this build can print and exit",
+    )
 
     project = commands.add_parser("project-add", help="Add a project")
     project.add_argument("root_path")
     project.add_argument("--name")
+    project.add_argument("--repository-path", help="Explicit workspace-relative repository; empty keeps a local directory")
+
+    repository_inspect = commands.add_parser("repository-inspect", help="Inspect repository candidates in a workspace")
+    repository_inspect.add_argument("root_path")
+    repository_select = commands.add_parser("repository-select", help="Associate an existing Room with a selected repository")
+    repository_select.add_argument("project_id")
+    repository_select.add_argument("repository_path")
 
     commands.add_parser("project-list", help="List projects")
 
@@ -1057,6 +1239,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="acrb.v1 bundle: a file path or the literal value; omit with --token",
     )
     submit.add_argument("--token", default="", help="Single project credential (acr.*)")
+    submit.add_argument(
+        "--management-token",
+        default="",
+        help=(
+            "Management bearer used when the server requires management "
+            "authentication. Omit it and the command fails with "
+            "management_auth_required instead of a bare 401."
+        ),
+    )
     submit.add_argument("--message", default="", help="Room message body to post")
     submit.add_argument(
         "--report-task", default="", help="Task id or number for the work report"
@@ -1327,6 +1518,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     lease.add_argument("--ttl", type=int)
     lease.add_argument("--reason", default="")
+    lease.add_argument(
+        "--takeover",
+        action="store_true",
+        help="Preempt a lease a live Session of the same identity still holds",
+    )
 
     release = commands.add_parser("lease-release", help="Release a file lease")
     release.add_argument("project_id")
@@ -1431,6 +1627,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="CRITERION::passed or CRITERION::failed (defaults to passed)",
     )
     knowledge_review.add_argument("--notes", default="")
+    knowledge_review.add_argument(
+        "--expected-version-id",
+        default="",
+        help=(
+            "Version id from knowledge-get. Required for --verdict approved "
+            "so the review stays pinned to the version that was read."
+        ),
+    )
 
     knowledge_supersede = commands.add_parser(
         "knowledge-supersede", help="Supersede an approved Knowledge Asset"
@@ -1450,6 +1654,29 @@ def build_parser() -> argparse.ArgumentParser:
     knowledge_archive.add_argument("--token", required=True)
     knowledge_archive.add_argument("--reason", default="")
     return parser
+
+
+def _read_event_cursor(settings) -> int | None:
+    """Best-effort latest event id, or None when it cannot be read.
+
+    Stamping the manifest is what lets a later restore prove the snapshot is
+    current. A backup that genuinely cannot read the cursor must report that,
+    rather than write a manifest that looks complete.
+    """
+    try:
+        from .database import create_database
+
+        backend = create_database(settings)
+        try:
+            with backend.connect() as connection:
+                row = connection.execute(
+                    "SELECT COALESCE(MAX(id), 0) AS cursor FROM events"
+                ).fetchone()
+            return int(row["cursor"])
+        finally:
+            backend.close()
+    except Exception:
+        return None
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -1490,7 +1717,12 @@ def main(argv: list[str] | None = None) -> None:
         )
         return
     if args.command == "stop":
-        print_result(stop_detached_server(load_settings(args.config)), args.json)
+        result = stop_detached_server(load_settings(args.config))
+        print_result(result, args.json)
+        # not_running is a successful no-op. A live process that did not
+        # stop, or a terminate error, must not look like success to scripts.
+        if result.get("stopped") is not True and result.get("reason") != "not_running":
+            raise SystemExit(1)
         return
     if args.command == "gui":
         from .gui import run_gui
@@ -1508,34 +1740,51 @@ def main(argv: list[str] | None = None) -> None:
         )
         return
     if args.command == "mcp-config":
+        if args.list_clients:
+            print_result(
+                {
+                    "clients": [
+                        {
+                            "id": profile_id,
+                            "label": profile.get("label", profile_id),
+                            "vendor": profile.get("vendor", ""),
+                            "format": profile.get("format", ""),
+                            "managed_local_config": isinstance(
+                                profile.get("local_config"), dict
+                            ),
+                        }
+                        for profile_id, profile in sorted(MCP_CLIENT_PROFILES.items())
+                    ]
+                },
+                args.json,
+            )
+            return
         settings = load_settings(args.config, data_dir=args.data_dir)
         integration = build_mcp_integration(settings)
-        if args.transport == "remote-bridge":
-            formats = {
-                "generic-json": "remote_bridge_json",
-                "workbuddy-json": "remote_bridge_json",
-                "grok-toml": "remote_bridge_toml",
-                "codex-toml": "remote_bridge_toml",
-            }
-        elif args.transport == "streamable-http":
-            formats = {
-                "generic-json": "streamable_http_json",
-                "workbuddy-json": "streamable_http_json",
-                "grok-toml": "grok_streamable_http_toml",
-                "codex-toml": "codex_streamable_http_toml",
-            }
+        # A named client prints that profile's own config text for the chosen
+        # transport, whose software identity is a real value rather than the
+        # `<...>` placeholders on the top-level aliases. `generic` stays the
+        # fill-in template.
+        text_keys = {
+            "local-stdio": "local_config_text",
+            "remote-bridge": "remote_bridge_config_text",
+            "streamable-http": "streamable_http_config_text",
+        }
+        generic_keys = {
+            "local-stdio": "generic_json",
+            "remote-bridge": "remote_bridge_json",
+            "streamable-http": "streamable_http_json",
+        }
+        profile_id = args.client or LEGACY_FORMAT_PROFILE_IDS.get(args.format)
+        if profile_id is None:
+            print_result(integration[generic_keys[args.transport]], args.json)
+            return
+        profile = integration["profiles"][profile_id]
+        output = profile[text_keys[args.transport]]
+        if profile.get("format") == "json":
+            print_result(json.loads(output), args.json)
         else:
-            formats = {
-                "generic-json": "generic_json",
-                "workbuddy-json": "generic_json",
-                "grok-toml": "grok_toml",
-                "codex-toml": "codex_toml",
-            }
-        output = integration[formats[args.format]]
-        if args.format in {"grok-toml", "codex-toml"}:
             print(output, end="")
-        else:
-            print_result(output, args.json)
         return
 
     if args.command in {"backup", "restore"}:
@@ -1543,11 +1792,20 @@ def main(argv: list[str] | None = None) -> None:
         try:
             if args.command == "backup":
                 output = Path(args.output).expanduser().resolve()
+                # The CLI backs the database up directly, bypassing the service
+                # wrapper that normally stamps the manifest. Without the cursor
+                # the in-app restore cannot prove the snapshot is current and
+                # refuses it as backup_cursor_unknown (#295).
+                cursor = _read_event_cursor(settings)
                 if settings.database_backend == "sqlite":
-                    result = backup_sqlite(settings.database_path, output)
+                    result = backup_sqlite(
+                        settings.database_path, output, latest_event_id=cursor
+                    )
                 else:
                     database_url = os.getenv(settings.database_url_env, "").strip()
-                    result = backup_postgresql(database_url, output)
+                    result = backup_postgresql(
+                        database_url, output, latest_event_id=cursor
+                    )
             else:
                 if not args.confirm:
                     raise SystemExit("restore requires --confirm")
@@ -1567,7 +1825,10 @@ def main(argv: list[str] | None = None) -> None:
         print_result(result, args.json)
         return
 
-    base = args.url
+    if args.url:
+        base = str(args.url).rstrip("/")
+    else:
+        base = configured_service_url(load_settings(getattr(args, "config", None)))
 
     def call_api(
         method: str,
@@ -1586,8 +1847,13 @@ def main(argv: list[str] | None = None) -> None:
         result = call_api(
             "POST",
             "/api/v1/projects",
-            {"root_path": args.root_path, "name": args.name},
+            {"root_path": args.root_path, "name": args.name, "repository_path": args.repository_path},
         )
+    elif args.command == "repository-inspect":
+        result = call_api("POST", "/api/v1/local/repositories/inspect", {"root_path": args.root_path})
+    elif args.command == "repository-select":
+        result = call_api("PUT", f"/api/v1/projects/{args.project_id}/repository",
+                          {"repository_path": args.repository_path})
     elif args.command == "project-list":
         result = call_api("GET", "/api/v1/projects")
     elif args.command == "project-update":
@@ -1675,8 +1941,8 @@ def main(argv: list[str] | None = None) -> None:
         )
     elif args.command == "room-bootstrap":
         from .bootstrap import bootstrap_local_room, configured_software_identity
-        from .database import create_database
-        from .services import AgentChatRoomService
+        from .errors import DomainError
+        from .service_lifetime import require_running_service
 
         identity = configured_software_identity()
         if identity is None:
@@ -1685,8 +1951,38 @@ def main(argv: list[str] | None = None) -> None:
             result = bootstrap_status_payload("identity_not_configured")
         else:
             from .bootstrap import PROJECT_PATH_ENV
+            from .database import create_database
+            from .services import AgentChatRoomService
 
             settings = load_settings(args.config)
+            # Deployment checks and the live service lock both happen before
+            # any database or checkout write. A stopped service must not open
+            # a second writer or report itself as connected.
+            validate_runtime_settings(settings)
+            try:
+                generation = require_running_service(settings)
+            except DomainError as error:
+                required_action = str((error.details or {}).get("required_action") or "")
+                print_result(
+                    {
+                        "ok": False,
+                        "status": error.code,
+                        "required_action": required_action,
+                        "connection": {
+                            "software_configured": True,
+                            "process_connected": False,
+                            "room_session": "absent",
+                            "conversation_synced": False,
+                        },
+                        "error": {
+                            "code": error.code,
+                            "message": error.message,
+                            "required_action": required_action,
+                        },
+                    },
+                    args.json,
+                )
+                raise SystemExit(1) from error
             room_service = AgentChatRoomService(create_database(settings), settings)
             room_service.initialize()
             outcome = bootstrap_local_room(
@@ -1697,8 +1993,13 @@ def main(argv: list[str] | None = None) -> None:
                 model=args.model,
                 cwd=args.cwd or os.getcwd(),
                 explicit_project_path=os.getenv(PROJECT_PATH_ENV, "").strip() or None,
+                process_connected=bool(generation),
             )
             result = outcome.public
+            connection = result.get("connection")
+            if isinstance(connection, dict):
+                connection["process_connected"] = bool(generation)
+                connection["service_generation"] = generation
             if outcome.binding is not None and outcome.binding.token in json.dumps(
                 result, ensure_ascii=False, default=str
             ):
@@ -1970,6 +2271,7 @@ def main(argv: list[str] | None = None) -> None:
                 "task_id": args.task_id,
                 "ttl_seconds": args.ttl,
                 "reason": args.reason,
+                "takeover": args.takeover,
             },
         )
     elif args.command == "lease-release":
@@ -2087,6 +2389,7 @@ def main(argv: list[str] | None = None) -> None:
                 "verdict": args.verdict,
                 "criteria": parse_knowledge_criteria(args.criterion),
                 "notes": args.notes,
+                "expected_version_id": args.expected_version_id,
             },
         )
     elif args.command == "knowledge-supersede":

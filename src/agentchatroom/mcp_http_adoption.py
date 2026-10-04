@@ -28,6 +28,7 @@ This adapter removes that failure mode without weakening the identity model:
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import time
@@ -39,6 +40,7 @@ logger = logging.getLogger(__name__)
 
 MCP_SESSION_ID_HEADER = b"mcp-session-id"
 SOFTWARE_KEY_HEADER = b"x-agentchatroom-software-key"
+AUTHORIZATION_HEADER = b"authorization"
 JSON_CONTENT_TYPE = b"application/json"
 SSE_ACCEPT = b"application/json, text/event-stream"
 ADOPTED_FROM_HEADER = b"x-agentchatroom-adopted-from"
@@ -55,6 +57,32 @@ ADOPTION_BODY_LIMIT = 8 * 1024 * 1024
 
 Scope = MutableMapping[str, Any]
 Message = MutableMapping[str, Any]
+
+
+def _software_key(scope: Scope) -> str:
+    """The declared software identity of this request, or empty when unusable."""
+    raw_key = _scope_header(scope, SOFTWARE_KEY_HEADER)
+    if not raw_key:
+        return ""
+    try:
+        return decode_http_identity_value(raw_key).strip()
+    except ValueError:
+        return ""
+
+
+def _request_identity(scope: Scope) -> str:
+    """A stable, non-reversible fingerprint of who is asking.
+
+    An adopted transport was created with one caller's credential and carries
+    that caller's Room binding, so it may only be reused by the same caller. The
+    fingerprint covers the credential and the declared software identity; a
+    rotated token or a different install therefore opens its own surrogate
+    instead of borrowing someone else's. Only a digest is kept, never the secret.
+    """
+    material = "\x00".join(
+        (_scope_header(scope, AUTHORIZATION_HEADER), _software_key(scope))
+    )
+    return hashlib.sha256(material.encode("utf-8", "surrogateescape")).hexdigest()
 
 
 def _scope_header(scope: Scope, name: bytes) -> str:
@@ -98,6 +126,14 @@ class PayloadTooLargeError(Exception):
     def __init__(self, limit: int) -> None:
         super().__init__(f"request body exceeds {limit} bytes")
         self.limit = limit
+
+
+class IncompleteRequestBodyError(Exception):
+    """Raised when the client aborted before the adoption-path body completed."""
+
+    def __init__(self, received: int) -> None:
+        super().__init__(f"request body incomplete after {received} bytes")
+        self.received = received
 
 
 class _Recorder:
@@ -165,6 +201,7 @@ class TolerantSessionAdoptionMiddleware:
         is_active: Callable[[str], bool] | None = None,
         lookup_binding: Callable[[str, str], Any] | None = None,
         adopt_binding: Callable[[str, Any], None] | None = None,
+        note_terminated: Callable[[str], None] | None = None,
         map_limit: int = ADOPTION_MAP_LIMIT,
         map_ttl_seconds: float = ADOPTION_MAP_TTL_SECONDS,
         handshake_timeout_seconds: float = ADOPTION_HANDSHAKE_TIMEOUT_SECONDS,
@@ -177,12 +214,18 @@ class TolerantSessionAdoptionMiddleware:
         self._is_active = is_active
         self._lookup_binding = lookup_binding
         self._adopt_binding = adopt_binding
+        self._note_terminated = note_terminated
         self._map_limit = max(1, int(map_limit))
         self._map_ttl_seconds = float(map_ttl_seconds)
         self._handshake_timeout_seconds = float(handshake_timeout_seconds)
         self._max_parked = max(1, int(max_parked_handshakes))
         self._body_limit = max(1, int(body_limit))
-        self._adopted: dict[str, tuple[str, float]] = {}
+        self._adopted: dict[tuple[str, str], tuple[str, float]] = {}
+        # One adoption at a time per (bookmark, identity): the read-check-write
+        # around ``_open_surrogate`` spans awaits, so without this a client
+        # retrying in parallel opened a separate transport per request and each
+        # one parked a handshake task until the bound failed adoption closed.
+        self._adopting: dict[tuple[str, str], asyncio.Lock] = {}
         # Parked synthetic handshake tasks (kept referenced so they are never
         # garbage-collected while still running; each ends when its transport
         # is reaped).
@@ -206,15 +249,29 @@ class TolerantSessionAdoptionMiddleware:
         method = str(scope.get("method") or "GET").upper()
         if method == "DELETE":
             # An explicit session teardown for an unknown id stays a no-op 404.
+            # Either way the client stated it will not replay this id, so the
+            # transport must not be retained as an adoption tombstone: the
+            # server-side reaper would otherwise turn every deliberate
+            # teardown (a Bridge that opens one transport per call does this on
+            # every request) into LRU pressure that evicts bookmarks a client
+            # may still come back to replay.
+            if self._note_terminated is not None:
+                self._note_terminated(_scope_header(scope, MCP_SESSION_ID_HEADER))
             await self.app(scope, receive, send)
             return
         session_id = _scope_header(scope, MCP_SESSION_ID_HEADER)
         if not session_id or self._transport_active(session_id):
             await self.app(scope, receive, send)
             return
+        # A bookmark alone never identifies a caller, so it cannot identify an
+        # adopted transport either: the surrogate was opened with its creator's
+        # credential and re-attached to that creator's Room binding.
+        adoption_key = (session_id, _request_identity(scope))
 
         body = b""
+        body_consumed = False
         if method == "POST":
+            body_consumed = True
             try:
                 body = await _read_request_body(receive, limit=self._body_limit)
             except PayloadTooLargeError as error:
@@ -222,24 +279,52 @@ class TolerantSessionAdoptionMiddleware:
                 # silently truncated body that only fails as a parse error (#192).
                 await self._send_payload_too_large(send, error.limit)
                 return
-        surrogate = self._active_surrogate(session_id)
-        if surrogate is None:
-            surrogate = await self._open_surrogate(scope)
-            if surrogate is None:
-                # The server-side handshake is impossible (invalid credentials,
-                # shutdown, ...). Replay untouched so the original, closed
-                # behaviour (401/404) still applies instead of hanging.
-                await self._forward(scope, send, body, session_id=None)
+            except IncompleteRequestBodyError as error:
+                # The client is already gone: nothing may be replayed and no
+                # surrogate may be opened for a request that never completed.
+                await self._send_incomplete_body(send, error.received)
                 return
-            self._remember(session_id, surrogate)
-            self._restore_room_binding(session_id, surrogate, scope)
-            logger.info(
-                "Adopted reaped MCP session %s as %s",
-                session_id[:16],
-                surrogate[:16],
-            )
+        surrogate = self._active_surrogate(adoption_key)
+        if surrogate is None:
+            async with self._adoption_lock(adoption_key):
+                # Re-check inside the lock: a parallel request with the same
+                # bookmark and identity may already have finished the handshake,
+                # and sharing that transport is the whole point.
+                surrogate = self._active_surrogate(adoption_key)
+                if surrogate is None:
+                    surrogate = await self._open_surrogate(scope)
+                    if surrogate is None:
+                        # The server-side handshake is impossible (invalid
+                        # credentials, shutdown, ...). Replay untouched so the
+                        # original, closed behaviour (401/404) still applies
+                        # instead of hanging.
+                        await self._forward(
+                            scope,
+                            send,
+                            body,
+                            session_id=None,
+                            upstream_receive=receive,
+                            body_consumed=body_consumed,
+                        )
+                        return
+                    self._remember(adoption_key, surrogate)
+                    logger.info(
+                        "Adopted reaped MCP session %s as %s",
+                        session_id[:16],
+                        surrogate[:16],
+                    )
+        # Run on every request, not only on the first adoption: the retained
+        # binding is re-attached to the surrogate under the same identity check,
+        # so a reuse cannot outlive the comparison that authorised it.
+        self._restore_room_binding(session_id, surrogate, scope)
         await self._forward(
-            scope, send, body, session_id=surrogate, adopted_from=session_id
+            scope,
+            send,
+            body,
+            session_id=surrogate,
+            adopted_from=session_id,
+            upstream_receive=receive,
+            body_consumed=body_consumed,
         )
 
     def _transport_active(self, transport_session_id: str) -> bool:
@@ -259,19 +344,39 @@ class TolerantSessionAdoptionMiddleware:
         while len(self._adopted) > self._map_limit:
             oldest = min(self._adopted.items(), key=lambda item: item[1][1])[0]
             self._adopted.pop(oldest, None)
+        # A guard lock is only worth keeping while it still names a live mapping
+        # or an adoption in flight; otherwise the lock table would outgrow the
+        # bounded map it protects.
+        for key, lock in list(self._adopting.items()):
+            if key not in self._adopted and not lock.locked():
+                self._adopting.pop(key, None)
+        while len(self._adopting) > self._map_limit:
+            idle = next(
+                (k for k, lock in self._adopting.items() if not lock.locked()), None
+            )
+            if idle is None:
+                break
+            self._adopting.pop(idle, None)
 
-    def _active_surrogate(self, original_session_id: str) -> str | None:
-        entry = self._adopted.get(original_session_id)
+    def _adoption_lock(self, adoption_key: tuple[str, str]) -> asyncio.Lock:
+        lock = self._adopting.get(adoption_key)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._adopting[adoption_key] = lock
+        return lock
+
+    def _active_surrogate(self, adoption_key: tuple[str, str]) -> str | None:
+        entry = self._adopted.get(adoption_key)
         if entry is None:
             return None
         surrogate, _ = entry
         if not self._transport_active(surrogate):
-            self._adopted.pop(original_session_id, None)
+            self._adopted.pop(adoption_key, None)
             return None
         return surrogate
 
-    def _remember(self, original_session_id: str, surrogate: str) -> None:
-        self._adopted[original_session_id] = (surrogate, time.monotonic())
+    def _remember(self, adoption_key: tuple[str, str], surrogate: str) -> None:
+        self._adopted[adoption_key] = (surrogate, time.monotonic())
         self._prune_adopted()
 
     def _restore_room_binding(
@@ -279,14 +384,7 @@ class TolerantSessionAdoptionMiddleware:
     ) -> None:
         if self._lookup_binding is None or self._adopt_binding is None:
             return
-        raw_key = _scope_header(scope, SOFTWARE_KEY_HEADER)
-        software_key = ""
-        if raw_key:
-            try:
-                software_key = decode_http_identity_value(raw_key).strip()
-            except ValueError:
-                software_key = ""
-        binding = self._lookup_binding(original_session_id, software_key)
+        binding = self._lookup_binding(original_session_id, _software_key(scope))
         if binding is None:
             return
         self._adopt_binding(surrogate, binding)
@@ -314,6 +412,37 @@ class TolerantSessionAdoptionMiddleware:
             {
                 "type": "http.response.start",
                 "status": 413,
+                "headers": [
+                    (b"content-type", b"application/json"),
+                    (b"content-length", str(len(payload)).encode("latin-1")),
+                ],
+            }
+        )
+        await send({"type": "http.response.body", "body": payload})
+
+    async def _send_incomplete_body(
+        self, send: Callable[[Message], Awaitable[None]], received: int
+    ) -> None:
+        payload = json.dumps(
+            {
+                "error": {
+                    "code": "request_body_incomplete",
+                    "message": "Client disconnected before the request body completed",
+                    "data": {
+                        "code": "request_body_incomplete",
+                        "received_bytes": received,
+                        "required_action": "resend_request",
+                    },
+                }
+            }
+        ).encode("utf-8")
+        logger.warning(
+            "Adoption dropped request aborted after %d body bytes", received
+        )
+        await send(
+            {
+                "type": "http.response.start",
+                "status": 400,
                 "headers": [
                     (b"content-type", b"application/json"),
                     (b"content-length", str(len(payload)).encode("latin-1")),
@@ -429,7 +558,9 @@ class TolerantSessionAdoptionMiddleware:
         body: bytes,
         *,
         session_id: str | None,
+        upstream_receive: Callable[[], Awaitable[Message]],
         adopted_from: str | None = None,
+        body_consumed: bool = False,
     ) -> None:
         headers = [
             (bytes(key), bytes(value))
@@ -452,19 +583,20 @@ class TolerantSessionAdoptionMiddleware:
                     (ADOPTED_FROM_HEADER, adopted_from.encode("latin-1"))
                 )
         delivered = False
-        # Parked forever: after the body is delivered there is no disconnect
-        # signal to relay, and a prematurely reported disconnect would truncate
-        # a streaming (SSE) response mid-body. POST SSE responses self-close
-        # after the JSON-RPC result event, ending the replay naturally.
-        parked = asyncio.Event()
 
         async def replay_receive() -> Message:
             nonlocal delivered
-            if delivered:
-                await parked.wait()
-                return {"type": "http.disconnect"}
-            delivered = True
-            return {"type": "http.request", "body": body, "more_body": False}
+            if body_consumed and not delivered:
+                delivered = True
+                return {"type": "http.request", "body": body, "more_body": False}
+            # The buffered body has been handed over, so the transport's own
+            # receive is the only source of a disconnect. Parking here instead
+            # meant a real client abort never reached the downstream app: the
+            # adopted request kept its stream alive until the transport was
+            # reaped (#306). Nothing is invented -- http.disconnect arrives when
+            # it actually happens, never synthesised early, so a streaming (SSE)
+            # response is still not truncated mid-body.
+            return await upstream_receive()
 
         async def replay_send(message: Message) -> None:
             if (
@@ -493,13 +625,17 @@ async def _read_request_body(
 
     Never returns a truncated body: hitting the limit raises
     :class:`PayloadTooLargeError` so the middleware can answer 413 instead
-    of replaying incomplete JSON-RPC downstream.
+    of replaying incomplete JSON-RPC downstream, and an abort before the
+    body completes raises :class:`IncompleteRequestBodyError` (#306).
     """
     chunks = bytearray()
     while True:
         message = await receive()
         if message.get("type") != "http.request":
-            break
+            # The client went away mid-body. The bytes buffered so far are a
+            # prefix of a request, not a request: returning them would replay a
+            # truncated JSON-RPC call downstream as though it were complete.
+            raise IncompleteRequestBodyError(len(chunks))
         chunks.extend(message.get("body") or b"")
         if len(chunks) > limit:
             raise PayloadTooLargeError(limit)
@@ -520,6 +656,7 @@ def with_session_adoption(
     is_active: Callable[[str], bool] | None = None,
     lookup_binding: Callable[[str, str], Any] | None = None,
     adopt_binding: Callable[[str, Any], None] | None = None,
+    note_terminated: Callable[[str], None] | None = None,
     map_limit: int = ADOPTION_MAP_LIMIT,
     map_ttl_seconds: float = ADOPTION_MAP_TTL_SECONDS,
     max_parked_handshakes: int = 32,
@@ -533,6 +670,7 @@ def with_session_adoption(
         is_active=is_active,
         lookup_binding=lookup_binding,
         adopt_binding=adopt_binding,
+        note_terminated=note_terminated,
         map_limit=map_limit,
         map_ttl_seconds=map_ttl_seconds,
         max_parked_handshakes=max_parked_handshakes,

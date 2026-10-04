@@ -7,6 +7,8 @@ selects the delivery mode so every capability ships inside that exe:
   control console (the default double-click behavior; the console
   starts and stops the detached service, and accepts ``--config``);
 - ``mcp``: run the MCP stdio server for Agent host integration;
+- ``mcp-bridge``: run the stdio Bridge that forwards a local MCP client to a
+  remote center, for clients that can only launch a local process;
 - ``pick-directory``: run the native folder chooser helper;
 - any other subcommand: delegate to the console CLI (``serve``,
   ``stop``, ``logs``, ...).
@@ -24,6 +26,15 @@ def main() -> None:
         from agentchatroom.stdio_runtime import run_mcp_entry
 
         run_mcp_entry(args[1:])
+        return
+    if command == "mcp-bridge":
+        # A frozen build ships no interpreter, so the remote Bridge is reached
+        # through this exe rather than `python -m agentchatroom.mcp_bridge`.
+        # Without it the packaged center would hand every remote client a
+        # launcher that cannot start.
+        from agentchatroom.mcp_bridge import main as run_bridge
+
+        run_bridge(args[1:])
         return
     from agentchatroom.stdio_runtime import prepare_standard_streams
 

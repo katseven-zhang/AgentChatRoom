@@ -1,3 +1,4 @@
+# audit-allow-file:windows_absolute_path
 from scripts.verify_live_server import EXPECTED_TOOLS, parse_args
 
 

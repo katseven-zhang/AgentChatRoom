@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import json
 import os
+import time
 import re
 import subprocess
+from contextlib import contextmanager
 import uuid
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any, Mapping
@@ -95,7 +97,7 @@ def normalize_remote(value: str) -> str:
     return normalized.rstrip("/").lower()
 
 
-def detect_git_info(root: Path) -> tuple[str, Path, bool]:
+def detect_git_info(root: Path, *, timeout_seconds: float = 3) -> tuple[str, Path, bool]:
     """Return (origin_remote, git_toplevel, is_git_work_tree).
 
     Work-tree membership comes from ``rev-parse --show-toplevel`` succeeding —
@@ -108,7 +110,7 @@ def detect_git_info(root: Path) -> tuple[str, Path, bool]:
             ["git", *arguments],
             check=False,
             capture_output=True,
-            timeout=3,
+            timeout=timeout_seconds,
             stdin=subprocess.DEVNULL,
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
@@ -130,6 +132,32 @@ def detect_git_info(root: Path) -> tuple[str, Path, bool]:
 _git_info = detect_git_info
 
 
+def repository_directory(root_path: str | Path, repository_path: str = "") -> Path:
+    """Resolve an explicitly selected repository within the workspace boundary."""
+    root = Path(root_path).expanduser().resolve()
+    raw = repository_path.strip().replace("\\", "/")
+    path = PurePosixPath(raw)
+    if (PureWindowsPath(raw).drive or path.is_absolute() or ".." in path.parts
+            or any(ord(char) < 32 for char in raw)):
+        raise DomainError(
+            "invalid_repository_path", "Repository selection must be workspace-relative",
+            status_code=422,
+            details={"required_action": "select_repository_inside_workspace"},
+        )
+    selected = (root / raw).resolve()
+    try:
+        selected.relative_to(root)
+    except ValueError as error:
+        raise DomainError(
+            "untrusted_repository", "Repository selection escapes the workspace",
+            status_code=403,
+            details={"required_action": "select_repository_inside_workspace"},
+        ) from error
+    if not selected.is_dir():
+        raise DomainError("project_path_not_found", "Selected repository directory does not exist")
+    return selected
+
+
 def project_registration_path(root_path: str | Path) -> Path:
     return Path(root_path).expanduser().resolve() / PROJECT_REGISTRATION_RELATIVE_PATH
 
@@ -147,6 +175,13 @@ def _project_instructions_error(path: Path, message: str) -> DomainError:
     )
 
 
+def _read_raw(path: Path) -> bytes:
+    try:
+        return path.read_bytes()
+    except OSError:
+        return b""
+
+
 def _read_project_instructions(path: Path) -> str:
     if not path.exists():
         return ""
@@ -156,7 +191,10 @@ def _read_project_instructions(path: Path) -> str:
             "Project AGENTS.md path exists but is not a regular file",
         )
     try:
-        return path.read_text(encoding="utf-8-sig")
+        # Path.read_text(newline=) exists only on Python 3.13+. The project
+        # supports 3.11, and newline="" must keep the original line endings.
+        with path.open(encoding="utf-8-sig", newline="") as handle:
+            return handle.read()
     except (OSError, UnicodeError) as error:
         raise _project_instructions_error(
             path,
@@ -165,11 +203,19 @@ def _read_project_instructions(path: Path) -> str:
 
 
 def _managed_instructions_range(path: Path, text: str) -> tuple[int, int] | None:
+    # Blanks around a marker are a formatting difference, not a different block.
+    # Requiring the marker at column zero meant an editor that trimmed the line
+    # or applied indentation stopped it being recognised, so the writer found no
+    # range, appended a second block, and the file grew a copy per bootstrap.
     begin_matches = list(
-        re.finditer(rf"(?m)^{re.escape(PROJECT_INSTRUCTIONS_BEGIN)}\r?$", text)
+        re.finditer(
+            rf"(?m)^[ \t]*{re.escape(PROJECT_INSTRUCTIONS_BEGIN)}[ \t]*\r?$", text
+        )
     )
     end_matches = list(
-        re.finditer(rf"(?m)^{re.escape(PROJECT_INSTRUCTIONS_END)}\r?$", text)
+        re.finditer(
+            rf"(?m)^[ \t]*{re.escape(PROJECT_INSTRUCTIONS_END)}[ \t]*\r?$", text
+        )
     )
     if not begin_matches and not end_matches:
         return None
@@ -206,7 +252,7 @@ def _write_project_instructions(path: Path, text: str) -> None:
     temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
-        temporary.write_text(text, encoding="utf-8")
+        temporary.write_text(text, encoding="utf-8", newline="")
         temporary.replace(path)
     except OSError as error:
         try:
@@ -265,7 +311,11 @@ def write_project_coordination_instructions(
         if not updated.endswith(("\n", "\r")):
             updated += newline
         action = "updated"
-    if updated == existing:
+    # The END-marker range stops before the line's terminator, so re-rendering an
+    # already-managed file can differ from it by that one separator alone. Compare
+    # line-ending-insensitively: rewriting in that case would touch a user file
+    # whose managed block has not actually changed.
+    if updated.replace("\r\n", "\n") == existing.replace("\r\n", "\n"):
         action = "unchanged"
     else:
         _write_project_instructions(path, updated)
@@ -309,7 +359,10 @@ def remove_project_coordination_instructions(root_path: str | Path) -> bool:
                 "project_instructions_write_failed",
                 "Generated project AGENTS.md could not be removed",
                 status_code=500,
-                details={"path": str(path)},
+                details={
+                    "path": str(path),
+                    "required_action": "retry_checkout_cleanup_or_remove_the_generated_instructions",
+                },
             ) from error
     return True
 
@@ -318,6 +371,7 @@ def checkout_scope(
     root_path: str | Path,
     *,
     logical_path: str = "",
+    repository_path: str | None = None,
 ) -> dict[str, str]:
     root = Path(root_path).expanduser().resolve()
     if not root.is_dir():
@@ -326,8 +380,15 @@ def checkout_scope(
             "Project root must be an existing directory",
             details={"root_path": str(root)},
         )
-    remote, git_root, _is_work_tree = _git_info(root)
-    logical = derive_logical_path(root, git_root, logical_path)
+    if repository_path is None:
+        registration = load_checkout_registration(root, logical_path=logical_path)
+        repository_path = str((registration or {}).get("repository_path") or "")
+    selected = repository_directory(root, repository_path)
+    remote, git_root, _is_work_tree = _git_info(selected)
+    if repository_path and not _is_work_tree:
+        raise DomainError("repository_not_found", "Selected repository is no longer a Git worktree",
+                          status_code=409, details={"required_action": "recheck_repository_selection"})
+    logical = derive_logical_path(selected, git_root, logical_path)
     if remote:
         return {
             "kind": "git",
@@ -344,6 +405,29 @@ def checkout_scope(
     }
 
 
+def repository_root_from_logical(root: Path, logical: str) -> Path:
+    """Undo ``repository root / logical_path`` for a row that kept only the join.
+
+    A path-scoped Project is identified by its repository root plus the
+    repository-relative logical path, because that is what the candidate side can
+    compute from a checkout. The stored ``root_path`` is the directory the operator
+    selected, so recovering the root is the only way the two sides can meet -
+    without it a monorepo subproject without an origin never recognised its own
+    Room and every bootstrap created another Project.
+    """
+    parts = [
+        part
+        for part in Path(str(logical).replace("\\", "/")).parts
+        if part not in ("", ".")
+    ]
+    if not parts:
+        return root
+    repo_root = root
+    for _ in parts:
+        repo_root = repo_root.parent
+    return repo_root
+
+
 def stored_project_scope(project: Mapping[str, Any]) -> dict[str, str]:
     logical = normalize_logical_path(str(project.get("logical_path", "") or ""))
     remote = str(project.get("git_remote", "") or "").strip()
@@ -354,9 +438,15 @@ def stored_project_scope(project: Mapping[str, Any]) -> dict[str, str]:
             "logical_path": logical,
         }
     root = Path(str(project.get("root_path", ""))).expanduser().resolve()
+    root = root / str(project.get("repository_path") or "")
+    # Local monorepo identity is the repository root, not its scoped
+    # subdirectory. repository_root_from_logical already walks up by the logical
+    # parts; walking here as well would overshoot by that many levels again.
     return {
         "kind": "path",
-        "identity": os.path.normcase(str(root)),
+        "identity": os.path.normcase(
+            str(repository_root_from_logical(root, logical))
+        ),
         "logical_path": logical,
     }
 
@@ -448,8 +538,16 @@ def _is_path_to_git_upgrade(
             registered_identity = os.path.normcase(
                 str(Path(str(registered_scope.get("identity", ""))).expanduser().resolve())
             )
+            # A path-scope identity is the repository root, not the selected
+            # subdirectory, so the upgrade check has to walk the same number of
+            # logical segments back from the checkout.
             current_identity = os.path.normcase(
-                str(Path(root_path).expanduser().resolve())
+                str(
+                    repository_root_from_logical(
+                        Path(root_path).expanduser().resolve(),
+                        str(requested_scope.get("logical_path", "") or ""),
+                    )
+                )
             )
             return registered_identity == current_identity
         except (OSError, ValueError):
@@ -474,7 +572,8 @@ def resolve_checkout_project_key(
         return None, False
 
     if registration["scope"] != expected_scope:
-        if not _is_path_to_git_upgrade(root_path, registration["scope"], expected_scope):
+        selected = repository_directory(root_path, str(registration.get("repository_path") or ""))
+        if not _is_path_to_git_upgrade(selected, registration["scope"], expected_scope):
             raise DomainError(
                 "project_registration_scope_conflict",
                 "Checkout Project registration belongs to another repository scope",
@@ -495,7 +594,10 @@ def validate_project_scope(
     *,
     logical_path: str = "",
 ) -> None:
-    requested_scope = checkout_scope(root_path, logical_path=logical_path)
+    requested_scope = checkout_scope(
+        root_path, logical_path=logical_path,
+        repository_path=str(project.get("repository_path") or ""),
+    )
     actual_scope = stored_project_scope(project)
     if requested_scope != actual_scope:
         if not _is_path_to_git_upgrade(root_path, actual_scope, requested_scope):
@@ -511,13 +613,71 @@ def validate_project_scope(
             )
 
 
-def _write_document(path: Path, document: dict[str, Any]) -> None:
+# Read-modify-write on the registration file is not atomic, and bootstrap runs
+# from more than one Agent. A lock file in the same directory serialises the
+# writers; O_CREAT|O_EXCL is the portable form and needs no dependency.
+_REGISTRATION_LOCK_STALE_SECONDS = 30
+_REGISTRATION_LOCK_WAIT_SECONDS = 5
+
+
+def _lock_path_for(path: Path) -> Path:
+    return path.with_name(f".{path.name}.lock")
+
+
+def _acquire_registration_lock(path: Path) -> Any:
+    """Take the per-registration lock, or wait briefly for whoever holds it."""
+    lock = _lock_path_for(path)
+    deadline = time.monotonic() + _REGISTRATION_LOCK_WAIT_SECONDS
+    while True:
+        try:
+            handle = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            os.write(handle, str(os.getpid()).encode("ascii"))
+            os.close(handle)
+            return lock
+        except FileExistsError:
+            # A writer that crashed leaves the lock behind. Break it once it is
+            # clearly older than any legitimate write, or the file stays locked
+            # for good after one kill.
+            try:
+                age = time.time() - lock.stat().st_mtime
+            except OSError:
+                age = 0
+            if age > _REGISTRATION_LOCK_STALE_SECONDS:
+                try:
+                    lock.unlink()
+                except OSError:
+                    pass
+                continue
+            if time.monotonic() >= deadline:
+                raise DomainError(
+                    "project_registration_locked",
+                    "Another Agent is writing this checkout registration; "
+                    "retry once it finishes",
+                    status_code=409,
+                    details={
+                        "required_action": "retry_the_bootstrap_after_the_other_write"
+                    },
+                )
+            time.sleep(0.05)
+
+
+def _release_registration_lock(lock: Path) -> None:
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
+        lock.unlink()
+    except OSError:
+        pass
+
+
+def _write_document(path: Path, document: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lock = _acquire_registration_lock(path)
+    temporary: Path | None = None
+    try:
         temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
         temporary.write_text(
             json.dumps(document, ensure_ascii=False, indent=2) + "\n",
             encoding="utf-8",
+            newline="\n",
         )
         temporary.replace(path)
     except OSError as error:
@@ -527,6 +687,15 @@ def _write_document(path: Path, document: dict[str, Any]) -> None:
             status_code=500,
             details={"path": str(path)},
         ) from error
+    finally:
+        # A temporary file left behind is litter inside the user's checkout, and
+        # it is the evidence that something went wrong.
+        if temporary is not None:
+            try:
+                temporary.unlink()
+            except OSError:
+                pass
+        _release_registration_lock(lock)
 
 
 def register_checkout_project(
@@ -577,12 +746,21 @@ def register_checkout_project(
     entry = {
         "logical_path": logical,
         "project_key": project_key,
-        "scope": checkout_scope(root_path, logical_path=logical),
+        "scope": checkout_scope(root_path, logical_path=logical,
+                                repository_path=str(project.get("repository_path") or "")),
     }
+    if project.get("repository_path"):
+        entry["repository_path"] = str(project["repository_path"])
     if existing is None:
         registrations.append(entry)
     else:
-        registrations[registrations.index(existing)] = entry
+        # Merge over the stored entry rather than replacing it. A newer build
+        # writing a subset of the keys used to delete everything the other one
+        # had recorded, and the file is shared by every checkout in the repo.
+        position = registrations.index(existing)
+        merged = dict(existing)
+        merged.update(entry)
+        registrations[position] = merged
     document["registrations"] = sorted(
         registrations,
         key=lambda registration: str(registration.get("logical_path", "")),
@@ -590,6 +768,25 @@ def register_checkout_project(
     _write_document(path, document)
     write_project_coordination_instructions(root_path, project)
     return path
+
+
+@contextmanager
+def checkout_registration_change(root: Path, project: Mapping[str, Any]):
+    """Restore the two derived checkout files if registration or DB association fails."""
+    paths = (project_registration_path(root), project_instructions_path(root))
+    before = [(path, path.read_bytes() if path.is_file() else None) for path in paths]
+    try:
+        register_checkout_project(root, project)
+        yield
+    except Exception:
+        for path, content in before:
+            if content is None:
+                path.unlink(missing_ok=True)
+            else:
+                temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+                temporary.write_bytes(content)
+                temporary.replace(path)
+        raise
 
 
 def remove_checkout_project_registration(
@@ -629,6 +826,9 @@ def remove_checkout_project_registration(
                 "project_registration_write_failed",
                 "Checkout Project registration could not be removed",
                 status_code=500,
-                details={"path": str(path)},
+                details={
+                    "path": str(path),
+                    "required_action": "retry_checkout_cleanup_or_remove_the_registration_file",
+                },
             ) from error
     return True

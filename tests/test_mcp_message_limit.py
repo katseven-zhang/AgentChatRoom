@@ -111,14 +111,13 @@ def test_mcp_context_filtering_and_boundaries(service, project, joined_agents):
         token=executor["token"],
     )
 
-    # 4. Add system message
+    # 4. An operator notice on the system channel. An Agent may not post this
+    # kind (it would be invisible to every peer), so it goes through the
+    # operator path, which carries no Agent Session.
     service.post_message(
         project["id"],
         body="System broadcast",
         kind="system",
-        session_id=executor["agent"]["id"],
-        token=executor["token"],
-        model_display_name="system",
     )
 
     # 5. Add 12 valid agent messages of mixed types
@@ -246,6 +245,187 @@ def test_mcp_cursor_and_repeated_sync(service, project, joined_agents):
     )
     assert len(third_sync["events"]) == 2
     assert [ev["project_seq"] for ev in third_sync["events"]] == [new_msg1["event_id"], new_msg2["event_id"]]
+
+
+def test_an_agent_may_not_post_a_kind_its_peers_can_never_see(
+    service, project, joined_agents
+):
+    """`system` is reserved for the operator, so no Agent can hide a message.
+
+    `system` is not in MCP_CONTEXT_EVENT_TYPES, so a message posted under that
+    kind reaches the audit log but no other Agent's context window, ever. Any
+    Agent could therefore post a blocker or a warning that the rest of the room
+    silently never receives. The kinds an Agent may use are exactly the ones
+    every other Agent can read, which is what makes the refusal below correct
+    rather than merely restrictive.
+    """
+    executor, reviewer = joined_agents
+    with pytest.raises(DomainError) as refused:
+        service.post_message(
+            project["id"],
+            body="BLOCKER: stop merging, production is down",
+            kind="system",
+            session_id=executor["agent"]["id"],
+            token=executor["token"],
+            model_display_name="test-model",
+        )
+    assert refused.value.code == "agent_may_not_post_system_message"
+    # The refusal names the alternative, so a client can recover without
+    # guessing, and it lists exactly the kinds that are peer-visible.
+    assert refused.value.details["agent_visible_kinds"] == [
+        "blocker",
+        "decision",
+        "message",
+    ]
+    assert refused.value.details["required_action"] == "post_message_decision_or_blocker"
+
+    # Nothing was written: a refused post must not leave a trace that reads as
+    # if the warning had been delivered.
+    assert not any(
+        event["event_type"] == "message.system"
+        and "production is down" in ((event.get("payload") or {}).get("body") or "")
+        for event in service.list_events(project["id"], after=0)["events"]
+    )
+
+    # A blocker - the kind the refused post should have used - is accepted and
+    # does reach the other Agent's context. This is the half that proves the
+    # rule keeps the legitimate path open.
+    blocker = service.post_message(
+        project["id"],
+        body="BLOCKER: stop merging, production is down",
+        kind="blocker",
+        session_id=executor["agent"]["id"],
+        token=executor["token"],
+        model_display_name="test-model",
+    )
+    seen = service.room_sync(
+        project["id"],
+        session_id=reviewer["agent"]["id"],
+        token=reviewer["token"],
+        mcp_context=True,
+        initial_inject=True,
+    )
+    assert any(event["id"] == blocker["event_id"] for event in seen["events"])
+
+
+def test_the_operator_may_still_post_the_system_kind(service, project):
+    """The operator path is unchanged: it posts without an Agent Session.
+
+    The reservation is about accountability, not about removing the kind. An
+    operator post is attributable to the deployment rather than to a peer
+    Session that any Agent could speak as, so it stays allowed - and it lands
+    on the system channel, out of the Agent context window by design.
+    """
+    posted = service.post_message(
+        project["id"],
+        body="Operator maintenance window at 22:00",
+        kind="system",
+    )
+    event = next(
+        item
+        for item in service.list_events(project["id"], after=0)["events"]
+        if item["id"] == posted["event_id"]
+    )
+    assert event["event_type"] == "message.system"
+    assert event["channel"] == "system"
+    # No Agent Session is behind it, so no Agent can be the author.
+    assert event["actor_session_id"] is None
+
+
+def test_incremental_sync_larger_than_the_window_delivers_every_message_in_order(
+    service, project, joined_agents
+):
+    """A burst bigger than the window must arrive whole, oldest first (#238).
+
+    The existing incremental test only ever added two messages against a window
+    of five, so it never exercised the case the fix exists for. Taking the
+    newest `limit` rows and then advancing the cursor to the project head marks
+    every older unread message as read - and a requires_ack blocker that is
+    never delivered is a message the acknowledgement loop depends on being
+    seen. So the assertions below are about the *whole* burst arriving, in
+    order, across as many round trips as it takes.
+
+    The bootstrap inject is deliberately a "most recent window" view, so the
+    burst is posted after it: what is under test is the incremental path that
+    follows a cursor, not that first window.
+    """
+    executor, reviewer = joined_agents
+    service.update_project(project["id"], settings={"mcp_message_limit": 5})
+
+    # Some history so the bootstrap inject has a window to show and a cursor to
+    # continue from.
+    for index in range(8):
+        service.post_message(
+            project["id"],
+            body=f"History {index}",
+            kind="message",
+            session_id=executor["agent"]["id"],
+            token=executor["token"],
+            model_display_name="test-model",
+        )
+    bootstrap = service.room_sync(
+        project["id"],
+        session_id=reviewer["agent"]["id"],
+        token=reviewer["token"],
+        mcp_context=True,
+        initial_inject=True,
+    )
+    assert len(bootstrap["events"]) == 5
+    cursor = bootstrap["cursor"]
+
+    # One ack-requiring blocker, then a burst well past the window.
+    blocker = service.post_message(
+        project["id"],
+        body="BLOCKER: hold the release",
+        kind="blocker",
+        session_id=executor["agent"]["id"],
+        token=executor["token"],
+        model_display_name="test-model",
+        requires_ack=True,
+    )["event_id"]
+    burst = [
+        service.post_message(
+            project["id"],
+            body=f"Burst message {index}",
+            kind="message",
+            session_id=executor["agent"]["id"],
+            token=executor["token"],
+            model_display_name="test-model",
+        )["event_id"]
+        for index in range(12)
+    ]
+    expected = [blocker, *burst]
+
+    # Drain by repeatedly syncing from the bootstrap cursor. Every message must
+    # arrive exactly once, in ascending order, and the run must converge.
+    delivered: list[int] = []
+    after = cursor
+    rounds = 0
+    while True:
+        rounds += 1
+        assert rounds <= len(expected), "sync did not converge"
+        page = service.room_sync(
+            project["id"],
+            session_id=reviewer["agent"]["id"],
+            token=reviewer["token"],
+            mcp_context=True,
+            after=after,
+        )
+        delivered.extend(event["project_seq"] for event in page["events"])
+        if not page["has_more"]:
+            break
+        # A full window each time, and the cursor advances by exactly what was
+        # delivered - never past it, which is how messages used to be skipped.
+        assert len(page["events"]) == 5
+        assert page["cursor"] == delivered[-1]
+        after = page["cursor"]
+
+    assert delivered == sorted(delivered), "incremental sync delivered out of order"
+    assert len(delivered) == len(set(delivered)), "a message was delivered twice"
+    assert delivered == expected, (
+        f"expected {len(expected)} messages in order, got {len(delivered)}; "
+        f"missing {sorted(set(expected) - set(delivered))}"
+    )
 
 
 def test_configuration_precedence(monkeypatch, tmp_path, service, project, joined_agents):
@@ -412,14 +592,12 @@ def test_room_bootstrap_message_projection(monkeypatch, service, project_dir):
         model="test-model",
     )
 
-    # Post system message and 8 agent messages
+    # Post an operator system message and 8 agent messages. The system kind is
+    # operator-only, so it carries no Agent Session.
     service.post_message(
         project["id"],
         body="System warning",
         kind="system",
-        session_id=joined["agent"]["id"],
-        token=joined["token"],
-        model_display_name="system",
     )
     for i in range(8):
         service.post_message(
@@ -458,3 +636,149 @@ def test_room_bootstrap_message_projection(monkeypatch, service, project_dir):
         "Bootstrap msg 6",
         "Bootstrap msg 7",
     ]
+
+def _sync_window(sync):
+    block = sync.get("messages")
+    if isinstance(block, dict):
+        return block.get("events") or block.get("messages") or []
+    return block if block is not None else (sync.get("events") or [])
+
+
+def _sync_cursor(sync):
+    block = sync.get("messages")
+    if isinstance(block, dict):
+        return int(block.get("cursor") or 0)
+    return int(sync.get("cursor") or 0)
+
+
+def _sync_has_more(sync):
+    block = sync.get("messages")
+    if isinstance(block, dict):
+        return bool(block.get("has_more"))
+    return bool(sync.get("has_more"))
+
+
+def _agent_cursor(service, project_id, session_id):
+    with service.database.connect() as connection:
+        return int(
+            connection.execute(
+                "SELECT last_read_cursor FROM agent_sessions WHERE id = ? AND project_id = ?",
+                (session_id, project_id),
+            ).fetchone()[0]
+            or 0
+        )
+
+
+def _ack_message_seq(service, project_id, body):
+    events = service.list_events(project_id, after=0)["events"]
+    match = [
+        event
+        for event in events
+        if str(event["event_type"]).startswith("message.")
+        and (event.get("payload") or {}).get("body") == body
+    ]
+    assert match, [event["event_type"] for event in events]
+    return int(match[0]["project_seq"])
+
+
+def test_incremental_sync_walks_the_window_without_marking_unseen_messages_read(
+    service, project
+):
+    """#238: the cursor used to jump to the project head while only the newest
+    window was returned, so a burst larger than the window was marked read
+    without ever being delivered."""
+    agent = join_room_with_workspace(
+        service, project, agent_key="reader-a", name="Reader A", client="pytest",
+        model="unknown",
+    )
+    session_id = agent["agent"]["id"]
+    service.room_sync(
+        project["id"], session_id=session_id, token=agent["token"],
+        mcp_context=True, initial_inject=True,
+    )
+
+    for index in range(7):
+        service.post_message(
+            project["id"],
+            body=f"burst message {index}",
+            session_id=session_id,
+            token=agent["token"],
+            model_display_name="unknown",
+        )
+
+    first = service.room_sync(
+        project["id"], session_id=session_id, token=agent["token"], mcp_context=True
+    )
+    first_window = _sync_window(first)
+    assert 0 < len(first_window) <= 5, first_window
+    assert _sync_has_more(first) is True
+    seen = [int(message["project_seq"]) for message in first_window]
+    assert seen == sorted(seen), "incremental context must arrive oldest first"
+    assert _agent_cursor(service, project["id"], session_id) == max(seen)
+    assert max(seen) < _sync_cursor_of_latest(service, project["id"])
+
+    second = service.room_sync(
+        project["id"], session_id=session_id, token=agent["token"], mcp_context=True
+    )
+    seen.extend(int(message["project_seq"]) for message in _sync_window(second))
+    assert len(set(seen)) == len(seen), "no message may be delivered twice"
+    assert _sync_has_more(second) is False
+    assert len(seen) >= 7, seen
+
+
+def _sync_cursor_of_latest(service, project_id):
+    with service.database.connect() as connection:
+        return int(
+            connection.execute(
+                "SELECT COALESCE(MAX(project_seq), 0) AS n FROM events WHERE project_id = ?",
+                (project_id,),
+            ).fetchone()["n"]
+        )
+
+
+def test_requires_ack_message_cannot_be_swallowed_by_the_window(service, project):
+    agent = join_room_with_workspace(
+        service, project, agent_key="reader-b", name="Reader B", client="pytest",
+        model="unknown",
+    )
+    session_id = agent["agent"]["id"]
+    service.room_sync(
+        project["id"], session_id=session_id, token=agent["token"],
+        mcp_context=True, initial_inject=True,
+    )
+    for index in range(6):
+        service.post_message(
+            project["id"],
+            body=f"plain message {index}",
+            session_id=session_id,
+            token=agent["token"],
+            model_display_name="unknown",
+        )
+    ack_body = "needs acknowledgement"
+    service.post_message(
+        project["id"],
+        body=ack_body,
+        session_id=session_id,
+        token=agent["token"],
+        model_display_name="unknown",
+        requires_ack=True,
+        priority=4,
+    )
+    ack_seq = _ack_message_seq(service, project["id"], ack_body)
+
+    delivered = []
+    settled = False
+    for _ in range(4):
+        sync = service.room_sync(
+            project["id"], session_id=session_id, token=agent["token"], mcp_context=True
+        )
+        delivered.extend(_sync_window(sync))
+        if not _sync_has_more(sync):
+            settled = True
+            break
+    assert settled, "has_more never settled"
+
+    seqs = {int(item["project_seq"]) for item in delivered}
+    assert ack_seq in seqs, (
+        "a requires_ack message must reach the Agent, not be marked read unseen"
+    )

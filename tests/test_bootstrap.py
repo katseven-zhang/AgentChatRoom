@@ -3,12 +3,15 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
+import subprocess
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
-from agentchatroom import mcp_server
+from agentchatroom import bootstrap, mcp_server
 from agentchatroom.bootstrap import (
     BOOTSTRAP_STATES,
     PROJECT_PATH_ENV,
@@ -490,6 +493,7 @@ def test_mcp_task_update_cannot_change_another_sessions_task(
         member_id=service.create_project_member(
             project["id"], member_key="codex", name="Codex"
         )["member"]["id"],
+        manage_member_reference=True,
     )
     intruder = service.join_room(
         project["id"],
@@ -499,6 +503,7 @@ def test_mcp_task_update_cannot_change_another_sessions_task(
         member_id=service.create_project_member(
             project["id"], member_key="grok-build", name="Grok Build"
         )["member"]["id"],
+        manage_member_reference=True,
     )
     task = service.create_task(
         project["id"],
@@ -680,6 +685,223 @@ def test_session_leave_clears_runtime_binding(monkeypatch, service, project_dir)
     assert mcp_server.get_runtime_binding() is None
     expired = _call_tool("room_sync")
     assert expired["error"]["code"] == "session_expired"
+
+
+def test_rejected_session_leave_keeps_the_runtime_binding(monkeypatch, service, project_dir):
+    """#269: 被拒的离开不得销毁绑定——Token 在本机只有内存这一份。"""
+    _configure_software(monkeypatch)
+    _register_project(service, project_dir)
+    monkeypatch.setattr(mcp_server, "service", service)
+    monkeypatch.chdir(project_dir)
+    assert mcp_server.room_bootstrap()["ok"] is True
+    binding = mcp_server.get_runtime_binding()
+    assert binding is not None
+
+    refused = _call_tool("session_leave", {"token": "wrong-token-value-not-the-binding"})
+    assert refused["ok"] is False
+    assert refused["error"]["code"] == "runtime_context_mismatch"
+
+    # The Session is still addressable with the binding it already had, and the
+    # caller can keep working on it.
+    assert mcp_server.get_runtime_binding() == binding
+    assert _call_tool("room_sync")["ok"] is True
+
+    # ...and the rejection says so instead of failing silently.
+    assert (
+        refused["error"]["details"]["required_action"]
+        == "retry_leave_or_continue_with_current_binding"
+    )
+    assert refused["error"]["details"]["binding_retained"] is True
+
+    # The same leave with the real credentials still closes the Session.
+    left = _call_tool("session_leave")
+    assert left["ok"] is True
+    assert mcp_server.get_runtime_binding() is None
+
+
+def test_credential_rejected_session_leave_keeps_the_runtime_binding(
+    monkeypatch, service, project_dir
+):
+    """#269: 门禁拒绝（返回 ok:False 而非抛错）同样不得销毁绑定。"""
+    _configure_software(monkeypatch)
+    _register_project(service, project_dir)
+    monkeypatch.setattr(mcp_server, "service", service)
+    monkeypatch.chdir(project_dir)
+    assert mcp_server.room_bootstrap()["ok"] is True
+    binding = mcp_server.get_runtime_binding()
+    assert binding is not None
+
+    def forbidden(*args, **kwargs):
+        # Same code, message and status the real gateway raises for a credential
+        # that is not authorized for this Project.
+        raise DomainError(
+            "agent_token_project_forbidden",
+            "Agent token is not authorized for this Project",
+            status_code=403,
+        )
+
+    monkeypatch.setattr(mcp_server, "_authorize_remote", forbidden)
+    refused = _call_tool("session_leave")
+    assert refused["ok"] is False
+    assert refused["error"]["code"] == "agent_token_project_forbidden"
+
+    assert mcp_server.get_runtime_binding() == binding
+    # The room:join gate only guards leave, so the binding keeps working as before.
+    monkeypatch.setattr(mcp_server, "_authorize_remote", lambda *a, **k: None)
+    assert _call_tool("room_sync")["ok"] is True
+
+    assert (
+        refused["error"]["details"]["required_action"]
+        == "retry_leave_or_continue_with_current_binding"
+    )
+
+
+def test_roots_failure_keeps_the_previous_bootstrap_binding(
+    monkeypatch, service, project_dir
+):
+    """#270: roots 采集失败不是领域拒绝，不得把已有 Session 变成新会话。"""
+    _configure_software(monkeypatch)
+    project = _register_project(service, project_dir)
+    monkeypatch.setattr(mcp_server, "service", service)
+    monkeypatch.setattr(
+        service,
+        "settings",
+        replace(service.settings, mcp_roots_timeout_seconds=0.02),
+    )
+    monkeypatch.chdir(project_dir)
+    state = {"uris": [project_dir.resolve().as_uri()], "stalled": False}
+
+    class FakeContext:
+        def __init__(self) -> None:
+            async def list_roots():
+                if state["stalled"]:
+                    await asyncio.sleep(1)
+                return SimpleNamespace(
+                    roots=[SimpleNamespace(uri=uri) for uri in state["uris"]]
+                )
+
+            self.request_context = SimpleNamespace(
+                session=SimpleNamespace(
+                    list_roots=list_roots, session_id="roots-probe"
+                )
+            )
+
+    ctx = FakeContext()
+    first = _call_tool("room_bootstrap", {}, context=ctx)
+    assert first["ok"] is True
+    session_id = first["result"]["session"]["id"]
+    key = mcp_server.mcp_session_key(ctx)
+    binding = mcp_server.get_runtime_binding(key)
+    assert binding is not None
+
+    # Own work, so the loss would be observable rather than theoretical.
+    created = _call_tool(
+        "task_create",
+        {"title": "#270 keep this task", "acceptance_criteria": ["still owned"]},
+        context=ctx,
+    )
+    assert created["ok"] is True
+    task_id = created["result"]["task"]["id"]
+    assert _call_tool("task_claim", {"task_id": task_id}, context=ctx)["ok"] is True
+    leased = _call_tool(
+        "lease_acquire",
+        {"path_pattern": "#270-keep.py", "reason": "#270 restore after roots failure"},
+        context=ctx,
+    )
+    assert leased["ok"] is True
+    lease_id = leased["result"]["lease"]["id"]
+
+    # The client stops answering the roots question: a transient hiccup, not a
+    # rebinding attempt the domain refused.
+    state["stalled"] = True
+    failed = _call_tool("room_bootstrap", {}, context=ctx)
+    assert failed["ok"] is False
+    assert failed["error"]["code"] == "workspace_roots_unavailable"
+
+    # Fail closed is untouched: a connection whose roots went away gets no usable
+    # binding and no tool may act on it.
+    assert mcp_server.get_runtime_binding(key) is None
+    refused = _call_tool("room_sync", {}, context=ctx)
+    assert refused["ok"] is False
+    assert refused["error"]["code"] == "session_expired"
+
+    # What the failure must not cost is the Session identity itself.
+    state["stalled"] = False
+    again = _call_tool("room_bootstrap", {}, context=ctx)
+    assert again["ok"] is True
+    assert again["result"]["connection"]["room_session"] == "restored"
+    assert again["result"]["session"]["id"] == session_id
+    owned = service.get_task(project["id"], task_id)
+    assert owned["owner_session_id"] == session_id
+    leases = {
+        lease["id"]: lease
+        for lease in service.snapshot(project["id"])["leases"]
+    }
+    assert leases[lease_id]["session_id"] == session_id
+    assert mcp_server.lookup_pending_restore(key) is None
+
+    # The rejection also states the next step instead of quietly costing the run.
+    assert (
+        failed["error"]["details"]["required_action"]
+        == "restore_client_connection_and_retry_bootstrap"
+    )
+    assert failed["error"]["details"]["session_restorable"] is True
+
+
+def test_pending_restore_is_dropped_with_the_binding_lifecycle(monkeypatch, service, project_dir):
+    """#270: 恢复记录只是补偿，不能越过显式离开或服务重启存活。"""
+    _configure_software(monkeypatch)
+    _register_project(service, project_dir)
+    monkeypatch.setattr(mcp_server, "service", service)
+    monkeypatch.setattr(
+        service,
+        "settings",
+        replace(service.settings, mcp_roots_timeout_seconds=0.02),
+    )
+    monkeypatch.chdir(project_dir)
+    uri = project_dir.resolve().as_uri()
+    state = {"stalled": False}
+
+    class FakeContext:
+        def __init__(self) -> None:
+            async def list_roots():
+                if state["stalled"]:
+                    await asyncio.sleep(1)
+                return SimpleNamespace(roots=[SimpleNamespace(uri=uri)])
+
+            self.request_context = SimpleNamespace(
+                session=SimpleNamespace(
+                    list_roots=list_roots, session_id="pending-restore"
+                )
+            )
+
+    ctx = FakeContext()
+    key = mcp_server.mcp_session_key(ctx)
+    first = _call_tool("room_bootstrap", {}, context=ctx)
+    assert first["ok"] is True
+    session_id = first["result"]["session"]["id"]
+    assert mcp_server.lookup_pending_restore(key) is None
+
+    state["stalled"] = True
+    assert _call_tool("room_bootstrap", {}, context=ctx)["ok"] is False
+    pending = mcp_server.lookup_pending_restore(key)
+    assert pending is not None and pending.session_id == session_id
+
+    # A stop/start or a full registry reset must not be survived either.
+    mcp_server.clear_runtime_binding()
+    assert mcp_server.lookup_pending_restore(key) is None
+
+    state["stalled"] = False
+    restarted = _call_tool("room_bootstrap", {}, context=ctx)
+    assert restarted["ok"] is True
+    restarted_session = restarted["result"]["session"]["id"]
+    state["stalled"] = True
+    assert _call_tool("room_bootstrap", {}, context=ctx)["ok"] is False
+    assert mcp_server.lookup_pending_restore(key) is not None
+
+    # An explicit leave of that Session takes the orphan record with it.
+    mcp_server.clear_bindings_for_agent_session(restarted_session)
+    assert mcp_server.lookup_pending_restore(key) is None
 
 
 def test_bootstrap_does_not_log_live_token(monkeypatch, service, project_dir):
@@ -1177,8 +1399,11 @@ def test_bootstrap_rejects_restoring_with_credential_pinned_to_another_member(
         restore_binding=first.binding,
         credential_id=credential["id"],
     )
-    assert rejected.public["status"] == "room_unavailable"
+    assert rejected.public["status"] == "credential_conflict"
+    assert rejected.public["required_action"] == REQUIRED_ACTIONS["credential_conflict"]
     assert rejected.public["details"]["code"] == "credential_already_linked"
+    assert rejected.public["details"]["message"]
+    assert rejected.public["details"]["status_code"] == 409
     assert rejected.binding is None
     assert service.list_agent_tokens(project["id"])[0]["member_id"] == other["id"]
 
@@ -1309,6 +1534,124 @@ def test_runtime_binding_restore_requires_the_same_project_and_identity():
         )
         is None
     )
+
+
+def test_monorepo_subproject_bootstrap_does_not_rewrite_the_registration(
+    monkeypatch, service, tmp_path
+):
+    """#307：子项目登记按 logical_path 存放，自愈查空键会每次 bootstrap 重写。"""
+    _configure_software(monkeypatch)
+    repository = tmp_path / "repository"
+    api_dir = repository / "packages" / "api"
+    api_dir.mkdir(parents=True)
+    subprocess.run(["git", "-C", str(repository), "init"], check=True, capture_output=True)
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(repository),
+            "remote",
+            "add",
+            "origin",
+            "git@example.invalid:team/repo.git",
+        ],
+        check=True,
+        capture_output=True,
+    )
+    project = service.create_project(root_path=str(api_dir), name="Bootstrap Api")
+    register_checkout_project(api_dir, project)
+    assert project["logical_path"] == "packages/api"
+    registration_path = api_dir / ".agentchatroom" / "project.json"
+
+    # The rewrite is byte-identical, so count the atomic replace instead of
+    # comparing content or mtime.
+    writes: list[Path] = []
+    original_replace = Path.replace
+
+    def counting_replace(self, target, *args, **kwargs):
+        writes.append(Path(target))
+        return original_replace(self, target, *args, **kwargs)
+
+    first = _bootstrap(service, api_dir)
+    assert first.public["status"] == "ready"
+    monkeypatch.setattr(Path, "replace", counting_replace)
+    try:
+        for _ in range(2):
+            again = _bootstrap(service, api_dir)
+            assert again.public["status"] == "ready"
+    finally:
+        monkeypatch.undo()
+    assert registration_path not in writes
+
+
+def test_bootstrap_registration_self_heal_still_repairs_a_drifted_scope(
+    monkeypatch, service, project_dir
+):
+    """#307：真实漂移（scope 变化）仍必须重写登记。"""
+    _configure_software(monkeypatch)
+    project = _register_project(service, project_dir)
+    registration_path = project_dir / ".agentchatroom" / "project.json"
+    document = json.loads(registration_path.read_text(encoding="utf-8"))
+    drifted = {"kind": "git", "identity": "drifted", "logical_path": ""}
+    document["registrations"][0]["scope"] = drifted
+    registration_path.write_text(
+        json.dumps(document, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+
+    # selected_project_id resolves the checkout from the stored root, so the
+    # self-heal block is the only thing that can repair the drifted scope.
+    outcome = _bootstrap(
+        service,
+        project_dir,
+        workspace_roots=[],
+        selected_project_id=project["id"],
+    )
+
+    assert outcome.public["status"] == "ready"
+    repaired = json.loads(registration_path.read_text(encoding="utf-8"))
+    assert repaired["registrations"][0]["scope"] != drifted
+    assert repaired["registrations"][0]["project_key"] == project["project_key"]
+
+
+def test_bootstrap_adapter_issues_no_bare_session_select():
+    """#307：bootstrap 适配层不得绕过域服务手写不限定项目的 SQL。"""
+    source = Path(bootstrap.__file__).read_text(encoding="utf-8")
+    assert not re.search(
+        r"SELECT\s+.*?\s+FROM\s+agent_sessions", source, re.IGNORECASE | re.DOTALL
+    )
+    assert "service.database.connect" not in source
+
+
+def test_restored_session_links_credential_to_its_own_member(
+    monkeypatch, service, project_dir
+):
+    """#307：恢复路径的凭据关联改走 verify_session，member_id 仍要取到。"""
+    _configure_software(monkeypatch)
+    project = _register_project(service, project_dir)
+    first = _bootstrap(service, project_dir)
+    assert first.binding is not None
+    credential = service.issue_agent_token(
+        project["id"], name="Restored credential"
+    )["credential"]
+
+    restored = _bootstrap(
+        service,
+        project_dir,
+        restore_binding=first.binding,
+        credential_id=credential["id"],
+    )
+
+    assert restored.binding is not None
+    assert restored.binding.session_id == first.binding.session_id
+    linked = next(
+        item
+        for item in service.list_agent_tokens(project["id"])
+        if item["id"] == credential["id"]
+    )
+    session = service.verify_session(
+        project["id"], first.binding.session_id, first.binding.token
+    )
+    assert linked["member_id"] == session["member_id"]
 
 
 def test_bind_runtime_arguments_derives_actor_session_id_with_token():

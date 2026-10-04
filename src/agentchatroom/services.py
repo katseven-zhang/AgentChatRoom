@@ -17,13 +17,21 @@ import subprocess
 import threading
 import time
 import uuid
+from contextlib import contextmanager
 from functools import wraps
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping
 
 from .config import Settings
-from .backup import backup_postgresql, backup_sqlite, restore_postgresql
+from .backup import (
+    BackupError,
+    _validate_sqlite_backup,
+    backup_postgresql,
+    backup_sqlite,
+    restore_postgresql,
+    restore_sqlite,
+)
 from .contracts import (
     ASSIGNMENT_RESPONSES,
     ASSIGNMENT_STATUSES,
@@ -47,6 +55,8 @@ from .contracts import (
     TASK_INTEGRATION_STATUSES,
     TASK_INTAKE_STATUSES,
     TASK_INTAKE_TRANSITIONS,
+    TASK_PRIORITY_MAX,
+    TASK_PRIORITY_MIN,
     TASK_RELEASE_COMPAT_REASON_CODE,
     TASK_RELEASE_EXECUTION_STATUSES,
     TASK_RELEASE_REASON_CODES,
@@ -54,16 +64,24 @@ from .contracts import (
     TASK_VIEW_ATTENTION_PHASES,
     TASK_VIEW_SCHEMA_VERSION,
     TASK_VIEW_UNCLASSIFIED_PHASE,
+    task_available_actions,
     task_contract,
     task_state_for_legacy_status,
     task_view,
 )
 from .database import SCHEMA_VERSION, DatabaseBackend
+from .redaction import SENSITIVE_KEYS, redact_value
 from .errors import DomainError
 from .project_registration import (
+    checkout_registration_change,
+    checkout_scope,
     detect_git_info,
     derive_logical_path,
     load_checkout_registration,
+    register_checkout_project,
+    repository_directory,
+    stored_project_scope,
+    validate_project_coordination_instructions,
 )
 from .task_history import (
     TASK_HISTORY_LIMIT_MAX,
@@ -113,18 +131,38 @@ PROJECT_SETTINGS_DEFAULTS: dict[str, Any] = {
     "mcp_message_context_limit": 5,
 }
 SOFTWARE_MEMBER_PREFIX = "software:"
-REQUEST_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
-SENSITIVE_REQUEST_FIELDS = {
-    "token",
-    "agent_token",
-    "admin_token",
-    "password",
-    "secret",
-    "authorization",
-    "bearer",
-    "cookie",
-    "api_key",
+# Whether the server confirmed that a registered workspace path really belongs
+# to the Project. A remote join sends the path in the request body, so it is
+# caller-asserted; the local MCP branch validates the scope before registering
+# and marks its own. Server-side git evidence is only ever collected from a
+# verified root, because an asserted path lets a client aim the server's
+# `git -C` at any repository the process can read.
+WORKSPACE_EVIDENCE_SOURCE_KEY = "agentchatroom_evidence_source"
+WORKSPACE_EVIDENCE_SERVER_VERIFIED = "server_verified"
+WORKSPACE_EVIDENCE_CLIENT_ASSERTED = "client_asserted"
+# One vocabulary for "this Project credential can no longer open a Session", so
+# REST, MCP and CLI report the same failure instead of three different ones.
+# The internal agent_token_* codes stay for token management operations.
+PROJECT_CREDENTIAL_REVOKED = "project_credential_revoked"
+PROJECT_CREDENTIAL_EXPIRED = "project_credential_expired"
+PROJECT_CREDENTIAL_INVALID = "project_credential_invalid"
+CREDENTIAL_FAILURE_CODES = {
+    "agent_token_revoked": PROJECT_CREDENTIAL_REVOKED,
+    "agent_token_expired": PROJECT_CREDENTIAL_EXPIRED,
+    "agent_token_invalid": PROJECT_CREDENTIAL_INVALID,
 }
+CREDENTIAL_FAILURE_ACTIONS = {
+    PROJECT_CREDENTIAL_REVOKED: "issue_new_project_token_and_update_bundle",
+    PROJECT_CREDENTIAL_EXPIRED: "renew_project_token",
+    PROJECT_CREDENTIAL_INVALID: "replace_project_token_in_bundle",
+}
+CREDENTIAL_FAILURE_MESSAGES = {
+    PROJECT_CREDENTIAL_REVOKED: "The selected Project Token has been revoked",
+    PROJECT_CREDENTIAL_EXPIRED: "The selected Project Token has expired",
+    PROJECT_CREDENTIAL_INVALID: "The selected Project Token is invalid",
+}
+REQUEST_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
+SENSITIVE_REQUEST_FIELDS = SENSITIVE_KEYS
 logger = logging.getLogger(__name__)
 
 _UNCLASSIFIED_TASK_VIEW_WARNED: set[str] = set()
@@ -181,6 +219,60 @@ def _sql_placeholders(count: int) -> str:
     return ",".join("?" for _ in range(count))
 
 
+# SQLite's default SQLITE_MAX_VARIABLE_NUMBER is 999; batching an ``IN`` list
+# under that cap keeps the same statement working on both backends.
+_SQL_PARAMETER_CHUNK = 400
+
+
+# Snapshot page cursors are `created_at|id` (`created_at|event_id|session_id`
+# for acknowledgements). Each segment is bounded and shape-checked before it
+# reaches SQL or `int()`: the cursor arrives from a query string, and a segment
+# count alone let `<ts>|x|y` through to a ValueError inside the projection.
+_PAGE_CURSOR_MAX_PART_LENGTH = 64
+_PAGE_CURSOR_TIMESTAMP_LENGTH = 32
+_PAGE_CURSOR_SEQ_LENGTH = 19
+_PAGE_CURSOR_IDENTIFIER_CHARS = frozenset(
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-."
+)
+_DECIMAL_DIGITS = frozenset("0123456789")
+
+
+def _invalid_page_cursor(cursor: str) -> DomainError:
+    return DomainError(
+        "invalid_page_cursor",
+        "Snapshot page cursor must be created_at|id (acks add event_id|session_id)",
+        status_code=422,
+        details={"cursor": cursor[:256]},
+    )
+
+
+def _page_cursor_part_ok(part: str, kind: str) -> bool:
+    """Whether one cursor segment matches the shape its position is used with."""
+    if kind == "timestamp":
+        # Stored created_at is iso_now(), so the cursor carries an ISO instant.
+        # It is compared as text, but it must also be a real instant: a garbage
+        # timestamp silently pages from a boundary that never existed.
+        if len(part) > _PAGE_CURSOR_TIMESTAMP_LENGTH:
+            return False
+        try:
+            parse_time(part)
+        except (ValueError, TypeError):
+            return False
+        return True
+    if kind == "seq":
+        # project_seq is a non-negative integer, and `_fetch_ack_page` compares
+        # it numerically after `int()`.
+        if not part or len(part) > _PAGE_CURSOR_SEQ_LENGTH:
+            return False
+        return set(part) <= _DECIMAL_DIGITS
+    # identifier: an opaque row/session key. It is compared for equality, so the
+    # only requirements are that it is a bounded token free of `|` (guaranteed
+    # by the split), whitespace and control characters.
+    if not part or len(part) > _PAGE_CURSOR_MAX_PART_LENGTH:
+        return False
+    return set(part) <= _PAGE_CURSOR_IDENTIFIER_CHARS
+
+
 class TokenTouchBuffer:
     """Queue last_used_at updates so token verification stays on a read path."""
 
@@ -202,6 +294,11 @@ class TokenTouchBuffer:
         self._wakeup = threading.Event()
         self._backoff_seconds = 0.05
         self._thread: threading.Thread | None = None
+        # Registered so an interpreter that exits without close() still flushes,
+        # and unregistered by close() so the buffer stops being reachable from
+        # the atexit registry - otherwise every rebuilt service (a config retry,
+        # a second create_app in one process) left a live callback behind that
+        # would touch an already-closed database at exit.
         atexit.register(self.flush)
 
     def note(self, credential_id: str) -> None:
@@ -209,6 +306,11 @@ class TokenTouchBuffer:
             return
         used_at = iso_now()
         with self._lock:
+            if self._closed:
+                # Re-checked under the lock: close() sets the flag inside it, so
+                # a note that raced the close would otherwise queue work for a
+                # worker that is about to stop and never run it.
+                return
             self._pending[credential_id] = used_at
             self._calls_since_flush += 1
             due = (
@@ -221,6 +323,8 @@ class TokenTouchBuffer:
 
     def flush(self) -> None:
         with self._lock:
+            if self._closed and not self._pending:
+                return
             pending = self._pending
             self._pending = {}
             self._calls_since_flush = 0
@@ -243,16 +347,29 @@ class TokenTouchBuffer:
         except Exception:
             logger.exception("Failed to flush Agent token last_used_at updates")
             with self._lock:
-                for credential_id, used_at in pending.items():
-                    self._pending.setdefault(credential_id, used_at)
+                # A closed buffer has no worker left to retry, so re-queueing
+                # would only strand the update: the caller's own note() path
+                # will re-touch the credential, and nothing is lost that a later
+                # verification would not record anyway.
+                if not self._closed:
+                    for credential_id, used_at in pending.items():
+                        self._pending.setdefault(credential_id, used_at)
             self._backoff_seconds = min(self._backoff_seconds * 2, 5.0)
             if not self._closed:
                 time.sleep(self._backoff_seconds)
 
     def close(self) -> None:
-        self._closed = True
+        with self._lock:
+            self._closed = True
+            thread = self._thread
         self._wakeup.set()
+        # Join before the final flush: the worker is the other writer of
+        # _pending, so flushing while it is still running lets it re-queue an
+        # update behind this one and exit without writing it.
+        if isinstance(thread, threading.Thread) and thread.is_alive():
+            thread.join(timeout=5)
         self.flush()
+        atexit.unregister(self.flush)
 
     def _ensure_thread_locked(self) -> None:
         if self._thread is None or not self._thread.is_alive():
@@ -277,7 +394,29 @@ def utc_now() -> datetime:
 
 
 def iso_now() -> str:
-    return utc_now().isoformat().replace("+00:00", "Z")
+    """The current instant in a fixed-width UTC form.
+
+    ``isoformat()`` drops the fractional part when it is exactly zero, so two
+    instants a few hundred milliseconds apart could produce ``...13Z`` and
+    ``...13.000001Z`` - and those do not sort in the order they happened:
+    ``'...13.000001Z' < '...13Z'`` is true as a string comparison, so a
+    text-ordered ``ORDER BY created_at`` puts the later row first. Since
+    several listings order on that column with no tie-break, the width has to
+    be constant. ``parse_time`` still accepts both spellings, so historical
+    rows written before this keep reading.
+    """
+    return utc_now().strftime("%Y-%m-%dT%H:%M:%S.%f") + "Z"
+
+
+def format_instant(moment: datetime) -> str:
+    """Render one instant the way :func:`iso_now` does.
+
+    Deadlines and creation stamps share columns and comparisons with the values
+    ``iso_now`` produces, so they have to be spelled the same way: an
+    isoformat-without-fraction stamp next to a fixed-width one is what made a
+    text-ordered listing non-monotonic.
+    """
+    return moment.strftime("%Y-%m-%dT%H:%M:%S.%f") + "Z"
 
 
 def parse_time(value: str) -> datetime:
@@ -314,7 +453,18 @@ def request_payload_for_hash(value: Any, *, field_name: str = "") -> Any:
     return str(value)
 
 
-def idempotent_write(operation: str):
+def idempotent_write(operation: str, *, replay_guard: str | None = None):
+    """Deduplicate a write by request id, and optionally refuse a stale replay.
+
+    ``replay_guard`` names a method on the service. It receives the recorded
+    response and returns False when the effect it describes has lapsed, which
+    must be decided from live state: a lease deadline stored in the record is
+    the snapshot from when it was granted and says nothing about now. A lease
+    or a heartbeat is only protected until its deadline, so replaying the
+    recorded "acquired" answer told the Agent it still held the file while
+    nothing was holding it. For those operations the record is dropped and the
+    action runs again, handing back a live effect instead of a stale success.
+    """
     def decorate(callable_):
         call_signature = inspect.signature(callable_)
 
@@ -337,11 +487,33 @@ def idempotent_write(operation: str):
                 operation=operation,
                 request_payload=payload,
                 action=lambda: callable_(self, *args, **kwargs),
+                replay_guard=getattr(self, replay_guard) if replay_guard else None,
             )
 
         return wrapped
 
     return decorate
+
+
+def _iter_deadlines(value: Any, depth: int = 0):
+    """Yield every ``*expires_at`` string in a recorded response.
+
+    The deadline is nested differently per operation - a lease answers
+    ``{"lease": {"expires_at": ...}}`` while a heartbeat puts
+    ``token_expires_at`` at the top level - so the guard cannot assume a key.
+    """
+    if depth > 4:
+        return
+    if isinstance(value, dict):
+        for key, item in value.items():
+            if isinstance(key, str) and key.endswith("expires_at"):
+                if isinstance(item, str) and item:
+                    yield item
+            else:
+                yield from _iter_deadlines(item, depth + 1)
+    elif isinstance(value, list):
+        for item in value:
+            yield from _iter_deadlines(item, depth + 1)
 
 
 def row_dict(row: Mapping[str, Any] | None) -> dict[str, Any] | None:
@@ -370,10 +542,15 @@ def normalize_project_settings(settings: dict[str, Any] | None) -> dict[str, Any
         "default_task_priority",
         PROJECT_SETTINGS_DEFAULTS["default_task_priority"],
     )
-    if not isinstance(default_priority, int) or isinstance(default_priority, bool) or not 0 <= default_priority <= 4:
+    if (
+        not isinstance(default_priority, int)
+        or isinstance(default_priority, bool)
+        or not TASK_PRIORITY_MIN <= default_priority <= TASK_PRIORITY_MAX
+    ):
         raise DomainError(
             "invalid_project_settings",
-            "default_task_priority must be an integer between 0 and 4",
+            "default_task_priority must be an integer between "
+            f"{TASK_PRIORITY_MIN} and {TASK_PRIORITY_MAX}",
         )
     retention = values.get(
         "audit_retention_days",
@@ -429,18 +606,117 @@ def normalize_remote(remote: str) -> str:
 
 
 def normalize_pattern(pattern: str) -> str:
+    """Fold every spelling of one scope onto the one stored pattern.
+
+    A leading ``./`` was stripped only once and inner ``.`` segments survived, so
+    ``././src`` and ``src``, or ``src/./a.py`` and ``src/a.py``, were different
+    strings: two Agents could then hold exclusive leases on the same file with no
+    conflict event, the pre-commit check saw a different scope than the one the
+    other lease actually covered, and the owning Session's idempotent fast path
+    created a second row instead of renewing the first.
+    """
     value = pattern.strip().replace("\\", "/")
-    value = re.sub(r"^\./", "", value)
-    value = re.sub(r"/+", "/", value).strip("/")
-    if not value or value.startswith("../") or "/../" in f"/{value}/":
-        raise DomainError("invalid_path_pattern", "Path pattern must stay inside the project")
-    return value
+    segments = [segment for segment in value.split("/") if segment not in ("", ".")]
+    if not segments or any(segment == ".." for segment in segments):
+        raise DomainError(
+            "invalid_path_pattern", "Path pattern must stay inside the project"
+        )
+    return "/".join(segments)
+
+
+def normalize_evidence_path(value: Any) -> str:
+    """Fold one changed-file claim without lease-glob semantics.
+
+    `files` on a message, handoff, or integration is a claim about concrete
+    files that a commit can prove. Reusing the lease pattern for it accepted
+    absolute and drive-letter paths (which reach outside the Project and end up
+    in exported audit data), and answered a blank entry with the lease error
+    code `invalid_path_pattern` on a surface that never mentioned a lease.
+    """
+    text = str(value or "").strip().replace("\\", "/")
+    if not text:
+        raise DomainError(
+            "invalid_changed_file",
+            "A changed file entry must not be empty",
+            status_code=422,
+            details={
+                "required_action": "list_project_relative_file_paths_without_globs",
+                "field": "files",
+            },
+        )
+    if any(marker in text for marker in "*?[]"):
+        raise DomainError(
+            "invalid_changed_file",
+            "A changed file must name one concrete path, not a glob pattern",
+            status_code=422,
+            details={
+                "required_action": "list_each_changed_file_separately",
+                "field": "files",
+                "value": text,
+            },
+        )
+    if text.startswith("/") or text.startswith("~") or re.match(r"^[A-Za-z]:", text):
+        raise DomainError(
+            "invalid_changed_file",
+            "A changed file must be relative to the project root",
+            status_code=422,
+            details={
+                "required_action": "strip_the_absolute_prefix_and_keep_the_project_relative_path",
+                "field": "files",
+                "value": text,
+            },
+        )
+    segments = [segment for segment in text.split("/") if segment not in ("", ".")]
+    if not segments or any(segment == ".." for segment in segments):
+        raise DomainError(
+            "invalid_changed_file",
+            "A changed file must stay inside the project",
+            status_code=422,
+            details={
+                "required_action": "keep_the_path_inside_the_project",
+                "field": "files",
+                "value": text,
+            },
+        )
+    return "/".join(segments)
 
 
 def lease_modes_conflict(left: str, right: str) -> bool:
     if "readonly" in {left, right}:
         return False
     return "exclusive" in {left, right}
+
+
+def _pattern_covers(broad: str, narrow: str) -> bool:
+    """True when every path inside ``narrow`` is also inside ``broad``.
+
+    A same-identity takeover must only retire leases the new scope actually
+    replaces. Releasing a broader lease because it merely *overlaps* a narrower
+    request silently shrank the caller's own protection.
+
+    Comparison folds case, storage does not: a lease registered as
+    ``README.md`` keeps that spelling in the Room while still conflicting with
+    one registered as ``readme.md``. Windows and macOS filesystems do not
+    distinguish them, so treating the two as different scopes let two Agents hold
+    exclusive leases on one file - the exact outcome this check exists to
+    prevent. The siblings here already compare with casefold, so the case
+    sensitivity was the outlier rather than the rule.
+    """
+    broad = normalize_pattern(broad).casefold()
+    narrow = normalize_pattern(narrow).casefold()
+    if broad == narrow:
+        return True
+    if fnmatch.fnmatchcase(narrow, broad):
+        return True
+    prefix = _static_prefix(broad)
+    return bool(prefix) and (
+        narrow == prefix or narrow.startswith(f"{prefix}/") or narrow.startswith(prefix)
+    )
+
+
+# How much protection each mode buys, so re-acquiring one scope with a different
+# mode is an explicit upgrade or a refused downgrade rather than a silent no-op.
+LEASE_MODE_STRENGTH = {"readonly": 0, "shared": 1, "exclusive": 2}
 
 
 def _static_prefix(pattern: str) -> str:
@@ -451,15 +727,45 @@ def _static_prefix(pattern: str) -> str:
     return pattern[:wildcard].rstrip("/")
 
 
+def _patterns_can_cover_same_path(left: str, right: str) -> bool:
+    """Compare two scopes segment by segment instead of giving up.
+
+    A pattern that begins with a wildcard has no static prefix, and the old code
+    read that as "overlaps everything": one Agent holding ``*.md`` then blocked an
+    unrelated ``src/app.py``, including under the pre-commit policy. Walking the
+    segments answers the real question instead - can one path satisfy both.
+    """
+    for left_segment, right_segment in zip(left.split("/"), right.split("/")):
+        if left_segment == "**" or right_segment == "**":
+            continue
+        if (
+            left_segment == right_segment
+            or fnmatch.fnmatchcase(left_segment, right_segment)
+            or fnmatch.fnmatchcase(right_segment, left_segment)
+        ):
+            continue
+        return False
+    return True
+
+
 def patterns_overlap(left: str, right: str) -> bool:
-    left = normalize_pattern(left)
-    right = normalize_pattern(right)
+    """True when two lease scopes can cover a common path.
+
+    Case is folded here for the same reason as in ``_pattern_covers``: the
+    stored pattern keeps its spelling, but two Agents naming one file
+    differently still collide on it, because the filesystem they are protecting
+    does not distinguish the two names either.
+    """
+    left = normalize_pattern(left).casefold()
+    right = normalize_pattern(right).casefold()
     if left == right or fnmatch.fnmatchcase(left, right) or fnmatch.fnmatchcase(right, left):
         return True
     left_prefix = _static_prefix(left)
     right_prefix = _static_prefix(right)
     if not left_prefix or not right_prefix:
-        return True
+        # No static prefix only means the pattern starts with a wildcard; it does
+        # not make it overlap every other scope in the project.
+        return _patterns_can_cover_same_path(left, right)
     return (
         left_prefix == right_prefix
         or left_prefix.startswith(f"{right_prefix}/")
@@ -492,24 +798,186 @@ def _project_scope(
     return ("path", os.path.normcase(str(git_root.resolve())), logical_path.casefold())
 
 
+def canonical_workspace_key(value: str) -> str:
+    """The identity a workspace path is stored and matched under.
+
+    A registered path is a key, not a display string: the row is looked up by
+    it and sessions bind to whichever row they hit. Storing the raw text means
+    the same checkout written with different case, mixed separators or a
+    trailing slash becomes three workspaces; sessions then bind to different
+    rows, and ``_trusted_worktree`` validates an Agent-reported worktree
+    against a different root each time - so the git evidence comes from no
+    consistent anchor.
+
+    Resolution is best-effort: a path that cannot be resolved (a remote or
+    temporarily unavailable mount) still normalises by separator and case
+    rather than raising, because refusing to register it would be a worse
+    answer than registering a slightly coarser key.
+    """
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    try:
+        text = str(Path(text).expanduser().resolve(strict=False))
+    except (OSError, ValueError, RuntimeError):
+        pass
+    # normcase is a no-op off Windows, so separators are folded separately:
+    # a client on one OS registering a path for another must still match.
+    text = text.replace("\\", "/")
+    while len(text) > 1 and text.endswith("/"):
+        text = text[:-1]
+    return os.path.normcase(text)
+
+
 def _stored_project_scope(project: Mapping[str, Any]) -> tuple[str, str, str]:
-    logical_path = str(project["logical_path"] or "")
-    remote = str(project["git_remote"] or "")
-    if remote:
-        return ("git", normalize_remote(remote), logical_path.casefold())
-    root_path = Path(str(project["root_path"])).expanduser().resolve()
-    return ("path", os.path.normcase(str(root_path)), logical_path.casefold())
+    """The stored row's scope, from the same implementation the registration and
+    bootstrap paths use, so no second copy can drift again."""
+    try:
+        scope = stored_project_scope(dict(project))
+    except (OSError, ValueError):
+        # A root_path that cannot be resolved (legacy, corrupt, or deliberately
+        # malformed) owns no scope at all: it must never match a candidate and
+        # must never turn an ordinary read into a 500.
+        return ("unreadable", "", "")
+    return (
+        scope["kind"],
+        scope["identity"],
+        scope["logical_path"].casefold(),
+    )
+
+
+def run_git_capture(
+    command: list[str], *, timeout_seconds: float = 5
+) -> tuple[int, str, str]:
+    """Run a git command and return ``(returncode, stdout, stderr)`` as text.
+
+    ``text=True`` decodes with the process locale, which on Windows is the
+    console code page — not the UTF-8 that git actually writes. A branch or
+    path with non-ASCII characters then becomes mojibake, and because
+    UnicodeDecodeError is a ValueError it slips past the ``OSError`` /
+    ``SubprocessError`` handling, surfacing as a 500 or as corrupted bytes
+    written into append-only evidence. Decoding explicitly keeps the result
+    readable and the failure total.
+    """
+    try:
+        completed = subprocess.run(
+            command,
+            check=False,
+            capture_output=True,
+            timeout=timeout_seconds,
+            stdin=subprocess.DEVNULL,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return 1, "", ""
+    return (
+        completed.returncode,
+        completed.stdout.decode("utf-8", "replace").strip(),
+        completed.stderr.decode("utf-8", "replace").strip(),
+    )
+
+
+def is_strict_int(value: Any) -> bool:
+    """True only for a genuine integer.
+
+    ``bool`` is a subclass of ``int`` in Python, so a JSON ``false`` passes an
+    ``isinstance(value, int)`` check and is then stored as exit code 0 — turning
+    a failed check into a recorded pass inside append-only evidence that can
+    never be rewritten. Adapters share this one predicate so REST, MCP and CLI
+    cannot disagree about what an integer is.
+    """
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def require_int_field(value: Any, field: str) -> Any:
+    """Pass an integer-typed input through, refusing booleans.
+
+    REST bodies arrive as untyped dictionaries, so ``priority: true`` reaches
+    the domain as a bool and still satisfies a range check such as
+    ``0 <= True <= 4``. Every integer-typed entry point routes through this so
+    REST, MCP and CLI cannot disagree about what an integer is.
+    """
+    if value is None:
+        return None
+    if not is_strict_int(value):
+        raise DomainError(
+            f"invalid_{field}",
+            f"{field.replace('_', ' ')} must be an integer",
+            status_code=422,
+            details={"field": field},
+        )
+    return int(value)
+
+
+def require_int_or_default(value: Any, field: str, default: int) -> int:
+    """Integer input with a fallback, refusing booleans.
+
+    Paging parameters are optional, and the old spelling was
+    ``int(after or 0)``. That quietly accepted ``after=true`` as 1: JSON
+    booleans reach the domain as bool, and ``0 <= True <= 4`` or ``int(True)``
+    is a valid number, so a client sending the wrong type got a confident
+    answer instead of a correction. The default is only for a missing value or
+    an explicit falsy zero, never for a wrong type.
+    """
+    if value is None:
+        return default
+    if not is_strict_int(value):
+        raise DomainError(
+            f"invalid_{field}",
+            f"{field.replace('_', ' ')} must be an integer",
+            status_code=422,
+            details={"field": field},
+        )
+    return int(value)
+
+
+def credential_state_error(reason: str) -> DomainError:
+    """Map a credential failure onto the shared Project-credential vocabulary.
+
+    Adapters raise the internal ``agent_token_*`` codes from the domain; every
+    caller that wants to tell an Agent what to do next uses this instead, so
+    REST, MCP and CLI all return the same code, message and required_action.
+    """
+    code = CREDENTIAL_FAILURE_CODES.get(reason, PROJECT_CREDENTIAL_INVALID)
+    return DomainError(
+        code,
+        CREDENTIAL_FAILURE_MESSAGES[code],
+        status_code=401,
+        details={"required_action": CREDENTIAL_FAILURE_ACTIONS[code]},
+    )
+
+
+def _require_live_credential(row: Mapping[str, Any]) -> None:
+    """Refuse a credential that was revoked or has already expired.
+
+    Opening a Session is exactly as privileged as using the credential, so the
+    same liveness rule that guards an authenticated call must guard a join.
+    """
+    if row["revoked_at"] is not None:
+        raise credential_state_error("agent_token_revoked")
+    if parse_time(row["expires_at"]) <= utc_now():
+        raise credential_state_error("agent_token_expired")
 
 
 class AgentChatRoomService:
     def __init__(self, database: DatabaseBackend, settings: Settings) -> None:
         self.database = database
         self.settings = settings
-        self._retention_last_run: dict[str, float] = {}
+        # Monotonic deadlines, not wall-clock timestamps: an NTP correction or a
+        # resumed VM can move time backwards and stall retention for the whole
+        # process lifetime.
+        self._retention_next_run: dict[str, float] = {}
         # Serializes create_backup / restore_backup (including auto_backup_worker)
         # so a backup cannot snapshot a half-restored SQLite file and restore
         # stale checks cannot race concurrent in-process backups.
         self._backup_restore_lock = threading.RLock()
+        self._repository_selection_lock = threading.RLock()
+        # Retention as last applied through management, overriding the value
+        # captured in Settings at startup. Without this, saving a larger
+        # retention count would be silently undone by the next manual backup,
+        # which prunes with the stale startup number and deletes backups
+        # irreversibly.
+        self._applied_backup_max_kept: int | None = None
         # Wired by the API layer to the MCP transport state lookup: "alive",
         # "gone" (reaped transport, tombstone retained) or "unknown" for
         # sessions without an HTTP transport. Presence heartbeats are
@@ -560,10 +1028,12 @@ class AgentChatRoomService:
         retention_days = int(getattr(self.settings, "idempotency_retention_days", 30))
         if retention_days <= 0:
             return {"deleted": 0, "retention_days": 0}
-        now = time.time()
-        if not force and now - self._retention_last_run.get("idempotency", 0.0) < 3600:
+        now = time.monotonic()
+        if not force and now < self._retention_next_run.get("idempotency", 0.0):
             return {"deleted": 0, "retention_days": retention_days, "skipped": True}
-        self._retention_last_run["idempotency"] = now
+        self._retention_next_run["idempotency"] = (
+            now + self.retention_sweep_interval_seconds()
+        )
         cutoff = (utc_now() - timedelta(days=retention_days)).isoformat().replace(
             "+00:00", "Z"
         )
@@ -593,6 +1063,33 @@ class AgentChatRoomService:
             )
         return materialized
 
+    @staticmethod
+    def _review_criteria_map(criteria: list[Any]) -> dict[str, str]:
+        """Criterion name -> verdict, with the shape every review surface accepts.
+
+        Reviews are append-only evidence: a blank criterion or a status outside
+        passed/failed would otherwise be permanently readable as an assessment.
+        """
+        assessed: dict[str, str] = {}
+        for item in criteria:
+            if not isinstance(item, Mapping):
+                raise DomainError(
+                    "invalid_review_criteria",
+                    "Every review criterion must be an object with criterion/status",
+                    status_code=422,
+                )
+            criterion = str(item.get("criterion", "")).strip()
+            status = str(item.get("status", "")).strip()
+            if not criterion or status not in {"passed", "failed"}:
+                raise DomainError(
+                    "invalid_review_criteria",
+                    "Every review criterion requires a criterion and passed/failed status",
+                    status_code=422,
+                    details={"criterion": criterion, "status": status},
+                )
+            assessed[criterion] = status
+        return assessed
+
     def _validate_test_evidence_list(
         self, tests: Any, *, field: str = "tests"
     ) -> list[dict[str, Any]]:
@@ -620,8 +1117,8 @@ class AgentChatRoomService:
                     status_code=422,
                     details={"field": field, "unexpected_keys": unexpected},
                 )
-            if not str(test.get("command", "")).strip() or not isinstance(
-                test.get("exit_code"), int
+            if not str(test.get("command", "")).strip() or not is_strict_int(
+                test.get("exit_code")
             ):
                 raise DomainError(
                     "invalid_test_evidence",
@@ -662,6 +1159,7 @@ class AgentChatRoomService:
         operation: str,
         request_payload: dict[str, Any],
         action: Callable[[], dict[str, Any]],
+        replay_guard: Callable[[dict], bool] | None = None,
     ) -> dict[str, Any]:
         clean_request_id = request_id.strip()
         if not REQUEST_ID_PATTERN.fullmatch(clean_request_id):
@@ -677,8 +1175,49 @@ class AgentChatRoomService:
         )
         request_hash = hashlib.sha256(canonical_request.encode()).hexdigest()
         scope = f"project:{project_id}"
+        # Liveness is decided before any write transaction opens. Reading it
+        # inside one holds the SQLite write lock (or the PostgreSQL advisory
+        # lock) across a second connection's query, so a replay check that
+        # touched agent_sessions or file_leases serialised every other writer
+        # for the length of that read - and the answer cannot change between
+        # the two statements anyway.
+        recorded = self._idempotency_record(scope, clean_request_id)
+        replay_live: bool | None = None
+        if recorded is not None:
+            if (
+                recorded["operation"] != operation
+                or recorded["request_hash"] != request_hash
+            ):
+                raise DomainError(
+                    "idempotency_conflict",
+                    "Request ID was already used for different input",
+                    status_code=409,
+                    details={"request_id": clean_request_id},
+                )
+            if not recorded["response_json"]:
+                raise DomainError(
+                    "idempotency_in_progress",
+                    "The original request is still being processed",
+                    status_code=409,
+                    details={"request_id": clean_request_id},
+                )
+            replay = json_load(recorded["response_json"], {})
+            replay_live = replay_guard is None or replay_guard(replay)
+            if replay_live:
+                return {
+                    **replay,
+                    "request_id": clean_request_id,
+                    "idempotent_replay": True,
+                }
+        # The reservation is deliberately its own short transaction. The action
+        # can run git subprocesses and touch disk, so holding the database write
+        # lock across it stalls every other writer — and freezes the
+        # Streamable-HTTP event loop — for as long as that work takes.
         with self.database.connect(write=True) as connection:
             self._require_project(connection, project_id)
+            # Re-read under the write lock: another writer may have completed or
+            # replaced this request_id since the liveness read, and only the
+            # state inside the transaction may decide what to do with it.
             existing = connection.execute(
                 """
                 SELECT operation, request_hash, response_json
@@ -705,12 +1244,31 @@ class AgentChatRoomService:
                         status_code=409,
                         details={"request_id": clean_request_id},
                     )
-                replay = json_load(existing["response_json"], {})
-                return {
-                    **replay,
-                    "request_id": clean_request_id,
-                    "idempotent_replay": True,
-                }
+                if replay_live is None or existing["response_json"] == (
+                    recorded["response_json"] if recorded is not None else None
+                ):
+                    # Nothing raced this request while liveness was being read,
+                    # so the answer computed outside the transaction still holds.
+                    replay = json_load(existing["response_json"], {})
+                    if replay_guard is None or replay_guard(replay):
+                        return {
+                            **replay,
+                            "request_id": clean_request_id,
+                            "idempotent_replay": True,
+                        }
+                # The recorded effect has expired (a lapsed lease, a heartbeat
+                # that stopped keeping the Session alive). Replaying it would
+                # report success for protection the caller no longer has, so
+                # drop the record and run the action again to produce a live
+                # effect.
+                connection.execute(
+                    """
+                    DELETE FROM idempotency_records
+                    WHERE scope = ? AND request_id = ?
+                    """,
+                    (scope, clean_request_id),
+                )
+                existing = None
 
             now = iso_now()
             connection.execute(
@@ -722,9 +1280,20 @@ class AgentChatRoomService:
                 """,
                 (scope, clean_request_id, operation, request_hash, now),
             )
+
+        try:
             result = action()
             if not isinstance(result, dict):
                 raise RuntimeError("Idempotent write results must be objects")
+        except BaseException:
+            # The action commits on its own now, so its failure can no longer
+            # roll the reservation back. Drop the unfinished record instead:
+            # leaving it behind would pin the request id to "in progress"
+            # forever and block every corrected retry.
+            self._release_idempotency_reservation(scope, clean_request_id)
+            raise
+
+        with self.database.connect(write=True) as connection:
             connection.execute(
                 """
                 UPDATE idempotency_records
@@ -733,11 +1302,106 @@ class AgentChatRoomService:
                 """,
                 (json_dump(result), iso_now(), scope, clean_request_id),
             )
-            return {
-                **result,
-                "request_id": clean_request_id,
-                "idempotent_replay": False,
-            }
+        # Writing is the only thing that makes the table grow, so a write is
+        # the right place to sweep it. Without this the records accumulated
+        # for the whole process lifetime whenever nobody read the audit log.
+        # The sweep is throttled internally by a monotonic deadline.
+        self.enforce_idempotency_retention()
+        return {
+            **result,
+            "request_id": clean_request_id,
+            "idempotent_replay": False,
+        }
+
+    def _idempotency_record(
+        self, scope: str, request_id: str
+    ) -> Mapping[str, Any] | None:
+        """Read one idempotency record without taking the write lock.
+
+        The replay guard that consumes this result queries leases or sessions,
+        and that read has to happen outside the write transaction; see
+        ``_execute_idempotent``.
+        """
+        with self.database.connect() as connection:
+            return connection.execute(
+                """
+                SELECT operation, request_hash, response_json
+                FROM idempotency_records
+                WHERE scope = ? AND request_id = ?
+                """,
+                (scope, request_id),
+            ).fetchone()
+
+    def _lease_replay_is_live(self, response: Mapping[str, Any]) -> bool:
+        """True while the recorded lease still exists unreleased and unexpired.
+
+        The stored response only carries the deadline as of the moment it was
+        granted, so liveness has to be read back from the row: an Agent that
+        replays after the lease lapsed must get a fresh one, not a success
+        describing protection that is gone.
+        """
+        lease = response.get("lease")
+        lease_id = lease.get("id") if isinstance(lease, dict) else None
+        if not lease_id:
+            return True
+        with self.database.connect() as connection:
+            row = connection.execute(
+                """
+                SELECT released_at, expires_at FROM file_leases WHERE id = ?
+                """,
+                (lease_id,),
+            ).fetchone()
+        if row is None:
+            return False
+        if row["released_at"] is not None:
+            return False
+        try:
+            return parse_time(str(row["expires_at"])) > utc_now()
+        except ValueError:
+            return False
+
+    def _session_replay_is_live(self, response: Mapping[str, Any]) -> bool:
+        """True while the recorded Session token has not expired.
+
+        A heartbeat replayed past its token deadline would keep reporting an
+        online Session that the service has already expired, so the check reads
+        the row rather than the stored timestamp.
+        """
+        session_id = response.get("id") or response.get("session_id")
+        if not session_id:
+            return True
+        with self.database.connect() as connection:
+            row = connection.execute(
+                """
+                SELECT token_expires_at, left_at FROM agent_sessions WHERE id = ?
+                """,
+                (session_id,),
+            ).fetchone()
+        if row is None:
+            return False
+        if row["left_at"] is not None:
+            return False
+        raw = row["token_expires_at"]
+        if not raw:
+            return True
+        try:
+            return parse_time(str(raw)) > utc_now()
+        except ValueError:
+            return False
+
+    def _release_idempotency_reservation(self, scope: str, request_id: str) -> None:
+        try:
+            with self.database.connect(write=True) as connection:
+                connection.execute(
+                    """
+                    DELETE FROM idempotency_records
+                    WHERE scope = ? AND request_id = ? AND response_json IS NULL
+                    """,
+                    (scope, request_id),
+                )
+        except Exception:
+            # Cleanup must never mask the failure that triggered it.
+            pass
 
     def _require_project(self, connection: Any, project_id: str) -> Mapping[str, Any]:
         row = connection.execute(
@@ -996,17 +1660,52 @@ class AgentChatRoomService:
         # 对外事件编号统一为 project_seq；物理主键 id 仅作存储内部标识。
         return int(row["project_seq"])
 
-    def _event_dict(
-        self, row: Mapping[str, Any], connection: Any | None = None
-    ) -> dict[str, Any]:
-        data = dict(row)
-        data["payload"] = json_load(data.pop("payload_json"), {})
-        if connection is not None and data.get("task_id"):
-            task = connection.execute(
-                "SELECT task_number FROM tasks WHERE id = ?",
-                (data["task_id"],),
-            ).fetchone()
-            data["task_number"] = int(task["task_number"]) if task else None
+    def _project_events(
+        self, connection: Any, rows: Iterable[Mapping[str, Any]]
+    ) -> list[dict[str, Any]]:
+        """Project a page of event rows, reading task numbers in one query.
+
+        ``_event_dict`` issued one ``SELECT task_number`` per event carrying a
+        ``task_id``, so a page cost 200 round trips: every SSE poll, every
+        ``room_sync``, every audit page and the whole export paid it again. The
+        same ``IN`` batch the task relations already use collapses the page to a
+        single lookup, and a task that no longer exists still projects as
+        ``task_number=None`` exactly as the per-event read did.
+        """
+        materialized = [dict(row) for row in rows]
+        if not materialized:
+            return []
+        task_ids = sorted(
+            {
+                str(row["task_id"])
+                for row in materialized
+                if row.get("task_id")
+            }
+        )
+        task_numbers: dict[str, int] = {}
+        if task_ids:
+            # Chunked so a page larger than the backend's parameter cap (SQLite
+            # defaults to 999) still projects instead of raising.
+            for start in range(0, len(task_ids), _SQL_PARAMETER_CHUNK):
+                chunk = task_ids[start : start + _SQL_PARAMETER_CHUNK]
+                for task in connection.execute(
+                    f"SELECT id, task_number FROM tasks "
+                    f"WHERE id IN ({_sql_placeholders(len(chunk))})",
+                    chunk,
+                ).fetchall():
+                    task_numbers[str(task["id"])] = int(task["task_number"])
+        events: list[dict[str, Any]] = []
+        for data in materialized:
+            data["payload"] = redact_value(json_load(data.pop("payload_json"), {}))
+            if data.get("task_id"):
+                data["task_number"] = task_numbers.get(str(data["task_id"]))
+            self._decorate_event_channel(data)
+            events.append(data)
+        return events
+
+    @staticmethod
+    def _decorate_event_channel(data: dict[str, Any]) -> None:
+        """Derive the default channel and rewrite the public event number."""
         if data["event_type"].startswith("review."):
             default_channel = "review"
         elif data["task_id"]:
@@ -1021,10 +1720,12 @@ class AgentChatRoomService:
         # name — one event, one citable number, on every adapter.
         data.pop("id", None)
         seq = data.get("project_seq")
+        # Always emit the key. A consumer reading event.id must not get
+        # undefined because a row happened to carry no public number, and a
+        # missing key is indistinguishable from a projection bug.
+        data["id"] = int(seq) if seq is not None else None
         if seq is not None:
-            data["id"] = int(seq)
             data["project_seq"] = int(seq)
-        return data
 
     def _project_dict(
         self,
@@ -1041,9 +1742,18 @@ class AgentChatRoomService:
             project_source = (
                 "git_remote"
                 if str(data.get("git_remote") or "").strip()
-                else "path"
+                else "git_local" if data.get("repository_path") else "path"
             )
         data["project_source"] = project_source
+        data["workspace_root"] = data["root_path"]
+        data["project_path"] = str(Path(data["root_path"]) / str(data.get("repository_path") or ""))
+        data["repository_root"] = ""
+        if project_source != "path" or data.get("repository_path"):
+            repository_root = Path(data["project_path"])
+            for _part in str(data.get("logical_path") or "").split("/"):
+                if _part:
+                    repository_root = repository_root.parent
+            data["repository_root"] = str(repository_root)
         if git_scope_recheck is not None:
             data["git_scope_recheck"] = dict(git_scope_recheck)
         return data
@@ -1250,6 +1960,74 @@ class AgentChatRoomService:
             )
         return clean
 
+    @staticmethod
+    def _reject_reserved_member_key(
+        value: str,
+        *,
+        kind: str,
+        metadata: Mapping[str, Any] | None,
+        management_authorized: bool,
+    ) -> str:
+        """Keep the durable identity namespace writable only by the backend.
+
+        A row under the ``software:`` prefix is adopted as a permanent software
+        identity the next time the matching client joins, so pre-staking one hands
+        the writer somebody else's identity (display name, member_id, and
+        therefore same-identity task reclaim).
+        """
+        clean = value.strip()
+        if not clean.casefold().startswith(SOFTWARE_MEMBER_PREFIX):
+            return clean
+        if not management_authorized:
+            raise DomainError(
+                "reserved_member_key",
+                "Member keys in the reserved software identity namespace are issued "
+                "by the backend when that identity first joins, or by an "
+                "authenticated management request",
+                status_code=409,
+                details={
+                    "reserved_prefix": SOFTWARE_MEMBER_PREFIX,
+                    "required_action": "use_management_identity",
+                },
+            )
+        values = metadata or {}
+        if (
+            kind != "software_agent"
+            or not values.get("managed_identity")
+            or not str(values.get("software_key") or "").strip()
+            or not str(values.get("client") or "").strip()
+        ):
+            raise DomainError(
+                "software_identity_unmanaged",
+                "A member in the reserved namespace must be issued as a managed "
+                "software identity with a software key and client binding",
+                status_code=409,
+                details={
+                    "required_action": "set_kind_software_agent_and_metadata_"
+                    "managed_identity_software_key_client"
+                },
+            )
+        return clean
+
+    @staticmethod
+    def _software_name_conflict(
+        connection: Any,
+        project_id: str,
+        name: str,
+        *,
+        exclude_member_key: str,
+    ) -> Mapping[str, Any] | None:
+        """Return the active software identity already using ``name``, if any."""
+        return connection.execute(
+            """
+            SELECT id, member_key FROM project_members
+            WHERE project_id = ? AND kind = 'software_agent' AND status = 'active'
+              AND lower(trim(name)) = lower(trim(?)) AND member_key != ?
+            LIMIT 1
+            """,
+            (project_id, name, exclude_member_key),
+        ).fetchone()
+
     def _ensure_software_member(
         self,
         connection: Any,
@@ -1273,8 +2051,35 @@ class AgentChatRoomService:
                     status_code=409,
                 )
             metadata = json_load(member["metadata_json"], {})
+            if (
+                str(member["kind"] or "") != "software_agent"
+                or not metadata.get("managed_identity")
+            ):
+                # Roster writes are blocked from this namespace, but rows can
+                # predate that rule. Only a row the backend issued may become a
+                # durable identity, never a pre-staked one.
+                raise DomainError(
+                    "software_identity_unmanaged",
+                    "This member key is reserved but was never issued as a managed "
+                    "software identity",
+                    status_code=409,
+                    details={
+                        "member_id": str(member["id"]),
+                        "required_action": "recreate_the_row_through_the_management_api_or_use_another_key",
+                    },
+                )
             expected_client = str(metadata.get("client") or "").strip().casefold()
-            if expected_client and expected_client != client.strip().casefold():
+            if not expected_client:
+                raise DomainError(
+                    "software_identity_client_unbound",
+                    "The managed software identity has no client binding to verify",
+                    status_code=409,
+                    details={
+                        "member_id": str(member["id"]),
+                        "required_action": "set_metadata_client_through_management",
+                    },
+                )
+            if expected_client != client.strip().casefold():
                 raise DomainError(
                     "software_identity_client_mismatch",
                     "The software identity is already bound to another client",
@@ -1282,15 +2087,9 @@ class AgentChatRoomService:
                 )
             return member, False
 
-        name_conflict = connection.execute(
-            """
-            SELECT id, member_key FROM project_members
-            WHERE project_id = ? AND kind = 'software_agent' AND status = 'active'
-              AND lower(trim(name)) = lower(trim(?)) AND member_key != ?
-            LIMIT 1
-            """,
-            (project_id, name, member_key),
-        ).fetchone()
+        name_conflict = self._software_name_conflict(
+            connection, project_id, name, exclude_member_key=member_key
+        )
         if name_conflict is not None:
             # 拒绝静默创建第二个同名 active 成员（#139）：同名不同 key 的
             # 接入必须走既有成员合并或由调用方改名，否则成员列表会出现
@@ -1331,6 +2130,49 @@ class AgentChatRoomService:
         ).fetchone()
         return member, True
 
+    def _require_joinable_member_identity(
+        self,
+        member: Mapping[str, Any],
+        *,
+        software_key: str,
+        management_reference: bool,
+    ) -> None:
+        """Refuse a member reference the caller cannot prove it owns.
+
+        A software-managed member is only joinable by presenting the same
+        durable software key that the member was registered with. A member
+        that carries no software identity of its own is only reachable through
+        an authenticated management reference, because nothing in a plain
+        join request can distinguish "operator asked for this offline
+        identity" from "caller guessed the member id".
+        """
+        data = dict(member)
+        metadata = json_load(data.get("metadata_json"), {})
+        pinned_key = str(metadata.get("software_key") or "").strip()
+        member_key = str(data.get("member_key") or "").strip()
+        if not pinned_key and member_key.startswith(SOFTWARE_MEMBER_PREFIX):
+            pinned_key = member_key[len(SOFTWARE_MEMBER_PREFIX) :]
+        requested = str(software_key or "").strip()
+        if pinned_key:
+            if requested and self._normalize_software_key(
+                pinned_key
+            ) == self._normalize_software_key(requested):
+                return
+        elif management_reference:
+            return
+        raise DomainError(
+            "software_identity_mismatch",
+            "Joining as this project member requires proving the same software "
+            "identity. Restore the original identity configuration, or issue a "
+            "management credential linked to that member.",
+            status_code=403,
+            details={
+                "required_action": (
+                    "restore_configured_software_identity_or_use_management_credential"
+                ),
+            },
+        )
+
     @staticmethod
     def _same_agent_identity(
         first: Mapping[str, Any] | None,
@@ -1347,6 +2189,149 @@ class AgentChatRoomService:
         first_key = str(first_data.get("agent_key") or "").strip()
         second_key = str(second_data.get("agent_key") or "").strip()
         return bool(first_key and second_key and first_key == second_key)
+
+    def _require_independent_reviewer(
+        self,
+        connection: Any,
+        project_id: str,
+        task: Mapping[str, Any],
+        reviewer: Mapping[str, Any],
+    ) -> None:
+        """Refuse a review by any software identity that authored the work.
+
+        Independence has to be judged against who *wrote* the task, not against
+        whoever owns it right now. Ownership moves - a report is rejected, the
+        task is reassigned, the owner Session ends - and every one of those
+        transitions used to turn the executing identity into an acceptable
+        reviewer of its own code. ``work_reports`` is the durable record of
+        authorship, so the whole set of contributing identities is compared.
+
+        The set being empty, or a contributing Session no longer resolving to a
+        row, is treated as "cannot show independence" rather than "independent":
+        a review that cannot prove a second party was involved must not be
+        recorded as if it had.
+        """
+        task_id = str(task["id"])
+        contributors = connection.execute(
+            """
+            SELECT DISTINCT r.session_id AS session_id,
+                   a.member_id AS member_id, a.agent_key AS agent_key
+            FROM work_reports r
+            LEFT JOIN agent_sessions a ON a.id = r.session_id
+            WHERE r.task_id = ? AND r.project_id = ?
+            """,
+            (task_id, project_id),
+        ).fetchall()
+        if not contributors:
+            raise DomainError(
+                "reviewer_independence_unprovable",
+                "No work report records who authored this task, so no reviewer "
+                "can be shown independent of it",
+                status_code=409,
+                details={"task_id": task_id, "required_action": "restore_work_report"},
+            )
+        unresolvable = sorted(
+            str(row["session_id"])
+            for row in contributors
+            if row["session_id"] is None
+            or (row["member_id"] is None and not (row["agent_key"] or "").strip())
+        )
+        if unresolvable:
+            # A missing Session row means the contributing identity can no
+            # longer be named, so it also cannot be excluded. Defaulting to
+            # independent here is exactly the hole this closes.
+            raise DomainError(
+                "reviewer_independence_unprovable",
+                "A Session that reported work on this task no longer resolves to "
+                "a software identity, so independence cannot be established",
+                status_code=409,
+                details={
+                    "task_id": task_id,
+                    "unresolvable_report_sessions": unresolvable,
+                    "required_action": "restore_session_or_reassign_task",
+                },
+            )
+        if any(
+            self._same_agent_identity(row, reviewer) for row in contributors
+        ):
+            raise DomainError(
+                "reviewer_not_independent",
+                "A software identity that reported work on this task cannot "
+                "independently verify it",
+                status_code=409,
+                details={
+                    "task_id": task_id,
+                    "contributing_session_ids": sorted(
+                        str(row["session_id"]) for row in contributors
+                    ),
+                },
+            )
+
+    def _owner_liveness(
+        self,
+        connection: Any,
+        project_id: str,
+        owner_session_id: str,
+    ) -> dict[str, Any]:
+        """How alive an owning Session is, by the evidence ``task_claim`` trusts.
+
+        ``left_at`` alone is not proof of absence: a Session that stopped
+        heartbeating without leaving still holds a transport, and a Session whose
+        transport was reaped is gone even inside the heartbeat window. Every path
+        that moves ownership between Sessions has to use this one judgement.
+        """
+        owner = connection.execute(
+            """
+            SELECT a.*,
+                   (SELECT MAX(e.created_at) FROM events e
+                    WHERE e.project_id = a.project_id
+                      AND e.actor_session_id = a.id) AS last_activity_at
+            FROM agent_sessions a
+            WHERE a.id = ? AND a.project_id = ?
+            """,
+            (owner_session_id, project_id),
+        ).fetchone()
+        if owner is None:
+            return {
+                "owner": None,
+                "connected": False,
+                "transport_state": "owner_missing",
+                "last_seen": None,
+            }
+        last_seen = parse_time(owner["last_heartbeat"])
+        if owner["last_activity_at"]:
+            last_seen = max(last_seen, parse_time(owner["last_activity_at"]))
+        connected = owner["left_at"] is None and (
+            utc_now() - last_seen
+            <= timedelta(seconds=self.settings.heartbeat_timeout_seconds)
+        )
+        transport_state = "not_checked"
+        if connected:
+            state_check = self.transport_liveness_check
+            if state_check is None:
+                transport_state = "unavailable"
+            else:
+                transport_state = (
+                    str(state_check(project_id, str(owner["id"])) or "") or "unknown"
+                )
+                if transport_state == "gone":
+                    connected = False
+        return {
+            "owner": owner,
+            "connected": connected,
+            "transport_state": transport_state,
+            "last_seen": last_seen,
+        }
+
+    def retention_sweep_interval_seconds(self) -> float:
+        """Minimum gap between two automatic retention sweeps, in monotonic seconds."""
+        return float(
+            getattr(self.settings, "retention_sweep_interval_seconds", 3600.0)
+        )
+
+    def min_agent_token_ttl_seconds(self) -> int:
+        """Smallest Agent-token lifetime this deployment accepts."""
+        return int(getattr(self.settings, "min_agent_token_ttl_seconds", 300))
 
     def _host_dict(self, row: Mapping[str, Any]) -> dict[str, Any]:
         data = dict(row)
@@ -1410,14 +2395,15 @@ class AgentChatRoomService:
         return member
 
     def _transition_task_intake(
-        self, connection: Any, current: Mapping[str, Any], next_status: str
+        self, connection: Any, current_status: str, next_status: str
     ) -> None:
+        """The single gate every intake status write has to pass."""
         if next_status not in TASK_INTAKE_STATUSES:
             raise DomainError("invalid_task_intake_status", "Unsupported intake status")
-        if next_status not in TASK_INTAKE_TRANSITIONS[current["status"]]:
+        if next_status not in TASK_INTAKE_TRANSITIONS.get(str(current_status), set()):
             raise DomainError(
                 "invalid_task_intake_transition",
-                f"Task intake cannot move from {current['status']} to {next_status}",
+                f"Task intake cannot move from {current_status} to {next_status}",
                 status_code=409,
             )
 
@@ -1435,6 +2421,11 @@ class AgentChatRoomService:
             legacy_status=data["status"],
         )
         data["state_view"] = task_view(
+            execution_status=data["execution_status"],
+            verification_status=data["verification_status"],
+            integration_status=data["integration_status"],
+        )
+        data["available_actions"] = task_available_actions(
             execution_status=data["execution_status"],
             verification_status=data["verification_status"],
             integration_status=data["integration_status"],
@@ -1585,20 +2576,27 @@ class AgentChatRoomService:
             str(row["id"]): {} for row in materialized
         }
         project_id = str(materialized[0]["project_id"])
-        for claim_event in connection.execute(
+        # Same three entry events the single-task lookup reads, and the same
+        # "newest one that actually carries a snapshot" rule. This projection had
+        # its own narrower query, so the task list showed {} for every task that
+        # entered through an assignment or a reclaim even after the single-task
+        # read was fixed.
+        entry_placeholders = ", ".join("?" for _ in self.TASK_ENTRY_EVENTS)
+        for entry_event in connection.execute(
             f"""
             SELECT task_id, payload_json FROM events
-            WHERE project_id = ? AND event_type = 'task.claimed'
+            WHERE project_id = ? AND event_type IN ({entry_placeholders})
               AND task_id IN ({placeholders})
-            ORDER BY id ASC
+            ORDER BY id DESC
             """,
-            [project_id, *task_ids],
+            [project_id, *self.TASK_ENTRY_EVENTS, *task_ids],
         ):
-            snapshot = json_load(claim_event["payload_json"], {}).get(
+            snapshot = json_load(entry_event["payload_json"], {}).get(
                 "project_documents"
             )
-            if snapshot:
-                spec_receipts[str(claim_event["task_id"])] = snapshot
+            task_key = str(entry_event["task_id"])
+            if snapshot and not spec_receipts.get(task_key):
+                spec_receipts[task_key] = snapshot
         assembled: list[dict[str, Any]] = []
         for row in materialized:
             data = self._task_dict(row)
@@ -1637,6 +2635,170 @@ class AgentChatRoomService:
         data["active"] = ttl_active
         return data
 
+    def inspect_repository_candidates(self, root_path: str) -> dict[str, Any]:
+        """Bounded, explicit inspection; never run recursive discovery during polling."""
+        root = repository_directory(root_path)
+        deadline = time.monotonic() + self.settings.repository_scan_timeout_seconds
+        candidates: list[dict[str, Any]] = []
+        errors: list[dict[str, str]] = []
+        pending = [(root, 0)]
+        visited = 0
+        truncated = False
+        excludes = {name.casefold() for name in self.settings.repository_scan_excludes}
+        while pending:
+            if visited >= self.settings.repository_scan_max_directories or time.monotonic() >= deadline:
+                truncated = True
+                break
+            directory, depth = pending.pop(0)
+            visited += 1
+            try:
+                # A marker is only a cheap candidate hint; Git remains authoritative.
+                if depth == 0 or (directory / ".git").exists():
+                    remaining = max(0.001, (deadline - time.monotonic()) / 2)
+                    remote, git_root, is_worktree = detect_git_info(directory, timeout_seconds=remaining)
+                    if is_worktree and (depth == 0 or git_root == directory.resolve()):
+                        candidates.append({
+                            "relative_path": directory.relative_to(root).as_posix().replace("./", "")
+                                             if directory != root else "",
+                            "project_path": str(directory), "repository_root": str(git_root),
+                            "logical_path": derive_logical_path(directory, git_root),
+                            "project_source": _project_source_from_disk(remote, True),
+                        })
+                        continue
+                if depth >= self.settings.repository_scan_max_depth:
+                    # Report partial discovery even when no candidate was found at the depth limit.
+                    with os.scandir(directory) as entries:
+                        if any(entry.is_dir(follow_symlinks=False) and entry.name.casefold() not in excludes
+                               for entry in entries):
+                            truncated = True
+                    continue
+                with os.scandir(directory) as entries:
+                    children = []
+                    for entry in entries:
+                        if time.monotonic() >= deadline:
+                            truncated = True
+                            break
+                        candidate = Path(entry.path)
+                        if (entry.name.casefold() in excludes or entry.is_symlink()
+                                or (hasattr(candidate, "is_junction") and candidate.is_junction())):
+                            continue
+                        if entry.is_dir(follow_symlinks=False):
+                            try:
+                                candidate.resolve().relative_to(root)
+                            except ValueError:
+                                continue
+                            children.append(candidate)
+                            if len(pending) + len(children) + visited >= self.settings.repository_scan_max_directories:
+                                truncated = True
+                                break
+                    pending.extend((child, depth + 1) for child in sorted(children))
+            except OSError:
+                errors.append({"relative_path": directory.relative_to(root).as_posix(), "reason": "unreadable_directory"})
+        if time.monotonic() >= deadline:
+            truncated = True
+        return {
+            "schema_version": 1, "workspace_root": str(root), "candidates": candidates,
+            "selection_required": bool(candidates and candidates[0]["relative_path"]),
+            "complete": not truncated and not errors, "truncated": truncated,
+            "errors": errors, "visited_directories": visited,
+            "required_action": "select_repository_explicitly" if candidates else
+                               "enter_repository_relative_path_or_keep_local_directory" if truncated or errors else
+                               "keep_local_directory",
+        }
+
+    def _selected_repository(self, root: Path, selection: str | None) -> tuple[Path, str]:
+        if selection is None:
+            _remote, _git_root, is_worktree = _project_git_info(root)
+            if not is_worktree:
+                inspection = self.inspect_repository_candidates(str(root))
+                if inspection["candidates"] or not inspection["complete"]:
+                    raise DomainError(
+                        "repository_selection_required", "Inspect and explicitly select the repository, or keep the local directory",
+                        status_code=409, details=inspection,
+                    )
+            selection = ""
+        selected = repository_directory(root, selection)
+        relative = selected.relative_to(root).as_posix() if selected != root else ""
+        if relative:
+            _remote, _git_root, is_worktree = _project_git_info(selected)
+            if not is_worktree:
+                raise DomainError("repository_not_found", "Selected directory is not a Git worktree",
+                                  status_code=409, details={"required_action": "select_detected_repository"})
+        return selected, relative
+
+    def select_project_repository(self, project_id: str, repository_path: str) -> dict[str, Any]:
+        with self._repository_selection_lock:
+            return self._select_project_repository(project_id, repository_path)
+
+    def _select_project_repository(self, project_id: str, repository_path: str) -> dict[str, Any]:
+        """Associate a repository without moving the workspace or changing Room identity."""
+        with self.database.connect() as connection:
+            previous = dict(self._require_project(connection, project_id))
+        if previous["archived_at"] is not None:
+            raise DomainError("project_archived", "Restore the Room before selecting its repository", status_code=409)
+        root = repository_directory(previous["root_path"])
+        selected, relative = self._selected_repository(root, repository_path)
+        remote, git_root, is_worktree = _project_git_info(selected)
+        logical = derive_logical_path(selected, git_root)
+        scope = _project_scope(remote, git_root, logical)
+        registration = load_checkout_registration(root, logical_path=str(previous["logical_path"] or ""))
+        if registration and registration["project_key"] != previous["project_key"]:
+            raise DomainError("project_registration_conflict", "Workspace registration belongs to another Room",
+                              status_code=409, details={"required_action": "resolve_workspace_registration_conflict"})
+        validate_project_coordination_instructions(root)
+        # Existing repository associations cannot be silently changed into a different repository.
+        old_selection = str(previous.get("repository_path") or "")
+        _old_remote, old_git_root, old_is_worktree = _project_git_info(root)
+        if not old_selection and old_is_worktree and (
+            old_git_root != git_root or logical != str(previous["logical_path"] or "")
+        ):
+            raise DomainError("repository_selection_conflict", "A Git-scoped Room cannot move to another repository or subproject",
+                              status_code=409, details={"required_action": "use_a_separate_room_for_another_repository"})
+        if old_selection and relative != old_selection:
+            raise DomainError("repository_selection_conflict", "This Room is already associated with another repository",
+                              status_code=409, details={"required_action": "use_a_separate_room_for_another_repository"})
+        if previous["git_remote"] and normalize_remote(previous["git_remote"]) != normalize_remote(remote):
+            raise DomainError("repository_selection_conflict", "Repository identity differs from the Room",
+                              status_code=409, details={"required_action": "use_a_separate_room_for_another_repository"})
+        proposed = {**previous, "repository_path": relative, "git_remote": remote or None, "logical_path": logical}
+        # Preflight ownership before touching files; recheck again in the final write transaction.
+        with self.database.connect() as connection:
+            conflicts = [other for other in connection.execute("SELECT * FROM projects").fetchall()
+                         if other["id"] != project_id and other["archived_at"] is None and _stored_project_scope(other) == scope]
+            if conflicts:
+                raise DomainError("project_scope_conflict", "Selected repository scope belongs to another active Room",
+                                  status_code=409, details={"project_ids": [p["id"] for p in conflicts],
+                                                           "required_action": "use_the_existing_repository_room"})
+        # Filesystem/Git work runs before opening the SQL transaction. The context restores
+        # derived files if either registration or the transaction's ownership recheck fails.
+        with checkout_registration_change(root, proposed), self.database.connect(write=True) as connection:
+            current = dict(self._require_project(connection, project_id))
+            if any(current[key] != previous[key] for key in ("repository_path", "git_remote", "logical_path", "archived_at")):
+                raise DomainError("repository_selection_conflict", "Repository selection changed; refresh before retrying",
+                                  status_code=409, details={"required_action": "refresh_project"})
+            conflicts = [dict(other) for other in connection.execute("SELECT * FROM projects").fetchall()
+                         if other["id"] != project_id and other["archived_at"] is None and _stored_project_scope(other) == scope]
+            if conflicts:
+                raise DomainError("project_scope_conflict", "Selected repository scope belongs to another active Room",
+                                  status_code=409, details={"project_ids": [p["id"] for p in conflicts],
+                                                           "required_action": "use_the_existing_repository_room"})
+            if (old_selection, str(previous["git_remote"] or ""), previous["logical_path"]) == (relative, remote, logical):
+                project = self._project_dict(current, project_source=_project_source_from_disk(remote, is_worktree))
+                cursor = self.latest_cursor(connection, project_id)
+                event_id = None
+            else:
+                connection.execute("UPDATE projects SET repository_path = ?, git_remote = ?, logical_path = ?, updated_at = ? WHERE id = ?",
+                                   (relative, remote or None, logical, iso_now(), project_id))
+                cursor = event_id = self._emit(connection, project_id, "project.updated", payload={
+                    "changed_fields": ["repository_path", "git_remote", "logical_path"],
+                    "repository_path": relative, "previous_repository_path": old_selection,
+                    "workspace_root_unchanged": True,
+                })
+                row = connection.execute("SELECT * FROM projects WHERE id = ?", (project_id,)).fetchone()
+                project = self._project_dict(row, project_source=_project_source_from_disk(remote, is_worktree))
+        self._git_scope_probe_cache.pop(project_id, None)
+        return {"project": project, "event_id": event_id, "cursor": cursor}
+
     def create_project(
         self,
         *,
@@ -1644,6 +2806,7 @@ class AgentChatRoomService:
         name: str | None = None,
         logical_path: str = "",
         settings: dict[str, Any] | None = None,
+        repository_path: str | None = None,
     ) -> dict[str, Any]:
         root = Path(root_path).expanduser().resolve()
         if not root.is_dir():
@@ -1652,8 +2815,9 @@ class AgentChatRoomService:
                 "Project root must be an existing directory",
                 details={"root_path": str(root)},
             )
-        remote, git_root, is_work_tree = _project_git_info(root)
-        logical = derive_logical_path(root, git_root, logical_path)
+        selected, repository_path = self._selected_repository(root, repository_path)
+        remote, git_root, is_work_tree = _project_git_info(selected)
+        logical = derive_logical_path(selected, git_root, logical_path)
         candidate_scope = _project_scope(remote, git_root, logical)
         now = iso_now()
         normalized_settings = normalize_project_settings(settings)
@@ -1670,6 +2834,11 @@ class AgentChatRoomService:
             ]
             if len(active_conflicts) == 1:
                 existing = active_conflicts[0]
+                if repository_path and (str(existing["root_path"]) != str(root)
+                                        or str(dict(existing).get("repository_path") or "") != repository_path):
+                    raise DomainError("project_scope_conflict", "Selected repository is already registered to another Room",
+                                      status_code=409, details={"project_ids": [existing["id"]],
+                                                               "required_action": "use_the_existing_repository_room"})
                 return self._project_dict(
                     existing,
                     project_source=_project_source_from_disk(
@@ -1725,15 +2894,16 @@ class AgentChatRoomService:
             connection.execute(
                 """
                 INSERT INTO projects(
-                    id, project_key, name, root_path, git_remote, logical_path,
+                    id, project_key, name, root_path, repository_path, git_remote, logical_path,
                     settings_json, archived_at, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)
                 """,
                 (
                     project_id,
                     project_key,
                     name or root.name,
                     str(root),
+                    repository_path,
                     remote or None,
                     logical,
                     json_dump(normalized_settings),
@@ -1776,8 +2946,14 @@ class AgentChatRoomService:
                 "Project root must be an existing directory",
                 details={"root_path": str(root)},
             )
-        remote, git_root, _is_work_tree = _project_git_info(root)
-        logical = derive_logical_path(root, git_root, logical_path)
+        registration = load_checkout_registration(root, logical_path=logical_path)
+        selected_path = str((registration or {}).get("repository_path") or "")
+        selected = repository_directory(root, selected_path)
+        remote, git_root, _is_work_tree = _project_git_info(selected)
+        if selected_path and not _is_work_tree:
+            raise DomainError("repository_not_found", "Selected repository is no longer available",
+                              status_code=409, details={"required_action": "recheck_repository_selection"})
+        logical = derive_logical_path(selected, git_root, logical_path)
         candidate_scope = _project_scope(remote, git_root, logical)
         reg_key = str(registered_project_key or "").strip()
         with self.database.connect(write=True) as connection:
@@ -1817,33 +2993,41 @@ class AgentChatRoomService:
                         },
                     )
             if not scope_projects and remote:
-                heal_target = None
                 norm_root = os.path.normcase(str(root.resolve()))
-                if reg_key:
-                    for p in all_projects:
-                        if str(p["project_key"]).strip() == reg_key:
-                            try:
-                                p_root = os.path.normcase(
-                                    str(Path(p["root_path"]).expanduser().resolve())
-                                )
-                                if p_root == norm_root:
-                                    heal_target = p
-                                    break
-                            except OSError:
-                                pass
-                if heal_target is None and not reg_key:
-                    matching_path_projects = [
-                        p
-                        for p in all_projects
-                        if p["archived_at"] is None
-                        and not str(p["git_remote"] or "").strip()
-                        and os.path.normcase(
-                            str(Path(p["root_path"]).expanduser().resolve())
+                # One selector for both self-heal branches. It never considers an
+                # archived Room (restoring one is an explicit management action
+                # that emits project.restored), it treats an unreadable stored
+                # root as non-matching instead of letting ValueError become a 500,
+                # and it re-checks the derived logical path so a different
+                # subproject of the same repository cannot be healed by accident.
+                heal_candidates = []
+                for candidate in all_projects:
+                    if candidate["archived_at"] is not None:
+                        continue
+                    if reg_key and str(candidate["project_key"]).strip() != reg_key:
+                        continue
+                    if not reg_key and str(candidate["git_remote"] or "").strip():
+                        continue
+                    if (
+                        str(candidate["logical_path"] or "").casefold()
+                        != logical.casefold()
+                    ):
+                        continue
+                    try:
+                        candidate_root = os.path.normcase(
+                            str(
+                                Path(str(candidate["root_path"]))
+                                .expanduser()
+                                .resolve()
+                            )
                         )
-                        == norm_root
-                    ]
-                    if len(matching_path_projects) == 1:
-                        heal_target = matching_path_projects[0]
+                    except (OSError, ValueError):
+                        continue
+                    if candidate_root == norm_root:
+                        heal_candidates.append(candidate)
+                heal_target = (
+                    heal_candidates[0] if len(heal_candidates) == 1 else None
+                )
 
                 if heal_target is not None:
                     now = iso_now()
@@ -1917,6 +3101,32 @@ class AgentChatRoomService:
                         ],
                     },
                 )
+            if reg_key:
+                # The registered Room exists but is archived, so it was excluded
+                # from the self-heal above. Report that instead of the orphaned
+                # registration error the fall-through would produce.
+                registered_row = next(
+                    (
+                        p
+                        for p in all_projects
+                        if str(p["project_key"]).strip() == reg_key
+                    ),
+                    None,
+                )
+                if (
+                    registered_row is not None
+                    and registered_row["archived_at"] is not None
+                ):
+                    raise DomainError(
+                        "project_archived",
+                        "Project is archived and must be restored explicitly before agents join",
+                        status_code=409,
+                        details={
+                            "project_id": registered_row["id"],
+                            "project_key": registered_row["project_key"],
+                            "archived_at": registered_row["archived_at"],
+                        },
+                    )
             if str(registered_project_key or "").strip():
                 raise DomainError(
                     "project_registration_orphaned",
@@ -1927,6 +3137,7 @@ class AgentChatRoomService:
         return self.create_project(
             root_path=str(root),
             logical_path=logical,
+            repository_path=selected_path,
         )
 
     def list_projects(self) -> list[dict[str, Any]]:
@@ -1944,6 +3155,20 @@ class AgentChatRoomService:
                 project["project_source"] = self._peek_project_source(project)
         return projects
 
+    def git_scope_recheck_ttl_seconds(self) -> float:
+        """Configured TTL for the display-only git scope probe cache."""
+        return float(
+            getattr(
+                self.settings,
+                "git_scope_recheck_ttl_seconds",
+                GIT_SCOPE_RECHECK_TTL_SECONDS,
+            )
+        )
+
+    def invalidate_git_scope_probe(self, project_id: str) -> None:
+        """Drop a cached probe so the next read re-detects the scope."""
+        self._git_scope_probe_cache.pop(str(project_id), None)
+
     def _peek_project_source(self, project: Mapping[str, Any]) -> str:
         project_id = str(project.get("id") or "")
         root_path = str(project.get("root_path") or "").strip()
@@ -1951,22 +3176,22 @@ class AgentChatRoomService:
             return "path"
         now = time.monotonic()
         cached = self._git_scope_probe_cache.get(project_id)
-        if (
-            cached
-            and cached[1] == "path"
-            and (now - cached[0]) < GIT_SCOPE_RECHECK_TTL_SECONDS
-        ):
-            return "path"
+        if cached and (now - cached[0]) < self.git_scope_recheck_ttl_seconds():
+            return cached[1]
         source = "path"
         try:
             root = Path(root_path).expanduser().resolve()
             if root.is_dir():
-                remote, _git_root, is_work_tree = _project_git_info(root)
+                selected = repository_directory(root, str(project.get("repository_path") or ""))
+                remote, _git_root, is_work_tree = _project_git_info(selected)
                 source = _project_source_from_disk(remote, is_work_tree)
         except (OSError, DomainError):
             source = "path"
-        if source == "path":
-            self._git_scope_probe_cache[project_id] = (now, source, "")
+        # Cache every display-only probe result. Restricting the cache to "path"
+        # left a local work tree (source "git_local") re-running git subprocesses
+        # on every single read, which is exactly the cost this TTL cache exists to
+        # avoid - and the GUI polls once per second.
+        self._git_scope_probe_cache[project_id] = (now, source, "")
         return source
 
     def archive_project(self, project_id: str) -> dict[str, Any]:
@@ -2031,11 +3256,12 @@ class AgentChatRoomService:
         # Detail GET uses the same TTL cache as list for path candidates (#172):
         # avoid a git subprocess on every read when nothing has changed.
         cached = self._git_scope_probe_cache.get(project_id)
-        if cached and cached[1] == "path" and (now - cached[0]) < GIT_SCOPE_RECHECK_TTL_SECONDS:
-            return self._project_dict(project, project_source="path")
+        if cached and (now - cached[0]) < self.git_scope_recheck_ttl_seconds():
+            return self._project_dict(project, project_source=cached[1])
         try:
-            root = Path(root_path).expanduser().resolve()
-        except (OSError, ValueError):
+            workspace_root = Path(root_path).expanduser().resolve()
+            root = repository_directory(workspace_root, str(dict(project).get("repository_path") or ""))
+        except (OSError, ValueError, DomainError):
             return self._project_dict(project)
         if not root.is_dir():
             return self._project_dict(project)
@@ -2047,7 +3273,8 @@ class AgentChatRoomService:
 
         source = _project_source_from_disk(remote, is_work_tree)
         if not remote:
-            # Local work-tree or plain path: display-only, never write.
+            # Local work-tree or plain path: display-only, never write. Cached so
+            # the next read within the TTL skips the git subprocess entirely.
             self._git_scope_probe_cache[project_id] = (now, source, "")
             return self._project_dict(project, project_source=source)
 
@@ -2068,7 +3295,7 @@ class AgentChatRoomService:
             )
 
         candidate_scope = _project_scope(remote, git_root, logical)
-        norm_root = os.path.normcase(str(root))
+        norm_root = os.path.normcase(str(workspace_root))
 
         # Ownership resolution before any write (#166/#172 fail-closed).
         with self.database.connect() as connection:
@@ -2100,7 +3327,7 @@ class AgentChatRoomService:
             registration_unreadable = False
             try:
                 registration = load_checkout_registration(
-                    root, logical_path=logical
+                    workspace_root, logical_path=logical
                 )
             except DomainError:
                 registration = None
@@ -2296,12 +3523,18 @@ class AgentChatRoomService:
         metadata: dict[str, Any] | None = None,
         actor_session_id: str | None = None,
         token: str | None = None,
+        management_authorized: bool = False,
     ) -> dict[str, Any]:
-        clean_key = member_key.strip()
         clean_name = name.strip()
         clean_kind = kind.strip()
         clean_role = role.strip()
         clean_status = self._validate_member_status(status)
+        clean_key = self._reject_reserved_member_key(
+            member_key,
+            kind=clean_kind,
+            metadata=metadata,
+            management_authorized=management_authorized,
+        )
         if not clean_key or not clean_name or not clean_kind:
             raise DomainError(
                 "invalid_project_member",
@@ -2432,11 +3665,37 @@ class AgentChatRoomService:
         metadata: dict[str, Any] | None = None,
         actor_session_id: str | None = None,
         token: str | None = None,
+        management_authorized: bool = False,
     ) -> dict[str, Any]:
         with self.database.connect(write=True) as connection:
             member = self._require_member(connection, project_id, member_id)
             if actor_session_id:
-                self._authenticate(connection, project_id, actor_session_id, token or "")
+                actor = self._authenticate(
+                    connection, project_id, actor_session_id, token or ""
+                )
+                # member:write is a coarse capability that the default Agent
+                # credential bundle carries; it is not a licence to rewrite or
+                # revoke somebody else's durable identity. An Agent may maintain
+                # its own member record, and anything beyond that has to arrive
+                # through an authenticated management request.
+                actor_member_id = (
+                    actor["member_id"] if "member_id" in actor.keys() else None
+                )
+                if actor_member_id != member_id and not management_authorized:
+                    raise DomainError(
+                        "management_auth_required",
+                        "Updating or revoking another member's durable identity "
+                        "requires an authenticated management request",
+                        status_code=403,
+                        details={
+                            "required_action": "use_management_identity",
+                            "target_member_id": member_id,
+                        },
+                    )
+            elif not management_authorized:
+                raise _management_authorization_required(
+                    "update this project member"
+                )
             if member["status"] == "revoked" and status not in {None, "revoked"}:
                 raise DomainError(
                     "project_member_revoked",
@@ -2456,6 +3715,31 @@ class AgentChatRoomService:
                     "invalid_project_member",
                     "Member name and kind cannot be empty",
                 )
+            # The duplicate-name guard that joins already honour has to cover
+            # renames too, or renaming any member onto an existing software
+            # identity name makes the roster ambiguous for projection (#139).
+            if (
+                clean_kind == "software_agent"
+                and clean_status == "active"
+                and (clean_name != member["name"] or clean_kind != member["kind"])
+            ):
+                name_conflict = self._software_name_conflict(
+                    connection,
+                    project_id,
+                    clean_name,
+                    exclude_member_key=str(member["member_key"]),
+                )
+                if name_conflict is not None:
+                    raise DomainError(
+                        "software_identity_name_conflict",
+                        "Another active software identity already uses this name "
+                        "in the Project",
+                        status_code=409,
+                        details={
+                            "conflicting_member_id": str(name_conflict["id"]),
+                            "required_action": "pick_a_distinct_identity_name",
+                        },
+                    )
             clean_metadata = (
                 json_load(member["metadata_json"], {})
                 if metadata is None
@@ -2503,6 +3787,11 @@ class AgentChatRoomService:
                     project_id,
                 ),
             )
+            revocation: dict[str, Any] | None = None
+            if clean_status == "revoked":
+                revocation = self._revoke_member_access_locked(
+                    connection, project_id, member_id, now, actor_session_id
+                )
             event_id = self._emit(
                 connection,
                 project_id,
@@ -2512,6 +3801,7 @@ class AgentChatRoomService:
                     "member_id": member_id,
                     "changed_fields": changed_fields,
                     "status": clean_status,
+                    **({"access_revocation": revocation} if revocation else {}),
                 },
             )
             updated = connection.execute(
@@ -2523,14 +3813,113 @@ class AgentChatRoomService:
                 "cursor": event_id,
             }
 
-    @idempotent_write("project_member.revoke")
-    def revoke_project_member(
+    def _revoke_member_access_locked(
         self,
+        connection: Any,
+        project_id: str,
+        member_id: str,
+        now: str,
+        actor_session_id: str | None,
+    ) -> dict[str, Any]:
+        """End every write path a member still holds when it is revoked.
+
+        The roster row is only a display: the credentials, the Sessions already
+        joined and the file leases those Sessions hold are what grant write
+        authority. Revoking the roster alone left a removed identity posting
+        messages, claiming tasks and reporting work forever - and the heartbeat
+        kept renewing its token and leases on top of that.
+        """
+        credentials = connection.execute(
+            """
+            SELECT id FROM agent_credentials
+            WHERE project_id = ? AND member_id = ? AND revoked_at IS NULL
+            """,
+            (project_id, member_id),
+        ).fetchall()
+        if credentials:
+            placeholders = _sql_placeholders(len(credentials))
+            connection.execute(
+                f"""
+                UPDATE agent_credentials SET revoked_at = ?
+                WHERE project_id = ? AND member_id = ? AND revoked_at IS NULL
+                  AND id IN ({placeholders})
+                """,
+                (now, project_id, member_id, *[row["id"] for row in credentials]),
+            )
+        sessions = connection.execute(
+            """
+            SELECT id FROM agent_sessions
+            WHERE project_id = ? AND member_id = ? AND left_at IS NULL
+            """,
+            (project_id, member_id),
+        ).fetchall()
+        closed_session_ids = [row["id"] for row in sessions]
+        released_lease_ids: list[str] = []
+        if closed_session_ids:
+            session_placeholders = _sql_placeholders(len(closed_session_ids))
+            leased = connection.execute(
+                f"""
+                SELECT id FROM file_leases
+                WHERE project_id = ? AND released_at IS NULL
+                  AND session_id IN ({session_placeholders})
+                """,
+                (project_id, *closed_session_ids),
+            ).fetchall()
+            released_lease_ids = [row["id"] for row in leased]
+            if released_lease_ids:
+                lease_placeholders = _sql_placeholders(len(released_lease_ids))
+                connection.execute(
+                    f"""
+                    UPDATE file_leases SET released_at = ?
+                    WHERE project_id = ? AND released_at IS NULL
+                      AND id IN ({lease_placeholders})
+                    """,
+                    (now, project_id, *released_lease_ids),
+                )
+            connection.execute(
+                f"""
+                UPDATE agent_sessions
+                SET status = 'offline', left_at = ?, token_expires_at = ?
+                WHERE project_id = ? AND id IN ({session_placeholders})
+                """,
+                (now, now, project_id, *closed_session_ids),
+            )
+        for credential in credentials:
+            self._emit(
+                connection,
+                project_id,
+                "credential.revoked",
+                actor_session_id=actor_session_id,
+                payload={
+                    "credential_id": credential["id"],
+                    "reason": "member_revoked",
+                },
+            )
+        for closed_session_id in closed_session_ids:
+            self._emit(
+                connection,
+                project_id,
+                "session.leave",
+                actor_session_id=actor_session_id,
+                payload={
+                    "session_id": closed_session_id,
+                    "reason": "member_revoked",
+                },
+            )
+        return {
+            "credentials_revoked": len(credentials),
+            "sessions_closed": len(closed_session_ids),
+            "leases_released": len(released_lease_ids),
+        }
+
+    @idempotent_write("project_member.revoke")
+    def revoke_project_member(        self,
         project_id: str,
         member_id: str,
         *,
         actor_session_id: str | None = None,
         token: str | None = None,
+        management_authorized: bool = False,
     ) -> dict[str, Any]:
         return self.update_project_member(
             project_id,
@@ -2538,6 +3927,7 @@ class AgentChatRoomService:
             status="revoked",
             actor_session_id=actor_session_id,
             token=token,
+            management_authorized=management_authorized,
         )
 
     def issue_agent_token(
@@ -2551,25 +3941,39 @@ class AgentChatRoomService:
     ) -> dict[str, Any]:
         if not name.strip():
             raise DomainError("invalid_agent_token", "Agent token name is required")
-        selected = sorted(set(permissions or DEFAULT_AGENT_PERMISSIONS))
-        unknown = sorted(set(selected) - AGENT_PERMISSIONS)
-        if unknown:
+        if permissions is None:
+            selected = sorted(DEFAULT_AGENT_PERMISSIONS)
+            unknown: list[str] = []
+        else:
+            # An empty list is an explicit "no permissions", not an omitted
+            # field: treating it as unset silently minted a token holding every
+            # default permission, the opposite of the request, and the issue
+            # event recorded the escalated set as if it had been asked for.
+            selected = sorted(set(permissions))
+            unknown = sorted(set(selected) - AGENT_PERMISSIONS)
+        if not selected or unknown:
             raise DomainError(
                 "invalid_agent_permissions",
-                "Agent token contains unsupported permissions",
-                details={"unknown": unknown},
+                "Agent token permissions must contain only supported values",
+                details={
+                    "unknown": unknown,
+                    "required_action": "pass_supported_permissions_or_omit_the_field",
+                },
             )
+        # A boolean TTL satisfies the range check as 1 second; refuse the type.
         ttl = (
             self.settings.agent_token_ttl_seconds
             if expires_in_seconds is None
-            else expires_in_seconds
+            else require_int_or_default(expires_in_seconds, "expires_in_seconds", 0)
         )
-        if not 300 <= ttl <= self.settings.max_agent_token_ttl_seconds:
+        if not self.min_agent_token_ttl_seconds() <= ttl <= (
+            self.settings.max_agent_token_ttl_seconds
+        ):
             raise DomainError(
                 "invalid_agent_token_ttl",
                 "Agent token TTL is outside the configured range",
                 details={
-                    "minimum": 300,
+                    "minimum": self.min_agent_token_ttl_seconds(),
                     "maximum": self.settings.max_agent_token_ttl_seconds,
                 },
             )
@@ -2670,11 +4074,25 @@ class AgentChatRoomService:
                 )
             if row["revoked_at"] is not None:
                 raise DomainError(
-                    "agent_token_revoked", "Agent token has been revoked", status_code=401
+                    "agent_token_revoked",
+                    "Agent token has been revoked",
+                    status_code=401,
+                    details={
+                        "required_action": CREDENTIAL_FAILURE_ACTIONS[
+                            PROJECT_CREDENTIAL_REVOKED
+                        ]
+                    },
                 )
             if parse_time(row["expires_at"]) <= utc_now():
                 raise DomainError(
-                    "agent_token_expired", "Agent token has expired", status_code=401
+                    "agent_token_expired",
+                    "Agent token has expired",
+                    status_code=401,
+                    details={
+                        "required_action": CREDENTIAL_FAILURE_ACTIONS[
+                            PROJECT_CREDENTIAL_EXPIRED
+                        ]
+                    },
                 )
             if project_id is not None and row["project_id"] != project_id:
                 raise DomainError(
@@ -2812,12 +4230,17 @@ class AgentChatRoomService:
         *,
         extend_by_seconds: int,
     ) -> dict[str, Any]:
-        if not 300 <= extend_by_seconds <= self.settings.max_agent_token_ttl_seconds:
+        extend_by_seconds = require_int_or_default(
+            extend_by_seconds, "extend_by_seconds", 0
+        )
+        if not self.min_agent_token_ttl_seconds() <= extend_by_seconds <= (
+            self.settings.max_agent_token_ttl_seconds
+        ):
             raise DomainError(
                 "invalid_agent_token_extension",
                 "Agent token extension is outside the configured range",
                 details={
-                    "minimum": 300,
+                    "minimum": self.min_agent_token_ttl_seconds(),
                     "maximum": self.settings.max_agent_token_ttl_seconds,
                 },
             )
@@ -2862,7 +4285,7 @@ class AgentChatRoomService:
                         "current_expires_at": previous_expires_at,
                     },
                 )
-            expires_at = expires_time.isoformat().replace("+00:00", "Z")
+            expires_at = format_instant(expires_time)
             now = iso_now()
             connection.execute(
                 "UPDATE agent_credentials SET expires_at = ?, updated_at = ? WHERE id = ?",
@@ -2897,17 +4320,20 @@ class AgentChatRoomService:
         *,
         expires_in_seconds: int | None = None,
     ) -> dict[str, Any]:
+        # A boolean TTL satisfies the range check as 1 second; refuse the type.
         ttl = (
             self.settings.agent_token_ttl_seconds
             if expires_in_seconds is None
-            else expires_in_seconds
+            else require_int_or_default(expires_in_seconds, "expires_in_seconds", 0)
         )
-        if not 300 <= ttl <= self.settings.max_agent_token_ttl_seconds:
+        if not self.min_agent_token_ttl_seconds() <= ttl <= (
+            self.settings.max_agent_token_ttl_seconds
+        ):
             raise DomainError(
                 "invalid_agent_token_ttl",
                 "Agent token TTL is outside the configured range",
                 details={
-                    "minimum": 300,
+                    "minimum": self.min_agent_token_ttl_seconds(),
                     "maximum": self.settings.max_agent_token_ttl_seconds,
                 },
             )
@@ -2986,7 +4412,39 @@ class AgentChatRoomService:
             }
 
     @staticmethod
-    def _validate_workspace_path(field: str, value: str) -> str:
+    def _workspace_evidence_metadata(
+        workspace_metadata: dict[str, Any] | None,
+        *,
+        server_verified: bool,
+    ) -> dict[str, Any]:
+        """Stamp the evidence-provenance key, refusing to let a caller set it.
+
+        The key is the only record of whether the server confirmed the
+        registered path, and ``_trusted_worktree`` reads it to decide if
+        server-side git may run there. A caller that could write it could
+        promote its own asserted path to a trusted root, so the value is always
+        taken from the registration argument and a supplied value is an error
+        rather than something to overwrite silently.
+        """
+        metadata = dict(workspace_metadata or {})
+        if WORKSPACE_EVIDENCE_SOURCE_KEY in metadata:
+            raise DomainError(
+                "reserved_workspace_metadata_key",
+                f"{WORKSPACE_EVIDENCE_SOURCE_KEY} is set by the server and cannot "
+                "be supplied by a caller",
+                status_code=422,
+                details={"reserved_key": WORKSPACE_EVIDENCE_SOURCE_KEY},
+            )
+        metadata[WORKSPACE_EVIDENCE_SOURCE_KEY] = (
+            WORKSPACE_EVIDENCE_SERVER_VERIFIED
+            if server_verified
+            else WORKSPACE_EVIDENCE_CLIENT_ASSERTED
+        )
+        return metadata
+
+
+    @staticmethod
+    def _validate_workspace_path(field: str, value: str, *, canonical: bool = False) -> str:
         """Reject malformed workspace paths before they poison git evidence.
 
         Control characters (C0 and DEL) in a registered path silently break
@@ -2994,6 +4452,11 @@ class AgentChatRoomService:
         report from sessions bound to that workspace with an unrelated
         invalid_commit_hash error. Relative paths are equally meaningless for
         a host-anchored workspace registration.
+
+        ``canonical`` is for the path that identifies a workspace, so that one
+        checkout cannot be registered three times over separators and case. It
+        is off by default: a descriptive field like worktree is re-resolved
+        before every comparison and reads better as its caller typed it.
         """
         text = value.strip()
         if any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in text):
@@ -3014,7 +4477,7 @@ class AgentChatRoomService:
                 "invalid_workspace",
                 f"{field} must be an absolute path",
             )
-        return text
+        return canonical_workspace_key(text) if canonical else text
 
     def register_workspace(
         self,
@@ -3028,17 +4491,76 @@ class AgentChatRoomService:
         git_remote: str = "",
         host_metadata: dict[str, Any] | None = None,
         workspace_metadata: dict[str, Any] | None = None,
+        host_updates_allowed: bool = False,
+        server_verified: bool = True,
     ) -> dict[str, Any]:
+        """Register a host workspace, recording where its path came from.
+
+Register a host workspace, recording where its path came from.
+
+        ``server_verified`` states that the server may read git from this path.
+        It defaults to true because every other caller is a server-side or
+        operator-authenticated path: the local MCP branch resolves the Project
+        from the checkout and validates the scope first, and the REST endpoint
+        sits behind management authentication. A remote join is the one caller
+        whose path arrives in an Agent-Token request body, so it passes false
+        and the path it registers is recorded as asserted.
+
+        Recording the difference is what lets server-side git evidence tell a
+        verified root from an asserted one: an asserted path would otherwise let
+        any valid Agent Token aim the server's `git -C` at a repository the
+        process can read and publish its branch, HEAD and dirty-file list.
+
+Attach a workspace to a host, creating the host row if it is new.
+
+        ``hosts`` has no project scope: one row is shared by every Project on
+        the Room. So an existing row only gets ``last_seen_at`` refreshed here.
+        Rewriting its ``name``/``metadata`` would let any Project - through any
+        Agent that can call room_bootstrap - rename a host another Project
+        displays, and ``list_workspaces`` shows that name verbatim. A caller that
+        actually holds management authority passes ``host_updates_allowed``.
+        """
         if not host_key.strip() or not host_name.strip() or not local_path.strip():
             raise DomainError(
                 "invalid_workspace",
-                "Host key, Host name, and local workspace path are required",
+                "Host key, Host name, and Local workspace path are required",
             )
-        local_path = self._validate_workspace_path("local_path", local_path)
-        if str(worktree or "").strip():
-            worktree = self._validate_workspace_path("worktree", worktree)
+        # The registered path is a key, so it is canonicalised; the text the
+        # caller typed is kept beside it for display. Storing the raw string
+        # made one checkout three workspaces depending on separators and case.
+        # Only local_path is an identity - it is the half of the UNIQUE key - so
+        # only local_path is canonicalised. worktree is descriptive and is
+        # re-resolved before every comparison anyway.
+        display_local_path = str(local_path or "").strip()
+        local_path = self._validate_workspace_path(
+            "local_path", local_path, canonical=True
+        )
+        worktree = self._validate_workspace_path("worktree", worktree) if str(
+            worktree or ""
+        ).strip() else ""
+        workspace_metadata = self._workspace_evidence_metadata(
+            workspace_metadata, server_verified=server_verified
+        )
+        # The selected repository a workspace belongs to is server-owned state:
+        # a caller-supplied ``repository_path`` never reaches storage, and a
+        # workspace rooted directly at the selected repository needs no
+        # sub-path at all (#367).
+        with self.database.connect() as connection:
+            project_for_workspace = dict(
+                self._require_project(connection, project_id)
+            )
+        selection = str(project_for_workspace.get("repository_path") or "")
+        sanitized = dict(workspace_metadata)
+        if selection:
+            local_root = Path(local_path).expanduser().resolve()
+            if local_root.is_dir():
+                direct_scope = checkout_scope(local_root, repository_path="")
+                if direct_scope == stored_project_scope(project_for_workspace):
+                    selection = ""
+            sanitized["repository_path"] = selection
         else:
-            worktree = ""
+            sanitized.pop("repository_path", None)
+        workspace_metadata = sanitized
         now = iso_now()
         with self.database.connect(write=True) as connection:
             self._require_project(connection, project_id)
@@ -3065,7 +4587,7 @@ class AgentChatRoomService:
                         now,
                     ),
                 )
-            else:
+            elif host_updates_allowed:
                 host_id = host["id"]
                 connection.execute(
                     """
@@ -3081,12 +4603,21 @@ class AgentChatRoomService:
                         host_id,
                     ),
                 )
+            else:
+                # last_seen_at only. Rewriting the shared row's identity fields
+                # from an ordinary Project registration is how one Project's
+                # Agent ended up renaming another Project's host.
+                host_id = host["id"]
+                connection.execute(
+                    "UPDATE hosts SET last_seen_at = ? WHERE id = ?",
+                    (now, host_id),
+                )
             workspace = connection.execute(
                 """
                 SELECT * FROM workspaces
                 WHERE project_id = ? AND host_id = ? AND local_path = ?
                 """,
-                (project_id, host_id, local_path.strip()),
+                (project_id, host_id, local_path),
             ).fetchone()
             workspace_created = workspace is None
             if workspace is None:
@@ -3094,15 +4625,17 @@ class AgentChatRoomService:
                 connection.execute(
                     """
                     INSERT INTO workspaces(
-                        id, project_id, host_id, local_path, branch, worktree,
-                        git_remote, metadata_json, created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        id, project_id, host_id, local_path, display_path,
+                        branch, worktree, git_remote, metadata_json,
+                        created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         workspace_id,
                         project_id,
                         host_id,
-                        local_path.strip(),
+                        local_path,
+                        display_local_path,
                         branch.strip(),
                         worktree.strip(),
                         git_remote.strip(),
@@ -3116,11 +4649,12 @@ class AgentChatRoomService:
                 connection.execute(
                     """
                     UPDATE workspaces
-                    SET branch = ?, worktree = ?, git_remote = ?,
-                        metadata_json = ?, updated_at = ?
+                    SET display_path = ?, branch = ?, worktree = ?,
+                        git_remote = ?, metadata_json = ?, updated_at = ?
                     WHERE id = ?
                     """,
                     (
+                        display_local_path,
                         branch.strip(),
                         worktree.strip(),
                         git_remote.strip(),
@@ -3141,6 +4675,13 @@ class AgentChatRoomService:
                     "host_created": host_created,
                     "workspace_id": workspace_id,
                     "local_path": local_path.strip(),
+                    # A caller that asked to rename a host it does not own is
+                    # refused, and the refusal is part of the event rather than
+                    # a silent no-op the caller cannot tell from success.
+                    "host_renamed": host_created or host_updates_allowed,
+                    "host_rename_refused": (
+                        not host_created and not host_updates_allowed
+                    ),
                 },
             )
             host = connection.execute(
@@ -3188,6 +4729,7 @@ class AgentChatRoomService:
         workspace_id: str | None = None,
         credential_id: str | None = None,
         member_id: str | None = None,
+        manage_member_reference: bool = False,
     ) -> dict[str, Any]:
         if not name.strip() or not client.strip():
             raise DomainError("invalid_agent", "Agent name and client are required")
@@ -3196,6 +4738,17 @@ class AgentChatRoomService:
                 "invalid_agent_model",
                 "Agent model code is required; use unknown only when unavailable",
             )
+        # A Session worktree is later used as a filesystem root (git evidence
+        # capture, permanent Project cleanup), so it follows the same guard the
+        # sibling workspace registration applies.
+        clean_worktree = (
+            self._validate_workspace_path("worktree", worktree)
+            if str(worktree or "").strip()
+            else ""
+        )
+        clean_branch = str(branch or "").strip()
+        if any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in clean_branch):
+            raise DomainError("invalid_agent", "branch contains control characters")
         token = secrets.token_urlsafe(32)
         session_id = new_id("agent")
         now = iso_now()
@@ -3221,10 +4774,35 @@ class AgentChatRoomService:
                         status_code=404,
                     )
                 host_id = workspace["host_id"]
+            elif host_id:
+                # A Session worktree reference is a foreign key, so an unknown
+                # host used to reach the INSERT and surface as a raw
+                # sqlite3.IntegrityError (HTTP 500 with a traceback) instead of
+                # the 404 the workspace branch gives for the same class of typo.
+                host = connection.execute(
+                    "SELECT id FROM hosts WHERE id = ?", (host_id,)
+                ).fetchone()
+                if host is None:
+                    raise DomainError(
+                        "host_not_found",
+                        "Host does not exist; register the workspace before joining",
+                        status_code=404,
+                        details={
+                            "host_id": host_id,
+                            "required_action": "register_workspace_or_omit_host_id",
+                        },
+                    )
+            credential = None
+            # Only a credential already linked to a member proves that join.
+            # An unlinked credential used to skip the proof and adopt whatever
+            # member_id the caller supplied, which minted a Session as that
+            # identity and then pinned the credential to them.
+            credential_proves_member = False
             if credential_id:
                 credential = connection.execute(
                     """
-                    SELECT id, member_id, name FROM agent_credentials
+                    SELECT id, member_id, name, revoked_at, expires_at
+                    FROM agent_credentials
                     WHERE id = ? AND project_id = ?
                     """,
                     (credential_id, project_id),
@@ -3235,13 +4813,24 @@ class AgentChatRoomService:
                         "Agent credential does not belong to this Project",
                         status_code=404,
                     )
-                if member_id and credential["member_id"] not in {None, member_id}:
+                # A revoked or expired credential must not be able to mint a new
+                # 12h Session; previously only the existence of the row was
+                # checked, so a revoked Token kept full write authority.
+                _require_live_credential(credential)
+                linked_member_id = credential["member_id"]
+                if (
+                    linked_member_id
+                    and member_id
+                    and str(linked_member_id) != str(member_id)
+                ):
                     raise DomainError(
                         "project_member_mismatch",
                         "Agent credential is linked to a different project member",
                         status_code=409,
                     )
-                member_id = member_id or credential["member_id"]
+                if linked_member_id:
+                    member_id = str(linked_member_id)
+                    credential_proves_member = True
             if member_id:
                 member = self._require_member(connection, project_id, member_id)
                 if member["status"] != "active":
@@ -3249,6 +4838,21 @@ class AgentChatRoomService:
                         "project_member_inactive",
                         "Agent session can only join as an active project member",
                         status_code=409,
+                    )
+                # Naming a member is not proof of being that member. A caller
+                # may join as a member only when it can actually prove that
+                # identity: a management-issued credential already linked to
+                # that member (resolved above), or a software key equal to the
+                # member's pinned key. Management may additionally reference a
+                # member that carries no software identity of its own. Without
+                # one of these proofs any caller could mint a Session as
+                # another software identity and inherit its independence,
+                # lease takeovers and append-only history.
+                if not credential_proves_member:
+                    self._require_joinable_member_identity(
+                        member,
+                        software_key=software_key,
+                        management_reference=manage_member_reference,
                     )
                 member_created = False
             else:
@@ -3266,6 +4870,7 @@ class AgentChatRoomService:
             # software identity. Multiple active members sharing one client
             # (e.g. two machines both using "zcode") must not absorb each
             # other's orphan history; leave member_id NULL for explicit merge.
+            adopted_sessions: list[dict[str, Any]] = []
             shared_client_members = int(
                 connection.execute(
                     """
@@ -3280,54 +4885,107 @@ class AgentChatRoomService:
                 ).fetchone()["member_count"]
             )
             if shared_client_members == 0:
-                connection.execute(
+                # Adopting an ownerless Session assigns a durable identity to it,
+                # so its tasks and leases become reachable by the joiner. Matching
+                # on the client string alone let any same-client identity inherit
+                # another identity's orphan history; the recorded software key has
+                # to match as well, and the rewrite is audited in agent.joined.
+                orphan_rows = connection.execute(
                     """
-                    UPDATE agent_sessions SET member_id = ?, agent_key = ?
+                    SELECT id, agent_key, member_id FROM agent_sessions
                     WHERE project_id = ? AND member_id IS NULL
                       AND lower(trim(client)) = lower(trim(?))
+                      AND lower(trim(agent_key)) = lower(trim(?))
                     """,
-                    (member_id, canonical_agent_key, project_id, client),
+                    (
+                        project_id,
+                        client,
+                        self._normalize_software_key(software_key or client),
+                    ),
+                ).fetchall()
+                if orphan_rows:
+                    connection.execute(
+                        """
+                        UPDATE agent_sessions SET member_id = ?, agent_key = ?
+                        WHERE project_id = ? AND member_id IS NULL
+                          AND lower(trim(client)) = lower(trim(?))
+                          AND lower(trim(agent_key)) = lower(trim(?))
+                        """,
+                        (
+                            member_id,
+                            canonical_agent_key,
+                            project_id,
+                            client,
+                            self._normalize_software_key(software_key or client),
+                        ),
+                    )
+                adopted_sessions = [
+                    {
+                        "session_id": str(row["id"]),
+                        "previous_member_id": (
+                            None if row["member_id"] is None else str(row["member_id"])
+                        ),
+                        "member_id": member_id,
+                        "previous_agent_key": str(row["agent_key"] or ""),
+                        "agent_key": canonical_agent_key,
+                    }
+                    for row in orphan_rows
+                ]
+            try:
+                connection.execute(
+                    """
+                    INSERT INTO agent_sessions(
+                        id, project_id, member_id, agent_key, name, client, model, role, status, branch,
+                        worktree, host_id, workspace_id, credential_id,
+                        capabilities_json, metadata_json, token_hash,
+                        token_expires_at, created_at, last_heartbeat
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'online', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        session_id,
+                        project_id,
+                        member_id,
+                        canonical_agent_key,
+                        name.strip(),
+                        client.strip(),
+                        model.strip(),
+                        role.strip() or "executor",
+                        clean_branch,
+                        clean_worktree,
+                        host_id,
+                        workspace_id,
+                        credential_id,
+                        json_dump(capabilities or {}),
+                        json_dump(metadata or {}),
+                        hashlib.sha256(token.encode()).hexdigest(),
+                        token_expires_at,
+                        now,
+                        now,
+                    ),
                 )
-            connection.execute(
-                """
-                INSERT INTO agent_sessions(
-                    id, project_id, member_id, agent_key, name, client, model, role, status, branch,
-                    worktree, host_id, workspace_id, credential_id,
-                    capabilities_json, metadata_json, token_hash,
-                    token_expires_at, created_at, last_heartbeat
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'online', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    session_id,
-                    project_id,
-                    member_id,
-                    canonical_agent_key,
-                    name.strip(),
-                    client.strip(),
-                    model.strip(),
-                    role.strip() or "executor",
-                    branch.strip(),
-                    worktree.strip(),
-                    host_id,
-                    workspace_id,
-                    credential_id,
-                    json_dump(capabilities or {}),
-                    json_dump(metadata or {}),
-                    hashlib.sha256(token.encode()).hexdigest(),
-                    token_expires_at,
-                    now,
-                    now,
-                ),
-            )
-            # One durable software identity may have several concurrent client
+
+            except sqlite3.IntegrityError as error:
+                # Every reference has been resolved above, so a violation here
+                # is an unforeseen constraint: answer with the domain vocabulary
+                # rather than a bare traceback through the adapter.
+                raise DomainError(
+                    "invalid_join_reference",
+                    "The Session could not be created against these references",
+                    status_code=409,
+                    details={
+                        "required_action": "register_the_workspace_or_credential_first"
+                    },
+                ) from error            # One durable software identity may have several concurrent client
             # conversations. Session ownership is intentionally independent:
             # joining a new conversation must not close another connection or
             # silently move its tasks and leases.
-            replacement = {
-                "previous_session_ids": [],
-                "transferred_task_ids": [],
-                "transferred_lease_ids": [],
-            }
+            previous_member_sessions = int(
+                connection.execute(
+                    "SELECT COUNT(*) AS total FROM agent_sessions"
+                    " WHERE project_id = ? AND member_id = ? AND id <> ?",
+                    (project_id, member_id, session_id),
+                ).fetchone()["total"]
+            )
             if member_created:
                 self._emit(
                     connection,
@@ -3370,14 +5028,6 @@ class AgentChatRoomService:
                             "name": cred_name,
                         },
                     )
-            if replacement["previous_session_ids"]:
-                self._emit(
-                    connection,
-                    project_id,
-                    "agent.session_replaced",
-                    actor_session_id=session_id,
-                    payload=replacement,
-                )
             event_id = self._emit(
                 connection,
                 project_id,
@@ -3393,7 +5043,8 @@ class AgentChatRoomService:
                     "client": client.strip(),
                     "model": model.strip(),
                     "role": role,
-                    "member_id": member_id,
+                    "reconnected": previous_member_sessions > 0,
+                    "adopted_sessions": adopted_sessions,
                 },
             )
             connection.execute(
@@ -3407,7 +5058,6 @@ class AgentChatRoomService:
                 "agent": self._agent_dict(row),
                 "identity": self._member_dict(member),
                 "member_created": member_created,
-                "replaced": replacement,
                 "token": token,
                 "event_id": event_id,
                 "cursor": event_id,
@@ -3523,10 +5173,11 @@ class AgentChatRoomService:
         host_key: str,
         host_name: str,
         workspace_path: str,
-        agent_key: str,
-        name: str,
-        client: str,
         model: str,
+        software_key: str = "",
+        agent_key: str = "",
+        name: str = "",
+        client: str = "",
         role: str = "executor",
         branch: str = "",
         worktree: str = "",
@@ -3548,10 +5199,33 @@ class AgentChatRoomService:
             branch=branch,
             worktree=worktree,
             git_remote=git_remote,
+            # The path arrived in the request body. The server has no way to
+            # confirm it names a repository belonging to this Project, so it is
+            # recorded as asserted and stays ineligible for server-side git.
+            server_verified=False,
         )
+        # The credential is the trust boundary for a remote join: a member it
+        # is linked to pins the durable identity, and its display fields are
+        # derived from that member. An unlinked credential falls back to the
+        # software identity the adapter already validated against the request
+        # credentials and headers. Caller-supplied display fields never select
+        # which software identity the Session runs as.
+        credential_member_id = str(credential.get("member_id") or "")
+        if credential_member_id:
+            with self.database.connect() as connection:
+                linked_member = self._require_member(
+                    connection, project_id, credential_member_id
+                )
+            linked_metadata = json_load(linked_member["metadata_json"], {})
+            name = str(name or "").strip() or str(linked_member["name"] or "").strip()
+            client = (
+                str(client or "").strip()
+                or str(linked_metadata.get("client") or "").strip()
+            )
         joined = self.join_room(
             project_id,
             agent_key=agent_key,
+            software_key=software_key,
             name=name,
             client=client,
             model=model,
@@ -3563,11 +5237,11 @@ class AgentChatRoomService:
             host_id=registered["host"]["id"],
             workspace_id=registered["workspace"]["id"],
             credential_id=credential["id"],
-            member_id=credential.get("member_id"),
+            member_id=credential_member_id or None,
         )
         return {"credential": credential, **registered, **joined}
 
-    @idempotent_write("session.heartbeat")
+    @idempotent_write("session.heartbeat", replay_guard="_session_replay_is_live")
     def heartbeat(
         self,
         project_id: str,
@@ -3689,8 +5363,8 @@ class AgentChatRoomService:
         after: int = 0,
         limit: int = 200,
     ) -> dict[str, Any]:
-        limit = max(1, min(limit, 1000))
-        after = max(0, int(after or 0))
+        limit = max(1, min(require_int_or_default(limit, "limit", 200), 1000))
+        after = require_int_or_default(after, "after", 0)
         rows = connection.execute(
             """
             SELECT * FROM events
@@ -3699,13 +5373,35 @@ class AgentChatRoomService:
             """,
             (project_id, after, limit),
         ).fetchall()
-        events = [self._event_dict(row, connection) for row in rows]
+        events = self._project_events(connection, rows)
         cursor = events[-1]["project_seq"] if events else after
         latest = connection.execute(
             "SELECT COALESCE(MAX(project_seq), 0) AS cursor FROM events WHERE project_id = ?",
             (project_id,),
         ).fetchone()["cursor"]
-        return {"events": events, "cursor": int(cursor), "latest_cursor": int(latest)}
+        # A retention purge can leave a hole between the caller's cursor and
+        # the oldest retained event. Reporting the highest purged project_seq
+        # lets a client holding an old cursor tell "there is a gap here" apart
+        # from "you are already at the start".
+        purged_before = 0
+        for receipt in connection.execute(
+            """
+            SELECT payload_json FROM events
+            WHERE project_id = ? AND event_type = 'audit.purged'
+            ORDER BY project_seq DESC
+            """,
+            (project_id,),
+        ).fetchall():
+            value = json_load(receipt["payload_json"], {}).get("purged_before")
+            if isinstance(value, int) and not isinstance(value, bool):
+                purged_before = max(purged_before, value)
+        return {
+            "events": events,
+            "cursor": int(cursor),
+            "latest_cursor": int(latest),
+            "purged_before": purged_before or None,
+            "cursor_is_purged": bool(purged_before) and after < purged_before,
+        }
 
     def get_project_mcp_message_limit(
         self, project_id: str, *, connection: Any | None = None
@@ -3754,7 +5450,24 @@ class AgentChatRoomService:
                 effective_after = int(session_row["last_read_cursor"])
 
         placeholders = ", ".join("?" for _ in MCP_CONTEXT_EVENT_TYPES)
-        if effective_after > 0:
+        # An incremental sync must deliver from the read cursor forwards, one
+        # contiguous window at a time. Taking the newest `limit` rows and then
+        # advancing the cursor to the project head marked every older
+        # not-yet-shown message as read, so a burst of traffic bigger than the
+        # window was silently swallowed - including requires_ack messages, which
+        # the whole acknowledgement loop depends on being seen.
+        incremental = not initial_inject and effective_after > 0
+        if incremental:
+            query = f"""
+                SELECT * FROM events
+                WHERE project_id = ?
+                  AND event_type IN ({placeholders})
+                  AND project_seq > ?
+                ORDER BY project_seq ASC
+                LIMIT ?
+            """
+            params = (project_id, *MCP_CONTEXT_EVENT_TYPES, effective_after, limit)
+        elif effective_after > 0:
             query = f"""
                 SELECT * FROM events
                 WHERE project_id = ?
@@ -3775,17 +5488,38 @@ class AgentChatRoomService:
             params = (project_id, *MCP_CONTEXT_EVENT_TYPES, limit)
 
         rows = connection.execute(query, params).fetchall()
-        events = [self._event_dict(row, connection) for row in reversed(rows)]
+        events = self._project_events(connection, rows if incremental else reversed(rows))
         latest = connection.execute(
             "SELECT COALESCE(MAX(project_seq), 0) AS cursor FROM events WHERE project_id = ?",
             (project_id,),
         ).fetchone()["cursor"]
-        cursor = latest if (initial_inject or effective_after <= 0) else max(after, latest)
+        if incremental:
+            delivered_through = max(
+                (int(event["project_seq"]) for event in events),
+                default=effective_after,
+            )
+            cursor = max(int(after or 0), effective_after, delivered_through)
+            # A real existence probe, not a window heuristic: the caller needs
+            # to know whether more context is still waiting behind the cursor.
+            remaining = connection.execute(
+                f"""
+                SELECT COUNT(*) AS n FROM events
+                WHERE project_id = ?
+                  AND event_type IN ({placeholders})
+                  AND project_seq > ?
+                """,
+                (project_id, *MCP_CONTEXT_EVENT_TYPES, cursor),
+            ).fetchone()["n"]
+        else:
+            cursor = latest
+            remaining = 0
         return {
             "events": events,
             "messages": events,
             "cursor": int(cursor),
             "latest_cursor": int(latest),
+            "has_more": int(remaining) > 0,
+            "next_after": int(cursor),
         }
 
     def verify_session(
@@ -3795,6 +5529,23 @@ class AgentChatRoomService:
             return self._agent_dict(
                 self._authenticate(connection, project_id, session_id, token)
             )
+
+    def session_active(self, project_id: str, session_id: str) -> bool:
+        """Report whether a Room Session still exists in this Project and has
+        not left.
+
+        Read-only and Project-scoped, so a transport-liveness caller can tell a
+        tombstone that is still worth replaying from one whose Session is gone.
+        """
+        with self.database.connect(write=False) as connection:
+            row = connection.execute(
+                """
+                SELECT left_at FROM agent_sessions
+                WHERE project_id = ? AND id = ?
+                """,
+                (project_id, session_id),
+            ).fetchone()
+        return row is not None and row["left_at"] is None
 
     def query_audit(
         self,
@@ -3818,9 +5569,9 @@ class AgentChatRoomService:
         ``has_newer`` report continuation under the same filters.
         """
         self.enforce_audit_retention_throttled(project_id)
-        limit = max(1, min(limit, 1000))
-        after = max(0, int(after or 0))
-        before = max(0, int(before or 0))
+        limit = max(1, min(require_int_or_default(limit, "limit", 200), 1000))
+        after = require_int_or_default(after, "after", 0)
+        before = require_int_or_default(before, "before", 0)
         if after and before and after >= before:
             raise DomainError(
                 "conflicting_audit_window",
@@ -3864,7 +5615,7 @@ class AgentChatRoomService:
                     [*parameters, after, limit],
                 ).fetchall()
                 older_where, older_params = forward_where, [*parameters, after]
-            events = [self._event_dict(row, connection) for row in rows]
+            events = self._project_events(connection, rows)
             cursor = events[-1]["project_seq"] if events else after
             first_id = events[0]["project_seq"] if events else None
             has_newer = False
@@ -3909,10 +5660,10 @@ class AgentChatRoomService:
         limit: int = 50,
         event_type: str = "",
     ) -> dict[str, Any]:
-        limit = max(1, min(int(limit or 50), TASK_HISTORY_LIMIT_MAX))
-        after = max(0, int(after or 0))
-        before = max(0, int(before or 0))
-        cursor = max(0, int(cursor or 0))
+        limit = max(1, min(require_int_or_default(limit, "limit", 50), TASK_HISTORY_LIMIT_MAX))
+        after = require_int_or_default(after, "after", 0)
+        before = require_int_or_default(before, "before", 0)
+        cursor = require_int_or_default(cursor, "cursor", 0)
         if cursor and after and cursor != after:
             raise DomainError(
                 "conflicting_history_cursor",
@@ -3979,20 +5730,35 @@ class AgentChatRoomService:
                 """,
                 page_parameters,
             ).fetchall()
-            events = [self._event_dict(row, connection) for row in rows]
+            events = self._project_events(connection, rows)
             if order == "DESC":
                 events.reverse()
             items = self._project_task_history_items(connection, events)
-            next_after = items[-1]["event_id"] if items else after
-            next_before = items[0]["event_id"] if items else before
+            # An empty page still has to hand back the position it was asked
+            # about, not the zero default, so the opposite direction stays
+            # navigable instead of silently claiming there is nothing there.
+            next_after = items[-1]["event_id"] if items else (after or before)
+            next_before = items[0]["event_id"] if items else (before or after)
             # The Room-wide cursor moves with unrelated tasks, so forward
             # pagination bounds must be computed from THIS task's events:
             # only an event of this task after ``next_after`` means more.
-            task_latest_sql = (
-                f"SELECT MAX(project_seq) AS max_id FROM events WHERE {' AND '.join(clauses)}"
-            )
-            task_latest_row = connection.execute(task_latest_sql, parameters).fetchone()
-            task_latest = int(task_latest_row["max_id"] or 0)
+            # Boundary probes rather than ``bool(items)`` plus a count proxy:
+            # an empty page still has to answer honestly which side holds data,
+            # or the disabled direction is the one the user just walked past.
+            def _has_further(direction: str, boundary: int) -> bool:
+                # ``before`` of the first event can never match, but boundary 0
+                # on the forward side is a real position: it means the caller
+                # walked past the oldest event and newer data does exist.
+                if direction == "before" and boundary <= 1:
+                    return False
+                op = ">" if direction == "after" else "<"
+                row = connection.execute(
+                    f"SELECT 1 AS hit FROM events WHERE {' AND '.join(clauses)}"
+                    f" AND project_seq {op} ? LIMIT 1",
+                    [*parameters, boundary],
+                ).fetchone()
+                return row is not None
+
             latest = self.latest_cursor(connection, project_id)
             return {
                 "schema_version": TASK_HISTORY_SCHEMA_VERSION,
@@ -4006,8 +5772,8 @@ class AgentChatRoomService:
                 "cursor": next_after,
                 "next_after": next_after,
                 "next_before": next_before,
-                "has_more_after": bool(items) and next_after < task_latest,
-                "has_more_before": bool(items) and next_before > 1 and total > len(items),
+                "has_more_after": _has_further("after", next_after),
+                "has_more_before": _has_further("before", next_before),
                 "latest_cursor": latest,
                 "event_type": wanted_type,
             }
@@ -4319,6 +6085,30 @@ class AgentChatRoomService:
     ) -> dict[str, Any]:
         if kind not in MESSAGE_KINDS:
             raise DomainError("invalid_message_kind", "Unsupported message kind")
+        if kind == "system" and session_id:
+            # `system` never enters an Agent's context window
+            # (MCP_CONTEXT_EVENT_TYPES), so letting an Agent choose it lets any
+            # Agent write a message the rest of the room can never see - a
+            # blocker or a warning that silently reaches nobody. The kind is
+            # reserved for the operator path, which posts without an Agent
+            # Session and is accountable to the deployment rather than to a
+            # peer that can be impersonated.
+            raise DomainError(
+                "agent_may_not_post_system_message",
+                "The system kind is reserved for the operator; Agents post "
+                "message, decision or blocker, all of which every other Agent "
+                "can see",
+                status_code=403,
+                details={
+                    "requested_kind": kind,
+                    "agent_visible_kinds": sorted(
+                        kind
+                        for kind in MESSAGE_KINDS
+                        if kind != "system"
+                    ),
+                    "required_action": "post_message_decision_or_blocker",
+                },
+            )
         if not body.strip():
             raise DomainError("empty_message", "Message body is required")
         if len(body) > self.settings.message_max_body_length:
@@ -4328,8 +6118,12 @@ class AgentChatRoomService:
                 f"({self.settings.message_max_body_length})",
                 details={"limit": self.settings.message_max_body_length},
             )
-        if not 0 <= priority <= 4:
-            raise DomainError("invalid_priority", "Priority must be between 0 and 4")
+        if not TASK_PRIORITY_MIN <= priority <= TASK_PRIORITY_MAX:
+            raise DomainError(
+                "invalid_priority",
+                "Priority must be between "
+                f"{TASK_PRIORITY_MIN} and {TASK_PRIORITY_MAX}",
+            )
         if channel not in MESSAGE_CHANNELS:
             raise DomainError("invalid_message_channel", "Unsupported message channel")
         clean_model_display_name = str(model_display_name or "").strip()
@@ -4344,7 +6138,7 @@ class AgentChatRoomService:
         list_limit = int(getattr(self.settings, "list_input_max_count", 100))
         clean_files = self._require_list_input_limit(
             "files",
-            sorted({normalize_pattern(path) for path in (files or [])}),
+            sorted({normalize_evidence_path(path) for path in (files or [])}),
             limit=list_limit,
         )
         clean_mentions = self._require_list_input_limit(
@@ -4629,6 +6423,9 @@ class AgentChatRoomService:
         target_member_id: str,
         target_session_id: str | None = None,
         note: str = "",
+        session_id: str | None = None,
+        token: str | None = None,
+        management_authorized: bool = False,
     ) -> dict[str, Any]:
         clean_member_id = target_member_id.strip()
         clean_session_id = target_session_id.strip() if target_session_id else None
@@ -4637,7 +6434,20 @@ class AgentChatRoomService:
                 "task_intake_target_required", "An Agent target is required"
             )
         with self.database.connect(write=True) as connection:
+            # Reassignment moves someone else's work, so it needs a real actor:
+            # either an authenticated Session or an authenticated management
+            # request. Anonymous callers used to succeed here and the audit
+            # event then recorded the actor as a manager nobody had proven.
+            actor_session_id: str | None = None
+            if session_id or token:
+                agent = self._authenticate(
+                    connection, project_id, str(session_id or ""), str(token or "")
+                )
+                actor_session_id = str(agent["id"])
+            elif not management_authorized:
+                raise _management_authorization_required("reassign a task intake")
             intake = self._require_task_intake(connection, project_id, intake_id)
+            previous_status = str(intake["status"])
             if intake["status"] == "defined":
                 raise DomainError(
                     "task_intake_already_defined",
@@ -4648,6 +6458,7 @@ class AgentChatRoomService:
                 raise DomainError(
                     "task_intake_cancelled", "A cancelled intake cannot be reassigned", status_code=409
                 )
+            self._transition_task_intake(connection, intake["status"], "pending")
             member = self._require_intake_target(
                 connection, project_id, clean_member_id, clean_session_id
             )
@@ -4667,12 +6478,12 @@ class AgentChatRoomService:
             # An offline member remains a valid target; in that case the
             # identity is stored without a session until it reconnects.
             now = iso_now()
-            connection.execute(
+            updated_rows = connection.execute(
                 """
                 UPDATE task_intakes
                 SET target_member_id = ?, target_session_id = ?, status = 'pending',
                     note = ?, updated_at = ?
-                WHERE id = ? AND project_id = ?
+                WHERE id = ? AND project_id = ? AND status = ?
                 """,
                 (
                     member["id"],
@@ -4681,17 +6492,28 @@ class AgentChatRoomService:
                     now,
                     intake_id,
                     project_id,
+                    previous_status,
                 ),
             )
+            if updated_rows.rowcount != 1:
+                raise DomainError(
+                    "task_modified_concurrently",
+                    "Task intake was modified concurrently; reload the intake and retry",
+                    status_code=409,
+                )
             event_id = self._emit(
                 connection,
                 project_id,
                 "task.intake_reassigned",
+                actor_session_id=actor_session_id,
                 payload={
                     "intake_id": intake_id,
+                    "previous_status": previous_status,
+                    "status": "pending",
                     "target_member_id": member["id"],
                     "target_session_id": clean_session_id,
                     "note": note.strip(),
+                    "performed_by": "agent_session" if actor_session_id else "management",
                 },
             )
             updated = self._require_task_intake(connection, project_id, intake_id)
@@ -4747,6 +6569,7 @@ class AgentChatRoomService:
                     status_code=409,
                 )
             next_status = response
+            self._transition_task_intake(connection, intake["status"], next_status)
             now = iso_now()
             cursor = connection.execute(
                 """
@@ -4772,6 +6595,90 @@ class AgentChatRoomService:
                     "response": response,
                     "note": note.strip(),
                     "target_session_id": session_id,
+                },
+            )
+            updated = self._require_task_intake(connection, project_id, intake_id)
+            return {
+                "intake": self._task_intake_dict(updated),
+                "event_id": event_id,
+                "cursor": event_id,
+            }
+
+    @idempotent_write("task.intake.cancel")
+    def cancel_task_intake(
+        self,
+        project_id: str,
+        intake_id: str,
+        *,
+        session_id: str | None = None,
+        token: str | None = None,
+        reason: str = "",
+        management_authorized: bool = False,
+    ) -> dict[str, Any]:
+        """Retire an intake that will not become a formal task.
+
+        `cancelled` was a declared destination of the intake state machine and
+        a published vocabulary value, but nothing could write it: an intake
+        whose target never accepts it, or that the user no longer wants, had
+        to sit in `pending` forever. This is the missing write path.
+
+        Authorization mirrors task intake reassignment: withdrawing work
+        recorded against someone else's identity needs a real actor, so an
+        authenticated Session or an authenticated management request, never an
+        anonymous caller.
+        """
+        clean_reason = reason.strip()
+        with self.database.connect(write=True) as connection:
+            actor_session_id: str | None = None
+            if session_id or token:
+                agent = self._authenticate(
+                    connection, project_id, str(session_id or ""), str(token or "")
+                )
+                actor_session_id = str(agent["id"])
+            elif not management_authorized:
+                raise _management_authorization_required("cancel a task intake")
+            intake = self._require_task_intake(connection, project_id, intake_id)
+            if intake["status"] == "cancelled":
+                # Repeating a cancel is idempotent: no second event, same row.
+                return {
+                    "intake": self._task_intake_dict(intake),
+                    "event_id": None,
+                    "cursor": self.latest_cursor(connection, project_id),
+                }
+            if intake["status"] == "defined":
+                raise DomainError(
+                    "task_intake_already_defined",
+                    "A defined intake must be cancelled through its formal task",
+                    status_code=409,
+                )
+            previous_status = str(intake["status"])
+            self._transition_task_intake(connection, previous_status, "cancelled")
+            now = iso_now()
+            updated_rows = connection.execute(
+                """
+                UPDATE task_intakes
+                SET status = 'cancelled', note = ?, updated_at = ?
+                WHERE id = ? AND project_id = ? AND status = ?
+                """,
+                (clean_reason, now, intake_id, project_id, previous_status),
+            ).rowcount
+            if updated_rows != 1:
+                raise DomainError(
+                    "task_modified_concurrently",
+                    "The task intake changed while it was being cancelled",
+                    status_code=409,
+                )
+            event_id = self._emit(
+                connection,
+                project_id,
+                "task.intake_cancelled",
+                actor_session_id=actor_session_id,
+                payload={
+                    "intake_id": intake_id,
+                    "previous_status": previous_status,
+                    "status": "cancelled",
+                    "reason": clean_reason,
+                    "target_member_id": str(intake["target_member_id"]),
                 },
             )
             updated = self._require_task_intake(connection, project_id, intake_id)
@@ -4814,6 +6721,7 @@ class AgentChatRoomService:
             # Optimistic lock BEFORE creating the task: two concurrent defines
             # must not both mint formal tasks (the loser must not leave an
             # orphan duplicate behind).
+            self._transition_task_intake(connection, intake["status"], "defining")
             claim = connection.execute(
                 """
                 UPDATE task_intakes
@@ -4840,7 +6748,8 @@ class AgentChatRoomService:
             )
             task = created["task"]
             now = iso_now()
-            connection.execute(
+            self._transition_task_intake(connection, "defining", "defined")
+            defined_rows = connection.execute(
                 """
                 UPDATE task_intakes
                 SET status = 'defined', formal_task_id = ?, note = ?, updated_at = ?
@@ -4848,6 +6757,12 @@ class AgentChatRoomService:
                 """,
                 (task["id"], note.strip(), now, intake_id, project_id),
             )
+            if defined_rows.rowcount != 1:
+                raise DomainError(
+                    "task_modified_concurrently",
+                    "Task intake was modified concurrently; the formal task was not linked",
+                    status_code=409,
+                )
             defined_event_id = self._emit(
                 connection,
                 project_id,
@@ -4903,7 +6818,8 @@ class AgentChatRoomService:
                     f"Task {field_name} exceeds task_text_max_length ({text_limit})",
                     details={"field": field_name, "limit": text_limit},
                 )
-        if priority is not None and not 0 <= priority <= 4:
+        priority = require_int_field(priority, "priority")
+        if priority is not None and not TASK_PRIORITY_MIN <= priority <= TASK_PRIORITY_MAX:
             raise DomainError("invalid_priority", "Priority must be between 0 and 4")
         list_limit = int(getattr(self.settings, "list_input_max_count", 100))
         criteria = self._require_list_input_limit(
@@ -4942,7 +6858,7 @@ class AgentChatRoomService:
                         PROJECT_SETTINGS_DEFAULTS["default_task_priority"],
                     )
                 )
-                if not 0 <= priority <= 4:
+                if not TASK_PRIORITY_MIN <= priority <= TASK_PRIORITY_MAX:
                     priority = PROJECT_SETTINGS_DEFAULTS["default_task_priority"]
             if not actor_session_id:
                 # 正式任务必须能追溯到创建者；无操作者的创建一律显式拒绝，
@@ -4952,8 +6868,9 @@ class AgentChatRoomService:
                     "Task creation requires the authenticated Agent session of the operator",
                 )
             self._authenticate(connection, project_id, actor_session_id, token or "")
-            for dependency_id in dependencies:
-                self._require_task(connection, project_id, dependency_id)
+            self._require_acyclic_dependencies(
+                connection, project_id, task_id, dependencies
+            )
             task_number = self._next_task_number(connection, project_id)
             try:
                 connection.execute(
@@ -5091,6 +7008,175 @@ class AgentChatRoomService:
             task = self._require_task_by_number(connection, project_id, task_number)
             return self._task_with_dependencies(connection, task)
 
+    def _unfinished_dependencies(self, connection: Any, task_id: str) -> list[Any]:
+        return connection.execute(
+            """
+            SELECT t.id, t.title, t.status, t.execution_status,
+                   t.verification_status, t.integration_status
+            FROM task_dependencies d
+            JOIN tasks t ON t.id = d.depends_on_task_id
+            WHERE d.task_id = ?
+              AND NOT (
+                  t.verification_status = 'approved'
+                  AND t.integration_status = 'done'
+              )
+            """,
+            (task_id,),
+        ).fetchall()
+
+    def _require_finished_dependencies(self, connection: Any, task_id: str) -> None:
+        """Gate entry into work, whatever door is used.
+
+        Claim, assignment acceptance and handoff acceptance all move a task into
+        ``claimed``. The dependency rule lived only in ``claim_task``, so
+        assigning a blocked task and having the target accept it stepped straight
+        past the gate, and the task then read as claimed and could be reported
+        and reviewed with its dependencies unfinished.
+        """
+        blockers = self._unfinished_dependencies(connection, task_id)
+        if blockers:
+            raise DomainError(
+                "task_dependencies_incomplete",
+                "Task has unfinished dependencies",
+                status_code=409,
+                details={"blockers": [dict(row) for row in blockers]},
+            )
+
+    def list_dependency_cycles(self, project_id: str) -> dict[str, Any]:
+        """Report tasks that already sit inside a dependency cycle.
+
+        ``create_task`` and ``update_task`` now refuse to write a cycle, but
+        rows written before that guard existed are still in the table and stay
+        permanently unclaimable. This is a read-only report: it never edits
+        dependencies and never rewrites an event, so an operator can see the
+        damage and repair it deliberately.
+        """
+        with self.database.connect() as connection:
+            self._require_project(connection, project_id)
+            rows = connection.execute(
+                """
+                WITH RECURSIVE reach(root_id, task_id, depth) AS (
+                    SELECT task_id, depends_on_task_id, 1
+                    FROM task_dependencies
+                    UNION
+                    SELECT r.root_id, d.depends_on_task_id, r.depth + 1
+                    FROM reach r
+                    JOIN task_dependencies d ON d.task_id = r.task_id
+                    WHERE r.depth < 64
+                )
+                SELECT root_id, task_id
+                FROM reach
+                WHERE root_id = task_id
+                GROUP BY root_id, task_id
+                ORDER BY root_id
+                """
+            ).fetchall()
+            member_ids = sorted({row["root_id"] for row in rows})
+            if not member_ids:
+                return {"cycles": [], "cycle_task_count": 0}
+            numbers = {
+                row["id"]: row["task_number"]
+                for row in connection.execute(
+                    "SELECT id, task_number FROM tasks WHERE project_id = ? AND id IN ({})".format(
+                        ",".join("?" * len(member_ids))
+                    ),
+                    (project_id, *member_ids),
+                ).fetchall()
+            }
+        cycles = [
+            {
+                "task_id": task_id,
+                "task_number": numbers.get(task_id),
+                "required_action": "rewrite_depends_on_to_break_the_cycle",
+            }
+            for task_id in member_ids
+        ]
+        return {"cycles": cycles, "cycle_task_count": len(cycles)}
+
+    def _require_acyclic_dependencies(
+        self,
+        connection: Any,
+        project_id: str,
+        task_id: str,
+        dependencies: list[str],
+    ) -> None:
+        """Reject a dependency set that would make ``task_id`` unreachable.
+
+        A cycle is written by pointing A at B after B already points at A, so
+        the edge is accepted one task at a time and the graph only becomes
+        cyclic after the insert. Every task inside the cycle then reports
+        ``task_dependencies_incomplete`` for **every** member forever: the
+        blocker query can never be satisfied, and the only escape is
+        rewriting ``depends_on`` with the full list guessed from outside.
+
+        Both ``create_task`` and ``update_task`` wire dependencies up, and
+        ``define_task_from_intake`` delegates to ``create_task``, so the check
+        lives here once. A task that does not exist yet (``create_task``
+        mints its id before the insert) cannot already be a cycle member, so
+        the reachability walk starts from each dependency.
+        """
+        for dependency_id in dependencies:
+            if dependency_id == task_id:
+                raise DomainError(
+                    "task_dependency_cycle",
+                    "A task cannot depend on itself",
+                    details={
+                        "depends_on_task_id": dependency_id,
+                        "task_id": task_id,
+                        "required_action": "remove_the_self_dependency",
+                    },
+                )
+            self._require_satisfiable_dependency(connection, project_id, dependency_id)
+            reaches_task = connection.execute(
+                """
+                WITH RECURSIVE chain(task_id) AS (
+                    SELECT depends_on_task_id FROM task_dependencies WHERE task_id = ?
+                    UNION
+                    SELECT d.depends_on_task_id
+                    FROM task_dependencies d JOIN chain c ON d.task_id = c.task_id
+                )
+                SELECT 1 FROM chain WHERE task_id = ? LIMIT 1
+                """,
+                (dependency_id, task_id),
+            ).fetchone()
+            if reaches_task:
+                raise DomainError(
+                    "task_dependency_cycle",
+                    "Task dependencies cannot contain a cycle",
+                    details={
+                        "depends_on_task_id": dependency_id,
+                        "task_id": task_id,
+                        "required_action": "break_the_dependency_cycle_before_claiming",
+                    },
+                )
+
+    def _require_satisfiable_dependency(
+        self, connection: Any, project_id: str, dependency_id: str
+    ) -> None:
+        """Reject a dependency that can never be satisfied.
+
+        The gate a dependency has to clear is ``approved`` plus ``integrated``.
+        A cancelled task can never reach it again - cancelled is terminal - so
+        depending on one turned the new task into a permanent
+        ``task_dependencies_incomplete``, discovered only when someone tried to
+        claim it. Say so at the moment the dependency is wired up instead.
+        """
+        dependency = self._require_task(connection, project_id, dependency_id)
+        if dependency["execution_status"] != "cancelled":
+            return
+        raise DomainError(
+            "invalid_dependency_status",
+            f"Task #{dependency['task_number']} is cancelled and can never "
+            "satisfy a dependency",
+            status_code=422,
+            details={
+                "depends_on_task_id": dependency_id,
+                "task_number": dependency["task_number"],
+                "execution_status": dependency["execution_status"],
+                "required_action": "drop_the_cancelled_dependency_or_pick_another",
+            },
+        )
+
     @idempotent_write("task.claim")
     def claim_task(
         self,
@@ -5112,17 +7198,10 @@ class AgentChatRoomService:
                     "cursor": self.latest_cursor(connection, project_id),
                 }
             if task["owner_session_id"] is not None:
-                owner = connection.execute(
-                    """
-                    SELECT a.*,
-                           (SELECT MAX(e.created_at) FROM events e
-                            WHERE e.project_id = a.project_id
-                              AND e.actor_session_id = a.id) AS last_activity_at
-                    FROM agent_sessions a
-                    WHERE a.id = ? AND a.project_id = ?
-                    """,
-                    (task["owner_session_id"], project_id),
-                ).fetchone()
+                liveness = self._owner_liveness(
+                    connection, project_id, str(task["owner_session_id"])
+                )
+                owner = liveness["owner"]
                 can_reclaim = bool(
                     owner is not None
                     and self._same_agent_identity(claimant, owner)
@@ -5148,29 +7227,9 @@ class AgentChatRoomService:
                         "Only the same software identity can reclaim unfinished execution work",
                         status_code=403,
                     )
-                last_seen = parse_time(owner["last_heartbeat"])
-                if owner["last_activity_at"]:
-                    last_seen = max(last_seen, parse_time(owner["last_activity_at"]))
-                owner_connected = owner["left_at"] is None and (
-                    utc_now() - last_seen
-                    <= timedelta(seconds=self.settings.heartbeat_timeout_seconds)
-                )
-                transport_state = "not_checked"
-                if owner_connected:
-                    # Presence is display-only, but a reaped transport is hard
-                    # evidence the owning client is gone: allow the same
-                    # identity to reclaim immediately instead of waiting out
-                    # the heartbeat window.
-                    state_check = self.transport_liveness_check
-                    if state_check is None:
-                        transport_state = "unavailable"
-                    else:
-                        transport_state = (
-                            str(state_check(project_id, str(owner["id"])) or "")
-                            or "unknown"
-                        )
-                        if transport_state == "gone":
-                            owner_connected = False
+                last_seen = liveness["last_seen"]
+                owner_connected = bool(liveness["connected"])
+                transport_state = str(liveness["transport_state"])
                 if owner_connected and not takeover:
                     # An ordinary reclaim never preempts a live owner.  A same-
                     # identity caller can choose an explicit, audited takeover
@@ -5237,6 +7296,11 @@ class AgentChatRoomService:
                         "transferred_lease_ids": lease_ids,
                         "execution_status": task["execution_status"],
                         "explicit_live_takeover": bool(takeover and owner_connected),
+                        # The new owner starts reading under the standards as
+                        # they stand now, not as they stood for the previous one.
+                        "project_documents": self._binding_document_snapshot(
+                            connection, project_id
+                        ),
                     },
                 )
                 row = connection.execute(
@@ -5261,27 +7325,7 @@ class AgentChatRoomService:
                         "status": task["status"],
                     },
                 )
-            blockers = connection.execute(
-                """
-                SELECT t.id, t.title, t.status, t.execution_status,
-                       t.verification_status, t.integration_status
-                FROM task_dependencies d
-                JOIN tasks t ON t.id = d.depends_on_task_id
-                WHERE d.task_id = ?
-                  AND NOT (
-                      t.verification_status = 'approved'
-                      AND t.integration_status = 'done'
-                  )
-                """,
-                (task_id,),
-            ).fetchall()
-            if blockers:
-                raise DomainError(
-                    "task_dependencies_incomplete",
-                    "Task has unfinished dependencies",
-                    status_code=409,
-                    details={"blockers": [dict(row) for row in blockers]},
-                )
+            self._require_finished_dependencies(connection, task_id)
             now = iso_now()
             updated = connection.execute(
                 """
@@ -5341,25 +7385,42 @@ class AgentChatRoomService:
         a task is cancelled. Runs inside an open write transaction so the
         terminal state never leaves orphan resources behind."""
         now = iso_now()
+        # A Session-driven cancellation only cleans up what that Session owns.
+        # Another Agent's exclusive lease on the task must survive: before this
+        # was scoped, cancelling an unowned task released leases held by an
+        # unrelated Agent that had bound work to it. A management cancellation
+        # carries no actor Session and keeps the documented whole-task sweep.
+        actor_clause = ""
+        lease_params: tuple[Any, ...] = (project_id, task_id)
+        if actor_session_id:
+            actor_clause = " AND session_id = ?"
+            lease_params = (project_id, task_id, actor_session_id)
         active_leases = connection.execute(
-            """
+            f"""
             SELECT id FROM file_leases
-            WHERE project_id = ? AND task_id = ? AND released_at IS NULL
+            WHERE project_id = ? AND task_id = ? AND released_at IS NULL{actor_clause}
             """,
-            (project_id, task_id),
+            lease_params,
         ).fetchall()
         released_lease_ids = [row["id"] for row in active_leases]
         if released_lease_ids:
+            placeholders = _sql_placeholders(len(released_lease_ids))
             connection.execute(
-                """
+                f"""
                 UPDATE file_leases SET released_at = ?
                 WHERE project_id = ? AND task_id = ? AND released_at IS NULL
+                  AND id IN ({placeholders})
                 """,
-                (now, project_id, task_id),
+                (now, project_id, task_id, *released_lease_ids),
             )
+        task_number_row = connection.execute(
+            "SELECT task_number FROM tasks WHERE id = ? AND project_id = ?",
+            (task_id, project_id),
+        ).fetchone()
+        task_number = int(task_number_row["task_number"]) if task_number_row else 0
         pending_assignments = connection.execute(
             """
-            SELECT id FROM task_assignments
+            SELECT id, assigned_to_session_id FROM task_assignments
             WHERE project_id = ? AND task_id = ? AND status = 'pending'
             """,
             (project_id, task_id),
@@ -5371,7 +7432,7 @@ class AgentChatRoomService:
                 f"""
                 UPDATE task_assignments
                 SET status = 'cancelled', responded_by_session_id = ?,
-                    response_note = 'cancelled by task cancellation', responded_at = ?
+                    response_note = 'task_cancellation', responded_at = ?
                 WHERE project_id = ? AND task_id = ?
                   AND status = 'pending' AND id IN ({placeholders})
                 """,
@@ -5383,9 +7444,28 @@ class AgentChatRoomService:
                     *cancelled_assignment_ids,
                 ),
             )
+            # Release and reassignment already emit one event per invalidated
+            # row; cancellation has to as well, or the event-sourced timelines
+            # show an assignment vanishing on release but not on cancellation.
+            for row in pending_assignments:
+                self._emit(
+                    connection,
+                    project_id,
+                    "task.assignment_cancelled",
+                    actor_session_id=actor_session_id,
+                    task_id=task_id,
+                    payload={
+                        "assignment_id": str(row["id"]),
+                        "by": "task_cancellation",
+                        "previous_target_session_id": str(
+                            row["assigned_to_session_id"] or ""
+                        ),
+                        "task_number": task_number,
+                    },
+                )
         pending_handoffs = connection.execute(
             """
-            SELECT id FROM task_handoffs
+            SELECT id, to_session_id FROM task_handoffs
             WHERE project_id = ? AND task_id = ? AND status = 'pending'
             """,
             (project_id, task_id),
@@ -5397,7 +7477,7 @@ class AgentChatRoomService:
                 f"""
                 UPDATE task_handoffs
                 SET status = 'cancelled', responded_by_session_id = ?,
-                    response_note = 'cancelled by task cancellation', responded_at = ?
+                    response_note = 'task_cancellation', responded_at = ?
                 WHERE project_id = ? AND task_id = ?
                   AND status = 'pending' AND id IN ({placeholders})
                 """,
@@ -5409,6 +7489,20 @@ class AgentChatRoomService:
                     *cancelled_handoff_ids,
                 ),
             )
+            for row in pending_handoffs:
+                self._emit(
+                    connection,
+                    project_id,
+                    "task.handoff_cancelled",
+                    actor_session_id=actor_session_id,
+                    task_id=task_id,
+                    payload={
+                        "handoff_id": str(row["id"]),
+                        "by": "task_cancellation",
+                        "previous_target_session_id": str(row["to_session_id"] or ""),
+                        "task_number": task_number,
+                    },
+                )
         return {
             "released_lease_ids": released_lease_ids,
             "cancelled_assignment_ids": cancelled_assignment_ids,
@@ -5522,7 +7616,7 @@ class AgentChatRoomService:
                 """,
                 (
                     actor_session_id,
-                    f"cancelled by task release ({clean_reason_code})",
+                    f"task_release:{clean_reason_code}",
                     now,
                     project_id,
                     task["id"],
@@ -5550,7 +7644,7 @@ class AgentChatRoomService:
                 """,
                 (
                     actor_session_id,
-                    f"cancelled by task release ({clean_reason_code})",
+                    f"task_release:{clean_reason_code}",
                     now,
                     project_id,
                     task["id"],
@@ -5886,7 +7980,7 @@ class AgentChatRoomService:
                     """
                     UPDATE task_assignments
                     SET status = 'cancelled', responded_by_session_id = ?,
-                        response_note = 'superseded by reassignment', responded_at = ?
+                        response_note = 'reassignment', responded_at = ?
                     WHERE id = ?
                     """,
                     (assigned_by_session_id, now_reassign, row["id"]),
@@ -6033,25 +8127,51 @@ class AgentChatRoomService:
                     status_code=409,
                 )
             reclaimed_from_session_id: str | None = None
+            transferred_lease_ids: list[str] = []
             if response == "accepted":
                 if task["owner_session_id"] not in {None, session_id}:
-                    previous_owner = connection.execute(
-                        "SELECT left_at FROM agent_sessions WHERE id = ? AND project_id = ?",
-                        (task["owner_session_id"], project_id),
-                    ).fetchone()
-                    can_reclaim = (
+                    previous_owner_id = str(task["owner_session_id"])
+                    liveness = self._owner_liveness(
+                        connection, project_id, previous_owner_id
+                    )
+                    # Accepting an assignment is explicit intent for this task,
+                    # but taking it away from another Session is a reclaim and
+                    # must satisfy the same contract task_claim enforces:
+                    # same software identity, provable absence, unfinished work.
+                    if not self._same_agent_identity(agent, liveness["owner"]):
+                        raise DomainError(
+                            "task_reclaim_forbidden",
+                            "Only the owning software identity may take back "
+                            "unfinished execution work through an assignment",
+                            status_code=403,
+                            details={
+                                "owner_session_id": previous_owner_id,
+                                "required_action": "task_claim_by_owner_identity_or_management_reassignment",
+                            },
+                        )
+                    if not (
                         task["execution_status"] == "in_progress"
                         and task["verification_status"] == "changes_requested"
-                        and previous_owner is not None
-                        and previous_owner["left_at"] is not None
-                    )
-                    if not can_reclaim:
+                    ):
                         raise DomainError(
                             "task_already_claimed",
                             "Task is already owned by another Agent",
                             status_code=409,
+                            details={"owner_session_id": previous_owner_id},
                         )
-                    reclaimed_from_session_id = task["owner_session_id"]
+                    if liveness["connected"]:
+                        raise DomainError(
+                            "task_owner_session_connected",
+                            "The owning Session is still connected; it must release "
+                            "the task or its own identity has to take over explicitly",
+                            status_code=409,
+                            details={
+                                "owner_session_id": previous_owner_id,
+                                "owner_transport_state": liveness["transport_state"],
+                                "required_action": "task_claim(takeover=true)_by_owner_identity",
+                            },
+                        )
+                    reclaimed_from_session_id = previous_owner_id
                 if task["execution_status"] not in {"todo", "claimed"} and not (
                     task["execution_status"] == "in_progress"
                     and task["verification_status"] == "changes_requested"
@@ -6068,6 +8188,7 @@ class AgentChatRoomService:
                 else:
                     owner_clause = "owner_session_id = ?"
                     owner_params = (task["owner_session_id"],)
+                self._require_finished_dependencies(connection, task_id)
                 updated_task = connection.execute(
                     f"""
                     UPDATE tasks
@@ -6091,6 +8212,35 @@ class AgentChatRoomService:
                         "Task was modified concurrently",
                         status_code=409,
                     )
+                if reclaimed_from_session_id is not None:
+                    # Ownership moved, so the departed owner's task-scoped
+                    # exclusive leases have to move with it; leaving them behind
+                    # blocks the new owner on its own task until the TTL expires.
+                    lease_rows = connection.execute(
+                        """
+                        SELECT id FROM file_leases
+                        WHERE project_id = ? AND task_id = ? AND session_id = ?
+                          AND released_at IS NULL
+                        """,
+                        (project_id, task_id, reclaimed_from_session_id),
+                    ).fetchall()
+                    transferred_lease_ids = [str(row["id"]) for row in lease_rows]
+                    if transferred_lease_ids:
+                        connection.execute(
+                            """
+                            UPDATE file_leases
+                            SET session_id = ?, renewed_at = ?
+                            WHERE project_id = ? AND task_id = ? AND session_id = ?
+                              AND released_at IS NULL
+                            """,
+                            (
+                                session_id,
+                                iso_now(),
+                                project_id,
+                                task_id,
+                                reclaimed_from_session_id,
+                            ),
+                        )
             now = iso_now()
             updated_assignment = connection.execute(
                 """
@@ -6118,6 +8268,15 @@ class AgentChatRoomService:
                     "response": response,
                     "note": note.strip(),
                     "reclaimed_from_session_id": reclaimed_from_session_id,
+                    "transferred_lease_ids": transferred_lease_ids,
+                    # Accepting an assignment is the third way into a task, and
+                    # it was leaving no receipt - a task that started this way
+                    # reported spec_receipt {} for its whole life.
+                    "project_documents": (
+                        self._binding_document_snapshot(connection, project_id)
+                        if response == "accepted"
+                        else {}
+                    ),
                 },
             )
             updated_assignment = connection.execute(
@@ -6143,6 +8302,7 @@ class AgentChatRoomService:
         next_step: str,
         from_session_id: str | None = None,
         token: str | None = None,
+        management_authorized: bool = False,
         completed_items: list[str] | None = None,
         pending_items: list[str] | None = None,
         files: list[str] | None = None,
@@ -6156,17 +8316,31 @@ class AgentChatRoomService:
                 "Task handoff requires a summary and an explicit next step",
             )
 
-        def clean_items(values: list[str] | None) -> list[str]:
+        def clean_items(values: list[str] | None, field: str) -> list[str]:
+            bounded = self._require_list_input_limit(
+                field,
+                values or [],
+                limit=int(getattr(self.settings, "list_input_max_count", 100)),
+            )
             return list(
                 dict.fromkeys(
-                    str(item).strip() for item in (values or []) if str(item).strip()
+                    str(item).strip() for item in bounded if str(item).strip()
                 )
             )
 
-        clean_completed = clean_items(completed_items)
-        clean_pending = clean_items(pending_items)
-        clean_files = sorted({normalize_pattern(path) for path in (files or [])})
-        clean_risks = clean_items(risks)
+        clean_completed = clean_items(completed_items, "completed_items")
+        clean_pending = clean_items(pending_items, "pending_items")
+        clean_files = sorted(
+            {
+                normalize_evidence_path(path)
+                for path in self._require_list_input_limit(
+                    "files",
+                    files or [],
+                    limit=int(getattr(self.settings, "list_input_max_count", 100)),
+                )
+            }
+        )
+        clean_risks = clean_items(risks, "risks")
         with self.database.connect(write=True) as connection:
             if bool(from_session_id) != bool(token):
                 raise DomainError(
@@ -6182,18 +8356,36 @@ class AgentChatRoomService:
                     token or "",
                 )
             task = self._require_task(connection, project_id, task_id)
-            source_session_id = from_session_id or task["owner_session_id"]
+            # "No credentials presented" is not owner authority. A handoff moves
+            # ownership once the target accepts, and accepting releases the
+            # source's active leases, so the caller must either prove it is the
+            # current owner or arrive through an authenticated management
+            # request. The unauthenticated path used to borrow the owner's own
+            # session id, which made the ownership check below compare a value
+            # with itself and never fail, and the audit then recorded another
+            # Agent's intrusion as requested_by "manager".
+            if not from_session_id and not management_authorized:
+                raise _management_authorization_required(
+                    "hand this task off using the owner's credentials"
+                )
+            if from_session_id:
+                if task["owner_session_id"] != from_session_id:
+                    raise DomainError(
+                        "not_task_owner",
+                        "Only the current task owner can hand off this task",
+                        status_code=403,
+                        details={
+                            "required_action": "handoff_requires_current_owner_credentials"
+                        },
+                    )
+                source_session_id = from_session_id
+            else:
+                source_session_id = task["owner_session_id"]
             if not source_session_id:
                 raise DomainError(
                     "handoff_source_missing",
                     "Task must have an owner before it can be handed off",
                     status_code=409,
-                )
-            if task["owner_session_id"] != source_session_id:
-                raise DomainError(
-                    "not_task_owner",
-                    "Only the current task owner can hand off this task",
-                    status_code=403,
                 )
             if task["execution_status"] == "cancelled":
                 raise DomainError(
@@ -6377,6 +8569,7 @@ class AgentChatRoomService:
                         "Cancelled tasks cannot accept a handoff",
                         status_code=409,
                     )
+                self._require_finished_dependencies(connection, task_id)
                 if task["execution_status"] == "completed" and (
                     task["verification_status"] != "approved"
                     or task["integration_status"] != "pending"
@@ -6495,6 +8688,38 @@ class AgentChatRoomService:
             if not session_id and not management_authorized:
                 raise _management_authorization_required("update this task")
             next_status = status or task["status"]
+            is_cancelling = next_status == "cancelled" and task["status"] != "cancelled"
+            # Cancellation is an ownership decision, not a field edit. An
+            # unowned task used to fall through the ownership check above, so
+            # any authenticated Session could cancel it and, through the
+            # terminal cleanup, release another Agent's exclusive lease on it.
+            # A cancelled task must never be reopened through this method: it
+            # is terminal, and the state machine below no longer offers the
+            # edge that made a silent cancelled -> todo hop possible.
+            if is_cancelling and not (is_owner or management_authorized):
+                raise DomainError(
+                    "management_auth_required",
+                    "Cancelling a task requires the task owner's own credentials "
+                    "or an authenticated management request",
+                    status_code=403,
+                    details={
+                        "required_action": (
+                            "use_task_owner_credentials_or_management_authorization"
+                        ),
+                        "attempted_status": next_status,
+                    },
+                )
+            if task["status"] == "cancelled" and next_status != "cancelled":
+                raise DomainError(
+                    "task_is_terminal",
+                    "A cancelled task is terminal and cannot be reopened through "
+                    "task_update; create a replacement task instead",
+                    status_code=409,
+                    details={
+                        "required_action": "create_a_replacement_task",
+                        "status": task["status"],
+                    },
+                )
             text_limit = self.settings.task_text_max_length
             for field_name, value in (
                 ("title", title),
@@ -6592,8 +8817,11 @@ class AgentChatRoomService:
             ) = task_state_for_legacy_status(
                 next_status,
                 previous_verification=task["verification_status"],
+                previous_integration=task["integration_status"],
             )
-            if priority is not None and not 0 <= priority <= 4:
+            priority = require_int_field(priority, "priority")
+            progress_percent = require_int_field(progress_percent, "progress_percent")
+            if priority is not None and not TASK_PRIORITY_MIN <= priority <= TASK_PRIORITY_MAX:
                 raise DomainError("invalid_priority", "Priority must be between 0 and 4")
             if progress_percent is not None and not 0 <= progress_percent <= 100:
                 raise DomainError(
@@ -6632,29 +8860,9 @@ class AgentChatRoomService:
                 if depends_on is None
                 else list(dict.fromkeys(depends_on))
             )
-            for dependency_id in next_dependencies:
-                if dependency_id == task_id:
-                    raise DomainError(
-                        "task_dependency_cycle", "A task cannot depend on itself"
-                    )
-                self._require_task(connection, project_id, dependency_id)
-                reaches_current = connection.execute(
-                    """
-                    WITH RECURSIVE chain(task_id) AS (
-                        SELECT depends_on_task_id FROM task_dependencies WHERE task_id = ?
-                        UNION
-                        SELECT d.depends_on_task_id
-                        FROM task_dependencies d JOIN chain c ON d.task_id = c.task_id
-                    )
-                    SELECT 1 FROM chain WHERE task_id = ? LIMIT 1
-                    """,
-                    (dependency_id, task_id),
-                ).fetchone()
-                if reaches_current:
-                    raise DomainError(
-                        "task_dependency_cycle",
-                        "Task dependencies cannot contain a cycle",
-                    )
+            self._require_acyclic_dependencies(
+                connection, project_id, task_id, next_dependencies
+            )
             next_blocker_reason = (
                 task["blocker_reason"]
                 if blocker_reason is None
@@ -6784,18 +8992,26 @@ class AgentChatRoomService:
                         """,
                         (task_id, dependency_id, iso_now()),
                     )
-            if next_status == "blocked" and task["status"] != "blocked":
+            # Cancellation is decided by the target state alone. It used to sit
+            # behind the unblocked branch, so a blocked -> cancelled move was
+            # recorded as task.unblocked and skipped the terminal cleanup
+            # entirely: the task's exclusive leases stayed held for their full
+            # TTL and its pending assignments/handoffs stayed actionable.
+            is_cancellation = (
+                next_status == "cancelled" and task["status"] != "cancelled"
+            )
+            if is_cancellation:
+                event_type = "task.cancelled"
+            elif next_status == "blocked" and task["status"] != "blocked":
                 event_type = "task.blocked"
             elif next_status == "todo" and task["owner_session_id"]:
                 event_type = "task.released"
             elif task["status"] == "blocked" and next_status != "blocked":
                 event_type = "task.unblocked"
-            elif next_status == "cancelled" and task["status"] != "cancelled":
-                event_type = "task.cancelled"
             else:
                 event_type = "task.updated"
             cancellation_cleanup: dict[str, Any] | None = None
-            if event_type == "task.cancelled":
+            if is_cancellation:
                 cancellation_cleanup = self._cancel_task_resources_locked(
                     connection, project_id, task_id, session_id
                 )
@@ -6830,7 +9046,7 @@ class AgentChatRoomService:
                 "cursor": event_id,
             }
 
-    @idempotent_write("lease.acquire")
+    @idempotent_write("lease.acquire", replay_guard="_lease_replay_is_live")
     def acquire_lease(
         self,
         project_id: str,
@@ -6842,6 +9058,7 @@ class AgentChatRoomService:
         task_id: str | None = None,
         reason: str = "",
         ttl_seconds: int | None = None,
+        takeover: bool = False,
     ) -> dict[str, Any]:
         pattern = normalize_pattern(path_pattern)
         if mode not in LEASE_MODES:
@@ -6849,10 +9066,12 @@ class AgentChatRoomService:
                 "invalid_lease_mode",
                 "Lease mode must be readonly, shared, or exclusive",
             )
+        # A boolean TTL would satisfy "between 1 and max" as 1 second, quietly
+        # taking the shortest lease instead of rejecting the wrong type.
         ttl = (
             self.settings.default_lease_ttl_seconds
             if ttl_seconds is None
-            else ttl_seconds
+            else require_int_or_default(ttl_seconds, "ttl_seconds", 0)
         )
         if not 1 <= ttl <= self.settings.max_lease_ttl_seconds:
             raise DomainError(
@@ -6882,7 +9101,7 @@ class AgentChatRoomService:
                 JOIN agent_sessions a ON a.id = l.session_id
                 WHERE l.project_id = ? AND l.released_at IS NULL AND l.expires_at > ?
                 """,
-                (project_id, now.isoformat().replace("+00:00", "Z")),
+                (project_id, format_instant(now)),
             ).fetchall()
             conflicts = []
             superseded: list[dict[str, Any]] = []
@@ -6898,10 +9117,56 @@ class AgentChatRoomService:
                     and row["owner_member_id"]
                     and row["owner_member_id"] == claimant_member_id
                 ):
-                    # Same software identity, new session: the successor
-                    # transparently takes over the stale lease of its own
-                    # identity (a reaped transport cannot release it itself).
-                    superseded.append(dict(row))
+                    # Same software identity, new session. This is a transfer of
+                    # working state, so it follows the same contract task_claim
+                    # and the assignment-accept path enforce: an ordinary
+                    # request never preempts a live owner. Only a Session the
+                    # liveness evidence proves gone may be replaced silently,
+                    # and that case is still recorded as an attributable event
+                    # below. Otherwise the caller has to say takeover=true.
+                    if _pattern_covers(pattern, row["path_pattern"]):
+                        successor_liveness = self._owner_liveness(
+                            connection, project_id, str(row["session_id"])
+                        )
+                        # Only positive evidence of death counts as consent to
+                        # transfer: the Session left, its row is gone, or the
+                        # transport probe says the connection was reaped. A stale
+                        # heartbeat is merely an absence of evidence - the
+                        # Session may be mid long edit - so it is not enough,
+                        # and neither is an unavailable probe. In those cases
+                        # the caller has to say takeover=True, which is cheap
+                        # and auditable, while a wrong silent transfer silently
+                        # removes another conversation's protection.
+                        predecessor_gone = (
+                            successor_liveness["owner"] is None
+                            or successor_liveness["owner"]["left_at"] is not None
+                            or str(successor_liveness["transport_state"]) == "gone"
+                        )
+                        if not predecessor_gone and not takeover:
+                            raise DomainError(
+                                "lease_owner_session_connected",
+                                "A Session of this software identity still holds "
+                                f"the lease on {row['path_pattern']}; release it, or "
+                                "take it over explicitly with takeover=true",
+                                status_code=409,
+                                details={
+                                    "lease_id": row["id"],
+                                    "owner_session_id": str(row["session_id"]),
+                                    "owner_transport_state": successor_liveness[
+                                        "transport_state"
+                                    ],
+                                    "required_action": "release_lease_or_takeover_true",
+                                },
+                            )
+                        superseded.append(
+                            {
+                                **dict(row),
+                                "owner_gone": predecessor_gone,
+                                "owner_transport_state": str(
+                                    successor_liveness["transport_state"]
+                                ),
+                            }
+                        )
                     continue
                 conflicts.append(
                     {
@@ -6912,22 +9177,6 @@ class AgentChatRoomService:
                         "mode": row["mode"],
                         "expires_at": row["expires_at"],
                     }
-                )
-            for stale in superseded:
-                connection.execute(
-                    "UPDATE file_leases SET released_at = ? WHERE id = ?",
-                    (now.isoformat().replace("+00:00", "Z"), stale["id"]),
-                )
-                self._emit(
-                    connection,
-                    project_id,
-                    "lease.released",
-                    actor_session_id=session_id,
-                    payload={
-                        "lease_id": stale["id"],
-                        "path_pattern": stale["path_pattern"],
-                        "reason": "same_member_takeover",
-                    },
                 )
             if conflicts:
                 event_id = self._emit(
@@ -6944,6 +9193,39 @@ class AgentChatRoomService:
                     "cursor": event_id,
                 }
             else:
+                # The same-identity takeover only happens when this request is
+                # actually granted. Releasing the predecessor's leases before a
+                # rejection destroyed coverage the caller never obtained.
+                for stale in superseded:
+                    connection.execute(
+                        "UPDATE file_leases SET released_at = ? WHERE id = ?",
+                        (format_instant(now), stale["id"]),
+                    )
+                    # The reason has to say which of the two admitted paths ran,
+                    # so an operator reading the log can tell an audited
+                    # deliberate takeover from a predecessor this service
+                    # positively knows is gone.
+                    takeover_reason = (
+                        "same_member_takeover"
+                        if stale.get("owner_gone")
+                        else "same_member_takeover_explicit"
+                    )
+                    self._emit(
+                        connection,
+                        project_id,
+                        "lease.released",
+                        actor_session_id=session_id,
+                        payload={
+                            "lease_id": stale["id"],
+                            "path_pattern": stale["path_pattern"],
+                            "reason": takeover_reason,
+                            "predecessor_session_id": str(stale["session_id"]),
+                            "predecessor_proven_gone": bool(stale.get("owner_gone")),
+                            "predecessor_transport_state": stale.get(
+                                "owner_transport_state", "not_checked"
+                            ),
+                        },
+                    )
                 # 幂等：同一 Session 对同一（归一化）范围的活跃租约重复申请
                 # 直接续用已有租约，不产生并行的重复占用行。
                 existing = next(
@@ -6956,6 +9238,66 @@ class AgentChatRoomService:
                     None,
                 )
                 if existing is not None:
+                    if existing["mode"] != mode:
+                        if (
+                            LEASE_MODE_STRENGTH[mode]
+                            < LEASE_MODE_STRENGTH[existing["mode"]]
+                        ):
+                            raise DomainError(
+                                "lease_mode_downgrade_requires_release",
+                                "An active lease cannot be weakened in place; "
+                                "release it and acquire the weaker mode explicitly",
+                                status_code=409,
+                                details={
+                                    "required_action": "release_lease_then_reacquire",
+                                    "lease_id": existing["id"],
+                                    "current_mode": existing["mode"],
+                                    "requested_mode": mode,
+                                },
+                            )
+                        # Raising the protection level of a scope the caller
+                        # already holds is a mode change, not a reuse of the old
+                        # mode: returning the readonly lease while the caller
+                        # believes it holds exclusive would leave check_leases
+                        # and the pre-commit policy blind to real writers.
+                        stamped = format_instant(now)
+                        connection.execute(
+                            """
+                            UPDATE file_leases
+                            SET mode = ?, expires_at = ?, renewed_at = ?, ttl_seconds = ?
+                            WHERE id = ?
+                            """,
+                            (
+                                mode,
+                                format_instant(expires),
+                                stamped,
+                                ttl,
+                                existing["id"],
+                            ),
+                        )
+                        mode_event_id = self._emit(
+                            connection,
+                            project_id,
+                            "lease.mode_changed",
+                            actor_session_id=session_id,
+                            task_id=task_id,
+                            payload={
+                                "lease_id": existing["id"],
+                                "path_pattern": pattern,
+                                "from_mode": existing["mode"],
+                                "to_mode": mode,
+                            },
+                        )
+                        changed = connection.execute(
+                            "SELECT * FROM file_leases WHERE id = ?", (existing["id"],)
+                        ).fetchone()
+                        return {
+                            "lease": self._lease_dict(changed),
+                            "already_held": True,
+                            "mode_changed": True,
+                            "event_id": mode_event_id,
+                            "cursor": mode_event_id,
+                        }
                     return {
                         "lease": self._lease_dict(existing),
                         "already_held": True,
@@ -6963,8 +9305,8 @@ class AgentChatRoomService:
                         "cursor": self.latest_cursor(connection, project_id),
                     }
                 lease_id = new_id("lease")
-                created_at = now.isoformat().replace("+00:00", "Z")
-                expires_at = expires.isoformat().replace("+00:00", "Z")
+                created_at = format_instant(now)
+                expires_at = format_instant(expires)
                 connection.execute(
                     """
                     INSERT INTO file_leases(
@@ -7009,20 +9351,56 @@ class AgentChatRoomService:
             )
         return result
 
+    def _list_leases(
+        self,
+        connection: Any,
+        project_id: str,
+        *,
+        include_inactive: bool = False,
+        limit: int | None = None,
+    ) -> list[dict[str, Any]]:
+        """Read leases for one Project.
+
+        Nothing ever deletes a released lease row, so this table only grows: the
+        active listing used to read every row the Project ever wrote and then
+        decide liveness in Python, which made each poll cost more than the last
+        and left a permanently growing scan behind it. The active listing now
+        states the same predicate in SQL — released, or expired — against the
+        existing ``idx_file_leases_active`` index, and is bounded. The full
+        history read (``include_inactive``) is what export needs, so it keeps
+        reading everything.
+        """
+        params: list[Any] = [project_id]
+        where = ["l.project_id = ?"]
+        if not include_inactive:
+            where.append("l.released_at IS NULL")
+            where.append("l.expires_at > ?")
+            params.append(iso_now())
+        statement = (
+            "SELECT l.*, a.last_heartbeat AS owner_last_heartbeat "
+            "FROM file_leases l "
+            "JOIN agent_sessions a ON a.id = l.session_id "
+            f"WHERE {' AND '.join(where)} ORDER BY l.created_at DESC"
+        )
+        if limit is not None and not include_inactive:
+            params.append(max(1, int(limit)))
+            statement += " LIMIT ?"
+        rows = connection.execute(statement, params).fetchall()
+        return [self._lease_dict(row) for row in rows]
+
     def list_leases(self, project_id: str, *, include_inactive: bool = False) -> list[dict[str, Any]]:
         with self.database.connect() as connection:
             self._require_project(connection, project_id)
-            rows = connection.execute(
-                """
-                SELECT l.*, a.last_heartbeat AS owner_last_heartbeat
-                FROM file_leases l
-                JOIN agent_sessions a ON a.id = l.session_id
-                WHERE l.project_id = ? ORDER BY l.created_at DESC
-                """,
-                (project_id,),
-            ).fetchall()
-            leases = [self._lease_dict(row) for row in rows]
-            return leases if include_inactive else [lease for lease in leases if lease["active"]]
+            return self._list_leases(
+                connection,
+                project_id,
+                include_inactive=include_inactive,
+                limit=(
+                    None
+                    if include_inactive
+                    else int(getattr(self.settings, "lease_list_limit", 500))
+                ),
+            )
 
     def check_leases(
         self,
@@ -7038,13 +9416,24 @@ class AgentChatRoomService:
                 "session_id and token must be supplied together",
                 status_code=401,
             )
+        paths = self._require_list_input_limit(
+            "paths",
+            paths,
+            limit=int(getattr(self.settings, "list_input_max_count", 100)),
+        )
         clean_paths = sorted({normalize_pattern(path) for path in paths})
         if not clean_paths:
             raise DomainError("missing_paths", "At least one file path is required")
         with self.database.connect(write=True) as connection:
             project = self._require_project(connection, project_id)
+            caller_member_id: str | None = None
             if session_id:
-                self._authenticate(connection, project_id, session_id, token or "")
+                caller = self._authenticate(
+                    connection, project_id, session_id, token or ""
+                )
+                caller_member_id = (
+                    caller["member_id"] if "member_id" in caller.keys() else None
+                )
             now = iso_now()
             # Presence is display-only (#119): a silent lease owner still
             # enforces its lease until the TTL lapses or it releases, so
@@ -7052,7 +9441,8 @@ class AgentChatRoomService:
             # check_leases and acquire_lease would disagree.
             active = connection.execute(
                 """
-                SELECT l.*, a.name AS agent_name FROM file_leases l
+                SELECT l.*, a.name AS agent_name, a.member_id AS owner_member_id
+                FROM file_leases l
                 JOIN agent_sessions a ON a.id = l.session_id
                 WHERE l.project_id = ? AND l.released_at IS NULL
                   AND l.expires_at > ? AND l.mode = 'exclusive'
@@ -7071,6 +9461,15 @@ class AgentChatRoomService:
                 for path in clean_paths
                 for lease in active
                 if lease["session_id"] != session_id
+                and not (
+                    # A lease belonging to the caller's own software identity is
+                    # takeable, not a conflict: acquire_lease treats it that way,
+                    # so the check must not disagree (the invariant this function
+                    # states in its own comment).
+                    caller_member_id
+                    and lease["owner_member_id"]
+                    and lease["owner_member_id"] == caller_member_id
+                )
                 and patterns_overlap(path, lease["path_pattern"])
             ]
             settings = normalize_project_settings(
@@ -7158,7 +9557,7 @@ class AgentChatRoomService:
     ) -> dict[str, Any]:
         clean_files = self._require_list_input_limit(
             "files",
-            sorted({normalize_pattern(path) for path in files}),
+            sorted({normalize_evidence_path(path) for path in files}),
             limit=int(getattr(self.settings, "list_input_max_count", 100)),
         )
         clean_no_code_reason = no_code_change_reason.strip()
@@ -7184,10 +9583,26 @@ class AgentChatRoomService:
                     "Task is not in a state that accepts a work report",
                     status_code=409,
                 )
-            worktree = self._trusted_worktree(connection, project, agent)
-        system_evidence = self._collect_git_evidence(
-            project, agent, commit_hash, worktree=worktree
-        )
+            worktree, evidence_source = self._trusted_worktree(
+                connection, project, agent
+            )
+        if evidence_source == WORKSPACE_EVIDENCE_SERVER_VERIFIED:
+            system_evidence = self._collect_git_evidence(
+                project, agent, commit_hash, worktree=worktree, files=clean_files
+            )
+        else:
+            # A client-asserted root is not a licence to run git on the server, so
+            # no evidence is read from it. The report is still accepted - the
+            # agent did the work - but it is recorded as carrying no server
+            # evidence, and a commit_hash cannot be verified against it.
+            system_evidence = {
+                "captured": False,
+                "reason": "workspace_evidence_untrusted",
+                "worktree": "",
+                "reported_commit_exists": False,
+                "commit_hash": "",
+                "evidence_source": WORKSPACE_EVIDENCE_CLIENT_ASSERTED,
+            }
         stored_commit = str(system_evidence.get("commit_hash") or "")
         if commit_hash.strip() and (
             not system_evidence.get("captured")
@@ -7204,7 +9619,17 @@ class AgentChatRoomService:
                     payload={
                         "commit_hash": "unknown",
                         "reported_commit_hash": commit_hash.strip(),
-                        "worktree": str(worktree),
+                        # Only a server-verified root may be named here. A
+                        # client-asserted path is the caller's own text, and
+                        # echoing it into the Room would republish the very
+                        # server-local path the evidence rules exist to keep
+                        # private.
+                        "worktree": (
+                            str(worktree)
+                            if evidence_source == WORKSPACE_EVIDENCE_SERVER_VERIFIED
+                            else ""
+                        ),
+                        "evidence_source": evidence_source,
                         "captured": bool(system_evidence.get("captured")),
                         "reported_commit_exists": system_evidence.get(
                             "reported_commit_exists"
@@ -7303,6 +9728,17 @@ class AgentChatRoomService:
                     "tests": tests,
                     "system_evidence": system_evidence,
                     "released_lease_ids": released_lease_ids,
+                    # from_* pairs: the history panel derives transitions from
+                    # these, and work.reported is where a task first leaves
+                    # in_progress.
+                    "from_status": task["status"],
+                    "status": "awaiting_review",
+                    "from_execution_status": task["execution_status"],
+                    "execution_status": "completed",
+                    "from_verification_status": task["verification_status"],
+                    "verification_status": "pending",
+                    "from_integration_status": task["integration_status"],
+                    "integration_status": "pending",
                     "spec_receipt": self._latest_claim_document_snapshot(
                         connection, project_id, task_id
                     ),
@@ -7317,8 +9753,15 @@ class AgentChatRoomService:
                 payload={
                     "report_id": report_id,
                     "no_code_change_reason": clean_no_code_reason,
+                    # from_* pairs, so the report that starts verification is
+                    # visible as a transition rather than only as an end state.
+                    "from_status": task["status"],
+                    "status": "awaiting_review",
+                    "from_execution_status": task["execution_status"],
                     "execution_status": "completed",
+                    "from_verification_status": task["verification_status"],
                     "verification_status": "pending",
+                    "from_integration_status": task["integration_status"],
                     "integration_status": "pending",
                 },
             )
@@ -7350,6 +9793,12 @@ class AgentChatRoomService:
             raise DomainError("invalid_review_verdict", "Unsupported review verdict")
         if not criteria:
             raise DomainError("missing_review_criteria", "Review must assess acceptance criteria")
+        criteria = self._require_list_input_limit(
+            "criteria",
+            criteria,
+            limit=int(getattr(self.settings, "list_input_max_count", 100)),
+        )
+        assessed = self._review_criteria_map(criteria)
         with self.database.connect(write=True) as connection:
             reviewer = self._authenticate(
                 connection, project_id, reviewer_session_id, token
@@ -7362,21 +9811,10 @@ class AgentChatRoomService:
                 raise DomainError(
                     "invalid_transition", "Task is not awaiting review", status_code=409
                 )
-            owner = connection.execute(
-                "SELECT * FROM agent_sessions WHERE id = ?",
-                (task["owner_session_id"],),
-            ).fetchone()
-            if self._same_agent_identity(owner, reviewer):
-                raise DomainError(
-                    "reviewer_not_independent",
-                    "The executing software identity cannot independently verify its own work",
-                    status_code=409,
-                )
+            self._require_independent_reviewer(
+                connection, project_id, task, reviewer
+            )
             expected = json_load(task["acceptance_criteria_json"], [])
-            assessed = {
-                str(item.get("criterion", "")).strip(): str(item.get("status", "")).strip()
-                for item in criteria
-            }
             if verdict == "approved" and (
                 any(assessed.get(item) != "passed" for item in expected)
                 or any(value != "passed" for value in assessed.values())
@@ -7450,8 +9888,17 @@ class AgentChatRoomService:
                     "verdict": verdict,
                     "criteria": criteria,
                     "notes": notes.strip(),
+                    # from_* pairs: task_history.state_changes() reports nothing
+                    # for an event carrying only the new value, so a review that
+                    # turned a task from in_progress to completed showed no
+                    # transition in the task's own history.
+                    "from_status": task["status"],
+                    "status": next_status,
+                    "from_execution_status": task["execution_status"],
                     "execution_status": next_execution_status,
+                    "from_verification_status": task["verification_status"],
                     "verification_status": next_verification_status,
+                    "from_integration_status": task["integration_status"],
                     "integration_status": "pending",
                 },
             )
@@ -7478,6 +9925,7 @@ class AgentChatRoomService:
         commit_hash: str = "",
         integrator_session_id: str | None = None,
         token: str | None = None,
+        management_authorized: bool = False,
     ) -> dict[str, Any]:
         if result not in INTEGRATION_RESULTS:
             raise DomainError(
@@ -7497,7 +9945,16 @@ class AgentChatRoomService:
                 "A successful integration requires every submitted test to pass",
                 status_code=409,
             )
-        clean_files = sorted({normalize_pattern(path) for path in (files or [])})
+        clean_files = sorted(
+            {
+                normalize_evidence_path(path)
+                for path in self._require_list_input_limit(
+                    "files",
+                    files or [],
+                    limit=int(getattr(self.settings, "list_input_max_count", 100)),
+                )
+            }
+        )
         with self.database.connect(write=True) as connection:
             if bool(integrator_session_id) != bool(token):
                 raise DomainError(
@@ -7512,6 +9969,13 @@ class AgentChatRoomService:
                     integrator_session_id,
                     token or "",
                 )
+            elif not management_authorized:
+                # Same gate as handoff/assign/release/update. An integration
+                # without credentials used to be honoured as a management write
+                # simply because nobody had authenticated it, which let any
+                # caller stamp the terminal integration state with no actor at
+                # all.
+                raise _management_authorization_required("record this integration")
             task = self._require_task(connection, project_id, task_id)
             if (
                 task["execution_status"] != "completed"
@@ -7522,12 +9986,41 @@ class AgentChatRoomService:
                     "Task must be execution-complete and independently approved before integration",
                     status_code=409,
                 )
+            # The dependency gate is shared, so integration uses it too. It used
+            # to guard only entry into work, which meant a task whose dependency
+            # later regressed (reopened, rolled back) could still be integrated
+            # on the strength of a stale approval.
+            #
+            # It runs before the already-integrated check on purpose: otherwise
+            # a re-integration attempt reports "already done" and the caller
+            # never learns that the dependency is now unfinished.
+            self._require_finished_dependencies(connection, task_id)
             if task["integration_status"] == "done":
                 raise DomainError(
                     "task_already_integrated",
                     "Task integration is already complete",
                     status_code=409,
                 )
+            # A commit hash carried by an integration is only as trustworthy as
+            # the commit the approved Work Report already proved against the
+            # trusted worktree. Re-running git here would put subprocess work
+            # back inside the write transaction (#337), so anything that does
+            # not match that proven commit is recorded honestly as
+            # self-reported instead of being rendered as captured evidence.
+            clean_commit = commit_hash.strip()
+            reported_commit = ""
+            for report_row in connection.execute(
+                """
+                SELECT payload_json FROM events
+                WHERE project_id = ? AND task_id = ? AND event_type = 'work.report'
+                ORDER BY id DESC LIMIT 1
+                """,
+                (project_id, task_id),
+            ).fetchall():
+                reported_commit = str(
+                    json_load(report_row["payload_json"], {}).get("commit_hash") or ""
+                ).strip()
+            commit_verified = bool(clean_commit) and clean_commit == reported_commit
             integration_id = new_id("integration")
             now = iso_now()
             connection.execute(
@@ -7545,7 +10038,7 @@ class AgentChatRoomService:
                     result,
                     clean_summary,
                     json_dump(clean_files),
-                    commit_hash.strip(),
+                    clean_commit,
                     json_dump(tests),
                     now,
                 ),
@@ -7582,13 +10075,23 @@ class AgentChatRoomService:
                     "result": result,
                     "summary": clean_summary,
                     "files": clean_files,
-                    "commit_hash": commit_hash.strip(),
+                    "commit_hash": clean_commit,
+                    "commit_verified": commit_verified,
+                    "commit_self_reported": (
+                        bool(clean_commit) and not commit_verified
+                    ),
                     "tests": tests,
                     "integrated_by": (
                         "agent" if integrator_session_id else "manager"
                     ),
+                    # from_* pairs, for the same reason as review.submitted.
+                    "from_status": task["status"],
+                    "status": "done" if result == "done" else "integration_failed",
+                    "from_execution_status": task["execution_status"],
                     "execution_status": "completed",
+                    "from_verification_status": task["verification_status"],
                     "verification_status": "approved",
+                    "from_integration_status": task["integration_status"],
                     "integration_status": result,
                 },
             )
@@ -7735,6 +10238,35 @@ class AgentChatRoomService:
         clean_body = body.strip()
         clean_kind = kind.strip()
         clean_summary = summary.strip()
+        # Knowledge content was the one user-facing write with no size bound,
+        # while every sibling write (task text, project documents) has one.
+        # Reuse the existing configured limits rather than adding new ones.
+        text_limit = int(getattr(self.settings, "task_text_max_length", 32768))
+        for field_name, value in (
+            ("title", clean_title),
+            ("summary", clean_summary),
+        ):
+            if len(value) > text_limit:
+                raise DomainError(
+                    "knowledge_content_too_long",
+                    f"Knowledge {field_name} exceeds task_text_max_length ({text_limit})",
+                    status_code=422,
+                    details={
+                        "field": field_name,
+                        "limit": text_limit,
+                        "length": len(value),
+                    },
+                )
+        body_limit = int(getattr(self.settings, "project_document_max_bytes", 262144))
+        body_bytes = len(clean_body.encode("utf-8"))
+        if body_bytes > body_limit:
+            raise DomainError(
+                "knowledge_content_too_large",
+                "Knowledge body exceeds project_document_max_bytes "
+                f"({body_limit})",
+                status_code=422,
+                details={"field": "body", "limit": body_limit, "size": body_bytes},
+            )
         list_limit = int(getattr(self.settings, "list_input_max_count", 100))
         clean_tags = self._require_list_input_limit(
             "tags",
@@ -7797,6 +10329,12 @@ class AgentChatRoomService:
                         "Archived knowledge assets cannot receive new versions",
                         status_code=409,
                     )
+                # A candidate may append a new version of itself: that is how an
+                # author corrects wording, and each version is kept. The
+                # transition table has no candidate -> candidate edge because
+                # the row's status does not change - only its current_version_id
+                # does - so the status guard below would otherwise reject a
+                # documented behaviour (test_body_edits_append_new_versions).
                 if asset["status"] != "candidate" and "candidate" not in (
                     KNOWLEDGE_ASSET_TRANSITIONS[asset["status"]]
                 ):
@@ -7814,6 +10352,15 @@ class AgentChatRoomService:
                     )
                 revision = True
                 previous_version_id = asset["current_version_id"]
+                # MAX(version)+1 is a read-modify-write. Both shipped backends
+                # happen to serialize writers (SQLite by BEGIN IMMEDIATE,
+                # PostgreSQL by the pg_advisory_xact_lock every connect(write=True)
+                # takes), so today no two revisions can read the same MAX. That
+                # safety is borrowed from a lock one layer down, though: any
+                # future backend without it turns the UNIQUE(asset_id, version)
+                # below into a raw driver error and an HTTP 500. The INSERT is
+                # therefore the authority on which number won, and a lost race
+                # is reported as the retryable conflict it is.
                 next_version_number = int(
                     connection.execute(
                         "SELECT COALESCE(MAX(version), 0) AS latest FROM knowledge_asset_versions WHERE asset_id = ?",
@@ -7846,14 +10393,25 @@ class AgentChatRoomService:
                 ).encode()
             ).hexdigest()
             if revision:
-                connection.execute(
+                # Compare-and-set on the previous status. Without the predicate
+                # two concurrent submissions both write 'candidate' and the
+                # loser's new version is silently orphaned; with it the loser is
+                # told the asset moved instead of overwriting it.
+                revised = connection.execute(
                     """
                     UPDATE knowledge_assets
                     SET status = 'candidate', updated_at = ?
-                    WHERE id = ? AND project_id = ?
+                    WHERE id = ? AND project_id = ? AND status = ?
                     """,
-                    (now, new_asset_id, project_id),
+                    (now, new_asset_id, project_id, asset["status"]),
                 )
+                if revised.rowcount != 1:
+                    raise DomainError(
+                        "knowledge_concurrent_transition",
+                        "The knowledge asset changed concurrently; retry",
+                        status_code=409,
+                        details={"asset_id": new_asset_id},
+                    )
             else:
                 connection.execute(
                     """
@@ -7873,37 +10431,60 @@ class AgentChatRoomService:
                         now,
                     ),
                 )
-            connection.execute(
-                """
-                INSERT INTO knowledge_asset_versions(
-                    id, project_id, asset_id, version, title, body, summary,
-                    content_hash, tags_json, source_type, source_task_id,
-                    source_report_id, source_review_id, source_integration_id,
-                    source_event_ids_json, created_by_session_id,
-                    supersedes_version_id, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    version_id,
-                    project_id,
-                    new_asset_id,
-                    next_version_number,
-                    clean_title,
-                    clean_body,
-                    clean_summary,
-                    content_hash,
-                    json_dump(clean_tags),
-                    clean_source_type,
-                    clean_task_id or None,
-                    clean_report_id or None,
-                    clean_review_id or None,
-                    clean_integration_id or None,
-                    json_dump({"v": 1, "space": "project_seq", "ids": clean_event_ids}),
-                    session_id,
-                    previous_version_id,
-                    now,
-                ),
-            )
+            try:
+                connection.execute(
+                    """
+                    INSERT INTO knowledge_asset_versions(
+                        id, project_id, asset_id, version, title, body, summary,
+                        content_hash, tags_json, source_type, source_task_id,
+                        source_report_id, source_review_id, source_integration_id,
+                        source_event_ids_json, created_by_session_id,
+                        supersedes_version_id, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        version_id,
+                        project_id,
+                        new_asset_id,
+                        next_version_number,
+                        clean_title,
+                        clean_body,
+                        clean_summary,
+                        content_hash,
+                        json_dump(clean_tags),
+                        clean_source_type,
+                        clean_task_id or None,
+                        clean_report_id or None,
+                        clean_review_id or None,
+                        clean_integration_id or None,
+                        json_dump(
+                            {"v": 1, "space": "project_seq", "ids": clean_event_ids}
+                        ),
+                        session_id,
+                        previous_version_id,
+                        now,
+                    ),
+                )
+            except Exception as error:
+                # Losing the MAX(version)+1 race lands here as a UNIQUE
+                # violation on (asset_id, version). It is a conflict the caller
+                # can retry, not a server fault, so it must not escape as a
+                # driver traceback and an HTTP 500. The status compare-and-set
+                # below cannot catch it: the two writers saw the same previous
+                # status, so both updates legitimately match one row.
+                if not _is_unique_constraint_error(error):
+                    raise
+                raise DomainError(
+                    "knowledge_version_conflict",
+                    "Another revision of this knowledge asset was recorded "
+                    "concurrently; retry to append the next version",
+                    status_code=409,
+                    details={
+                        "asset_id": new_asset_id,
+                        "retry_after_seconds": 1,
+                        "required_action": "retry_the_revision",
+                    },
+                ) from error
             connection.execute(
                 """
                 UPDATE knowledge_assets
@@ -7964,6 +10545,7 @@ class AgentChatRoomService:
         verdict: str,
         criteria: list[dict[str, Any]],
         notes: str = "",
+        expected_version_id: str = "",
     ) -> dict[str, Any]:
         if verdict not in KNOWLEDGE_REVIEW_VERDICTS:
             raise DomainError(
@@ -7978,17 +10560,7 @@ class AgentChatRoomService:
             criteria,
             limit=int(getattr(self.settings, "list_input_max_count", 100)),
         )
-        assessed = {
-            str(item.get("criterion", "")).strip(): str(item.get("status", "")).strip()
-            for item in criteria
-        }
-        if not all(assessed) or any(
-            status not in {"passed", "failed"} for status in assessed.values()
-        ):
-            raise DomainError(
-                "invalid_review_criteria",
-                "Every review criterion requires a criterion and passed/failed status",
-            )
+        assessed = self._review_criteria_map(criteria)
         if verdict == "approved" and any(
             status != "passed" for status in assessed.values()
         ):
@@ -7997,6 +10569,17 @@ class AgentChatRoomService:
                 "Approved reviews must mark every criterion as passed",
                 status_code=409,
                 details={"assessed": assessed},
+            )
+        if verdict == "approved" and not expected_version_id.strip():
+            # Approving is what puts unreviewed content into the Room, so the
+            # caller has to name the version it actually read. Rejecting and
+            # requesting changes cannot launder content, so they stay optional.
+            raise DomainError(
+                "knowledge_version_pin_required",
+                "Approving a candidate requires expected_version_id so the review "
+                "is bound to the content that was read",
+                status_code=422,
+                details={"required_action": "reread_and_review_current_version"},
             )
         with self.database.connect(write=True) as connection:
             reviewer = self._authenticate(
@@ -8019,6 +10602,24 @@ class AgentChatRoomService:
                     "knowledge_version_not_found",
                     "Knowledge asset has no current version",
                     status_code=409,
+                )
+            # A review must approve the exact content the reviewer read. The
+            # current version is dereferenced here, at write time, so without a
+            # precondition a v2 submitted mid-review would silently inherit
+            # criteria the reviewer wrote against v1. Callers pin with the
+            # version_id (or content_hash) returned by get/list.
+            pinned_version = expected_version_id.strip()
+            if pinned_version and pinned_version != str(version["id"]):
+                raise DomainError(
+                    "knowledge_version_stale",
+                    "The knowledge asset moved to a new version after you read it; "
+                    "re-read the current version and review that content",
+                    status_code=409,
+                    details={
+                        "expected_version_id": pinned_version,
+                        "current_version_id": str(version["id"]),
+                        "required_action": "reread_and_review_current_version",
+                    },
                 )
             creator = connection.execute(
                 "SELECT id, member_id, agent_key FROM agent_sessions WHERE id = ?",
@@ -8158,9 +10759,10 @@ class AgentChatRoomService:
         session_id: str,
         token: str,
         reason: str = "",
+        management_authorized: bool = False,
     ) -> dict[str, Any]:
         with self.database.connect(write=True) as connection:
-            self._authenticate(connection, project_id, session_id, token)
+            actor = self._authenticate(connection, project_id, session_id, token)
             asset = self._require_knowledge_asset(connection, project_id, asset_id)
             if "superseded" not in KNOWLEDGE_ASSET_TRANSITIONS[asset["status"]]:
                 raise DomainError(
@@ -8174,6 +10776,15 @@ class AgentChatRoomService:
                         ),
                     },
                 )
+            reason = self._require_knowledge_final_write_authority(
+                connection,
+                project_id,
+                asset,
+                actor,
+                reason=reason,
+                action="supersede",
+                management_authorized=management_authorized,
+            )
             now = iso_now()
             superseded = connection.execute(
                 """
@@ -8212,6 +10823,69 @@ class AgentChatRoomService:
                 "cursor": event_id,
             }
 
+    def _require_knowledge_final_write_authority(
+        self,
+        connection: Any,
+        project_id: str,
+        asset: Mapping[str, Any],
+        actor: Mapping[str, Any],
+        *,
+        reason: str,
+        action: str,
+        management_authorized: bool,
+    ) -> str:
+        """Guard a terminal knowledge write: owner or management, with a reason.
+
+        ``archive`` and ``supersede`` are irreversible - ``archived`` has no
+        outgoing transition - so a default-permission Agent could otherwise
+        retire knowledge somebody else wrote, and could do it silently. The
+        rule mirrors member maintenance: either the caller is the identity that
+        wrote the current version, or it acts with management authorization, and
+        in both cases it has to say why, because the reason is the only record
+        of why an irreversible removal happened.
+
+        Returns the trimmed reason so the caller does not repeat the strip.
+        """
+        # Status is checked by the caller before this runs: an impossible
+        # transition is the more fundamental refusal, and reporting "reason
+        # required" for an asset that could not have moved anyway would send
+        # the caller to fix the wrong thing.
+        clean_reason = str(reason or "").strip()
+        if not clean_reason:
+            raise DomainError(
+                "knowledge_reason_required",
+                f"{action} requires a reason; it is recorded in the event",
+                status_code=422,
+                details={"required_action": f"pass_a_reason_to_{action}"},
+            )
+        if management_authorized:
+            return clean_reason
+        version = connection.execute(
+            "SELECT created_by_session_id FROM knowledge_asset_versions WHERE id = ?",
+            (asset["current_version_id"],),
+        ).fetchone()
+        author_session_id = version["created_by_session_id"] if version else None
+        if not author_session_id or author_session_id == actor["id"]:
+            return clean_reason
+        author = connection.execute(
+            "SELECT id, member_id, agent_key FROM agent_sessions WHERE id = ?",
+            (author_session_id,),
+        ).fetchone()
+        if self._same_agent_identity(author, actor):
+            return clean_reason
+        raise DomainError(
+            "knowledge_write_not_permitted",
+            f"Only the submitting identity or a management session may {action} "
+            "knowledge it did not write",
+            status_code=403,
+            details={
+                "asset_id": asset["id"],
+                "required_action": (
+                    f"ask_the_author_or_a_management_session_to_{action}"
+                ),
+            },
+        )
+
     @idempotent_write("knowledge.archive")
     def archive_knowledge_asset(
         self,
@@ -8221,9 +10895,10 @@ class AgentChatRoomService:
         session_id: str,
         token: str,
         reason: str = "",
+        management_authorized: bool = False,
     ) -> dict[str, Any]:
         with self.database.connect(write=True) as connection:
-            self._authenticate(connection, project_id, session_id, token)
+            actor = self._authenticate(connection, project_id, session_id, token)
             asset = self._require_knowledge_asset(connection, project_id, asset_id)
             if "archived" not in KNOWLEDGE_ASSET_TRANSITIONS[asset["status"]]:
                 raise DomainError(
@@ -8237,6 +10912,15 @@ class AgentChatRoomService:
                         ),
                     },
                 )
+            reason = self._require_knowledge_final_write_authority(
+                connection,
+                project_id,
+                asset,
+                actor,
+                reason=reason,
+                action="archive",
+                management_authorized=management_authorized,
+            )
             now = iso_now()
             archived = connection.execute(
                 """
@@ -8371,12 +11055,35 @@ class AgentChatRoomService:
             ).fetchall()
             return [self._knowledge_asset_dict(connection, row) for row in rows]
 
+    def _workspace_evidence_source(self, workspace: Mapping[str, Any]) -> str:
+        """How this workspace's path was established, defaulting to unverified.
+
+        A row written before this key existed, or one whose metadata was edited
+        outside registration, is treated as client-asserted. Defaulting the
+        other way would let every pre-existing remote registration - exactly the
+        rows this guards - keep its server-side git evidence.
+        """
+        metadata = json_load(workspace["metadata_json"], {})
+        source = str(metadata.get(WORKSPACE_EVIDENCE_SOURCE_KEY) or "").strip()
+        if source == WORKSPACE_EVIDENCE_SERVER_VERIFIED:
+            return WORKSPACE_EVIDENCE_SERVER_VERIFIED
+        return WORKSPACE_EVIDENCE_CLIENT_ASSERTED
+
     def _trusted_worktree(
         self,
         connection: Any,
         project: Mapping[str, Any],
         agent: Mapping[str, Any],
-    ) -> Path:
+    ) -> tuple[Path, str]:
+        """Resolve the worktree to inspect, and say where its root came from.
+
+        Returns the resolved path together with the workspace's evidence source
+        so the caller can decide whether running git on it is justified. The
+        containment check below is retained for verified roots; for a
+        client-asserted one it proves only that the caller stayed inside the
+        directory it itself named, so the path is returned unverified and the
+        caller must not read git from it.
+        """
         workspace = None
         agent_data = dict(agent)
         workspace_id = str(agent_data.get("workspace_id") or "").strip()
@@ -8394,11 +11101,20 @@ class AgentChatRoomService:
                 "未登记工作区: the Agent has no registered workspace",
                 status_code=409,
             )
+        evidence_source = self._workspace_evidence_source(workspace)
         root = Path(str(workspace["local_path"])).expanduser().resolve(strict=False)
         reported_raw = str(agent_data.get("worktree") or "").strip()
-        reported = (
-            Path(reported_raw).expanduser().resolve(strict=False) if reported_raw else root
-        )
+        if not reported_raw:
+            reported = root
+        else:
+            # A legacy row may hold a relative value. Resolving it against the
+            # process CWD would make the containment verdict depend on where the
+            # server was started; anchoring it at the registered workspace root is
+            # the only reading that keeps `relative_to(root)` meaningful.
+            reported_candidate = Path(reported_raw).expanduser()
+            if not reported_candidate.is_absolute():
+                reported_candidate = root / reported_candidate
+            reported = reported_candidate.resolve(strict=False)
         try:
             reported.relative_to(root)
         except ValueError as error:
@@ -8408,11 +11124,59 @@ class AgentChatRoomService:
                 status_code=403,
                 details={"workspace_id": workspace["id"]},
             ) from error
-        return reported
+        selection = str(dict(project).get("repository_path") or "")
+        if selection:
+            selection = str(json_load(workspace["metadata_json"], {}).get("repository_path", selection))
+            selected = repository_directory(root, selection)
+            if reported != root:
+                try:
+                    reported.relative_to(selected)
+                except ValueError as error:
+                    raise DomainError("untrusted_repository", "Session worktree is outside the selected repository",
+                                      status_code=403, details={"required_action": "use_selected_repository"}) from error
+                # A deeper independent repository is a different scope even inside the selected path.
+                _remote, actual_root, inside = _project_git_info(reported)
+                _selected_remote, selected_root, _selected_inside = _project_git_info(selected)
+                if inside and actual_root != selected_root:
+                    raise DomainError("untrusted_repository", "Session worktree belongs to a nested independent repository",
+                                      status_code=403, details={"required_action": "use_a_separate_repository_room"})
+            return selected, evidence_source
+        return reported, evidence_source
 
     def _collect_git_status(self, worktree: Path) -> dict[str, Any]:
         return self._collect_git_evidence_from_worktree(worktree, "")
 
+    def checkout_cleanup_scope(self, project_id: str) -> dict[str, Any]:
+        """The checkouts a permanent Project delete may clean up, plus its identity.
+
+        Session worktrees are caller-supplied strings and legacy rows were stored
+        unvalidated, so the cleanup set is filtered to absolute local paths inside
+        the Project root. An unrelated or remote directory a Session happened to
+        report must never be stat/unlinked by deleting a Room.
+        """
+        with self.database.connect() as connection:
+            project = self._require_project(connection, project_id)
+            rows = connection.execute(
+                "SELECT worktree FROM agent_sessions WHERE project_id = ?",
+                (project_id,),
+            ).fetchall()
+        root = Path(str(project["root_path"])).expanduser().resolve(strict=False)
+        paths = {str(project["root_path"])}
+        for row in rows:
+            candidate = str(row["worktree"] or "").strip()
+            if not candidate:
+                continue
+            try:
+                validated = self._validate_workspace_path("worktree", candidate)
+                Path(validated).expanduser().resolve(strict=False).relative_to(root)
+            except (DomainError, OSError, ValueError):
+                continue
+            paths.add(validated)
+        return {
+            "project_key": str(project["project_key"]),
+            "logical_path": str(project["logical_path"] or ""),
+            "paths": sorted(paths),
+        }
     def _collect_git_evidence(
         self,
         project: Mapping[str, Any],
@@ -8420,9 +11184,55 @@ class AgentChatRoomService:
         commit_hash: str,
         *,
         worktree: Path | None = None,
+        files: list[str] | None = None,
     ) -> dict[str, Any]:
         resolved = worktree or Path(agent["worktree"] or project["root_path"])
-        return self._collect_git_evidence_from_worktree(resolved, commit_hash)
+        project_data = dict(project)
+        remote, git_root, is_worktree = _project_git_info(resolved)
+        if is_worktree:
+            stored_scope = stored_project_scope(project_data)
+            logical = derive_logical_path(resolved, git_root)
+            expected_logical = str(project_data.get("logical_path") or "")
+            identity_matches = (normalize_remote(remote) == stored_scope["identity"]
+                                if stored_scope["kind"] == "git" else
+                                os.path.normcase(str(git_root)) == stored_scope["identity"])
+            scope_matches = (logical.casefold() == expected_logical.casefold() or
+                             logical.casefold().startswith(expected_logical.casefold() + "/") or
+                             not expected_logical)
+            if not identity_matches or not scope_matches:
+                raise DomainError("untrusted_repository", "Git evidence belongs to a different repository scope",
+                                  status_code=403, details={"required_action": "select_repository_in_project_settings"})
+        evidence = self._collect_git_evidence_from_worktree(resolved, commit_hash)
+        evidence["schema_version"] = 2
+        evidence["workspace_root"] = str(project_data["root_path"])
+        evidence["repository_path"] = str(project_data.get("repository_path") or "")
+        evidence["file_evidence"] = self._repository_file_evidence(resolved, files or [])
+        return evidence
+
+    def _repository_file_evidence(self, root: Path, files: list[str]) -> list[dict[str, Any]]:
+        evidence = []
+        budget = self.settings.repository_evidence_max_file_bytes
+        for name in files:
+            item: dict[str, Any] = {"path": name}
+            try:
+                path = (root / name).resolve()
+                path.relative_to(root.resolve())
+                if not path.is_file():
+                    item["status"] = "missing_or_not_file"
+                elif path.stat().st_size > budget:
+                    item["status"] = "byte_budget_exceeded"
+                else:
+                    with path.open("rb") as stream:
+                        content = stream.read(budget + 1)
+                    if len(content) > budget:
+                        item["status"] = "byte_budget_exceeded"
+                    else:
+                        budget -= len(content)
+                        item.update(status="captured", size_bytes=len(content), sha256=hashlib.sha256(content).hexdigest())
+            except (OSError, ValueError):
+                item["status"] = "unreadable_or_outside_repository"
+            evidence.append(item)
+        return evidence
 
     def _collect_git_evidence_from_worktree(
         self,
@@ -8430,19 +11240,10 @@ class AgentChatRoomService:
         commit_hash: str,
     ) -> dict[str, Any]:
         def git(*arguments: str) -> tuple[int, str]:
-            try:
-                completed = subprocess.run(
-                    ["git", "-C", str(worktree), *arguments],
-                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-                    check=False,
-                    capture_output=True,
-                    text=True,
-                    timeout=5,
-                    stdin=subprocess.DEVNULL,
-                )
-                return completed.returncode, completed.stdout.strip()
-            except (OSError, subprocess.SubprocessError):
-                return 1, ""
+            returncode, stdout, _stderr = run_git_capture(
+                ["git", "-C", str(worktree), *arguments]
+            )
+            return returncode, stdout
 
         inside_code, inside = git("rev-parse", "--is-inside-work-tree")
         if inside_code != 0 or inside != "true":
@@ -8452,18 +11253,23 @@ class AgentChatRoomService:
                 "worktree": str(worktree),
                 "reported_commit_exists": False,
                 "commit_hash": "unknown" if commit_hash.strip() else "",
+                "required_action": "inspect_and_select_repository_in_project_settings",
             }
         _, head = git("rev-parse", "HEAD")
         _, branch = git("branch", "--show-current")
-        _, status = git("status", "--porcelain")
+        _, status = git("-c", "core.quotepath=false", "status", "--porcelain", "--", ".")
+        _, repository_root = git("rev-parse", "--show-toplevel")
+        _, working_diff_stat = git("diff", "--stat", "HEAD", "--", ".")
+        commit_diff_stat = ""
         commit_exists = None
         commit_files: list[str] = []
         stored_commit = commit_hash.strip()
         if stored_commit:
-            commit_code, _ = git("rev-parse", "--verify", f"{stored_commit}^{{commit}}")
+            commit_code, verified_commit = git("rev-parse", "--verify", "--end-of-options", f"{stored_commit}^{{commit}}")
             commit_exists = commit_code == 0
             if commit_exists:
-                _, changed = git("show", "--format=", "--name-only", stored_commit)
+                _, changed = git("-c", "core.quotepath=false", "show", "--format=", "--name-only", verified_commit, "--", ".")
+                _, commit_diff_stat = git("show", "--format=", "--stat", verified_commit, "--", ".")
                 commit_files = sorted(
                     {line for line in changed.splitlines() if line.strip()}
                 )
@@ -8472,12 +11278,15 @@ class AgentChatRoomService:
         return {
             "captured": True,
             "worktree": str(worktree.resolve()),
+            "repository_root": repository_root,
             "head": head,
             "branch": branch,
             "dirty_files": status.splitlines()[:200] if status else [],
             "reported_commit_exists": commit_exists,
             "commit_files": commit_files,
             "commit_hash": stored_commit,
+            "commit_diff_stat": commit_diff_stat.splitlines()[:200],
+            "working_diff_stat": working_diff_stat.splitlines()[:200],
         }
 
     def latest_cursor(self, connection: Any, project_id: str) -> int:
@@ -8524,18 +11333,147 @@ class AgentChatRoomService:
         return "|".join(str(row.get(field) or "") for field in fields)
 
     @staticmethod
-    def _decode_page_cursor(cursor: str | None, expected_parts: int) -> list[str] | None:
+    def _decode_page_cursor(
+        cursor: str | None,
+        expected_parts: int,
+        part_kinds: tuple[str, ...] = (),
+    ) -> list[str] | None:
+        """Split and shape-check one snapshot page cursor.
+
+        The segment count and a non-empty check are not enough. A cursor is a
+        client-supplied string that reaches SQL comparison and, for the
+        acknowledgement page, ``int()``: ``acknowledgements_before=<ts>|x|y``
+        counted three segments and then raised ValueError out of the projection,
+        so the documented 422 `invalid_page_cursor` surfaced as a 500 (README
+        promises 422 for a malformed cursor). Each segment is therefore checked
+        against the shape its position is actually compared with:
+        ``timestamp`` must parse as an ISO instant, ``seq`` must be a
+        non-negative decimal integer, and ``identifier`` must be a short opaque
+        token without separators, control characters or whitespace.
+        """
         if not cursor:
             return None
         parts = cursor.split("|")
-        if len(parts) != expected_parts or any(not part for part in parts):
-            raise DomainError(
-                "invalid_page_cursor",
-                "Snapshot page cursor must be created_at|id (acks add event_id|session_id)",
-                status_code=422,
-                details={"cursor": cursor},
-            )
+        if len(parts) != expected_parts:
+            raise _invalid_page_cursor(cursor)
+        kinds = part_kinds or ("identifier",) * expected_parts
+        if len(kinds) != expected_parts:
+            raise _invalid_page_cursor(cursor)
+        for part, kind in zip(parts, kinds):
+            if not _page_cursor_part_ok(part, kind):
+                raise _invalid_page_cursor(cursor)
         return parts
+
+    @staticmethod
+    def _page_cursor_seq(parts: list[str], index: int) -> int:
+        """The already-validated ``seq`` segment at ``index``.
+
+        Reached only for a cursor that ``_decode_page_cursor`` accepted, so the
+        conversion cannot raise; kept separate so the projection never repeats
+        the unchecked ``int()`` the cursor guard replaced.
+        """
+        return int(parts[index])
+
+    def list_session_presence(self, project_id: str) -> list[dict[str, Any]]:
+        """Presence fields for one project's Sessions, without the Room projection.
+
+        The GUI polls this every few seconds per project and only ever reads
+        ``id``/``name``/``status``/``left_at``. `snapshot()` additionally pages
+        events, tasks with relations, reports, reviews, acknowledgements,
+        leases and knowledge assets, and computes an unread counter per Session,
+        so a presence check cost a full Room rebuild each time. Status still comes
+        from `_agent_dict`, so the two surfaces cannot disagree about who is online.
+        """
+        with self.database.connect() as connection:
+            self._require_project(connection, project_id)
+            rows, _total = self._session_activity_rows(
+                connection,
+                project_id,
+                limit=int(getattr(self.settings, "snapshot_session_limit", 200)),
+            )
+        return [
+            {
+                "id": str(agent["id"]),
+                "name": str(agent.get("name") or ""),
+                "status": str(agent.get("status") or ""),
+                "left_at": agent.get("left_at"),
+            }
+            for agent in (self._agent_dict(row) for row in rows)
+        ]
+
+    def session_agent_key(self, project_id: str, session_id: str) -> str | None:
+        """Stored identity of one Session, or None when it is not in this Project.
+
+        Presence keepalive only needs the ``agent_key`` of a Session it is about
+        to register. Reading it through `snapshot()` rebuilt the whole Room board
+        (events, tasks with relations, reports, reviews, leases, knowledge) for
+        one label, so every hot MCP call paid for a full projection. This is the
+        single indexed row, and it still scopes by Project so a Session from
+        another Project is not adopted here.
+        """
+        with self.database.connect() as connection:
+            row = connection.execute(
+                """
+                SELECT agent_key FROM agent_sessions
+                WHERE id = ? AND project_id = ?
+                """,
+                (session_id, project_id),
+            ).fetchone()
+        if row is None:
+            return None
+        stored = str(dict(row).get("agent_key") or "").strip()
+        return stored or str(session_id)
+
+    def _session_activity_rows(
+        self, connection: Any, project_id: str, *, limit: int | None = None
+    ) -> tuple[list[dict[str, Any]], int]:
+        """Sessions for one Project with activity/unread counters attached.
+
+        Both counters used to be correlated subqueries in the ``SELECT`` list,
+        so the statement was evaluated once per Session row and every snapshot
+        or presence poll paid Sessions x 2 extra event scans. They are now two
+        grouped aggregates joined onto the Session row, and the Session list is
+        bounded newest-first: a Project accumulates one Session per agent
+        process for its whole life, so an unbounded read only ever grew.
+        Returns ``(rows, total_sessions)`` so a truncated read can say so.
+        """
+        total = int(
+            connection.execute(
+                "SELECT COUNT(*) AS c FROM agent_sessions WHERE project_id = ?",
+                (project_id,),
+            ).fetchone()["c"]
+        )
+        statement = """
+            SELECT a.*, activity.last_activity_at, unread.unread_count
+            FROM agent_sessions a
+            LEFT JOIN (
+                SELECT actor_session_id, MAX(created_at) AS last_activity_at
+                FROM events
+                WHERE project_id = ? AND actor_session_id IS NOT NULL
+                GROUP BY actor_session_id
+            ) activity ON activity.actor_session_id = a.id
+            LEFT JOIN (
+                SELECT a2.id AS session_id, COUNT(e.id) AS unread_count
+                FROM agent_sessions a2
+                LEFT JOIN events e
+                  ON e.project_id = a2.project_id
+                 AND e.project_seq > a2.last_read_cursor
+                WHERE a2.project_id = ?
+                GROUP BY a2.id
+            ) unread ON unread.session_id = a.id
+            WHERE a.project_id = ?
+            ORDER BY a.created_at DESC, a.id DESC
+        """
+        params: list[Any] = [project_id, project_id, project_id]
+        if limit is not None:
+            params.append(max(1, int(limit)))
+            statement += " LIMIT ?"
+        rows = [dict(row) for row in connection.execute(statement, params).fetchall()]
+        for row in rows:
+            # The grouped join yields NULL for a Session with no events, which
+            # is what the correlated MAX() subquery yielded too.
+            row["unread_count"] = int(row.get("unread_count") or 0)
+        return rows, total
 
     def _snapshot(
         self,
@@ -8550,31 +11488,11 @@ class AgentChatRoomService:
         acknowledgements_after: str | None = None,
     ) -> dict[str, Any]:
             project = self._project_dict(self._require_project(connection, project_id))
-            agent_rows = connection.execute(
-                """
-                SELECT a.*, (
-                    SELECT MAX(e.created_at)
-                    FROM events e
-                    WHERE e.project_id = a.project_id
-                      AND e.actor_session_id = a.id
-                ) AS last_activity_at,
-                (
-                    SELECT COUNT(*)
-                    FROM events e
-                    WHERE e.project_id = a.project_id
-                      AND e.project_seq > a.last_read_cursor
-                ) AS unread_count
-                FROM agent_sessions a
-                WHERE a.project_id = ?
-                ORDER BY a.created_at
-                """,
-                (project_id,),
-            ).fetchall()
-            agents = []
-            for row in agent_rows:
-                agent = self._agent_dict(row)
-                agent["unread_count"] = int(row["unread_count"] or 0)
-                agents.append(agent)
+            session_limit = int(getattr(self.settings, "snapshot_session_limit", 200))
+            agent_rows, session_total = self._session_activity_rows(
+                connection, project_id, limit=session_limit
+            )
+            agents = [self._agent_dict(row) for row in agent_rows]
             tasks = self._tasks_with_relations(
                 connection,
                 connection.execute(
@@ -8584,22 +11502,10 @@ class AgentChatRoomService:
             )
             members = self._list_project_members(connection, project_id)
             recent_limit = int(getattr(self.settings, "snapshot_recent_limit", 200))
-            leases = [
-                lease
-                for lease in (
-                    self._lease_dict(row)
-                    for row in connection.execute(
-                        """
-                        SELECT l.*, a.last_heartbeat AS owner_last_heartbeat
-                        FROM file_leases l
-                        JOIN agent_sessions a ON a.id = l.session_id
-                        WHERE l.project_id = ? ORDER BY l.created_at DESC
-                        """,
-                        (project_id,),
-                    ).fetchall()
-                )
-                if lease["active"]
-            ]
+            lease_limit = int(getattr(self.settings, "snapshot_lease_limit", 200))
+            leases = self._list_leases(
+                connection, project_id, limit=lease_limit
+            )
 
             def _fetch_tied_page(
                 table: str,
@@ -8625,7 +11531,9 @@ class AgentChatRoomService:
                 params: list[Any] = [project_id]
                 order_time = "DESC"
                 order_id = "DESC"
-                cursor_parts = self._decode_page_cursor(before or after, 2)
+                cursor_parts = self._decode_page_cursor(
+                    before or after, 2, ("timestamp", "identifier")
+                )
                 if cursor_parts is not None:
                     created_at, row_id = cursor_parts
                     if before:
@@ -8689,11 +11597,16 @@ class AgentChatRoomService:
                 order_time = "DESC"
                 order_seq = "DESC"
                 order_session = "DESC"
-                cursor_parts = self._decode_page_cursor(before or after, 3)
+                cursor_parts = self._decode_page_cursor(
+                    before or after, 3, ("timestamp", "seq", "identifier")
+                )
                 if cursor_parts is not None:
                     created_at, event_seq, session_id = cursor_parts
                     # Cursor encodes project_seq; compare project_seq (not e.id).
-                    seq_value = int(event_seq)
+                    # The seq segment was shape-checked as a non-negative
+                    # integer by _decode_page_cursor, so this cannot raise the
+                    # ValueError that used to surface as a 500.
+                    seq_value = self._page_cursor_seq(cursor_parts, 1)
                     if before:
                         where.append(
                             "(a.created_at < ? OR (a.created_at = ? AND "
@@ -8762,18 +11675,12 @@ class AgentChatRoomService:
             reports, reports_older, reports_newer = _fetch_tied_page(
                 "work_reports", before=reports_before, after=reports_after
             )
-            for report in reports:
-                report["files"] = json_load(report.pop("files_json", "[]"), [])
-                report["tests"] = json_load(report.pop("tests_json", "[]"), [])
-                report["system_evidence"] = json_load(
-                    report.pop("system_evidence_json", "{}"), {}
-                )
+            reports = [self._work_report_dict(report) for report in reports]
 
             reviews, reviews_older, reviews_newer = _fetch_tied_page(
                 "reviews", before=reviews_before, after=reviews_after
             )
-            for review in reviews:
-                review["criteria"] = json_load(review.pop("criteria_json", "[]"), [])
+            reviews = [self._review_dict(review) for review in reviews]
 
             acknowledgements, acks_older, acks_newer = _fetch_ack_page(
                 before=acknowledgements_before,
@@ -8872,6 +11779,29 @@ class AgentChatRoomService:
             )
             acks_info["total"] = totals["acknowledgements"]
 
+            # The lease and Session projections are bounded rather than
+            # paged: both are "what is true right now" lists, so they answer
+            # with the newest window and say plainly that they did.
+            lease_total = int(
+                connection.execute(
+                    "SELECT COUNT(*) AS c FROM file_leases "
+                    "WHERE project_id = ? AND released_at IS NULL AND expires_at > ?",
+                    (project_id, iso_now()),
+                ).fetchone()["c"]
+            )
+            lease_info = {
+                "returned": len(leases),
+                "limit": lease_limit,
+                "total": lease_total,
+                "truncated": len(leases) < lease_total,
+            }
+            session_info = {
+                "returned": len(agents_payload),
+                "limit": session_limit,
+                "total": session_total,
+                "truncated": len(agents_payload) < session_total,
+            }
+
             return {
                 "project": project,
                 "members": members,
@@ -8885,12 +11815,75 @@ class AgentChatRoomService:
                 "documents": self.list_project_documents(project_id)["documents"],
                 "cursor": cursor,
                 "totals": totals,
+                "lease_page_info": lease_info,
+                "session_page_info": session_info,
                 "page_info": {
                     "limit": recent_limit,
                     "reports": reports_info,
                     "reviews": reviews_info,
                     "acknowledgements": acks_info,
                 },
+            }
+
+    def _work_report_dict(self, row: Mapping[str, Any]) -> dict[str, Any]:
+        report = dict(row)
+        report["files"] = json_load(report.pop("files_json", "[]"), [])
+        report["tests"] = json_load(report.pop("tests_json", "[]"), [])
+        report["system_evidence"] = json_load(
+            report.pop("system_evidence_json", "{}"), {}
+        )
+        return report
+
+    def _review_dict(self, row: Mapping[str, Any]) -> dict[str, Any]:
+        review = dict(row)
+        review["criteria"] = json_load(review.pop("criteria_json", "[]"), [])
+        return review
+
+    def _acknowledgement_dict(self, row: Mapping[str, Any]) -> dict[str, Any]:
+        acknowledgement = dict(row)
+        acknowledgement.pop("physical_id", None)
+        return acknowledgement
+
+    def _export_room_writes(
+        self, project_id: str, cursor: int
+    ) -> dict[str, list[dict[str, Any]]]:
+        """Every Work Report, review, and acknowledgement for one export.
+
+        The snapshot lists these to a recency window, so an older report used to
+        vanish from the archive without a trace. Acknowledgements are capped at
+        the export cursor because that is what makes the event list complete.
+        """
+        with self.database.connect() as connection:
+            self._require_project(connection, project_id)
+            return {
+                "reports": [
+                    self._work_report_dict(row)
+                    for row in connection.execute(
+                        "SELECT * FROM work_reports WHERE project_id = ? "
+                        "ORDER BY created_at ASC, id ASC",
+                        (project_id,),
+                    ).fetchall()
+                ],
+                "reviews": [
+                    self._review_dict(row)
+                    for row in connection.execute(
+                        "SELECT * FROM reviews WHERE project_id = ? "
+                        "ORDER BY created_at ASC, id ASC",
+                        (project_id,),
+                    ).fetchall()
+                ],
+                "acknowledgements": [
+                    self._acknowledgement_dict(row)
+                    for row in connection.execute(
+                        "SELECT e.project_seq AS event_id, a.session_id, a.created_at, "
+                        "e.id AS physical_id "
+                        "FROM event_acknowledgements a "
+                        "JOIN events e ON e.id = a.event_id "
+                        "WHERE e.project_id = ? AND e.project_seq <= ? "
+                        "ORDER BY a.created_at ASC, e.project_seq ASC, a.session_id ASC",
+                        (project_id, cursor),
+                    ).fetchall()
+                ],
             }
 
     def _export_knowledge_assets(self, project_id: str) -> list[dict[str, Any]]:
@@ -8925,34 +11918,110 @@ class AgentChatRoomService:
                 assets.append(asset)
             return assets
 
-    def export_project(self, project_id: str) -> dict[str, Any]:
+    def _export_events(
+        self, project_id: str, cursor: int, limit: int
+    ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+        """Newest ``limit`` events at or below ``cursor``, with a window receipt.
+
+        The export used to walk the project's whole history one 1000-row page at
+        a time and hold every event in memory to serialize once, so cost grew
+        with the age of the Project rather than with the archive the caller
+        asked for. It now returns a declared window: the newest ``limit`` events
+        plus a receipt stating the total, the retained range, and whether
+        anything was left out. Truncation is never silent — an archive that
+        quietly dropped the beginning of a Project's history would be worse than
+        one that says where its window starts.
+        """
+        with self.database.connect() as connection:
+            self._require_project(connection, project_id)
+            total = int(
+                connection.execute(
+                    "SELECT COUNT(*) AS c FROM events "
+                    "WHERE project_id = ? AND project_seq <= ?",
+                    (project_id, cursor),
+                ).fetchone()["c"]
+            )
+            boundary = connection.execute(
+                """
+                SELECT MIN(project_seq) AS oldest FROM (
+                    SELECT project_seq FROM events
+                    WHERE project_id = ? AND project_seq <= ?
+                    ORDER BY project_seq DESC LIMIT ?
+                )
+                """,
+                (project_id, cursor, max(1, int(limit))),
+            ).fetchone()
+            oldest_retained = int(boundary["oldest"] or 0)
+            if oldest_retained:
+                rows = connection.execute(
+                    "SELECT * FROM events "
+                    "WHERE project_id = ? AND project_seq >= ? AND project_seq <= ? "
+                    "ORDER BY project_seq ASC",
+                    (project_id, oldest_retained, cursor),
+                ).fetchall()
+                events = self._project_events(connection, rows)
+            else:
+                events = []
+        window = {
+            "limit": int(limit),
+            "returned": len(events),
+            "total": total,
+            "truncated": bool(total and len(events) < total),
+            "first_project_seq": events[0]["project_seq"] if events else None,
+            "last_project_seq": events[-1]["project_seq"] if events else None,
+            "oldest_retained_project_seq": oldest_retained or None,
+        }
+        if window["truncated"]:
+            window["required_action"] = "narrow_the_window_with_export_before"
+        return events, window
+
+    def export_project(
+        self, project_id: str, *, event_limit: int | None = None
+    ) -> dict[str, Any]:
         snapshot = self.snapshot(project_id)
         cursor = snapshot["cursor"]
-        events: list[dict[str, Any]] = []
-        after = 0
-        while after < cursor:
-            batch = self.list_events(project_id, after=after, limit=1000)
-            current = [
-                event for event in batch["events"] if event["project_seq"] <= cursor
-            ]
-            if not current:
-                break
-            events.extend(current)
-            after = current[-1]["project_seq"]
+        limit = (
+            int(event_limit)
+            if event_limit is not None
+            else int(getattr(self.settings, "export_event_limit", 5000))
+        )
+        if limit <= 0:
+            raise DomainError(
+                "invalid_export_event_limit",
+                "export event limit must be positive",
+                status_code=422,
+                details={"field": "event_limit"},
+            )
+        events, event_window = self._export_events(project_id, cursor, limit)
+        writes = self._export_room_writes(project_id, cursor)
+        leases = self.list_leases(project_id, include_inactive=True)
+        assets = self._export_knowledge_assets(project_id)
         return {
-            "export_schema_version": 1,
+            "export_schema_version": 3,
             "exported_at": iso_now(),
             "project": snapshot["project"],
             "members": snapshot["members"],
             "cursor": cursor,
             "agents": snapshot["agents"],
             "tasks": snapshot["tasks"],
-            "leases": self.list_leases(project_id, include_inactive=True),
-            "reports": snapshot["reports"],
-            "reviews": snapshot["reviews"],
-            "acknowledgements": snapshot["acknowledgements"],
-            "knowledge_assets": self._export_knowledge_assets(project_id),
+            "leases": leases,
+            "reports": writes["reports"],
+            "reviews": writes["reviews"],
+            "acknowledgements": writes["acknowledgements"],
+            "knowledge_assets": assets,
             "events": events,
+            "window": {"events": event_window},
+            "counts": {
+                "members": len(snapshot["members"]),
+                "agents": len(snapshot["agents"]),
+                "tasks": len(snapshot["tasks"]),
+                "leases": len(leases),
+                "reports": len(writes["reports"]),
+                "reviews": len(writes["reviews"]),
+                "acknowledgements": len(writes["acknowledgements"]),
+                "knowledge_assets": len(assets),
+                "events": len(events),
+            },
         }
 
     # ------------------------------------------------------------------
@@ -8967,6 +12036,22 @@ class AgentChatRoomService:
             "SELECT id FROM projects WHERE archived_at IS NULL"
         ).fetchall()
         return [str(row["id"]) for row in rows]
+
+    def latest_backup_failure(self) -> dict[str, Any] | None:
+        with self.database.connect() as connection:
+            row = connection.execute(
+                """
+                SELECT payload_json, created_at FROM events
+                WHERE event_type = 'backup.failed'
+                ORDER BY id DESC LIMIT 1
+                """
+            ).fetchone()
+        if row is None:
+            return None
+        return {
+            "created_at": row["created_at"],
+            "payload": json_load(row["payload_json"], {}),
+        }
 
     def _emit_backup_event(
         self,
@@ -8999,47 +12084,84 @@ class AgentChatRoomService:
             stamp = iso_now().replace(":", "").replace("-", "")
             target = directory / f"backup-{stamp}.sqlite"
             backend = self.settings.database_backend
-            if backend == "sqlite":
-                result = backup_sqlite(self.database.path, target)
-            elif backend == "postgresql":
-                database_url = os.getenv(self.settings.database_url_env, "")
-                result = backup_postgresql(database_url, target)
-            else:
-                raise DomainError(
-                    "backup_backend_unsupported",
-                    f"Backups are not supported for backend {backend}",
-                    status_code=422,
-                )
-            latest_event_id = self._latest_event_id()
-            manifest_path = Path(result["manifest"])
-            manifest = json_load(manifest_path.read_text(encoding="utf-8"), {})
-            manifest["latest_event_id"] = latest_event_id
-            manifest["source"] = source
-            manifest_path.write_text(
-                json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
-                encoding="utf-8",
-            )
+            # Write the audit row before the snapshot so the producer stamps
+            # MAX(events.id) once and the file actually contains that event.
+            # A later rewrite of the manifest made the cursor lie about the file.
             self._emit_backup_event(
                 "backup.created",
                 payload={
                     "backend": backend,
-                    "output": result["output"],
-                    "manifest": str(manifest_path),
-                    "latest_event_id": latest_event_id,
+                    "output": str(target),
                     "source": source,
                 },
                 actor_session_id=actor_session_id,
             )
-            # The audit event about this backup is part of the protected history:
-            # record the cursor again so a fresh backup is never "stale".
             latest_event_id = self._latest_event_id()
-            manifest["latest_event_id"] = latest_event_id
-            manifest_path.write_text(
-                json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
-                encoding="utf-8",
-            )
+            try:
+                if backend == "sqlite":
+                    result = backup_sqlite(
+                        self.database.path,
+                        target,
+                        latest_event_id=latest_event_id,
+                        source_label=source,
+                    )
+                elif backend == "postgresql":
+                    database_url = os.getenv(self.settings.database_url_env, "")
+                    result = backup_postgresql(
+                        database_url,
+                        target,
+                        latest_event_id=latest_event_id,
+                        source_label=source,
+                    )
+                else:
+                    raise DomainError(
+                        "backup_backend_unsupported",
+                        f"Backups are not supported for backend {backend}",
+                        status_code=422,
+                    )
+            except BackupError as error:
+                self._emit_backup_event(
+                    "backup.failed",
+                    payload={
+                        "source": source,
+                        "output": str(target),
+                        "reason": error.__class__.__name__,
+                    },
+                    actor_session_id=actor_session_id,
+                )
+                raise DomainError(
+                    "backup_failed",
+                    "The database backup did not complete",
+                    status_code=409,
+                    details={
+                        "required_action": "inspect_the_database_and_retry_the_backup",
+                    },
+                ) from error
             kept = self._prune_backups(max_kept)
             return {**result, "latest_event_id": latest_event_id, "pruned": kept}
+
+    def _read_backup_manifest(self, manifest_path: Path) -> dict[str, Any] | None:
+        """Read one manifest, returning None when it cannot be trusted.
+
+        A single truncated, binary or unparseable manifest must not take the
+        backup subsystem down: listing feeds the admin page *and* the auto
+        backup worker, so an exception here would return 500 and silently stop
+        automatic backups for good.
+        """
+        try:
+            raw = manifest_path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            return None
+        try:
+            parsed = json.loads(raw)
+        except ValueError:
+            return None
+        return parsed if isinstance(parsed, dict) else None
+
+    def _current_backup_max_kept(self) -> int:
+        if self._applied_backup_max_kept is not None:
+            return self._applied_backup_max_kept
+        return int(getattr(self.settings, "auto_backup_max_kept", 10))
 
     def list_backups(self) -> list[dict[str, Any]]:
         directory = self._backup_directory()
@@ -9047,21 +12169,29 @@ class AgentChatRoomService:
             return []
         backups: list[dict[str, Any]] = []
         for manifest_path in sorted(directory.glob("*.manifest.json")):
-            data = json_load(manifest_path.read_text(encoding="utf-8"), {})
+            data = self._read_backup_manifest(manifest_path)
             target = manifest_path.with_name(manifest_path.name[: -len(".manifest.json")])
             if not target.name.startswith("backup-"):
                 # 历史遗留快照（如迁移前 .db 备份）不属于本功能管理列表，
                 # 保留在磁盘上但不进产品列表：它们多为旧 schema，已不可回滚。
                 continue
+            try:
+                size = target.stat().st_size if target.is_file() else 0
+            except OSError:
+                size = 0
             backups.append(
                 {
                     "file": str(target),
-                    "size": target.stat().st_size if target.is_file() else 0,
-                    "created_at": data.get("created_at"),
-                    "backend": data.get("backend"),
-                    "schema_version": data.get("database_schema_version"),
-                    "latest_event_id": data.get("latest_event_id"),
-                    "source": data.get("source"),
+                    "size": size,
+                    "created_at": (data or {}).get("created_at"),
+                    "backend": (data or {}).get("backend"),
+                    "schema_version": (data or {}).get("database_schema_version"),
+                    "latest_event_id": (data or {}).get("latest_event_id"),
+                    "source": (data or {}).get("source"),
+                    # Surfaced so the operator can see the file needs attention
+                    # instead of silently treating a broken manifest as "no
+                    # cursor recorded", which reads as "stale".
+                    "manifest_readable": data is not None,
                 }
             )
         backups.sort(key=lambda item: str(item.get("created_at") or ""), reverse=True)
@@ -9069,9 +12199,7 @@ class AgentChatRoomService:
 
     def _prune_backups(self, kept_max: int | None = None) -> list[str]:
         kept_max = (
-            int(kept_max)
-            if kept_max is not None
-            else int(getattr(self.settings, "auto_backup_max_kept", 10))
+            int(kept_max) if kept_max is not None else self._current_backup_max_kept()
         )
         if kept_max < 0:
             kept_max = 0
@@ -9079,14 +12207,20 @@ class AgentChatRoomService:
         removed: list[str] = []
         for stale in backups[kept_max:]:
             target = Path(stale["file"])
-            target.unlink(missing_ok=True)
-            target.with_name(target.name + ".manifest.json").unlink(missing_ok=True)
+            try:
+                target.unlink(missing_ok=True)
+                target.with_name(target.name + ".manifest.json").unlink(missing_ok=True)
+            except OSError:
+                # A locked or vanished file must not abort the rest of the
+                # sweep, and must not be reported as removed.
+                continue
             removed.append(str(target))
         return removed
 
     def enforce_backup_retention(self, max_kept: int) -> list[str]:
         """Apply the retention policy immediately (settings save path)."""
-        return self._prune_backups(max_kept)
+        self._applied_backup_max_kept = int(max_kept)
+        return self._prune_backups(self._applied_backup_max_kept)
 
     def delete_backup(
         self,
@@ -9148,6 +12282,25 @@ class AgentChatRoomService:
             row = connection.execute("SELECT COALESCE(MAX(id), 0) AS latest FROM events").fetchone()
             return int(row["latest"])
 
+    @contextmanager
+    def _hold_postgres_write_lock(self):
+        """Keep other PostgreSQL writers out until pg_restore finishes.
+
+        SQLite exclusion is the file lock taken above this call. PostgreSQL
+        writers take ``pg_advisory_xact_lock`` for a single transaction, which
+        ends as soon as the cursor read returns. ``hold_restore_lock`` keeps a
+        session lock on the same key until the restore process returns.
+        """
+        if self.settings.database_backend != "postgresql":
+            yield
+            return
+        holder = getattr(self.database, "hold_restore_lock", None)
+        if not callable(holder):
+            yield
+            return
+        with holder():
+            yield
+
     def restore_backup(
         self,
         backup_path: str,
@@ -9171,6 +12324,23 @@ class AgentChatRoomService:
             )
         target = Path(backup_path).expanduser().resolve()
         manifest_path = target.with_name(target.name + ".manifest.json")
+        # The path arrives from a management request. A restore copies this
+        # file over the live database, so an unconstrained path would let any
+        # readable file on the host be installed as the Room's database. Only
+        # managed snapshots inside the backups directory are restorable.
+        backup_root = self._backup_directory().resolve()
+        if target.parent != backup_root or not target.name.startswith("backup-"):
+            self._emit_backup_event(
+                "backup.restore_rejected",
+                payload={"file": str(target), "reason": "backup_path_outside_root"},
+                actor_session_id=actor_session_id,
+            )
+            raise DomainError(
+                "backup_path_outside_root",
+                "Only managed backups in the backups directory can be restored",
+                status_code=403,
+                details={"required_action": "select_a_listed_backup"},
+            )
         if not target.is_file() or not manifest_path.is_file():
             self._emit_backup_event(
                 "backup.restore_rejected",
@@ -9182,7 +12352,20 @@ class AgentChatRoomService:
                 f"Backup or manifest does not exist: {target}",
                 status_code=404,
             )
-        manifest = json_load(manifest_path.read_text(encoding="utf-8"), {})
+        manifest = self._read_backup_manifest(manifest_path)
+        if manifest is None:
+            self._emit_backup_event(
+                "backup.restore_rejected",
+                payload={"file": str(target), "reason": "backup_manifest_unreadable"},
+                actor_session_id=actor_session_id,
+            )
+            raise DomainError(
+                "backup_manifest_unreadable",
+                "The backup manifest cannot be parsed; refusing to restore an "
+                "unverifiable snapshot",
+                status_code=409,
+                details={"required_action": "delete_backup_and_retake"},
+            )
         current_schema = SCHEMA_VERSION
         if int(manifest.get("database_schema_version") or 0) != current_schema:
             self._emit_backup_event(
@@ -9201,34 +12384,85 @@ class AgentChatRoomService:
                 status_code=409,
                 details={"backup_schema": manifest.get("database_schema_version"), "current_schema": current_schema},
             )
-        backup_event_id = int(manifest.get("latest_event_id") or 0)
+        if self.settings.database_backend == "sqlite":
+            try:
+                _validate_sqlite_backup(target)
+            except BackupError as error:
+                self._emit_backup_event(
+                    "backup.restore_rejected",
+                    payload={"file": str(target), "reason": "backup_unusable"},
+                    actor_session_id=actor_session_id,
+                )
+                raise DomainError(
+                    "backup_unusable",
+                    "The backup file failed integrity or schema validation "
+                    "and the live database was not modified",
+                    status_code=409,
+                    details={"required_action": "delete_backup_and_retake"},
+                ) from error
+        # A manifest with no recorded cursor is not the same as a cursor of 0.
+        # CLI-produced backups never wrote one, and reading that as 0 made
+        # every such backup look older than any non-empty database.
+        raw_cursor = manifest.get("latest_event_id")
+        backup_event_id = (
+            int(raw_cursor)
+            if isinstance(raw_cursor, int) and not isinstance(raw_cursor, bool)
+            else None
+        )
         with self._backup_restore_lock:
             if self.settings.database_backend == "sqlite":
                 # Hold process mutex + SQLite EXCLUSIVE locking from the stale
                 # check through the page copy so concurrent writers cannot land
                 # in the window that allow_data_loss=False claims is empty.
-                live_connection = sqlite3.connect(self.database.path, timeout=10.0)
+                # Same configured wait the adapter layer uses; this used to be a
+                # third copy of a hardcoded 10 seconds.
+                sqlite_wait_seconds = float(
+                    self.settings.database_connect_timeout_seconds
+                )
+                live_connection = sqlite3.connect(
+                    self.database.path, timeout=sqlite_wait_seconds
+                )
                 try:
-                    live_connection.execute("PRAGMA busy_timeout=10000")
+                    live_connection.execute(
+                        f"PRAGMA busy_timeout={int(sqlite_wait_seconds * 1000)}"
+                    )
                     live_connection.execute("PRAGMA locking_mode=EXCLUSIVE")
                     row = live_connection.execute(
                         "SELECT COALESCE(MAX(id), 0) AS latest FROM events"
                     ).fetchone()
                     latest_event_id = int(row[0])
-                    stale = backup_event_id < latest_event_id
-                    if stale and not allow_data_loss:
+                    stale = (
+                        backup_event_id is not None
+                        and backup_event_id < latest_event_id
+                    )
+                    unknown_cursor = backup_event_id is None
+                    if (stale or unknown_cursor) and not allow_data_loss:
                         live_connection.close()
                         live_connection = None
+                        reason = "backup_stale" if stale else "backup_cursor_unknown"
                         self._emit_backup_event(
                             "backup.restore_rejected",
                             payload={
                                 "file": str(target),
-                                "reason": "backup_stale",
+                                "reason": reason,
                                 "backup_latest_event_id": backup_event_id,
                                 "current_latest_event_id": latest_event_id,
                             },
                             actor_session_id=actor_session_id,
                         )
+                        if unknown_cursor:
+                            raise DomainError(
+                                "backup_cursor_unknown",
+                                "The backup manifest records no event cursor, so it "
+                                "cannot be proven current; pass allow_data_loss to "
+                                "restore it anyway",
+                                status_code=409,
+                                details={
+                                    "backup_latest_event_id": None,
+                                    "current_latest_event_id": latest_event_id,
+                                    "required_action": "retake_backup_or_allow_data_loss",
+                                },
+                            )
                         raise DomainError(
                             "backup_stale",
                             "The backup is older than the current database; pass allow_data_loss "
@@ -9239,18 +12473,10 @@ class AgentChatRoomService:
                                 "current_latest_event_id": latest_event_id,
                             },
                         )
-                    source_connection = sqlite3.connect(
-                        f"file:{target.as_posix()}?mode=ro", uri=True
-                    )
-                    try:
-                        # Dest is the same connection that already holds the
-                        # EXCLUSIVE lock and has no open transaction.
-                        source_connection.backup(live_connection)
-                    finally:
-                        source_connection.close()
                 except sqlite3.Error as error:
                     if live_connection is not None:
                         live_connection.close()
+                        live_connection = None
                     raise DomainError(
                         "database_busy",
                         f"The live database is busy; stop writers before restoring: {error}",
@@ -9259,68 +12485,113 @@ class AgentChatRoomService:
                 finally:
                     if live_connection is not None:
                         live_connection.close()
+                        live_connection = None
+                # The file was validated before this lock. Replace it atomically
+                # and drop WAL sidecars in the same step as restore_sqlite,
+                # instead of copying pages into the open live database.
+                try:
+                    restore_sqlite(
+                        target,
+                        Path(self.database.path),
+                        overwrite=True,
+                        write_manifest=False,
+                    )
+                except BackupError as error:
+                    raise DomainError(
+                        "backup_unusable",
+                        "The backup file failed integrity or schema validation "
+                        "and was not applied",
+                        status_code=409,
+                        details={"required_action": "delete_backup_and_retake"},
+                    ) from error
                 self._emit_backup_event(
                     "backup.restore_started",
                     payload={"file": str(target), "stale": stale},
                     actor_session_id=actor_session_id,
                 )
             else:
-                latest_event_id = self._latest_event_id()
-                stale = backup_event_id < latest_event_id
-                if stale and not allow_data_loss:
+                with self._hold_postgres_write_lock():
+                    latest_event_id = self._latest_event_id()
+                    stale = (
+                        backup_event_id is not None
+                        and backup_event_id < latest_event_id
+                    )
+                    unknown_cursor = backup_event_id is None
+                    if (stale or unknown_cursor) and not allow_data_loss:
+                        reason = "backup_stale" if stale else "backup_cursor_unknown"
+                        self._emit_backup_event(
+                            "backup.restore_rejected",
+                            payload={
+                                "file": str(target),
+                                "reason": reason,
+                                "backup_latest_event_id": backup_event_id,
+                                "current_latest_event_id": latest_event_id,
+                            },
+                            actor_session_id=actor_session_id,
+                        )
+                        if unknown_cursor:
+                            raise DomainError(
+                                "backup_cursor_unknown",
+                                "The backup manifest records no event cursor, so it "
+                                "cannot be proven current; pass allow_data_loss to "
+                                "restore it anyway",
+                                status_code=409,
+                                details={
+                                    "backup_latest_event_id": None,
+                                    "current_latest_event_id": latest_event_id,
+                                    "required_action": "retake_backup_or_allow_data_loss",
+                                },
+                            )
+                        raise DomainError(
+                            "backup_stale",
+                            "The backup is older than the current database; pass allow_data_loss "
+                            "to accept losing newer events",
+                            status_code=409,
+                            details={
+                                "backup_latest_event_id": backup_event_id,
+                                "current_latest_event_id": latest_event_id,
+                            },
+                        )
+                    database_url = os.getenv(self.settings.database_url_env, "")
+                    # pg_restore rewrites the database it targets, so an audit row
+                    # written before it runs is destroyed by its own restore. The
+                    # started/completed trail is emitted around the call below, the
+                    # same way the SQLite branch does it. The session advisory lock
+                    # stays held until this call returns, so another process cannot
+                    # commit into the window pg_restore is about to erase.
+                    restore_postgresql(database_url, target)
                     self._emit_backup_event(
-                        "backup.restore_rejected",
-                        payload={
-                            "file": str(target),
-                            "reason": "backup_stale",
-                            "backup_latest_event_id": backup_event_id,
-                            "current_latest_event_id": latest_event_id,
-                        },
+                        "backup.restore_started",
+                        payload={"file": str(target), "stale": stale},
                         actor_session_id=actor_session_id,
                     )
-                    raise DomainError(
-                        "backup_stale",
-                        "The backup is older than the current database; pass allow_data_loss "
-                        "to accept losing newer events",
-                        status_code=409,
-                        details={
-                            "backup_latest_event_id": backup_event_id,
-                            "current_latest_event_id": latest_event_id,
-                        },
-                    )
-                self._emit_backup_event(
-                    "backup.restore_started",
-                    payload={"file": str(target), "stale": stale},
-                    actor_session_id=actor_session_id,
-                )
-                database_url = os.getenv(self.settings.database_url_env, "")
-                restore_postgresql(database_url, target)
+        # unknown_cursor is not "cursor 0". Allowing the restore still discards
+        # every event the manifest cannot account for, so data_loss stays true.
+        data_loss = bool(stale or unknown_cursor)
+        baseline = 0 if backup_event_id is None else int(backup_event_id)
+        lost_events = max(0, int(latest_event_id) - baseline) if data_loss else 0
         self._emit_backup_event(
             "backup.restore_completed",
-            payload={"file": str(target), "restored_latest_event_id": backup_event_id},
+            payload={
+                "file": str(target),
+                "restored_latest_event_id": backup_event_id,
+                "data_loss": data_loss,
+                "unknown_cursor": unknown_cursor,
+                "lost_events": lost_events,
+                "current_latest_event_id": latest_event_id,
+            },
             actor_session_id=actor_session_id,
         )
         return {
             "backend": self.settings.database_backend,
             "input": str(target),
             "restored": True,
-            "data_loss": stale,
+            "data_loss": data_loss,
+            "unknown_cursor": unknown_cursor,
+            "lost_events": lost_events,
+            "backup_latest_event_id": backup_event_id,
+            "current_latest_event_id": latest_event_id,
         }
-
-    def _ensure_sqlite_restorable(self, backup_path: Path) -> None:
-        """Fail loudly when the live SQLite database cannot take a restore."""
-        probe = sqlite3.connect(self.database.path, timeout=0.5)
-        try:
-            probe.execute("BEGIN IMMEDIATE")
-            probe.execute("ROLLBACK")
-        except sqlite3.Error as error:
-            raise DomainError(
-                "database_busy",
-                f"The live database is busy; stop writers before restoring: {error}",
-                status_code=409,
-            ) from error
-        finally:
-            probe.close()
 
     # ------------------------------------------------------------------
     # Project documents: versioned binding/reference docs injected to Agents
@@ -9414,6 +12685,7 @@ class AgentChatRoomService:
                 }
             }
 
+    @idempotent_write("project.document.upsert")
     def upsert_project_document(
         self,
         project_id: str,
@@ -9422,6 +12694,10 @@ class AgentChatRoomService:
         kind: str,
         title: str,
         content: str,
+        session_id: str = "",
+        token: str = "",
+        management_authorized: bool = False,
+        expected_version: int | None = None,
         actor: str | None = None,
     ) -> dict[str, Any]:
         key = str(doc_key or "").strip()
@@ -9459,12 +12735,55 @@ class AgentChatRoomService:
             )
         now = iso_now()
         with self.database.connect(write=True) as connection:
+            # A binding document is injected verbatim into every Agent's task
+            # response, so writing one is a privileged act and has to be
+            # attributable. The previous signature took a free-text actor and
+            # authenticated nobody: any caller holding document:write could
+            # replace the Room's own rules, and the event named nobody.
+            #
+            # Management authority stands on its own - the console has no Agent
+            # Session - so it skips the Agent credential check rather than
+            # demanding an identity the caller does not have. The Agent path is
+            # the one that must be refused.
+            actor_row: Mapping[str, Any] | None = None
+            if management_authorized:
+                if session_id and token:
+                    actor_row = self._authenticate(
+                        connection, project_id, session_id, token or ""
+                    )
+            else:
+                # Authenticating first would answer a no-credential caller with
+                # invalid_session_token, hiding the actual contract violation:
+                # a caller that brings no management authority at all - and no
+                # Agent credentials either - must hear management_auth_required.
+                if session_id and token:
+                    self._authenticate(connection, project_id, session_id, token or "")
+                raise _management_authorization_required(
+                    "write a project document"
+                )
             self._require_project(connection, project_id)
             head = connection.execute(
                 "SELECT * FROM project_document_heads WHERE project_id = ? AND doc_key = ?",
                 (project_id, key),
             ).fetchone()
             created = head is None
+            # Optimistic lock: a writer that read version N must still find N,
+            # or the document it meant to edit has moved under it.
+            if expected_version is not None:
+                current = int(head["current_version"]) if head else 0
+                if current != require_int_or_default(
+                    expected_version, "expected_version", 0
+                ):
+                    raise DomainError(
+                        "project_document_modified_concurrently",
+                        "The document changed since it was read",
+                        status_code=409,
+                        details={
+                            "expected_version": expected_version,
+                            "current_version": current,
+                            "required_action": "reload_the_document_and_retry",
+                        },
+                    )
             next_version = int(head["current_version"]) + 1 if head else 1
             document_id = new_id("doc")
             connection.execute(
@@ -9483,7 +12802,7 @@ class AgentChatRoomService:
                     next_version,
                     clean_content,
                     len(clean_content.encode("utf-8")),
-                    actor,
+                    str(actor or "") or (actor_row["id"] if actor_row else ""),
                     now,
                 ),
             )
@@ -9510,6 +12829,7 @@ class AgentChatRoomService:
                 connection,
                 project_id,
                 "document.created" if created else "document.updated",
+                actor_session_id=actor_row["id"] if actor_row else None,
                 payload={
                     "doc_key": key,
                     "kind": kind,
@@ -9522,10 +12842,30 @@ class AgentChatRoomService:
             return self.get_project_document(project_id, key)
 
     def archive_project_document(
-        self, project_id: str, doc_key: str, *, actor: str | None = None
+        self,
+        project_id: str,
+        doc_key: str,
+        *,
+        session_id: str = "",
+        token: str = "",
+        management_authorized: bool = False,
+        actor: str | None = None,
     ) -> dict[str, Any]:
         now = iso_now()
         with self.database.connect(write=True) as connection:
+            # Same rule as upsert: management authority stands alone, an Agent
+            # needs it and cannot supply it for itself.
+            actor_row = None
+            if management_authorized:
+                if session_id and token:
+                    actor_row = self._authenticate(
+                        connection, project_id, session_id, token or ""
+                    )
+            else:
+                self._authenticate(connection, project_id, session_id, token or "")
+                raise _management_authorization_required(
+                    "archive a project document"
+                )
             head = connection.execute(
                 "SELECT * FROM project_document_heads WHERE project_id = ? AND doc_key = ?",
                 (project_id, doc_key),
@@ -9548,6 +12888,7 @@ class AgentChatRoomService:
                 connection,
                 project_id,
                 "document.archived",
+                actor_session_id=actor_row["id"] if actor_row else None,
                 payload={"doc_key": doc_key, "actor": actor},
             )
         return self.get_project_document(project_id, doc_key)
@@ -9564,20 +12905,37 @@ class AgentChatRoomService:
         ).fetchall()
         return {row["doc_key"]: row["current_version"] for row in rows}
 
+    #: The three ways a Session can come to own a task. Only the first one used
+    #: to stamp a receipt, so a task that started through an assignment or a
+    #: reclaim reported an empty spec_receipt forever - and that receipt is what
+    #: proves which document versions the work was actually held to.
+    TASK_ENTRY_EVENTS = (
+        "task.claimed",
+        "task.assignment_acknowledged",
+        "task.reclaimed",
+    )
+
     def _latest_claim_document_snapshot(
         self, connection: Any, project_id: str, task_id: str
     ) -> dict[str, int]:
-        row = connection.execute(
-            """
-            SELECT payload_json FROM events
-            WHERE project_id = ? AND task_id = ? AND event_type = 'task.claimed'
-            ORDER BY id DESC LIMIT 1
+        placeholders = ", ".join("?" for _ in self.TASK_ENTRY_EVENTS)
+        rows = connection.execute(
+            f"""
+            SELECT event_type, payload_json FROM events
+            WHERE project_id = ? AND task_id = ?
+              AND event_type IN ({placeholders})
+            ORDER BY id DESC
             """,
-            (project_id, task_id),
-        ).fetchone()
-        if row is None:
-            return {}
-        return json_load(row["payload_json"], {}).get("project_documents") or {}
+            (project_id, task_id, *self.TASK_ENTRY_EVENTS),
+        ).fetchall()
+        for row in rows:
+            # An accepted assignment or a reclaim stamps the snapshot; a
+            # declined or blocked one does not, so keep looking back rather than
+            # treating the empty one as an answer.
+            snapshot = json_load(row["payload_json"], {}).get("project_documents")
+            if snapshot:
+                return snapshot
+        return {}
 
     def injectable_project_documents(
         self, project_id: str, *, connection: Any = None
@@ -9653,26 +13011,100 @@ class AgentChatRoomService:
             )
         )
 
+    def _audit_retention_protected_ids(
+        self, connection: Any, project_id: str
+    ) -> set[int]:
+        """Event ids a retention purge must not remove.
+
+        Three things still point at events. An acknowledgement cascades away
+        with its event, erasing "who confirmed what, when" while a later
+        message.acknowledged event keeps citing the now-missing number. Each
+        task's spec_receipt is derived by scanning the newest task.claimed that
+        carries the project-document snapshot, so purging that event silently
+        degrades the receipt to {} — a permanent false "this task had no bound
+        documents". And the audit.purged receipt records the purge, so deleting
+        it would leave no surviving evidence that the cleanup ever happened.
+        """
+        protected: set[int] = set()
+        for row in connection.execute(
+            """
+            SELECT a.event_id AS event_id
+            FROM event_acknowledgements a
+            JOIN events e ON e.id = a.event_id
+            WHERE e.project_id = ?
+            """,
+            (project_id,),
+        ).fetchall():
+            protected.add(int(row["event_id"]))
+        for row in connection.execute(
+            """
+            SELECT id FROM events
+            WHERE project_id = ? AND event_type = 'audit.purged'
+            """,
+            (project_id,),
+        ).fetchall():
+            protected.add(int(row["id"]))
+        for row in connection.execute(
+            """
+            SELECT id FROM events
+            WHERE project_id = ?
+              AND event_type = 'task.claimed'
+              AND payload_json LIKE '%"project_documents"%'
+              AND id = (
+                  SELECT MAX(inner_e.id) FROM events inner_e
+                  WHERE inner_e.project_id = events.project_id
+                    AND inner_e.task_id = events.task_id
+                    AND inner_e.event_type = 'task.claimed'
+                    AND inner_e.payload_json LIKE '%"project_documents"%'
+              )
+            """,
+            (project_id,),
+        ).fetchall():
+            protected.add(int(row["id"]))
+        return protected
+
     def enforce_audit_retention(self, project_id: str) -> dict[str, Any]:
         """Delete audit events older than the project retention policy.
 
         Only whole expired events are removed by created_at; retained events
-        are never rewritten or reordered. The purge itself is audited after
-        the deletion so the cleanup leaves a surviving trace.
+        are never rewritten or reordered. The purge is audited after the
+        deletion so the cleanup leaves a surviving trace, and that trace is
+        itself excluded from later purges — otherwise the receipt would be
+        destroyed by the very statement that records it. Events still
+        referenced by an acknowledgement or by a task's spec receipt are
+        deferred rather than cascading into a dangling reference.
         """
         with self.database.connect(write=True) as connection:
             row = self._require_project(connection, project_id)
             retention_days = self._project_retention_days(row)
             if retention_days <= 0:
-                return {"purged": 0, "retention_days": 0}
+                return {"purged": 0, "retention_days": 0, "purged_before": None}
             cutoff = (utc_now() - timedelta(days=retention_days)).isoformat().replace(
                 "+00:00", "Z"
             )
+            protected = sorted(self._audit_retention_protected_ids(connection, project_id))
+            base_scope = (
+                "project_id = ? AND created_at < ? AND event_type != 'audit.purged'"
+            )
+            if protected:
+                # NOT IN (NULL) is never true, so the clause can only be added
+                # when there is at least one protected id.
+                placeholders = ",".join("?" for _ in protected)
+                scope = f"{base_scope} AND id NOT IN ({placeholders})"
+                params = (project_id, cutoff, *protected)
+            else:
+                scope = base_scope
+                params = (project_id, cutoff)
+            bounds = connection.execute(
+                f"SELECT MIN(id) AS first_id, MAX(id) AS last_id FROM events WHERE {scope}",
+                params,
+            ).fetchone()
             cursor = connection.execute(
-                "DELETE FROM events WHERE project_id = ? AND created_at < ?",
-                (project_id, cutoff),
+                f"DELETE FROM events WHERE {scope}",
+                params,
             )
             purged = max(0, int(cursor.rowcount))
+            purged_before = int(bounds["last_id"] or 0) if purged else None
             if purged:
                 self._emit(
                     connection,
@@ -9682,17 +13114,26 @@ class AgentChatRoomService:
                         "retention_days": retention_days,
                         "cutoff": cutoff,
                         "deleted_events": purged,
+                        "purged_from": int(bounds["first_id"] or 0),
+                        "purged_before": purged_before,
+                        "deferred_referenced": len(protected),
                     },
                 )
-            return {"purged": purged, "retention_days": retention_days}
+            return {
+                "purged": purged,
+                "retention_days": retention_days,
+                "purged_before": purged_before,
+                "deferred_referenced": len(protected),
+            }
 
     def enforce_audit_retention_throttled(self, project_id: str) -> dict[str, Any]:
         """Retention sweep for read paths: at most once per hour per project."""
-        now = time.time()
-        last = self._retention_last_run.get(project_id, 0.0)
-        if now - last < 3600:
+        now = time.monotonic()
+        if now < self._retention_next_run.get(project_id, 0.0):
             return {"purged": 0, "retention_days": None, "skipped": True}
-        self._retention_last_run[project_id] = now
+        self._retention_next_run[project_id] = (
+            now + self.retention_sweep_interval_seconds()
+        )
         result = self.enforce_audit_retention(project_id)
         result["idempotency"] = self.enforce_idempotency_retention()
         return result

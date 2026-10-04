@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import logging
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Callable
 
+from .contracts import PRESENCE_DROP_ERROR_CODES
 from .errors import DomainError
 from .services import AgentChatRoomService
 
@@ -111,20 +112,26 @@ class LocalPresenceManager:
         if not self.enabled:
             return False
         resolved_agent_key = agent_key.strip()
-        if not resolved_agent_key:
-            try:
-                sessions = self.room_service.snapshot(project_id)["agents"]
-            except DomainError:
-                return False
-            session = next(
-                (item for item in sessions if str(item["id"]) == session_id),
-                None,
-            )
-            if session is None:
-                return False
-            resolved_agent_key = str(session.get("agent_key") or session_id)
         with self._lock:
             if session_id in self._sessions:
+                self._adopt_transport(session_id, transport_key)
+                return False
+        # Cold path only: the registry is process-local memory, so the first call
+        # after an MCP process restart has to look the identity up. Resolve it
+        # from the one Session row rather than rebuilding the Room board, which
+        # every already-registered session used to pay for on each hot call.
+        if not resolved_agent_key:
+            try:
+                resolved_agent_key = self.room_service.session_agent_key(
+                    project_id, session_id
+                )
+            except DomainError:
+                return False
+            if resolved_agent_key is None:
+                return False
+        with self._lock:
+            if session_id in self._sessions:
+                self._adopt_transport(session_id, transport_key)
                 return False
             self._sessions[session_id] = PresenceSession(
                 project_id=project_id,
@@ -134,6 +141,22 @@ class LocalPresenceManager:
                 transport_key=transport_key,
             )
             return True
+
+    def _adopt_transport(self, session_id: str, transport_key: str) -> None:
+        """Re-point an existing registration at the transport that is live now.
+
+        Transparent adoption hands a Session a new transport without a fresh
+        bootstrap, so this is the only signal that the old key has been reaped.
+        Leaving the stale key would make `heartbeat_once` treat a living client
+        as a dead transport and stop its keepalive, token slide and lease renewals.
+        The caller must hold `self._lock`.
+        """
+        if not transport_key:
+            return
+        existing = self._sessions[session_id]
+        if existing.transport_key == transport_key:
+            return
+        self._sessions[session_id] = replace(existing, transport_key=transport_key)
 
     def unregister(self, session_id: str) -> None:
         with self._lock:
@@ -177,11 +200,7 @@ class LocalPresenceManager:
                     session.token,
                 )
             except DomainError as error:
-                if error.code in {
-                    "session_not_found",
-                    "invalid_session_token",
-                    "session_closed",
-                }:
+                if error.code in PRESENCE_DROP_ERROR_CODES:
                     self.unregister(session.session_id)
                 if error.code == "session_closed":
                     # Explicit leave can close a session after this heartbeat

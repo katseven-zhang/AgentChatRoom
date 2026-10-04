@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import hmac
+import inspect
 import ipaddress
 import json
 import logging
@@ -11,9 +12,11 @@ import re
 import secrets
 import threading
 import time
+import traceback
 from contextlib import asynccontextmanager
+from functools import partial
 from pathlib import Path
-from typing import Any, Callable, Literal
+from typing import Any, Callable, Literal, Mapping
 
 from fastapi import FastAPI, Query, Request, Response
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
@@ -22,18 +25,23 @@ from pydantic import BaseModel, ConfigDict, Field
 from starlette.datastructures import MutableHeaders
 
 from . import __version__
-from .config import Settings, load_settings
+from .config import Settings, build_service_base_url, load_settings, rewrite_config_text
 from .database import create_database
 from .desktop import DirectoryPickerUnavailable, pick_directory
 from .errors import DomainError
+from .event_hub import CLOSED, TIMEOUT, ProjectEventHub
 from .integrations import build_mcp_integration
+from .integrations import build_issued_credential_prompt, build_mcp_integration
 from .local_mcp import LocalMcpConfigurator
+from .runtime_log import tail_text_lines
 from .mcp_server import (
     adopt_transport_binding,
+    configure_session_bindings,
     configure_transport_tombstones,
     create_mcp,
     http_transport_binding_alive,
     lookup_transport_tombstone,
+    note_client_terminated_transport,
     retain_transport_tombstone,
     session_transport_state,
     transport_session_active,
@@ -61,14 +69,21 @@ from .contracts import (
     MODEL_DISPLAY_NAME_MAX_LENGTH,
     PROJECT_MEMBER_SCHEMA_VERSION,
     PROJECT_MEMBER_STATUSES,
+    TASK_ACTION_CODES,
     TASK_EXECUTION_STATUSES,
     TASK_INTEGRATION_STATUSES,
     TASK_INTAKE_STATUSES,
     TASK_INTAKE_TRANSITIONS,
     TASK_PHASES,
     TASK_PHASE_COMMANDS,
+    TASK_PRIORITY_MAX,
+    TASK_PRIORITY_MIN,
+    TASK_PRIORITY_RANGE,
+    TASK_RELEASE_EXECUTION_STATUSES,
+    TASK_RELEASE_REASON_CODES,
     TASK_VIEW_ALL_PHASES,
     TASK_VIEW_ATTENTION_PHASES,
+    TASK_VIEW_ATTENTION_PHASE_ORDER,
     TASK_VIEW_GROUP_CODES,
     TASK_VIEW_SCHEMA_VERSION,
     TASK_VERIFICATION_STATUSES,
@@ -188,6 +203,44 @@ TASK_VIEW_INTEGRATION_LABELS = {
     "done": "已集成",
     "failed": "集成失败",
 }
+# Snapshot page cursors are `created_at|id` (`created_at|event_id|session_id`
+# for acknowledgements), so three bounded segments fit comfortably. The query
+# string is length-checked before it reaches the domain so an oversized cursor
+# is a 422 like any other malformed one, instead of an unbounded string walked
+# segment by segment.
+SNAPSHOT_CURSOR_MAX_LENGTH = 256
+# An idle Room still has to prove the connection is alive to proxies and to the
+# browser's EventSource, so a stream with nothing new says so on this interval.
+SSE_HEARTBEAT_SECONDS = 15.0
+# Action button wording for the codes contracts.task_available_actions emits.
+# Localized text belongs to this adapter, not to the domain projection.
+TASK_ACTION_BUTTON_LABELS = {
+    "assign": "指定 Agent",
+    "cancel": "取消任务",
+    "release": "释放任务",
+}
+# Intake status wording. Published next to the status codes so a client never
+# has to keep its own map for a vocabulary the service owns.
+TASK_INTAKE_LABELS = {
+    "pending": "待 Agent 受理",
+    "accepted": "已受理待定义",
+    "defining": "正在定义正式任务",
+    "defined": "已正式定义",
+    "declined": "Agent 已拒绝",
+    "blocked": "受理受阻",
+    "cancelled": "已取消",
+}
+# Intakes in these states still await the target Agent and belong in the
+# working list; the rest is archive.
+TASK_INTAKE_ACTIVE_STATUSES = ("pending", "accepted")
+# Release reason wording for TASK_RELEASE_REASON_CODES.
+TASK_RELEASE_REASON_LABELS = {
+    "quota_exhausted": "额度耗尽",
+    "agent_unavailable": "Agent 不可用",
+    "user_requested": "用户请求",
+    "reassignment_needed": "需要改派",
+    "other": "其他",
+}
 
 
 def task_view_presentation_config() -> dict[str, Any]:
@@ -199,11 +252,31 @@ def task_view_presentation_config() -> dict[str, Any]:
         "group_labels": dict(TASK_VIEW_GROUP_LABELS),
         "active_subgroup_order": list(TASK_VIEW_ACTIVE_SUBGROUP_ORDER),
         "attention_phases": sorted(TASK_VIEW_ATTENTION_PHASES),
-        "attention_label": TASK_VIEW_ATTENTION_LABEL,
+        # Severity order for the attention inbox, which is not alphabetical:
+        # an integration failure outranks a returned review, which outranks a
+        # plain block. Published separately so a client cannot have to
+        # re-derive the ranking the service already decided.
+        "attention_phase_order": list(TASK_VIEW_ATTENTION_PHASE_ORDER),        "attention_label": TASK_VIEW_ATTENTION_LABEL,
         "execution_labels": dict(TASK_VIEW_EXECUTION_LABELS),
         "verification_labels": dict(TASK_VIEW_VERIFICATION_LABELS),
         "integration_labels": dict(TASK_VIEW_INTEGRATION_LABELS),
         "status_labels": dict(TASK_VIEW_LEGACY_STATUS_LABELS),
+        "task_priority_range": list(TASK_PRIORITY_RANGE),
+        "action_codes": list(TASK_ACTION_CODES),
+        "action_labels": dict(TASK_ACTION_BUTTON_LABELS),
+    }
+
+
+def task_intake_presentation_config() -> dict[str, Any]:
+    return {
+        "statuses": sorted(TASK_INTAKE_STATUSES),
+        "status_labels": dict(TASK_INTAKE_LABELS),
+        "active_statuses": list(TASK_INTAKE_ACTIVE_STATUSES),
+        "transitions": {
+            status: sorted(next_states)
+            for status, next_states in TASK_INTAKE_TRANSITIONS.items()
+        },
+        "cancel_action": "task_intake_cancel",
     }
 
 
@@ -260,11 +333,15 @@ class RequestIdASGIMiddleware:
             return
 
         request = Request(scope, receive)
-        supplied = (
-            request.headers.get("idempotency-key")
-            or request.headers.get("x-request-id")
-            or ""
-        ).strip()
+        # Idempotency and correlation are different keys and must not share
+        # one: X-Request-ID is a correlation header that gateways commonly
+        # reuse across a whole connection, so treating it as an idempotency
+        # key made two genuinely different writes collide with
+        # idempotency_conflict 409 for the whole retention window. Only an
+        # explicit Idempotency-Key deduplicates a write.
+        idempotency_key = (request.headers.get("idempotency-key") or "").strip()
+        correlation_id = (request.headers.get("x-request-id") or "").strip()
+        supplied = idempotency_key or correlation_id
         request_id = supplied or new_id("request")
         if not REQUEST_ID_PATTERN.fullmatch(request_id):
             await JSONResponse(
@@ -278,10 +355,26 @@ class RequestIdASGIMiddleware:
                 },
             )(scope, receive, send)
             return
+        if idempotency_key and not REQUEST_ID_PATTERN.fullmatch(idempotency_key):
+            await JSONResponse(
+                status_code=400,
+                content={
+                    "error": {
+                        "code": "invalid_request_id",
+                        "message": (
+                            "Idempotency-Key must be 1-128 safe ASCII characters"
+                        ),
+                        "details": {},
+                    }
+                },
+            )(scope, receive, send)
+            return
 
         state = scope.setdefault("state", {})
         state["request_id"] = request_id
-        state["idempotency_request_id"] = supplied or None
+        # Every write routes on this, not on request_id: only an explicit
+        # Idempotency-Key makes a write replayable.
+        state["idempotency_request_id"] = idempotency_key or None
 
         async def send_with_request_id(message: dict[str, Any]) -> None:
             if message.get("type") == "http.response.start":
@@ -292,6 +385,32 @@ class RequestIdASGIMiddleware:
             await send(message)
 
         await self.app(scope, receive, send_with_request_id)
+
+
+def bearer_token(authorization: str) -> str:
+    """Extract a bearer credential, accepting any spelling of the scheme.
+
+    RFC 7235 defines the scheme as case-insensitive, and the two authentication
+    entry points used to disagree about it: management required the literal
+    "Bearer " while the event stream accepted any case, so the same valid
+    lowercase header was a 401 on one path and accepted on the other.
+    """
+    text = str(authorization or "").strip()
+    if text.lower().startswith("bearer "):
+        return text[len("bearer ") :].strip()
+    return ""
+
+
+def _same_origin_browser_request(request: Request) -> bool:
+    """Did the browser itself send this from the app's own page?
+
+    ``Sec-Fetch-Site`` is attached by the browser to every subresource request and
+    a cross-site document cannot forge it, so it is the cheapest way to keep the
+    local Web UI's event stream working without minting a session row. Missing or
+    unknown values are refused.
+    """
+    site = str(request.headers.get("sec-fetch-site", "")).strip().lower()
+    return site in {"same-origin", "none"}
 
 
 class ManagementAuthASGIMiddleware:
@@ -314,18 +433,22 @@ class ManagementAuthASGIMiddleware:
             and not path.startswith("/api/v1/auth/")
             and path not in self.PUBLIC_API_PATHS
         )
-        if protected and not self.authenticated(Request(scope, receive)):
-            await JSONResponse(
-                status_code=401,
-                content={
-                    "error": {
-                        "code": "management_auth_required",
-                        "message": "Management authentication is required",
-                        "details": {},
-                    }
-                },
-            )(scope, receive, send)
-            return
+        if protected:
+            authorized = self.authenticated(Request(scope, receive))
+            if inspect.isawaitable(authorized):
+                authorized = await authorized
+            if not authorized:
+                await JSONResponse(
+                    status_code=401,
+                    content={
+                        "error": {
+                            "code": "management_auth_required",
+                            "message": "Management authentication is required",
+                            "details": {},
+                        }
+                    },
+                )(scope, receive, send)
+                return
         await self.app(scope, receive, send)
 
 
@@ -338,6 +461,9 @@ class ProjectDocumentUpsert(StrictModel):
     kind: str
     title: str
     content: str
+    # The version the editor loaded. Absent means "create or replace", which is
+    # what the Web console sends when it has nothing open to lose.
+    expected_version: int | None = None
 
 
 class BackupSettingsUpdate(StrictModel):
@@ -352,7 +478,21 @@ class BackupRestoreRequest(StrictModel):
     allow_data_loss: bool = False
 
 
-_CREDENTIAL_VALUE = r"[^\s,;}\]&\"']+"
+# A credential value: any run of characters that is not whitespace, a
+# separator, a closing bracket, a quote, or the "[" that opens this policy's
+# own marker. Excluding "[" is what makes redaction idempotent - without it a
+# value that already reads "[REDACTED]" is matched again and the trailing "]"
+# is left behind as "[REDACTED]]".
+_CREDENTIAL_VALUE = r"[^\s,;}\]&\"'\[]+"
+
+# Stand-in for the marker while the rules run. It contains a NUL, which no
+# rule's value class accepts, so a rule cannot match another rule's output.
+_REDACTION_SENTINEL = "\x00redacted\x00"
+
+# How long the backup scheduler sleeps between reschedule checks. Short enough
+# that a shortened interval takes effect within a second of the save, long
+# enough that a period spanning hours still costs a handful of wakeups.
+BACKUP_TICK_SLICE_SECONDS = 1.0
 
 
 def redact_log_line(line: str) -> str:
@@ -361,49 +501,68 @@ def redact_log_line(line: str) -> str:
     Keeps operational context while masking authorization/bearer/cookie/token
     assignments, provider API keys (sk-/ghp_/gho_/xox*), and bare ``acr.*``
     Agent Token literals so server.log, admin_runtime, and GUI tails match.
+
+    Redaction is idempotent: a value this policy already replaced is left
+    alone, because the assignment rules would otherwise read
+    "token=[REDACTED]" as a fresh value and append another "[REDACTED]".
+    Existing markers are parked before the rules run and restored after, so a
+    line mixing an already-masked value with a real secret still has the
+    secret masked.
     """
+    # Everything this policy already replaced is parked behind a sentinel for
+    # the duration, and every rule below writes the sentinel rather than the
+    # marker itself. Two rules can then never see each other's output: the
+    # second cookie rule used to fire on what the first one had just produced,
+    # yielding "cookie:[REDACTED][REDACTED]".
+    # Only the marker is parked, never the blanks in front of it: a value
+    # pattern starting at the space in "cookie: [REDACTED]" would consume the
+    # separator and rewrite the line as "cookie:[REDACTED]" on every pass.
+    redacted = line.replace("[REDACTED]", _REDACTION_SENTINEL)
     redacted = re.sub(
-        r"(?i)(authorization\s*[:=]\s*)[^\r\n]+",
-        r"\1[REDACTED]",
-        line,
-    )
-    redacted = re.sub(
-        r"(?i)(bearer\s+)" + _CREDENTIAL_VALUE,
-        r"\1[REDACTED]",
+        r"(?i)(authorization[ \t]*[:=][ \t]*)[^\r\n\x00]+",
+        r"\1" + _REDACTION_SENTINEL,
         redacted,
     )
     redacted = re.sub(
-        r"(?i)(cookie\s*[:=]\s*)[^\r\n]+",
-        r"\1[REDACTED]",
+        r"(?i)(bearer\s+)" + _CREDENTIAL_VALUE,
+        r"\1" + _REDACTION_SENTINEL,
+        redacted,
+    )
+    redacted = re.sub(
+        r"(?i)(cookie[ \t]*[:=][ \t]*)[^\r\n\x00]+",
+        r"\1" + _REDACTION_SENTINEL,
         redacted,
     )
     redacted = re.sub(
         r"(?i)((?:^|[;,\s])[a-z0-9_-]*cookie[a-z0-9_-]*\s*[:=]\s*)"
         + _CREDENTIAL_VALUE,
-        r"\1[REDACTED]",
+        r"\1" + _REDACTION_SENTINEL,
         redacted,
     )
     redacted = re.sub(
         r"(?i)(token|secret|password|api[_-]?key)(\s*[:=]\s*)" + _CREDENTIAL_VALUE,
-        r"\1\2[REDACTED]",
+        r"\1\2" + _REDACTION_SENTINEL,
         redacted,
     )
     redacted = re.sub(
         r"\bsk-(?:proj-|svcacct-)?[A-Za-z0-9_-]{8,}\b",
-        "[REDACTED]",
+        _REDACTION_SENTINEL,
         redacted,
     )
     redacted = re.sub(
         r"\b(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{20,}\b",
-        "[REDACTED]",
+        _REDACTION_SENTINEL,
         redacted,
     )
     redacted = re.sub(
         r"\bxox[baprs]-[A-Za-z0-9-]{10,}\b",
-        "[REDACTED]",
+        _REDACTION_SENTINEL,
         redacted,
     )
-    return re.sub(r"\bacr\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b", "[REDACTED]", redacted)
+    redacted = re.sub(
+        r"\bacr\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b", _REDACTION_SENTINEL, redacted
+    )
+    return redacted.replace(_REDACTION_SENTINEL, "[REDACTED]")
 
 
 # Internal alias so existing call sites and tests keep one name while the
@@ -428,11 +587,53 @@ class CredentialRedactingLogFilter(logging.Filter):
                     key: _redact_log_line(value) if isinstance(value, str) else value
                     for key, value in record.args.items()
                 }
+        self._redact_exception(record)
         return True
+
+    @staticmethod
+    def _redact_exception(record: logging.LogRecord) -> None:
+        """Redact a formatted traceback attached to the record.
+
+        ``logger.exception(...)`` keeps the text out of ``msg`` and puts it in
+        ``exc_info``; the handler formats that only when it emits. A failing
+        database call is exactly where a connection string ends up in the
+        traceback, and it is only ever seen here - no ``msg`` rewrite reaches
+        it. The redacted text is pushed back onto the record so the formatter
+        uses it instead of the original.
+        """
+        exc_info = getattr(record, "exc_info", None)
+        if not exc_info:
+            return
+        # Already handled by a filter upstream: the tuple is gone, and
+        # re-formatting would append a second traceback.
+        if not isinstance(exc_info, tuple):
+            return
+        try:
+            text = "".join(traceback.format_exception(*exc_info))
+        except Exception:
+            # Never let redaction break logging itself.
+            return
+        if not text:
+            return
+        record.exc_text = _redact_log_line(text)
 
 
 def install_credential_log_redaction() -> None:
-    """Attach credential redaction to server loggers once per process."""
+    """Redact credentials on the way to every handler that writes server.log.
+
+    A filter attached to a *logger* only runs for records logged through that
+    exact logger. The application logs through ``agentchatroom.api`` and
+    ``agentchatroom.services``, which are children of ``agentchatroom``: their
+    records reach a parent handler without the parent's ``Logger.filters``
+    being consulted, so a traceback carrying a connection string landed in
+    server.log verbatim. The display path had its own redaction, which is why
+    this stayed invisible on screen and unsafe on disk.
+
+    Handlers are the choke point every record passes on its way to a file, so
+    that is where redaction belongs. The named loggers are kept as well: a
+    logger without a handler of its own has no other place to apply this, and
+    keeping them costs one extra pass on an already-redacted message.
+    """
     log_filter = CredentialRedactingLogFilter()
     for name in ("uvicorn", "uvicorn.access", "uvicorn.error", "agentchatroom"):
         logger = logging.getLogger(name)
@@ -441,6 +642,27 @@ def install_credential_log_redaction() -> None:
             for existing in logger.filters
         ):
             logger.addFilter(log_filter)
+        for handler in logger.handlers:
+            _attach_redaction(handler, log_filter)
+    # A record can reach the root logger's handlers with none of the above
+    # filters on its own logger, which is the case for a library logging under
+    # its own namespace. Redact there too rather than trust the caller.
+    _attach_redaction(logging.getLogger(), log_filter)
+
+
+def _attach_redaction(
+    handler: logging.Handler, log_filter: CredentialRedactingLogFilter
+) -> None:
+    """Add the redacting filter to one handler, once per handler."""
+    if any(
+        isinstance(existing, CredentialRedactingLogFilter)
+        for existing in handler.filters
+    ):
+        return
+    # handler filters run last, after the record is fully formatted, so they
+    # see exception tracebacks and %-style args that a logger-level filter
+    # can miss.
+    handler.addFilter(log_filter)
 
 
 def _reject_credentials_in_query(request: Request) -> None:
@@ -458,11 +680,32 @@ def _management_session_hash(session_id: str) -> str:
     return hashlib.sha256(session_id.encode("utf-8")).hexdigest()
 
 
+def _cleanup_failure(error: DomainError) -> dict[str, Any]:
+    """Surface a checkout-cleanup failure with a required next step."""
+    payload = dict(error.as_dict()["error"])
+    details = dict(payload.get("details") or {})
+    details.setdefault(
+        "required_action",
+        "retry_checkout_cleanup_or_remove_the_generated_files",
+    )
+    payload["details"] = details
+    return payload
+
+
 class ProjectCreate(StrictModel):
     root_path: str
     name: str | None = None
     logical_path: str = ""
     settings: dict[str, Any] = Field(default_factory=dict)
+    repository_path: str | None = None
+
+
+class RepositoryInspection(StrictModel):
+    root_path: str
+
+
+class RepositorySelection(StrictModel):
+    repository_path: str
 
 
 class LocalFolderPickRequest(StrictModel):
@@ -480,7 +723,6 @@ class ProjectUpdate(StrictModel):
 
 class AgentJoin(StrictModel):
     agent_key: str = ""
-    software_key: str = ""
     name: str
     client: str
     model: str
@@ -493,6 +735,10 @@ class AgentJoin(StrictModel):
     host_id: str | None = None
     workspace_id: str | None = None
     credential_id: str | None = None
+    # Presented project credential (acr.*). When set, the server authenticates
+    # it and that credential's member is the identity. Body member_id and
+    # credential_id are ignored on this path.
+    token: str = ""
 
 
 class AgentHeartbeat(StrictModel):
@@ -537,6 +783,10 @@ class ProjectMemberUpdate(StrictModel):
     role: str | None = None
     status: Literal["invited", "active", "suspended", "revoked"] | None = None
     metadata: dict[str, Any] | None = None
+    # An Agent maintaining its own roster entry proves its identity here;
+    # anything beyond that has to come through the management surface.
+    actor_session_id: str = ""
+    token: str = ""
 
 
 class WorkspaceRegister(StrictModel):
@@ -570,7 +820,9 @@ class MessageCreate(StrictModel):
     mentions: list[str] = Field(default_factory=list)
     files: list[str] = Field(default_factory=list)
     requires_ack: bool = False
-    priority: int = Field(default=2, ge=0, le=4)
+    priority: int = Field(
+        default=2, ge=TASK_PRIORITY_MIN, le=TASK_PRIORITY_MAX
+    )
     channel: Literal["public", "task", "review", "system"] = "public"
 
 
@@ -608,6 +860,30 @@ class TaskIntakeReassign(StrictModel):
     target_member_id: str
     target_session_id: str | None = None
     note: str = ""
+    session_id: str | None = None
+    token: str | None = None
+
+
+class McpIssuedPrompt(StrictModel):
+    """Body for the post-issuance handoff prompt.
+
+    Carries the freshly issued secrets, so this is a management-only,
+    write-audit-free read: nothing here is persisted, and the caller displays
+    the result exactly once.
+    """
+
+    profile_id: str
+    mode: str = "first_setup"
+    project_name: str = ""
+    project_credentials: list[dict[str, str]]
+    software_identity: dict[str, str]
+    linked_member_name: str = ""
+
+
+class TaskIntakeCancel(StrictModel):
+    reason: str = ""
+    session_id: str | None = None
+    token: str | None = None
 
 
 class TaskIntakeDefine(StrictModel):
@@ -617,7 +893,9 @@ class TaskIntakeDefine(StrictModel):
     description: str = ""
     acceptance_criteria: list[str] = Field(default_factory=list)
     depends_on: list[str] = Field(default_factory=list)
-    priority: int = Field(default=2, ge=0, le=4)
+    priority: int = Field(
+        default=2, ge=TASK_PRIORITY_MIN, le=TASK_PRIORITY_MAX
+    )
     note: str = ""
 
 
@@ -700,6 +978,7 @@ class LeaseCreate(StrictModel):
     task_id: str | None = None
     reason: str = ""
     ttl_seconds: int | None = None
+    takeover: bool = False
 
 
 class LeaseRelease(StrictModel):
@@ -764,6 +1043,7 @@ class KnowledgeReviewCreate(StrictModel):
     verdict: Literal["approved", "changes_requested"]
     criteria: list[dict[str, Any]]
     notes: str = ""
+    expected_version_id: str = ""
 
 
 class KnowledgeAssetAction(StrictModel):
@@ -901,9 +1181,6 @@ class LoginRateLimiter:
             self._locked_until.pop(key, None)
 
 
-_BACKUP_SETTINGS_OVERRIDE: dict[str, Any] = {}
-
-
 def upsert_toml_section(text: str, section: str, values: dict[str, Any]) -> str:
     """Insert or replace key/value pairs inside one ``[section]`` block.
 
@@ -950,42 +1227,104 @@ def run_auto_backup_cycle(service: Any, max_kept: int | None = None) -> dict[str
         return None
 
 
-def effective_backup_settings(settings: Any) -> dict[str, Any]:
-    """Runtime backup settings: management overrides over loaded config."""
+def effective_backup_settings(
+    settings: Any, overrides: Mapping[str, Any] | None = None
+) -> dict[str, Any]:
+    """Runtime backup settings: management overrides over loaded config.
+
+    The overrides belong to one application instance. They used to live in a
+    module-level dict, so a second ``create_app`` in the same process - a test,
+    a GUI window, a management call - silently changed the first one's backup
+    worker.
+    """
+    values = overrides or {}
     return {
-        "auto_backup_enabled": _BACKUP_SETTINGS_OVERRIDE.get(
+        "auto_backup_enabled": values.get(
             "auto_backup_enabled", settings.auto_backup_enabled
         ),
-        "auto_backup_interval_seconds": _BACKUP_SETTINGS_OVERRIDE.get(
+        "auto_backup_interval_seconds": values.get(
             "auto_backup_interval_seconds", settings.auto_backup_interval_seconds
         ),
-        "auto_backup_max_kept": _BACKUP_SETTINGS_OVERRIDE.get(
+        "auto_backup_max_kept": values.get(
             "auto_backup_max_kept", settings.auto_backup_max_kept
         ),
     }
 
 
 def auto_backup_worker(
-    service: Any, settings: Any, stop_event: "threading.Event"
+    service: Any,
+    settings: Any,
+    stop_event: "threading.Event",
+    overrides: Mapping[str, Any] | None = None,
+    *,
+    reschedule: "threading.Event | None" = None,
 ) -> None:
     """Backup loop: re-reads effective settings every cycle, so management
-    toggles (enable / interval / retention) apply without a restart."""
-    while not stop_event.wait(
-        timeout=max(60, int(effective_backup_settings(settings)["auto_backup_interval_seconds"]))
-    ):
-        state = effective_backup_settings(settings)
+    toggles (enable / interval / retention) apply without a restart.
+
+    A management save signals ``reschedule`` so a shortened interval takes
+    effect on the next tick instead of after the old, longer one expires. The
+    wait is split into short slices only when such a signal exists to observe:
+    a single ``wait(timeout=interval)`` evaluates its timeout once, on entry,
+    which is exactly why lowering the interval appeared to do nothing for up to
+    a full period. Without a reschedule signal there is nothing to poll, so the
+    wait stays whole.
+    """
+    while True:
+        state = effective_backup_settings(settings, overrides)
+        interval = max(60, int(state["auto_backup_interval_seconds"]))
+        if reschedule is None:
+            if stop_event.wait(timeout=interval):
+                return
+        elif _wait_for_backup_tick(stop_event, reschedule, interval):
+            return
+        state = effective_backup_settings(settings, overrides)
         if not state["auto_backup_enabled"]:
             continue
         run_auto_backup_cycle(service, state["auto_backup_max_kept"])
 
 
+def _wait_for_backup_tick(
+    stop_event: "threading.Event",
+    reschedule: "threading.Event",
+    interval_seconds: int,
+) -> bool:
+    """Sleep out one backup period in slices; True when the worker must stop.
+
+    The deadline is recomputed from the wall clock on every slice so a signal
+    that arrives part-way through does not extend the period, and a settings
+    change that lands while the worker is running a backup is still observed
+    before the next wait begins.
+    """
+    deadline = time.monotonic() + interval_seconds
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        if stop_event.wait(timeout=min(remaining, BACKUP_TICK_SLICE_SECONDS)):
+            return True
+        if reschedule.is_set():
+            reschedule.clear()
+            return False
+
+
 def start_auto_backup_worker(
-    service: Any, settings: Any, stop_event: "threading.Event"
+    service: Any,
+    settings: Any,
+    stop_event: "threading.Event",
+    overrides: dict[str, Any] | None = None,
+    *,
+    reschedule: "threading.Event | None" = None,
 ) -> "threading.Thread":
     """Start the daemon backup worker; per-cycle gating happens in the loop."""
+    # functools.partial rather than a keyword on Thread: the reschedule signal
+    # belongs to the worker's own signature, and Thread takes no such keyword.
+    target = auto_backup_worker
+    if reschedule is not None:
+        target = partial(auto_backup_worker, reschedule=reschedule)
     worker = threading.Thread(
-        target=auto_backup_worker,
-        args=(service, settings, stop_event),
+        target=target,
+        args=(service, settings, stop_event, overrides),
         name="agentchatroom-auto-backup",
         daemon=True,
     )
@@ -1023,8 +1362,9 @@ def create_app(
             f"{resolved.management_token_env} must contain at least 24 characters "
             "when management authentication is required"
         )
-    public_host = "127.0.0.1" if resolved.host in {"0.0.0.0", "::"} else resolved.host
-    base_url = resolved.external_base_url or f"http://{public_host}:{resolved.port}"
+    base_url = resolved.external_base_url or build_service_base_url(
+        resolved.host, resolved.port
+    )
     mcp_url = f"{base_url}{resolved.mcp_http_path}"
     http_presence_manager = LocalPresenceManager(
         service,
@@ -1062,6 +1402,15 @@ def create_app(
         configure_transport_tombstones(
             limit=resolved.mcp_http_tombstone_limit,
             ttl_seconds=resolved.mcp_http_tombstone_ttl_seconds,
+            session_active=service.session_active,
+        )
+        # The live binding table answers the same lifetime question as the
+        # tombstone table, so it takes the same configured window: a client that
+        # disconnects without a reap would otherwise leave one entry behind for
+        # the whole process lifetime.
+        configure_session_bindings(
+            limit=resolved.mcp_http_tombstone_limit,
+            ttl_seconds=resolved.mcp_http_tombstone_ttl_seconds,
         )
         # Tolerant adoption sits inside the #116 expiry contract: in the default
         # mode an unknown/reaped bookmark is adopted transparently (200, same
@@ -1084,12 +1433,16 @@ def create_app(
                 ),
                 lookup_binding=_adoption_binding,
                 adopt_binding=adopt_transport_binding,
+                note_terminated=note_client_terminated_transport,
                 map_limit=resolved.mcp_http_tombstone_limit,
                 map_ttl_seconds=resolved.mcp_http_tombstone_ttl_seconds,
             )
         )
 
     auto_backup_stop = threading.Event()
+    # Signalled by the management save so a shortened interval is re-evaluated
+    # immediately instead of after the period that was already in flight.
+    auto_backup_reschedule = threading.Event()
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
@@ -1100,7 +1453,11 @@ def create_app(
                 _windows_http_exception_handler(previous_exception_handler)
             )
         auto_backup_worker = start_auto_backup_worker(
-            service, resolved, auto_backup_stop
+            service,
+            resolved,
+            auto_backup_stop,
+            backup_settings_override,
+            reschedule=auto_backup_reschedule,
         )
         try:
             with running_service(resolved):
@@ -1112,6 +1469,7 @@ def create_app(
                         yield
         finally:
             http_presence_manager.stop()
+            event_hub.stop()
             auto_backup_stop.set()
             if auto_backup_worker is not None:
                 auto_backup_worker.join(timeout=5)
@@ -1130,35 +1488,54 @@ def create_app(
     app.state.mcp_server = mcp_server
     app.state.http_presence_manager = http_presence_manager
     app.state.directory_picker = resolved_directory_picker
+    # Per-application backup overrides: the management writer and this app's own
+    # worker share this dict and nothing else does.
+    backup_settings_override: dict[str, Any] = {}
+    app.state.backup_settings_override = backup_settings_override
     app.state.local_mcp_configurator = resolved_local_mcp_configurator
 
-    def management_authenticated(request: Request) -> bool:
+    def management_session_valid(session_id: str) -> bool:
+        if not session_id:
+            return False
+        with service.database.connect() as connection:
+            row = connection.execute(
+                "SELECT expires_at FROM management_sessions WHERE session_hash = ?",
+                (_management_session_hash(session_id),),
+            ).fetchone()
+        return row is not None and float(row["expires_at"]) > time.time()
+
+    def management_bearer_accepted(request: Request) -> bool:
+        """The credential checks that need no database access."""
         if not resolved.management_auth_required:
             return True
-        authorization = request.headers.get("authorization", "")
-        if authorization.startswith("Bearer ") and hmac.compare_digest(
-            authorization.removeprefix("Bearer "), management_token
-        ):
+        token = bearer_token(request.headers.get("authorization", ""))
+        return bool(token) and hmac.compare_digest(token, management_token)
+
+    def management_authenticated(request: Request) -> bool:
+        """Synchronous check for the endpoints that already run off the loop."""
+        if management_bearer_accepted(request):
+            return True
+        return management_session_valid(
+            request.cookies.get(resolved.management_cookie_name, "")
+        )
+
+    async def management_authenticated_async(request: Request) -> bool:
+        """Cookie authentication without a database read on the event loop.
+
+        Every request carrying a management cookie passes through this check, so
+        a synchronous query here serialises the whole ASGI application - including
+        the SSE streams - behind one round trip (#271, same rule as the #184
+        polling fix).
+        """
+        if management_bearer_accepted(request):
             return True
         session_id = request.cookies.get(resolved.management_cookie_name, "")
         if not session_id:
             return False
-        with service.database.connect() as connection:
-            row = connection.execute(
-                "SELECT expires_at FROM management_sessions WHERE session_hash = ?",
-                (_management_session_hash(session_id),),
-            ).fetchone()
-        return row is not None and float(row["expires_at"]) > time.time()
+        return await asyncio.to_thread(management_session_valid, session_id)
 
     def browser_session_valid(session_id: str) -> bool:
-        if not session_id:
-            return False
-        with service.database.connect() as connection:
-            row = connection.execute(
-                "SELECT expires_at FROM management_sessions WHERE session_hash = ?",
-                (_management_session_hash(session_id),),
-            ).fetchone()
-        return row is not None and float(row["expires_at"]) > time.time()
+        return management_session_valid(session_id)
 
     def issue_browser_session() -> tuple[str, JSONResponse]:
         session_id = secrets.token_urlsafe(32)
@@ -1209,11 +1586,7 @@ def create_app(
         ).strip()
         token = (request.headers.get("x-agentchatroom-token") or "").strip()
         authorization = request.headers.get("authorization", "")
-        bearer = (
-            authorization[7:].strip()
-            if authorization.lower().startswith("bearer ")
-            else ""
-        )
+        bearer = bearer_token(authorization)
         if session_id and not token:
             token = bearer
         if session_id and token:
@@ -1225,6 +1598,15 @@ def create_app(
                 project_id=project_id,
                 required_permission="room:read",
             )
+            return
+        if not resolved.management_auth_required and _same_origin_browser_request(
+            request
+        ):
+            # A local deployment is already trusted by the management middleware,
+            # so an in-app browser stream needs no session row. The same-origin
+            # check replaces the cookie that GET /auth/status used to mint (#281):
+            # a cross-site page driving the user's browser still cannot open a
+            # stream, and no anonymous GET can grow management_sessions.
             return
         cookie = request.cookies.get(resolved.management_cookie_name, "")
         if browser_session_valid(cookie):
@@ -1239,6 +1621,15 @@ def create_app(
         max_per_project=resolved.max_sse_clients_per_project,
         max_per_ip=resolved.sse_per_ip_limit,
     )
+    # One poller per Project behind every SSE connection (#359). The fetch runs
+    # on the hub's own thread, so sync SQLite never lands on the event loop —
+    # the same rule as the per-connection poller this replaces (#184).
+    event_hub = ProjectEventHub(
+        lambda project_id, after, limit: service.list_events(
+            project_id, after=after, limit=limit
+        ),
+        poll_interval_seconds=lambda: resolved.sse_poll_interval_seconds,
+    )
     login_rate_limiter = LoginRateLimiter(
         max_failures=resolved.management_login_max_failures,
         window_seconds=resolved.management_login_window_seconds,
@@ -1247,7 +1638,7 @@ def create_app(
 
     app.add_middleware(
         ManagementAuthASGIMiddleware,
-        authenticated=management_authenticated,
+        authenticated=management_authenticated_async,
     )
     app.add_middleware(RequestIdASGIMiddleware)
     install_credential_log_redaction()
@@ -1317,29 +1708,15 @@ def create_app(
 
     @app.get("/api/v1/auth/status")
     def management_auth_status(request: Request) -> JSONResponse:
-        cookie = request.cookies.get(resolved.management_cookie_name, "")
-        authenticated = management_authenticated(request)
-        response = JSONResponse(
+        # Read-only: a GET must not hand out management sessions. Issuance lives
+        # in the login flow, so an anonymous or cross-origin simple request can
+        # no longer insert 12h management_sessions rows without bound (#281).
+        return JSONResponse(
             {
                 "required": resolved.management_auth_required,
-                "authenticated": authenticated,
+                "authenticated": management_authenticated(request),
             }
         )
-        if (
-            not resolved.management_auth_required
-            and authenticated
-            and not browser_session_valid(cookie)
-        ):
-            session_id, _issued = issue_browser_session()
-            response = JSONResponse(
-                {
-                    "required": False,
-                    "authenticated": True,
-                    "expires_in_seconds": resolved.management_session_ttl_seconds,
-                }
-            )
-            attach_browser_cookie(response, session_id)
-        return response
 
     @app.post("/api/v1/auth/login")
     def management_login(request: Request, body: AdminLogin) -> JSONResponse:
@@ -1421,6 +1798,10 @@ def create_app(
                 "local_folder_picker": resolved.deployment_profile == "local",
                 "local_mcp_config_assistant": (
                     resolved.deployment_profile == "local"
+                    and any(
+                        isinstance(profile.get("local_config"), dict)
+                        for profile in build_mcp_integration(resolved)["profiles"].values()
+                    )
                 ),
                 "streamable_http_mcp": resolved.mcp_http_enabled,
                 "streamable_http_mcp_path": resolved.mcp_http_path,
@@ -1454,6 +1835,12 @@ def create_app(
                 "task_view": task_view_presentation_config(),
                 "task_history_schema_version": TASK_HISTORY_SCHEMA_VERSION,
                 "task_intake_statuses": sorted(TASK_INTAKE_STATUSES),
+                "task_intake": task_intake_presentation_config(),
+                "task_release_reason_codes": sorted(TASK_RELEASE_REASON_CODES),
+                "task_release_reason_labels": dict(TASK_RELEASE_REASON_LABELS),
+                "task_release_execution_statuses": sorted(
+                    TASK_RELEASE_EXECUTION_STATUSES
+                ),
                 "bootstrap_schema_version": BOOTSTRAP_SCHEMA_VERSION,
                 "bootstrap_states": list(BOOTSTRAP_STATES),
                 "bootstrap_required_actions": dict(REQUIRED_ACTIONS),
@@ -1489,6 +1876,40 @@ def create_app(
         return build_mcp_integration(
             resolved,
             project=service.get_project(project_id),
+        )
+
+    @app.post("/api/v1/projects/{project_id}/integrations/mcp/issued-prompt")
+    def issued_mcp_prompt(
+        request: Request, project_id: str, body: McpIssuedPrompt
+    ) -> dict[str, Any]:
+        """Generate the handoff prompt for freshly issued Project credentials.
+
+        The single generator for every prompt handed out after issuance. The
+        browser used to assemble its own copy, which is how the
+        `service_unavailable` constraint ended up in one prompt and not the
+        other, and how the credential slot came to be described as a display
+        name in one of them. Issued secrets stay in this response: nothing is
+        persisted, and the caller shows it once.
+        """
+        _require_management(request)
+        project = service.get_project(project_id)
+        integration = build_mcp_integration(resolved, project=project)
+        profile = integration["profiles"].get(body.profile_id)
+        if profile is None:
+            raise DomainError(
+                "mcp_profile_unknown",
+                "The requested MCP client profile does not exist",
+                status_code=404,
+            )
+        return build_issued_credential_prompt(
+            body.profile_id,
+            profile,
+            mode=body.mode,
+            project_name=body.project_name or str(project.get("name") or ""),
+            root_path=str(project.get("root_path") or ""),
+            project_credentials=body.project_credentials,
+            software_identity=body.software_identity,
+            linked_member_name=body.linked_member_name,
         )
 
     def local_mcp_profile(
@@ -1532,14 +1953,26 @@ def create_app(
         """Expose safe operational state for the authenticated management UI."""
         log_path = resolved.data_dir / "server.log"
         log_lines: list[str] = []
-        if lines and log_path.is_file():
-            log_lines = [
-                _redact_log_line(line)
-                for line in log_path.read_text(encoding="utf-8", errors="replace")
-                .splitlines()[-lines:]
-            ]
+        log_size_bytes = 0
+        log_truncated = False
+        if log_path.is_file():
+            try:
+                log_size_bytes = log_path.stat().st_size
+            except OSError:
+                log_size_bytes = 0
+            tail, log_truncated = tail_text_lines(log_path, lines)
+            log_lines = [_redact_log_line(line) for line in tail]
         pid_path = resolved.data_dir / "server.pid"
-        pid = pid_path.read_text(encoding="ascii").strip() if pid_path.is_file() else ""
+        # A pid file is written by another process: it can be empty, half-written,
+        # or hold bytes that are not ASCII. Decoding must never turn the management
+        # view into a 500, and a non-numeric value is not a live pid.
+        raw_pid = ""
+        if pid_path.is_file():
+            try:
+                raw_pid = pid_path.read_text(encoding="utf-8", errors="replace").strip()
+            except OSError:
+                raw_pid = ""
+        pid = raw_pid if raw_pid.isdigit() else ""
         return {
             "settings": resolved.public_dict(),
             "paths": {
@@ -1549,7 +1982,12 @@ def create_app(
                 "pid_path": str(pid_path),
             },
             "process": {"pid": pid, "managed": bool(pid)},
-            "log": {"lines": log_lines, "returned": len(log_lines)},
+            "log": {
+                "lines": log_lines,
+                "returned": len(log_lines),
+                "size_bytes": log_size_bytes,
+                "truncated": log_truncated,
+            },
         }
 
     @app.get("/api/v1/runtime/effective-config")
@@ -1573,19 +2011,25 @@ def create_app(
     @app.get("/api/v1/admin/backups")
     def list_managed_backups(request: Request) -> dict[str, Any]:
         _require_management(request)
+        effective = effective_backup_settings(resolved, backup_settings_override)
         return {
             "backups": service.list_backups(),
+            "last_failure": service.latest_backup_failure(),
             "auto_backup": {
-                "enabled": resolved.auto_backup_enabled,
-                "interval_seconds": resolved.auto_backup_interval_seconds,
-                "max_kept": resolved.auto_backup_max_kept,
+                "enabled": effective["auto_backup_enabled"],
+                "interval_seconds": effective["auto_backup_interval_seconds"],
+                "max_kept": effective["auto_backup_max_kept"],
             },
         }
 
     @app.post("/api/v1/admin/backups")
     def create_managed_backup(request: Request) -> dict[str, Any]:
         _require_management(request)
-        return service.create_backup(source="management")
+        effective = effective_backup_settings(resolved, backup_settings_override)
+        return service.create_backup(
+            source="management",
+            max_kept=int(effective["auto_backup_max_kept"]),
+        )
 
     @app.post("/api/v1/admin/backups/restore")
     def restore_managed_backup(request: Request, body: BackupRestoreRequest) -> dict[str, Any]:
@@ -1632,6 +2076,19 @@ def create_app(
             )
         return {"cancelled": False, "path": str(selected_path)}
 
+    @app.post("/api/v1/local/repositories/inspect")
+    def inspect_repositories(body: RepositoryInspection) -> dict[str, Any]:
+        return service.inspect_repository_candidates(body.root_path)
+
+    @app.post("/api/v1/projects/{project_id}/repository/inspect")
+    def inspect_project_repositories(project_id: str) -> dict[str, Any]:
+        project = service.get_project(project_id)
+        return service.inspect_repository_candidates(project["root_path"])
+
+    @app.put("/api/v1/projects/{project_id}/repository")
+    def select_project_repository(project_id: str, body: RepositorySelection) -> dict[str, Any]:
+        return service.select_project_repository(project_id, body.repository_path)
+
     @app.post("/api/v1/projects", status_code=201)
     def create_project(body: ProjectCreate) -> dict[str, Any]:
         validate_project_coordination_instructions(body.root_path)
@@ -1646,16 +2103,10 @@ def create_app(
         permanent: bool = Query(False),
     ) -> dict[str, Any]:
         if permanent:
-            snapshot = service.snapshot(project_id)
-            project = snapshot["project"]
-            checkout_paths = {
-                str(project["root_path"]),
-                *(
-                    str(agent.get("worktree", "")).strip()
-                    for agent in snapshot["agents"]
-                    if str(agent.get("worktree", "")).strip()
-                ),
-            }
+            # Which checkouts this Project may own is a domain decision; Session
+            # worktrees are caller-reported strings and must not widen the set.
+            cleanup_scope = service.checkout_cleanup_scope(project_id)
+            checkout_paths = list(cleanup_scope["paths"])
             deleted = service.delete_project(project_id)
             removed = 0
             instructions_removed = 0
@@ -1666,18 +2117,18 @@ def create_app(
                     removed += int(
                         remove_checkout_project_registration(
                             checkout_path,
-                            project_key=str(project["project_key"]),
-                            logical_path=str(project.get("logical_path", "") or ""),
+                            project_key=str(cleanup_scope["project_key"]),
+                            logical_path=str(cleanup_scope["logical_path"]),
                         )
                     )
                 except DomainError as error:
-                    registration_cleanup_errors.append(error.as_dict()["error"])
+                    registration_cleanup_errors.append(_cleanup_failure(error))
                 try:
                     instructions_removed += int(
                         remove_project_coordination_instructions(checkout_path)
                     )
                 except DomainError as error:
-                    instruction_cleanup_errors.append(error.as_dict()["error"])
+                    instruction_cleanup_errors.append(_cleanup_failure(error))
             deleted["project_registration"] = {
                 "removed": removed,
                 "cleanup_errors": registration_cleanup_errors,
@@ -1704,9 +2155,14 @@ def create_app(
         return result
 
     @app.get("/api/v1/projects/{project_id}/export")
-    def export_project(project_id: str) -> JSONResponse:
+    def export_project(
+        project_id: str,
+        # Bounded window, declared rather than silent: the payload carries
+        # window.events with the total and whether anything was left out (#359).
+        event_limit: int | None = Query(None, ge=1, le=1_000_000),
+    ) -> JSONResponse:
         return JSONResponse(
-            service.export_project(project_id),
+            service.export_project(project_id, event_limit=event_limit),
             headers={
                 "Content-Disposition": (
                     f'attachment; filename="agentchatroom-{project_id}.json"'
@@ -1718,12 +2174,16 @@ def create_app(
     def project_snapshot(
         project_id: str,
         response: Response,
-        reports_before: str | None = Query(None),
-        reports_after: str | None = Query(None),
-        reviews_before: str | None = Query(None),
-        reviews_after: str | None = Query(None),
-        acknowledgements_before: str | None = Query(None),
-        acknowledgements_after: str | None = Query(None),
+        reports_before: str | None = Query(None, max_length=SNAPSHOT_CURSOR_MAX_LENGTH),
+        reports_after: str | None = Query(None, max_length=SNAPSHOT_CURSOR_MAX_LENGTH),
+        reviews_before: str | None = Query(None, max_length=SNAPSHOT_CURSOR_MAX_LENGTH),
+        reviews_after: str | None = Query(None, max_length=SNAPSHOT_CURSOR_MAX_LENGTH),
+        acknowledgements_before: str | None = Query(
+            None, max_length=SNAPSHOT_CURSOR_MAX_LENGTH
+        ),
+        acknowledgements_after: str | None = Query(
+            None, max_length=SNAPSHOT_CURSOR_MAX_LENGTH
+        ),
     ) -> dict[str, Any]:
         response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
         response.headers["Pragma"] = "no-cache"
@@ -1755,10 +2215,16 @@ def create_app(
         project_id: str,
         body: ProjectMemberCreate,
     ) -> dict[str, Any]:
+        _reject_credentials_in_query(request)
+        # The roster carries durable identities and this model can carry no
+        # Session credentials, so an unauthenticated caller would otherwise be
+        # able to mint a member - including one in the reserved namespace.
+        _require_management(request)
         return service.create_project_member(
             project_id,
             **body.model_dump(),
-            request_id=request.state.request_id,
+            management_authorized=True,
+            request_id=request.state.idempotency_request_id,
         )
 
     @app.patch("/api/v1/projects/{project_id}/members/{member_id}")
@@ -1768,11 +2234,19 @@ def create_app(
         member_id: str,
         body: ProjectMemberUpdate,
     ) -> dict[str, Any]:
+        _reject_credentials_in_query(request)
+        payload = body.model_dump(exclude_unset=True)
+        # Roster writes change durable software identities: either the caller
+        # proves it is that member, or it is a management request.
+        management = not str(payload.get("actor_session_id") or "").strip()
+        if management:
+            _require_management(request)
         return service.update_project_member(
             project_id,
             member_id,
-            **body.model_dump(exclude_unset=True),
-            request_id=request.state.request_id,
+            **payload,
+            management_authorized=management,
+            request_id=request.state.idempotency_request_id,
         )
 
     @app.delete("/api/v1/projects/{project_id}/members/{member_id}")
@@ -1781,10 +2255,12 @@ def create_app(
         project_id: str,
         member_id: str,
     ) -> dict[str, Any]:
+        _require_management(request)
         return service.revoke_project_member(
             project_id,
             member_id,
-            request_id=request.state.request_id,
+            management_authorized=True,
+            request_id=request.state.idempotency_request_id,
         )
 
     @app.get("/api/v1/projects/{project_id}/events")
@@ -1796,11 +2272,16 @@ def create_app(
         return service.list_events(project_id, after=after, limit=limit)
 
     @app.get("/api/v1/projects/{project_id}/events/stream")
-    async def stream_events(
+    def stream_events(
         request: Request,
         project_id: str,
         after: int = Query(0, ge=0),
     ) -> StreamingResponse:
+        # A synchronous route runs in Starlette's worker threadpool, so the
+        # preamble below - project read, credential check - cannot put a database
+        # round trip on the event loop while 64 reconnecting EventSources arrive
+        # (#273, same rule as the #184 polling fix and #271 cookie auth).
+        # Only the streaming generator itself belongs on the loop.
         service.get_project(project_id)
         authorize_event_stream(request, project_id)
         client_ip = event_stream_client_ip(request)
@@ -1822,30 +2303,45 @@ def create_app(
 
         async def event_stream():
             cursor = after
-            idle_ticks = 0
+            idle_seconds = 0.0
+            # One poller per Project, not per connection (#359). The hub reads
+            # the event log once per interval and hands the result to every
+            # live subscriber, so 64 EventSources cost one SELECT instead of 64.
+            subscriber = event_hub.subscribe(project_id, after)
             try:
                 yield ": connected\n\n"
+                interval = max(0.01, resolved.sse_poll_interval_seconds)
                 while not await request.is_disconnected():
-                    # Sync SQLite must not run on the event loop (#184).
-                    result = await asyncio.to_thread(
-                        service.list_events, project_id, after=cursor, limit=200
-                    )
-                    if result["events"]:
-                        for event in result["events"]:
-                            # SSE id / Last-Event-ID use project_seq (same space as ?after=).
-                            cursor = event["project_seq"]
-                            payload = json.dumps(
-                                event, ensure_ascii=False, separators=(",", ":")
-                            )
-                            yield f"id: {cursor}\nevent: room_event\ndata: {payload}\n\n"
-                        idle_ticks = 0
-                    else:
-                        idle_ticks += 1
-                        if idle_ticks * resolved.sse_poll_interval_seconds >= 15:
+                    item = subscriber.get(interval)
+                    if item is CLOSED:
+                        break
+                    if item is TIMEOUT:
+                        # Nothing new. The heartbeat keeps proxies and the
+                        # browser from treating an idle Room as a dead one.
+                        idle_seconds += interval
+                        if idle_seconds >= SSE_HEARTBEAT_SECONDS:
                             yield ": heartbeat\n\n"
-                            idle_ticks = 0
-                    await asyncio.sleep(resolved.sse_poll_interval_seconds)
+                            idle_seconds = 0.0
+                        await asyncio.sleep(0)
+                        continue
+                    idle_seconds = 0.0
+                    if subscriber.dropped:
+                        # Fell too far behind to hold the backlog. End the
+                        # stream so the client reconnects with Last-Event-ID,
+                        # rather than skipping events it never got to read.
+                        yield ": resync\n\n"
+                        break
+                    # SSE id / Last-Event-ID use project_seq (same space as
+                    # ?after=), so a reconnect resumes exactly where this
+                    # stream stopped.
+                    cursor = int(item["project_seq"])
+                    payload = json.dumps(
+                        item, ensure_ascii=False, separators=(",", ":")
+                    )
+                    yield f"id: {cursor}\nevent: room_event\ndata: {payload}\n\n"
+                    await asyncio.sleep(0)
             finally:
+                event_hub.unsubscribe(subscriber)
                 release_slot()
 
         class _EnsureCloseStreamingResponse(StreamingResponse):
@@ -1872,11 +2368,35 @@ def create_app(
         )
 
     @app.post("/api/v1/projects/{project_id}/agents/join", status_code=201)
-    def join_agent(project_id: str, body: AgentJoin) -> dict[str, Any]:
-        return service.join_room(project_id, **body.model_dump())
+    def join_agent(request: Request, project_id: str, body: AgentJoin) -> dict[str, Any]:
+        # Creating a Session is how a software identity enters the Room.
+        # Without a credential, this stays management-only: an unauthenticated
+        # caller must not name somebody else's identity by choosing `client`
+        # or `member_id`. A presented project credential is authenticated
+        # here, and that credential — not the body — decides the member.
+        payload = body.model_dump()
+        presented = str(payload.pop("token", "") or "").strip()
+        if presented:
+            credential = service.authenticate_agent_token(
+                presented, project_id=project_id
+            )
+            payload["credential_id"] = str(credential["id"])
+            linked_member = str(credential.get("member_id") or "").strip()
+            payload["member_id"] = linked_member or None
+            return service.join_room(
+                project_id, manage_member_reference=False, **payload
+            )
+        _require_management(request)
+        return service.join_room(
+            project_id, manage_member_reference=True, **payload
+        )
 
     @app.get("/api/v1/projects/{project_id}/agent-tokens")
-    def list_agent_tokens(project_id: str) -> dict[str, Any]:
+    def list_agent_tokens(request: Request, project_id: str) -> dict[str, Any]:
+        # The listing is a credential inventory: it names every Token in the
+        # Project and who it belongs to. Metadata is a manifest too, so it is
+        # not readable anonymously.
+        _require_management(request)
         return {"credentials": service.list_agent_tokens(project_id)}
 
     @app.post("/api/v1/projects/{project_id}/agent-tokens", status_code=201)
@@ -1942,12 +2462,20 @@ def create_app(
 
     @app.post("/api/v1/projects/{project_id}/workspaces", status_code=201)
     def register_workspace(
-        project_id: str, body: WorkspaceRegister
+        project_id: str, body: WorkspaceRegister, request: Request
     ) -> dict[str, Any]:
-        return service.register_workspace(project_id, **body.model_dump())
+        # The hosts table is shared by every Project, so renaming an existing
+        # host is a Room-wide change: only an authenticated management surface
+        # may ask for it. Anyone else refreshes last_seen_at and nothing else.
+        _require_management(request)
+        return service.register_workspace(
+            project_id,
+            **body.model_dump(),
+            host_updates_allowed=True,
+        )
 
     def _backup_settings_payload() -> dict[str, Any]:
-        effective = effective_backup_settings(resolved)
+        effective = effective_backup_settings(resolved, backup_settings_override)
         return {
             "auto_backup_enabled": effective["auto_backup_enabled"],
             "auto_backup_interval_seconds": effective["auto_backup_interval_seconds"],
@@ -1957,7 +2485,7 @@ def create_app(
                 if resolved.config_path
                 else Path(resolved.data_dir) / "config.toml"
             ),
-            "effective": "保存即写入配置文件 [backup]（与自动备份调度共用同一来源）；调度线程在服务重启后的下一个周期按新配置执行",
+            "effective": "保存即写入配置文件 [backup]（与自动备份调度共用同一来源）；调度线程收到信号后按新间隔重新计时，无需重启服务",
         }
 
     @app.get("/api/v1/admin/backup-settings")
@@ -1990,12 +2518,16 @@ def create_app(
             if resolved.config_path
             else Path(resolved.data_dir) / "config.toml"
         )
-        existing_text = target.read_text(encoding="utf-8") if target.is_file() else ""
         applied = {key: value for key, value in updates.items() if value is not None}
-        updated_text = upsert_toml_section(existing_text, "backup", applied)
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(updated_text, encoding="utf-8")
-        _BACKUP_SETTINGS_OVERRIDE.update(applied)
+        rewrite_config_text(
+            target,
+            lambda current: upsert_toml_section(current, "backup", applied),
+        )
+        backup_settings_override.update(applied)
+        # Wake the scheduler so a shortened interval takes effect now rather
+        # than after the old period; the retention prune below already applies
+        # its new cap immediately.
+        auto_backup_reschedule.set()
         payload = _backup_settings_payload()
         # 保留份数立即生效：保存即按新上限清理现存备份，无需等下一次备份。
         payload["pruned"] = service.enforce_backup_retention(
@@ -2026,7 +2558,9 @@ def create_app(
             kind=body.kind,
             title=body.title,
             content=body.content,
-            actor="management",
+            management_authorized=True,
+            expected_version=body.expected_version,
+            request_id=request.state.idempotency_request_id,
         )
 
     @app.post("/api/v1/projects/{project_id}/documents/{doc_key}/archive")
@@ -2034,7 +2568,12 @@ def create_app(
         project_id: str, doc_key: str, request: Request
     ) -> dict[str, Any]:
         _require_management(request)
-        return service.archive_project_document(project_id, doc_key, actor="management")
+        return service.archive_project_document(
+            project_id,
+            doc_key,
+            management_authorized=True,
+            request_id=request.state.idempotency_request_id,
+        )
 
     @app.get("/api/v1/projects/{project_id}/audit")
     def query_audit(
@@ -2081,7 +2620,7 @@ def create_app(
             project_id,
             session_id,
             body.token,
-            request_id=request.state.request_id,
+            request_id=request.state.idempotency_request_id,
         )
 
     @app.post("/api/v1/projects/{project_id}/sync")
@@ -2095,7 +2634,7 @@ def create_app(
         return service.post_message(
             project_id,
             **body.model_dump(),
-            request_id=request.state.request_id,
+            request_id=request.state.idempotency_request_id,
         )
 
     @app.post("/api/v1/projects/{project_id}/events/{event_id}/acknowledge")
@@ -2110,7 +2649,7 @@ def create_app(
             event_id,
             body.session_id,
             body.token,
-            request_id=request.state.request_id,
+            request_id=request.state.idempotency_request_id,
         )
 
     @app.get("/api/v1/projects/{project_id}/tasks")
@@ -2133,11 +2672,11 @@ def create_app(
 
     @app.get("/api/v1/projects/{project_id}/tasks/{task_id}")
     def get_task(project_id: str, task_id: str) -> dict[str, Any]:
-        task = service.get_task(project_id, task_id)
-        # Additive injection keeps the historical {"task": ...} response intact
-        # while surfacing current binding documents for the caller.
-        task["project_documents"] = service.injectable_project_documents(project_id)
-        return {"task": task}
+        # One domain method, one connection: the task and the documents injected
+        # alongside it are read in the same snapshot, so a document published
+        # between the two reads cannot appear as a version the task never saw.
+        # This route used to call two methods and splice the result together.
+        return service.get_task_with_documents(project_id, task_id)
 
     @app.get("/api/v1/projects/{project_id}/tasks/{task_id}/history")
     def list_task_history(
@@ -2178,7 +2717,7 @@ def create_app(
         return service.submit_task_intake(
             project_id,
             **body.model_dump(),
-            request_id=request.state.request_id,
+            request_id=request.state.idempotency_request_id,
         )
 
     @app.post("/api/v1/projects/{project_id}/task-intakes/{intake_id}/acknowledge")
@@ -2192,7 +2731,7 @@ def create_app(
             project_id,
             intake_id,
             **body.model_dump(),
-            request_id=request.state.request_id,
+            request_id=request.state.idempotency_request_id,
         )
 
     @app.post("/api/v1/projects/{project_id}/task-intakes/{intake_id}/reassign")
@@ -2202,11 +2741,41 @@ def create_app(
         intake_id: str,
         body: TaskIntakeReassign,
     ) -> dict[str, Any]:
+        _reject_credentials_in_query(request)
+        payload = body.model_dump()
+        # No Session credentials is a management surface, so it must clear the
+        # management authentication; an anonymous request is not authority.
+        management = not str(payload.get("session_id") or "").strip()
+        if management:
+            _require_management(request)
         return service.reassign_task_intake(
             project_id,
             intake_id,
-            **body.model_dump(),
-            request_id=request.state.request_id,
+            **payload,
+            management_authorized=management,
+            request_id=request.state.idempotency_request_id,
+        )
+
+    @app.post("/api/v1/projects/{project_id}/task-intakes/{intake_id}/cancel")
+    def cancel_task_intake(
+        request: Request,
+        project_id: str,
+        intake_id: str,
+        body: TaskIntakeCancel,
+    ) -> dict[str, Any]:
+        _reject_credentials_in_query(request)
+        payload = body.model_dump()
+        # Same authority rule as reassign: withdrawing an intake is a
+        # management surface unless a real Session credential is presented.
+        management = not str(payload.get("session_id") or "").strip()
+        if management:
+            _require_management(request)
+        return service.cancel_task_intake(
+            project_id,
+            intake_id,
+            **payload,
+            management_authorized=management,
+            request_id=request.state.idempotency_request_id,
         )
 
     @app.post("/api/v1/projects/{project_id}/task-intakes/{intake_id}/define", status_code=201)
@@ -2220,7 +2789,7 @@ def create_app(
             project_id,
             intake_id,
             **body.model_dump(),
-            request_id=request.state.request_id,
+            request_id=request.state.idempotency_request_id,
         )
 
     @app.post("/api/v1/projects/{project_id}/tasks", status_code=201)
@@ -2230,7 +2799,7 @@ def create_app(
         return service.create_task(
             project_id,
             **body.model_dump(),
-            request_id=request.state.request_id,
+            request_id=request.state.idempotency_request_id,
         )
 
     @app.post("/api/v1/projects/{project_id}/tasks/{task_id}/claim")
@@ -2247,7 +2816,7 @@ def create_app(
             body.token,
             reclaim=body.reclaim,
             takeover=body.takeover,
-            request_id=request.state.request_id,
+            request_id=request.state.idempotency_request_id,
         )
 
     @app.post("/api/v1/projects/{project_id}/tasks/{task_id}/release")
@@ -2269,7 +2838,7 @@ def create_app(
             task_id,
             **payload,
             management_authorized=management,
-            request_id=request.state.request_id,
+            request_id=request.state.idempotency_request_id,
         )
 
     @app.post(
@@ -2291,7 +2860,7 @@ def create_app(
             task_id,
             **payload,
             management_authorized=management,
-            request_id=request.state.request_id,
+            request_id=request.state.idempotency_request_id,
         )
 
     @app.post(
@@ -2310,7 +2879,7 @@ def create_app(
             task_id,
             assignment_id,
             **body.model_dump(),
-            request_id=request.state.request_id,
+            request_id=request.state.idempotency_request_id,
         )
 
     @app.post(
@@ -2323,11 +2892,20 @@ def create_app(
         task_id: str,
         body: TaskHandoffCreate,
     ) -> dict[str, Any]:
+        _reject_credentials_in_query(request)
+        payload = body.model_dump()
+        # Missing Session credentials are not management authority, and they are
+        # certainly not the task owner either: handoff must pass the same gate
+        # its sibling writes (release/assign/update) pass.
+        management = not str(payload.get("from_session_id") or "").strip()
+        if management:
+            _require_management(request)
         return service.handoff_task(
             project_id,
             task_id,
-            **body.model_dump(),
-            request_id=request.state.request_id,
+            **payload,
+            management_authorized=management,
+            request_id=request.state.idempotency_request_id,
         )
 
     @app.post(
@@ -2346,7 +2924,7 @@ def create_app(
             task_id,
             handoff_id,
             **body.model_dump(),
-            request_id=request.state.request_id,
+            request_id=request.state.idempotency_request_id,
         )
 
     @app.patch("/api/v1/projects/{project_id}/tasks/{task_id}")
@@ -2366,7 +2944,7 @@ def create_app(
             task_id,
             **payload,
             management_authorized=management,
-            request_id=request.state.request_id,
+            request_id=request.state.idempotency_request_id,
         )
 
     @app.get("/api/v1/projects/{project_id}/leases")
@@ -2380,7 +2958,7 @@ def create_app(
         return service.acquire_lease(
             project_id,
             **body.model_dump(),
-            request_id=request.state.request_id,
+            request_id=request.state.idempotency_request_id,
         )
 
     @app.post("/api/v1/projects/{project_id}/leases/check")
@@ -2400,7 +2978,7 @@ def create_app(
             lease_id,
             body.session_id,
             body.token,
-            request_id=request.state.request_id,
+            request_id=request.state.idempotency_request_id,
         )
 
     @app.post("/api/v1/projects/{project_id}/tasks/{task_id}/reports", status_code=201)
@@ -2414,7 +2992,7 @@ def create_app(
             project_id,
             task_id,
             **body.model_dump(),
-            request_id=request.state.request_id,
+            request_id=request.state.idempotency_request_id,
         )
 
     @app.post("/api/v1/projects/{project_id}/tasks/{task_id}/reviews", status_code=201)
@@ -2428,7 +3006,7 @@ def create_app(
             project_id,
             task_id,
             **body.model_dump(),
-            request_id=request.state.request_id,
+            request_id=request.state.idempotency_request_id,
         )
 
     @app.post(
@@ -2441,11 +3019,19 @@ def create_app(
         task_id: str,
         body: IntegrationCreate,
     ) -> dict[str, Any]:
+        _reject_credentials_in_query(request)
+        payload = body.model_dump()
+        # No integrator credentials is not the same thing as management
+        # authority: the terminal integration state must say who wrote it.
+        management = not str(payload.get("integrator_session_id") or "").strip()
+        if management:
+            _require_management(request)
         return service.submit_integration(
             project_id,
             task_id,
-            **body.model_dump(),
-            request_id=request.state.request_id,
+            **payload,
+            management_authorized=management,
+            request_id=request.state.idempotency_request_id,
         )
 
     @app.get("/api/v1/projects/{project_id}/knowledge/assets")
@@ -2473,7 +3059,7 @@ def create_app(
         return service.submit_knowledge_candidate(
             project_id,
             **body.model_dump(),
-            request_id=request.state.request_id,
+            request_id=request.state.idempotency_request_id,
         )
 
     @app.get("/api/v1/projects/{project_id}/knowledge/assets/{asset_id}")
@@ -2496,7 +3082,7 @@ def create_app(
             project_id,
             asset_id,
             **body.model_dump(),
-            request_id=request.state.request_id,
+            request_id=request.state.idempotency_request_id,
         )
 
     @app.post(
@@ -2508,11 +3094,16 @@ def create_app(
         asset_id: str,
         body: KnowledgeAssetAction,
     ) -> dict[str, Any]:
+        # A terminal write. The domain requires the submitting identity or
+        # a management session, so the flag is passed as a fact rather than
+        # enforced here: an author is allowed without management auth, and
+        # _require_knowledge_final_write_authority turns down anyone else.
         return service.supersede_knowledge_asset(
             project_id,
             asset_id,
             **body.model_dump(),
-            request_id=request.state.request_id,
+            management_authorized=management_authenticated(request),
+            request_id=request.state.idempotency_request_id,
         )
 
     @app.post("/api/v1/projects/{project_id}/knowledge/assets/{asset_id}/archive")
@@ -2522,11 +3113,16 @@ def create_app(
         asset_id: str,
         body: KnowledgeAssetAction,
     ) -> dict[str, Any]:
+        # A terminal write. The domain requires the submitting identity or
+        # a management session, so the flag is passed as a fact rather than
+        # enforced here: an author is allowed without management auth, and
+        # _require_knowledge_final_write_authority turns down anyone else.
         return service.archive_knowledge_asset(
             project_id,
             asset_id,
             **body.model_dump(),
-            request_id=request.state.request_id,
+            management_authorized=management_authenticated(request),
+            request_id=request.state.idempotency_request_id,
         )
 
     web_dir = Path(__file__).with_name("web")
@@ -2540,7 +3136,11 @@ def create_app(
         # 验收退回修正：favicon 使用自身文件内容的指纹，而非复用 js/css 指纹。
         asset_fingerprint_cache: dict[str, tuple[tuple[int, int], str]] = {}
         fingerprint_assets = ("app.js", "app.css", "favicon.svg")
-        index_html_cache: dict[tuple[int, int, int, int], bytes] = {}
+        # One slot, not a dict keyed by mtimes: every distinct mtime combination
+        # used to add an entry that nothing ever evicted, so a long-lived server
+        # that touched index.html or an asset often enough kept every rendered
+        # copy of the page in memory (#282).
+        index_html_cache: tuple[tuple[int, ...], bytes] | None = None
 
         def _asset_fingerprint(name: str) -> str:
             asset = web_dir / name
@@ -2554,6 +3154,7 @@ def create_app(
 
         @app.get("/", include_in_schema=False)
         def web_index() -> Response:
+            nonlocal index_html_cache
             index_path = web_dir / "index.html"
             key = (
                 index_path.stat().st_mtime_ns,
@@ -2565,8 +3166,7 @@ def create_app(
             # Cache hits must reuse the stored document: computing ``html``
             # only inside the miss branch left it unbound on the second
             # request, turning every page refresh into a 500.
-            html = index_html_cache.get(key)
-            if html is None:
+            if index_html_cache is None or index_html_cache[0] != key:
                 html = index_path.read_bytes()
                 for name in fingerprint_assets:
                     html = re.sub(
@@ -2574,7 +3174,9 @@ def create_app(
                         b"\\g<1>" + _asset_fingerprint(name).encode(),
                         html,
                     )
-                index_html_cache[key] = html
+                index_html_cache = (key, html)
+            else:
+                html = index_html_cache[1]
             return Response(
                 html,
                 media_type="text/html",

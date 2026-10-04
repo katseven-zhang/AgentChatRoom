@@ -49,8 +49,12 @@ def test_task_intake_targets_include_active_offline_and_exclude_revoked(
     service.leave_session(project["id"], offline["agent"]["id"], offline["token"])
     service.leave_session(project["id"], revoked["agent"]["id"], revoked["token"])
     service.leave_session(project["id"], suspended["agent"]["id"], suspended["token"])
-    service.revoke_project_member(project["id"], revoked["agent"]["member_id"])
-    service.update_project_member(project["id"], suspended["agent"]["member_id"], status="suspended")
+    service.revoke_project_member(
+        project["id"], revoked["agent"]["member_id"], management_authorized=True
+    )
+    service.update_project_member(
+        project["id"], suspended["agent"]["member_id"], status="suspended", management_authorized=True
+    )
 
     targets = service.list_task_intake_targets(project["id"])
     by_id = {item["member_id"]: item for item in targets}
@@ -83,6 +87,7 @@ def test_reassign_task_intake_allows_active_offline_target_without_session(
         project["id"],
         intake["id"],
         target_member_id=second_target["agent"]["member_id"],
+        management_authorized=True,
     )["intake"]
     assert reassigned["target_member_id"] == second_target["agent"]["member_id"]
     assert reassigned["target_session_id"] is None
@@ -109,7 +114,9 @@ def test_submit_task_intake_allows_active_offline_target_without_session(
 
 def test_submit_task_intake_rejects_revoked_member(service, project):
     target = _join(service, project, agent_key="intake-revoked", name="Revoked")
-    service.revoke_project_member(project["id"], target["agent"]["member_id"])
+    service.revoke_project_member(
+        project["id"], target["agent"]["member_id"], management_authorized=True
+    )
     with pytest.raises(DomainError) as failure:
         service.submit_task_intake(
             project["id"],
@@ -274,6 +281,7 @@ def test_task_number_is_immutable_across_lifecycle_changes(service, project, joi
         result="done",
         summary="Merged",
         tests=[{"command": "pytest", "exit_code": 0}],
+        management_authorized=True,
     )
     fetched = service.get_task_by_number(project["id"], 1)
     assert fetched["id"] == task["id"]

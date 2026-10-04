@@ -22,7 +22,12 @@ def parse_args() -> argparse.Namespace:
         description="Verify two isolated remote AgentChatRoom Hosts through MCP Bridges."
     )
     parser.add_argument("--url", required=True, help="Center MCP URL, for example http://127.0.0.1:8765/mcp")
-    parser.add_argument("--token", required=True, help="Project Agent Token")
+    parser.add_argument(
+        "--token",
+        default=os.getenv("AGENTCHATROOM_AGENT_TOKEN", ""),
+        help="Project Agent Token; defaults to AGENTCHATROOM_AGENT_TOKEN. Passing a "
+        "live token here exposes it in this machine's process arguments.",
+    )
     parser.add_argument("--project-id", required=True)
     parser.add_argument("--workspace-a", required=True)
     parser.add_argument("--workspace-b", required=True)
@@ -34,7 +39,16 @@ def parse_args() -> argparse.Namespace:
         help="Optional prefix for idempotent write keys; defaults to a unique run prefix",
     )
     parser.add_argument("--timeout", type=float, default=15.0)
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.token:
+        # Never echo the value: the whole point is that argv is readable by other
+        # accounts on this machine.
+        print(
+            "WARNING: --token is deprecated and puts a live Agent Token in this "
+            "machine's process arguments; set AGENTCHATROOM_AGENT_TOKEN instead.",
+            file=sys.stderr,
+        )
+    return args
 
 
 @dataclass

@@ -39,6 +39,26 @@ def test_dialog_toast_top_layer_routing_and_close_adoption():
 
 
 
+def test_project_dialog_reports_failures_where_they_can_be_read():
+    """#163/#321: the project dialog's failure must land where someone sees it.
+
+    This harness existed but nothing ran it: no pytest case referenced it, so
+    the regression it guards could break without any test turning red. It is
+    wired in here so the main flow executes it like its two siblings.
+
+    Two failure surfaces are in play. While the dialog is open the message goes
+    to the inline banner, because the page-level toast is blurred behind
+    dialog::backdrop; once the dialog is closed the banner has no reader, so the
+    same failure has to go to the toast instead. An implementation that only
+    did the first would report a failure into an element nobody is looking at.
+    """
+    result = subprocess.run(
+        ["node", str(Path(__file__).with_name("project_dialog_error.cjs"))],
+        capture_output=True, text=True, timeout=20,
+    )
+    assert result.returncode == 0, result.stderr
+
+
 def test_web_add_project_issues_without_pasting_raw_config():
     """加入本项目：主流程零粘贴可签发；#141 起手动粘贴故障恢复区整体移除。"""
     markup = (WEB_DIR / "index.html").read_text(encoding="utf-8")
@@ -53,7 +73,12 @@ def test_web_add_project_issues_without_pasting_raw_config():
     # 提交路径不再读取粘贴文本：增量分支仅限加入本项目。
     assert "请粘贴客户端当前使用的 agentchatroom HTTP 配置" not in javascript
     assert ".required = isAddProject" not in javascript
-    assert "incrementalHttpPrompt(" in javascript
+    # #358: the incremental prompt comes from the server generator, so the
+    # browser only has to name the mode and pass the freshly issued bundle.
+    assert "loadIssuedServerPrompt(" in javascript
+    assert 'loadIssuedServerPrompt(setup, profileId, "add_project")' in javascript
+    assert "function incrementalHttpPrompt(" not in javascript
+    assert "integrations/mcp/issued-prompt" in javascript
     assert "incremental: true" in javascript
     assert 'if (setup.mode !== "add_project") {' in javascript
 
@@ -208,18 +233,21 @@ def test_web_token_dialog_shows_inline_validation_errors():
     javascript = (WEB_DIR / "app.js").read_text(encoding="utf-8")
 
     # 内联横幅位于 token-dialog 内部并带 alert 角色。
-    dialog_start = markup.index('<dialog id="token-dialog">')
+    dialog_start = markup.index('<dialog id="token-dialog"')
     dialog_end = markup.index("</dialog>", dialog_start)
     dialog_markup = markup[dialog_start:dialog_end]
     assert '<p class="form-error" id="token-form-error" role="alert" hidden></p>' in dialog_markup
     assert ".form-error {" in (WEB_DIR / "app.css").read_text(encoding="utf-8")
 
-    # 提交处理器内所有校验失败与 API 失败都写内联横幅，不再调用 toast。
+    # 弹窗仍打开时，校验失败与 API 失败写内联横幅。签发已经关掉弹窗之后
+    # 的失败（例如刷新管理数据失败）改走全局 toast，避免写进没人看得见的横幅（#321）。
     start = javascript.index('elements["token-form"].addEventListener("submit"')
     end = javascript.index('elements["task-assign-form"].addEventListener', start)
     handler = javascript[start:end]
+    closed_at = handler.index('if (!elements["token-dialog"].open)')
     assert handler.count("setTokenFormError(") >= 6
-    assert "showToast(" not in handler
+    assert "showToast(" not in handler[:closed_at]
+    assert "showToast(" in handler[closed_at:]
     assert "handleError(" not in handler
     # 弹窗关闭与下次提交都会先清空横幅，避免残留误导。
     assert 'setTokenFormError("")' in javascript
@@ -264,12 +292,30 @@ assert.notEqual(generic.softwareKey, 'standard-mcp-');
     assert "沿用现有身份合并接入" in javascript
 
 
-def test_frontend_exposes_only_http_while_backend_keeps_migration_support():
+def test_frontend_exposes_every_reachable_transport_and_client_profile():
+    """#357: every advertised transport must be selectable and usable.
+
+    The transport tabs used to ship HTTP only while `localMcpAssistantSupported`
+    required `integrationTransport === "local"` and a profile carrying
+    `local_config`. The assistant was therefore unreachable, and
+    `local_mcp_profile_unsupported` was the only reachable outcome, yet
+    /api/v1/config/public still advertised `local_mcp_config_assistant`.
+    """
     markup = (WEB_DIR / "index.html").read_text(encoding="utf-8")
     javascript = (WEB_DIR / "app.js").read_text(encoding="utf-8")
     assert '<option value="migrate_http">' not in markup
-    assert 'data-integration-transport="local"' not in markup
-    assert 'data-integration-transport="remote"' not in markup
+    for transport in ("http", "local", "remote"):
+        assert f'data-integration-transport="{transport}"' in markup, transport
+    # A per-client profile selector, or the local assistant stays unreachable.
+    assert 'id="integration-client-profile"' in markup
+    assert "function renderIntegrationProfileOptions()" in javascript
+    assert "state.integration.profiles" in javascript
+    # Transport availability is served, not hard-coded.
+    assert "transports.streamable_http" in javascript
+    assert "transports.remote_stdio_bridge" in javascript
+    # Selecting a client that has no managed path must say so rather than
+    # offering an apply button that would 404.
+    assert "local_config" in javascript
     assert 'state.integrationOnboardingMode === "migrate_http"' in javascript
     assert 'item.dataset.integrationTransport === "http"' in javascript
 
@@ -372,15 +418,23 @@ def test_web_bootstrap_and_phase_one_local_agent_hooks_are_complete():
     assert 'autocomplete="current-password"' in markup
     assert "function renderIntegrationJoin()" in javascript
     assert 'data-integration-transport="http"' in markup
-    assert 'data-integration-transport="local"' not in markup
-    assert 'data-integration-transport="remote"' not in markup
+    assert 'data-integration-transport="local"' in markup
+    assert 'data-integration-transport="remote"' in markup
     assert "streamable_http_config_text" in javascript
     assert "remote_bridge_config_text" in javascript
     assert 'id="token-config-value"' in markup
     assert "签发并生成接入提示词" in markup
     assert '<section class="integration-section onboarding-section" hidden>' in markup
-    assert "project_name_${index + 1}" in javascript
-    assert "project_token_${index + 1}" in javascript
+    # #358: the per-Project mapping is built by the generator, which is also
+    # where the credentials are encoded; the browser sends them as data.
+    integrations_source = (WEB_DIR.parent / "integrations.py").read_text(
+        encoding="utf-8"
+    )
+    assert "project_name_{index}=" in integrations_source
+    assert "project_token_{index}=" in integrations_source
+    assert "project_credentials: validateProjectCredentials(setup.projectCredentials)" in (
+        javascript
+    )
     # #143：占位配置复述与冗余禁令从提示词移除。
     assert "不要命名为 agentchatroom-stdio" not in javascript
     assert 'payload.host_key = "<stable-host-key>"' not in javascript
@@ -488,7 +542,7 @@ def test_web_project_export_lives_in_settings_as_audit_export():
 
     assert 'id="export-project-button"' not in markup
     assert "export-project-button" not in javascript
-    dialog_start = markup.index('<dialog id="settings-dialog">')
+    dialog_start = markup.index('<dialog id="settings-dialog"')
     dialog_end = markup.index("</dialog>", dialog_start)
     dialog_markup = markup[dialog_start:dialog_end]
     assert 'id="export-audit-data-button"' in dialog_markup
@@ -523,7 +577,7 @@ def test_web_system_settings_decoupled_from_project_settings():
     assert 'id="runtime-log"' in system_dialog
     assert 'id="backup-list"' in system_dialog
     # 项目设置弹窗不再有全局自动备份字段。
-    settings_start = markup.index('<dialog id="settings-dialog">')
+    settings_start = markup.index('<dialog id="settings-dialog"')
     settings_end = markup.index("</dialog>", settings_start)
     project_dialog = markup[settings_start:settings_end]
     assert 'id="settings-auto-backup"' not in project_dialog
@@ -777,8 +831,13 @@ def test_web_supports_human_reading_and_guided_interactions():
     assert "Token 未更换" in javascript
     assert "不关联；首次连接时按下面填写的显示名称自动创建成员" in javascript
     assert 'elements["token-agent-name"].value' in javascript
-    # #143：提示词 3 步结构与放大的结果展示。
-    assert "重启或重新加载客户端 MCP" in javascript
+    # #143：提示词 3 步结构与放大的结果展示。#358：结构由服务端生成器保证，
+    # 浏览器原样显示服务端返回的文本。
+    integrations_source = (WEB_DIR.parent / "integrations.py").read_text(
+        encoding="utf-8"
+    )
+    assert "2. 写入后重启或重新加载客户端 MCP，使配置生效。" in integrations_source
+    assert 'elements["token-config-value"].textContent = result.prompt;' in javascript
     assert "本工作区固定 bootstrap 参数" not in javascript
     assert 'id="token-config-value" class="code-block secret-block"' in markup
     assert 'class="primary-button integration-cta copy-button" type="button" data-copy-target="token-config-value"' in markup
@@ -789,7 +848,9 @@ def test_web_supports_human_reading_and_guided_interactions():
     # Deep links and Agent-visible numbers use project_seq, not the physical global id.
     assert 'data-open-event="${seq}"' in javascript
     assert "function eventFromCaches(eventSeq)" in javascript
-    assert "location.hash = `event-${seq}`" in javascript
+    assert "history.replaceState" in javascript
+    assert "next.hash = `event-${seq}`" in javascript
+    assert "location.hash = `event-${seq}`" not in javascript
     assert "Number(event.project_seq) === seq" in javascript
     # Navigation labels describe user destinations, not internal release status.
     assert 'class="tab-status"' not in markup
@@ -885,10 +946,10 @@ def test_web_local_mcp_assistant_separates_write_reload_and_presence_states():
 
     assert 'id="integration-local-assistant"' in markup
     assert '>接入 Agent</button>' in markup
-    assert '<h2>接入 Agent</h2>' in markup
+    assert '<h2 id="integration-dialog-title">接入 Agent</h2>' in markup
     assert 'data-integration-transport="http"' in markup
-    assert 'data-integration-transport="local"' not in markup
-    assert 'data-integration-transport="remote"' not in markup
+    assert 'data-integration-transport="local"' in markup
+    assert 'data-integration-transport="remote"' in markup
     assert '连接方式' in markup
     assert 'id="integration-http-token-guide"' in markup
     assert 'id="integration-open-token-button"' in markup
@@ -952,7 +1013,7 @@ def test_web_sse_and_project_switch_guard_stale_snapshots():
     markup = (WEB_DIR / "index.html").read_text(encoding="utf-8")
     stylesheet = (WEB_DIR / "app.css").read_text(encoding="utf-8")
 
-    assert "function refreshSnapshot(projectId)" in javascript
+    assert "function refreshSnapshot(projectId, options" in javascript
     assert "JSON.parse(message.data)" in javascript
     assert "Ignored malformed room event" in javascript
     assert "applySnapshotIfCurrent" in javascript
@@ -997,7 +1058,7 @@ def test_web_task_view_harness_covers_state_triple_samples(tmp_path):
     start_b = javascript.index("function taskNavigationEntries(tasks)")
     end_b = javascript.index("function renderTaskNavigation(tasks)")
     # Expert filter rendering (exact-state options must carry counts).
-    start_c = javascript.index("function renderTaskExpertFilters(tasks)")
+    start_c = javascript.index("function taskExpertFilterSignature(")
     end_c = javascript.index("function renderTasks(tasks)")
 
     config = {
@@ -1019,9 +1080,28 @@ def test_web_task_view_harness_covers_state_triple_samples(tmp_path):
             "integration": "待集成", "done": "已完成", "cancelled": "已取消",
             "unclassified": "未归类",
         },
+        "groups": [
+            "claimable", "active", "review", "integration", "done", "cancelled",
+            "unclassified",
+        ],
         "attention_phases": ["blocked", "changes_requested", "integration_failed"],
+        "attention_phase_order": ["integration_failed", "changes_requested", "blocked"],
         "attention_label": "需要处理",
         "active_subgroup_order": ["changes_requested", "blocked", "in_progress", "claimed"],
+        "task_priority_range": [0, 1, 2, 3, 4],
+        "execution_labels": {
+            "todo": "\u5f85\u5f00\u59cb", "claimed": "\u5df2\u8ba4\u9886",
+            "in_progress": "\u6267\u884c\u4e2d", "blocked": "\u963b\u585e",
+            "completed": "\u6267\u884c\u5b8c\u6210", "cancelled": "\u5df2\u53d6\u6d88",
+        },
+        "verification_labels": {
+            "not_required": "\u65e0\u9700\u9a8c\u8bc1", "pending": "\u5f85\u9a8c\u8bc1",
+            "changes_requested": "\u9700\u4fee\u6539", "approved": "\u5df2\u901a\u8fc7",
+        },
+        "integration_labels": {
+            "pending": "\u5f85\u96c6\u6210", "done": "\u5df2\u96c6\u6210",
+            "failed": "\u96c6\u6210\u5931\u8d25",
+        },
     }
 
     sample_triples = [
@@ -1075,7 +1155,7 @@ def test_web_task_view_harness_covers_state_triple_samples(tmp_path):
         "function escapeHtml(value) { return String(value ?? ''); }\n"
         "function shortId(value) { return String(value); }\n"
         "const captured = { expert: '' };\n"
-        "const document = { getElementById: (id) => ({ set innerHTML(value) { captured[id === 'task-expert-filters' ? 'expert' : id] = value; }, get innerHTML() { return captured[id] || ''; } }) };\n"
+        "const document = { getElementById: (id) => ({ dataset: {}, querySelector: () => null, set innerHTML(value) { captured[id === 'task-expert-filters' ? 'expert' : id] = value; }, get innerHTML() { return captured[id] || ''; } }) };\n"
         + javascript[start_a:end_a]
         + "\n"
         + javascript[start_b:end_b]
@@ -1569,11 +1649,11 @@ def test_web_assignment_labels_distinguish_release_from_reassignment(tmp_path):
 const outcomes = {};
 outcomes.releaseInvalidated = assignmentStatus({
   status: 'cancelled',
-  response_note: 'cancelled by task release (other)',
+  response_note: 'task_release:other',
 }) === '因任务释放失效';
 outcomes.reassignInvalidated = assignmentStatus({
   status: 'cancelled',
-  response_note: 'superseded by reassignment',
+  response_note: 'reassignment',
 }) === '因改派失效';
 outcomes.plainCancelStillWorks = assignmentStatus({
   status: 'cancelled',
@@ -1824,16 +1904,35 @@ def test_web_task_events_synchronize_navigation_and_table_counts(tmp_path):
                     "claimable": "待认领", "active": "进行中", "review": "待验收", "integration": "待集成",
                     "done": "已完成", "cancelled": "已取消", "unclassified": "未归类",
                 },
+                "groups": [
+                    "claimable", "active", "review", "integration", "done", "cancelled",
+                    "unclassified",
+                ],
                 "attention_phases": ["blocked", "changes_requested", "integration_failed"],
+                "attention_phase_order": ["integration_failed", "changes_requested", "blocked"],
                 "attention_label": "需要处理",
                 "active_subgroup_order": ["changes_requested", "blocked", "in_progress", "claimed"],
+                "task_priority_range": [0, 1, 2, 3, 4],
+                "execution_labels": {
+                    "todo": "\u5f85\u5f00\u59cb", "claimed": "\u5df2\u8ba4\u9886",
+                    "in_progress": "\u6267\u884c\u4e2d", "blocked": "\u963b\u585e",
+                    "completed": "\u6267\u884c\u5b8c\u6210", "cancelled": "\u5df2\u53d6\u6d88",
+                },
+                "verification_labels": {
+                    "not_required": "\u65e0\u9700\u9a8c\u8bc1", "pending": "\u5f85\u9a8c\u8bc1",
+                    "changes_requested": "\u9700\u4fee\u6539", "approved": "\u5df2\u901a\u8fc7",
+                },
+                "integration_labels": {
+                    "pending": "\u5f85\u96c6\u6210", "done": "\u5df2\u96c6\u6210",
+                    "failed": "\u96c6\u6210\u5931\u8d25",
+                },
             }
         }
     }
 
     start_cfg = javascript.index("function taskViewConfig()")
     end_table = javascript.index("function intakeTargetName(intake)")
-    start_snap = javascript.index("function fetchSnapshotDirect(projectId)")
+    start_snap = javascript.index("function fetchSnapshotDirect(")
     end_snap = javascript.index("async function api(path, options = {})")
     start_pres = javascript.index("async function refreshPresence()")
     end_apply = javascript.index("function connectEvents(after)")
@@ -1875,11 +1974,11 @@ const elements = {
 
 const dom = {
   'task-navigation': { innerHTML: '' },
-  'task-expert-filters': { innerHTML: '' },
+  'task-expert-filters': { innerHTML: '', dataset: {}, querySelector: () => null },
 };
 
 const document = {
-  getElementById: (id) => dom[id] || elements[id] || { innerHTML: '', addEventListener: () => {} },
+  getElementById: (id) => dom[id] || elements[id] || { innerHTML: '', dataset: {}, querySelector: () => null, addEventListener: () => {} },
   querySelectorAll: (selector) => [],
 };
 
@@ -1956,7 +2055,7 @@ function getNavCounts() {
   });
 
   const event1 = { id: 10, event_type: 'task.created', task_id: 't_1' };
-  let snap1 = await refreshSnapshot(state.projectId, event1.id);
+  let snap1 = await refreshSnapshot(state.projectId, { minCursor: event1.id });
   applySnapshotIfCurrent(state.projectId, snap1);
   renderForEvent(event1);
 
@@ -1990,7 +2089,7 @@ function getNavCounts() {
   });
 
   const event2 = { id: 20, event_type: 'task.created', task_id: 't_2' };
-  const eventPromise = refreshSnapshot(state.projectId, event2.id);
+  const eventPromise = refreshSnapshot(state.projectId, { minCursor: event2.id });
 
   // Resolve the in-flight snapshot with OLD data (cursor 10)
   state.snapshotInFlight = null;
@@ -2017,7 +2116,7 @@ function getNavCounts() {
   mockServerSnapshot.tasks[0].execution_status = 'claimed';
   mockServerSnapshot.tasks[0].state_view = { phase: 'claimed', group: 'active', needs_attention: false };
   const eventClaim = { id: 21, event_type: 'task.claimed', task_id: 't_1' };
-  let snapClaim = await refreshSnapshot(state.projectId, eventClaim.id);
+  let snapClaim = await refreshSnapshot(state.projectId, { minCursor: eventClaim.id });
   applySnapshotIfCurrent(state.projectId, snapClaim);
   renderForEvent(eventClaim);
 
@@ -2031,7 +2130,7 @@ function getNavCounts() {
   mockServerSnapshot.tasks[0].execution_status = 'todo';
   mockServerSnapshot.tasks[0].state_view = { phase: 'todo', group: 'claimable', needs_attention: false };
   const eventRelease = { id: 22, event_type: 'task.released', task_id: 't_1' };
-  let snapRelease = await refreshSnapshot(state.projectId, eventRelease.id);
+  let snapRelease = await refreshSnapshot(state.projectId, { minCursor: eventRelease.id });
   applySnapshotIfCurrent(state.projectId, snapRelease);
   renderForEvent(eventRelease);
 
@@ -2045,7 +2144,7 @@ function getNavCounts() {
   mockServerSnapshot.tasks[1].execution_status = 'cancelled';
   mockServerSnapshot.tasks[1].state_view = { phase: 'cancelled', group: 'cancelled', needs_attention: false };
   const eventCancel = { id: 23, event_type: 'task.cancelled', task_id: 't_2' };
-  let snapCancel = await refreshSnapshot(state.projectId, eventCancel.id);
+  let snapCancel = await refreshSnapshot(state.projectId, { minCursor: eventCancel.id });
   applySnapshotIfCurrent(state.projectId, snapCancel);
   renderForEvent(eventCancel);
 
@@ -2060,7 +2159,7 @@ function getNavCounts() {
   mockServerSnapshot.tasks[0].execution_status = 'claimed';
   mockServerSnapshot.tasks[0].state_view = { phase: 'claimed', group: 'active', needs_attention: false };
   const eventClaim2 = { id: 24, event_type: 'task.claimed', task_id: 't_1' };
-  applySnapshotIfCurrent(state.projectId, await refreshSnapshot(state.projectId, eventClaim2.id));
+  applySnapshotIfCurrent(state.projectId, await refreshSnapshot(state.projectId, { minCursor: eventClaim2.id }));
   renderForEvent(eventClaim2);
   counts = getNavCounts();
   if (counts['claimable'] !== 0 || counts['active'] !== 1) {
@@ -2072,7 +2171,7 @@ function getNavCounts() {
   mockServerSnapshot.tasks[0].execution_status = 'blocked';
   mockServerSnapshot.tasks[0].state_view = { phase: 'blocked', group: 'active', needs_attention: true };
   const eventBlocked = { id: 25, event_type: 'task.blocked', task_id: 't_1' };
-  applySnapshotIfCurrent(state.projectId, await refreshSnapshot(state.projectId, eventBlocked.id));
+  applySnapshotIfCurrent(state.projectId, await refreshSnapshot(state.projectId, { minCursor: eventBlocked.id }));
   renderForEvent(eventBlocked);
   counts = getNavCounts();
   if (counts['attention'] !== 1 || counts['active'] !== 1) {
@@ -2084,7 +2183,7 @@ function getNavCounts() {
   mockServerSnapshot.tasks[0].execution_status = 'in_progress';
   mockServerSnapshot.tasks[0].state_view = { phase: 'in_progress', group: 'active', needs_attention: false };
   const eventUnblocked = { id: 26, event_type: 'task.unblocked', task_id: 't_1' };
-  applySnapshotIfCurrent(state.projectId, await refreshSnapshot(state.projectId, eventUnblocked.id));
+  applySnapshotIfCurrent(state.projectId, await refreshSnapshot(state.projectId, { minCursor: eventUnblocked.id }));
   renderForEvent(eventUnblocked);
   counts = getNavCounts();
   if (counts['attention'] !== 0 || counts['active'] !== 1) {
@@ -2096,7 +2195,7 @@ function getNavCounts() {
   mockServerSnapshot.tasks[0].execution_status = 'awaiting_review';
   mockServerSnapshot.tasks[0].state_view = { phase: 'awaiting_review', group: 'review', needs_attention: false };
   const eventReported = { id: 27, event_type: 'task.reported', task_id: 't_1' };
-  applySnapshotIfCurrent(state.projectId, await refreshSnapshot(state.projectId, eventReported.id));
+  applySnapshotIfCurrent(state.projectId, await refreshSnapshot(state.projectId, { minCursor: eventReported.id }));
   renderForEvent(eventReported);
   counts = getNavCounts();
   if (counts['review'] !== 1 || counts['active'] !== 0) {
@@ -2108,7 +2207,7 @@ function getNavCounts() {
   mockServerSnapshot.tasks[0].execution_status = 'changes_requested';
   mockServerSnapshot.tasks[0].state_view = { phase: 'changes_requested', group: 'active', needs_attention: true };
   const eventChanges = { id: 28, event_type: 'task.review_submitted', task_id: 't_1' };
-  applySnapshotIfCurrent(state.projectId, await refreshSnapshot(state.projectId, eventChanges.id));
+  applySnapshotIfCurrent(state.projectId, await refreshSnapshot(state.projectId, { minCursor: eventChanges.id }));
   renderForEvent(eventChanges);
   counts = getNavCounts();
   if (counts['attention'] !== 1 || counts['review'] !== 0 || counts['active'] !== 1) {
@@ -2120,7 +2219,7 @@ function getNavCounts() {
   mockServerSnapshot.tasks[0].execution_status = 'awaiting_review';
   mockServerSnapshot.tasks[0].state_view = { phase: 'awaiting_review', group: 'review', needs_attention: false };
   const eventReported2 = { id: 29, event_type: 'task.reported', task_id: 't_1' };
-  applySnapshotIfCurrent(state.projectId, await refreshSnapshot(state.projectId, eventReported2.id));
+  applySnapshotIfCurrent(state.projectId, await refreshSnapshot(state.projectId, { minCursor: eventReported2.id }));
   renderForEvent(eventReported2);
   counts = getNavCounts();
   if (counts['attention'] !== 0 || counts['review'] !== 1 || counts['active'] !== 0) {
@@ -2132,7 +2231,7 @@ function getNavCounts() {
   mockServerSnapshot.tasks[0].execution_status = 'pending_integration';
   mockServerSnapshot.tasks[0].state_view = { phase: 'pending_integration', group: 'integration', needs_attention: false };
   const eventApproved = { id: 30, event_type: 'task.review_submitted', task_id: 't_1' };
-  applySnapshotIfCurrent(state.projectId, await refreshSnapshot(state.projectId, eventApproved.id));
+  applySnapshotIfCurrent(state.projectId, await refreshSnapshot(state.projectId, { minCursor: eventApproved.id }));
   renderForEvent(eventApproved);
   counts = getNavCounts();
   if (counts['review'] !== 0 || counts['integration'] !== 1) {
@@ -2144,7 +2243,7 @@ function getNavCounts() {
   mockServerSnapshot.tasks[0].execution_status = 'done';
   mockServerSnapshot.tasks[0].state_view = { phase: 'done', group: 'done', needs_attention: false };
   const eventIntegrated = { id: 31, event_type: 'task.integrated', task_id: 't_1' };
-  applySnapshotIfCurrent(state.projectId, await refreshSnapshot(state.projectId, eventIntegrated.id));
+  applySnapshotIfCurrent(state.projectId, await refreshSnapshot(state.projectId, { minCursor: eventIntegrated.id }));
   renderForEvent(eventIntegrated);
   counts = getNavCounts();
   if (counts['integration'] !== 0 || counts['done'] !== 1) {
@@ -2165,7 +2264,7 @@ function getNavCounts() {
     state_view: { phase: 'todo', group: 'claimable', needs_attention: false },
   });
   const eventIntake = { id: 32, event_type: 'task.intake_defined', task_id: 't_3' };
-  let snapIntake = await refreshSnapshot(state.projectId, eventIntake.id);
+  let snapIntake = await refreshSnapshot(state.projectId, { minCursor: eventIntake.id });
   applySnapshotIfCurrent(state.projectId, snapIntake);
   renderForEvent(eventIntake);
 
@@ -2260,7 +2359,7 @@ def test_web_intake_refresh_never_overwrites_snapshot_state(tmp_path):
 
     start_intake = javascript.index("let taskIntakeRefreshSequence = 0;")
     end_intake = javascript.index("function sessionName(sessionId)")
-    start_snap = javascript.index("function fetchSnapshotDirect(projectId)")
+    start_snap = javascript.index("function fetchSnapshotDirect(")
     end_snap = javascript.index("async function api(path, options = {})")
     start_apply = javascript.index("function applySnapshotIfCurrent(projectId, snapshot)")
     end_apply = javascript.index("function renderForEvent(event)")
@@ -2534,10 +2633,17 @@ def test_web_management_audit_refresh_queries_past_right_edge():
     assert "before: state.auditEvents[state.auditEvents.length - 1].id + 1" not in body
     assert "after: latestId" in body
     assert "before:" not in body
-    assert "fetchAuditTail(state.projectId, eventType)" in body
+    # #317: the tail fetch stays bound to the project this request was made
+    # for, which is now captured before the await instead of read after it.
+    assert "fetchAuditTail(projectId, eventType)" in body
+    assert "const projectId = anchor.projectId;" in body
+    assert "withinRequestScope(anchor)" in body
     assert "viewingLiveTail" in body
     assert "state.auditEvents = overflow ? merged.slice(overflow) : merged" in body
-    assert "state.auditHasNewer = fresh.length > 0 || state.auditHasNewer" in body
+    # #319: the mid-history view must honour the server's answer instead of
+    # counting rows (an empty refresh used to mean "we are at the end").
+    assert "state.auditHasNewer = Boolean(audit.has_newer)" in body
+    assert "state.auditHasNewer = fresh.length > 0 || state.auditHasNewer" not in body
 
 
 def test_web_audit_refresh_merge_surfaces_new_events_after_emit(tmp_path):
@@ -2950,7 +3056,7 @@ def test_web_intake_refresh_never_overwrites_snapshot_state(tmp_path):
 
     start_intake = javascript.index("let taskIntakeRefreshSequence = 0;")
     end_intake = javascript.index("function sessionName(sessionId)")
-    start_snap = javascript.index("function fetchSnapshotDirect(projectId)")
+    start_snap = javascript.index("function fetchSnapshotDirect(")
     end_snap = javascript.index("async function api(path, options = {})")
     start_apply = javascript.index("function applySnapshotIfCurrent(projectId, snapshot)")
     end_apply = javascript.index("function renderForEvent(event)")

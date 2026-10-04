@@ -4,6 +4,10 @@ This check is intentionally narrower than the MCP acceptance harnesses. It
 does not create Projects, issue credentials, join Rooms, or write business
 events. It verifies that a running center exposes its health and Web entry
 points, and optionally runs source-level gates from the repository root.
+
+The default run sends no credential anywhere. A management token is only
+attached when the operator asks for it explicitly, and only over https - a
+bearer token replayed in cleartext on a LAN is worse than not checking at all.
 """
 
 from __future__ import annotations
@@ -20,6 +24,17 @@ from urllib.request import Request, urlopen
 
 
 ROOT = Path(__file__).resolve().parents[1]
+
+# The source tree is the authority on what "correct" means. A preflight that
+# cannot import it would silently compare the server against nothing.
+sys.path.insert(0, str(ROOT / "src"))
+
+from agentchatroom import __version__ as SOURCE_VERSION  # noqa: E402
+from agentchatroom.config import Settings  # noqa: E402
+
+# The config schema this source tree understands. A server built from another
+# tree may answer every probe correctly and still parse the file differently.
+SOURCE_SCHEMA_VERSION = Settings(data_dir=ROOT).config_schema_version
 
 
 def normalize_base_url(value: str) -> str:
@@ -72,14 +87,32 @@ def http_check(
     timeout: float,
     headers: dict[str, str],
     predicate: Any,
+    expected_field: str = "",
+    expected_values: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    expected_values = expected_values or {}
     try:
         status, body = request_json(url, timeout=timeout, headers=headers)
         passed = status == 200 and bool(predicate(body))
         result: dict[str, Any] = {"name": name, "passed": passed, "status": status}
         if isinstance(body, dict):
             result["status_value"] = body.get("status")
-        if not passed:
+        # A reachable server is not the claim being made. A stale EXE still
+        # answers 200 on every probe, so the reported version has to be part of
+        # the verdict - otherwise "verify" certifies the wrong build.
+        expected = expected_values.get(name)
+        if passed and expected is not None:
+            observed = body.get(expected_field) if isinstance(body, dict) else None
+            result["expected_value"] = expected
+            result["observed_value"] = observed
+            if observed != expected:
+                passed = False
+                result["error"] = (
+                    f"{expected_field} mismatch: server reports {observed!r}, "
+                    f"this source tree is {expected!r}"
+                )
+        result["passed"] = passed
+        if not passed and "error" not in result:
             result["error"] = "unexpected response"
         return result
     except HTTPError as error:
@@ -144,7 +177,22 @@ def main(argv: list[str] | None = None) -> int:
     headers: dict[str, str] = {}
     admin_token = os.getenv("AGENTCHATROOM_ADMIN_TOKEN", "").strip()
     if admin_token:
+        # A bearer token is replayable by anything on the path. Sending one
+        # over cleartext to an http:// endpoint hands it to the network, which
+        # this module exists to avoid - so refuse rather than quietly proceed.
+        if not base_url.startswith("https://"):
+            raise SystemExit(
+                "refusing to send AGENTCHATROOM_ADMIN_TOKEN over http://; "
+                "use an https:// --url or unset the variable"
+            )
         headers["Authorization"] = f"Bearer {admin_token}"
+
+    # The source tree is what a release is cut from, so its versions are the
+    # expectation. Reaching a server proves nothing about which build it is.
+    expected_versions = {
+        "health_live": SOURCE_VERSION,
+        "public_config": SOURCE_SCHEMA_VERSION,
+    }
 
     checks = [
         http_check(
@@ -153,6 +201,8 @@ def main(argv: list[str] | None = None) -> int:
             timeout=args.timeout,
             headers=headers,
             predicate=lambda body: isinstance(body, dict) and body.get("status") == "ok",
+            expected_field="version",
+            expected_values=expected_versions,
         ),
         http_check(
             "health_ready",
@@ -167,6 +217,8 @@ def main(argv: list[str] | None = None) -> int:
             timeout=args.timeout,
             headers=headers,
             predicate=lambda body: isinstance(body, dict) and "domain" in body,
+            expected_field="config_schema_version",
+            expected_values=expected_versions,
         ),
     ]
     checks.extend(

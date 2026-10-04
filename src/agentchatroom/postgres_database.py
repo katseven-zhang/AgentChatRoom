@@ -8,11 +8,15 @@ from typing import Any, Iterator
 
 from .database import (
     MIGRATIONS,
+    read_schema_version,
+    write_schema_version,
     SCHEMA,
     SCHEMA_VERSION,
     ensure_agent_identity_columns,
     ensure_event_number_schema,
+    ensure_member_lookup_indexes,
     ensure_project_member_columns,
+    ensure_repository_path_schema,
     ensure_task_assignment_member_column,
     ensure_task_number_schema,
     migrate_knowledge_source_event_ids,
@@ -60,6 +64,11 @@ def translate_qmark(sql: str) -> str:
 
 
 def postgres_script(script: str) -> str:
+    # REAL is float4: about seven significant decimal digits, so a unix
+    # timestamp loses the sub-second part it is stored to carry, and the
+    # management session expiry comparison drifts by enough to expire a live
+    # session early. The SQLite side keeps REAL for its own storage format; this
+    # translation is where the wider type belongs, next to the other two.
     return (
         script.replace("INTEGER PRIMARY KEY AUTOINCREMENT", "BIGSERIAL PRIMARY KEY")
         .replace(
@@ -67,6 +76,8 @@ def postgres_script(script: str) -> str:
             "event_id BIGINT NOT NULL REFERENCES events(id)",
         )
         .replace("last_read_cursor INTEGER NOT NULL", "last_read_cursor BIGINT NOT NULL")
+        .replace("expires_at REAL NOT NULL", "expires_at DOUBLE PRECISION NOT NULL")
+        .replace("created_at REAL NOT NULL", "created_at DOUBLE PRECISION NOT NULL")
     )
 
 
@@ -117,6 +128,29 @@ class PostgresDatabase:
             tuple[PostgresConnection, bool] | None
         ] = ContextVar(f"agentchatroom_postgres_connection_{id(self)}", default=None)
 
+    @contextmanager
+    def hold_restore_lock(self) -> Iterator[None]:
+        """Block other writers from the stale check until pg_restore returns.
+
+        Writers already take ``pg_advisory_xact_lock`` on
+        ``POSTGRES_WRITE_LOCK_KEY`` for one transaction. A session-level lock
+        on that same key is not dropped when pg_restore rebuilds tables, and
+        it is not confined to the transaction that only read the event cursor.
+        """
+        self._ensure_open()
+        with self._pool.connection(timeout=self.connect_timeout_seconds) as raw:
+            raw.execute(
+                "SELECT pg_advisory_lock(%s)",
+                (POSTGRES_WRITE_LOCK_KEY,),
+            )
+            try:
+                yield
+            finally:
+                raw.execute(
+                    "SELECT pg_advisory_unlock(%s)",
+                    (POSTGRES_WRITE_LOCK_KEY,),
+                )
+
     def _ensure_open(self) -> None:
         if self._opened:
             return
@@ -138,27 +172,31 @@ class PostgresDatabase:
             ensure_task_number_schema(connection, postgres=True)
             ensure_task_assignment_member_column(connection, postgres=True)
             ensure_event_number_schema(connection, postgres=True)
-            row = connection.execute(
-                "SELECT version FROM schema_meta LIMIT 1"
-            ).fetchone()
-            if row is None:
-                connection.execute(
-                    "INSERT INTO schema_meta(version) VALUES (?)", (SCHEMA_VERSION,)
-                )
-            elif row["version"] > SCHEMA_VERSION:
+            # Mirrors the SQLite backend: a fresh PostgreSQL install never
+            # replays MIGRATIONS, so it needs the member lookup indexes too.
+            ensure_member_lookup_indexes(connection)
+            row_version = read_schema_version(connection)
+            if row_version is None:
+                write_schema_version(connection, SCHEMA_VERSION)
+            elif row_version > SCHEMA_VERSION:
                 raise RuntimeError(
-                    f"Unsupported database schema {row['version']}; expected {SCHEMA_VERSION}"
+                    f"Unsupported database schema {row_version}; expected {SCHEMA_VERSION}"
                 )
             else:
-                version = int(row["version"])
+                version = int(row_version)
                 while version < SCHEMA_VERSION:
                     target = version + 1
+                    # The whole unit - statements and the version bump - shares
+                    # this transaction, exactly like the SQLite backend, so a
+                    # failure halfway leaves the old schema and a restart can
+                    # replay the same migration instead of hitting a duplicate
+                    # column.
                     connection.executescript(MIGRATIONS[target])
                     if target == 25:
                         migrate_knowledge_source_event_ids(connection)
-                    connection.execute(
-                        "UPDATE schema_meta SET version = ?", (target,)
-                    )
+                    if target == 26:
+                        ensure_repository_path_schema(connection, postgres=True)
+                    write_schema_version(connection, target)
                     version = target
 
     @contextmanager

@@ -3,16 +3,22 @@ from __future__ import annotations
 import json
 import sqlite3
 import os
+import time
 from contextlib import contextmanager
 from contextvars import ContextVar
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, ContextManager, Iterator, Protocol
 
+from .errors import DomainError
+
 if TYPE_CHECKING:
     from .config import Settings
 
 
-SCHEMA_VERSION = 25
+SCHEMA_VERSION = 26
+# One source for both the connect timeout and the busy timeout: a writer that
+# loses the race waits this long before the contention is reported.
+SQLITE_BUSY_TIMEOUT_SECONDS = 10
 
 
 class DatabaseBackend(Protocol):
@@ -24,6 +30,58 @@ class DatabaseBackend(Protocol):
 
     def close(self) -> None: ...
 
+def _strip_comments(statement: str) -> str:
+    return "\n".join(
+        line for line in statement.splitlines() if not line.strip().startswith("--")
+    ).strip()
+
+
+def _iter_statements(script: str) -> Iterator[str]:
+    """Yield complete SQL statements out of a schema or migration script.
+
+    ``executescript`` is unusable inside an open transaction because it commits
+    first; splitting with ``sqlite3.complete_statement`` keeps the driver's own
+    quoting rules (a ``;`` inside a literal or a ``DEFAULT '{}'`` never ends a
+    statement) while letting each statement run on the live transaction.
+    """
+    buffer = ""
+    for chunk in script.split(";"):
+        candidate = f"{buffer}{chunk};"
+        if not sqlite3.complete_statement(candidate):
+            # A semicolon inside a string literal or a compound statement does
+            # not end anything: keep accumulating.
+            buffer = candidate
+            continue
+        statement = candidate.strip()
+        buffer = ""
+        core = _strip_comments(statement)
+        if core and core != ";":
+            yield statement
+    trailing = buffer.strip()
+    trailing_core = _strip_comments(trailing)
+    if trailing_core and trailing_core != ";" and sqlite3.complete_statement(f"{trailing};"):
+        yield trailing
+
+
+def read_schema_version(connection: Any) -> int | None:
+    """Deterministic single value, whatever legacy duplicates contain.
+
+    ``schema_meta`` had no row constraint and was read with a bare ``LIMIT 1``,
+    so a database that had somehow gained two rows could report either version
+    depending on the plan.
+    """
+    row = connection.execute(
+        "SELECT version FROM schema_meta ORDER BY version DESC LIMIT 1"
+    ).fetchone()
+    return None if row is None else int(row[0])
+
+
+def write_schema_version(connection: Any, version: int) -> None:
+    """Keep schema_meta a one-row table by construction."""
+    connection.execute("DELETE FROM schema_meta")
+    connection.execute("INSERT INTO schema_meta(version) VALUES (?)", (version,))
+
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS schema_meta (
     version INTEGER NOT NULL
@@ -34,6 +92,7 @@ CREATE TABLE IF NOT EXISTS projects (
     project_key TEXT NOT NULL UNIQUE,
     name TEXT NOT NULL,
     root_path TEXT NOT NULL,
+    repository_path TEXT NOT NULL DEFAULT '',
     git_remote TEXT,
     logical_path TEXT NOT NULL DEFAULT '',
     settings_json TEXT NOT NULL DEFAULT '{}',
@@ -57,6 +116,7 @@ CREATE TABLE IF NOT EXISTS workspaces (
     project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
     host_id TEXT NOT NULL REFERENCES hosts(id) ON DELETE CASCADE,
     local_path TEXT NOT NULL,
+    display_path TEXT NOT NULL DEFAULT '',
     branch TEXT NOT NULL DEFAULT '',
     worktree TEXT NOT NULL DEFAULT '',
     git_remote TEXT NOT NULL DEFAULT '',
@@ -435,6 +495,7 @@ CREATE TABLE IF NOT EXISTS project_document_heads (
 """
 
 MIGRATIONS = {
+    26: "SELECT 1;",  # Portable conditional column migration below.
     2: """
         ALTER TABLE agent_sessions ADD COLUMN token_expires_at TEXT NOT NULL DEFAULT '1970-01-01T00:00:00Z';
         ALTER TABLE file_leases ADD COLUMN renewed_at TEXT NOT NULL DEFAULT '1970-01-01T00:00:00Z';
@@ -806,7 +867,35 @@ MIGRATIONS = {
     25: """
         SELECT 1;
     """,
+    26: """
+        SELECT 1;
+    """,
 }
+
+
+def migrate_workspace_display_path(connection: Any) -> None:
+    """Add ``workspaces.display_path`` without repeating it (#255).
+
+    ``ALTER TABLE ... ADD COLUMN`` is not reentrant, and initialize runs inside
+    one transaction precisely so a failure cannot leave the version ahead of the
+    schema - but a database that was already half migrated before that
+    guarantee existed still replays this statement, and a bare ADD COLUMN then
+    fails with "duplicate column name" and refuses to start. Checking first
+    costs one pragma and makes the migration replayable.
+
+    The backfill is separate from the ADD so an existing row is never left with
+    an empty display string, which would silently hide the path it came from.
+    """
+    columns = {
+        row[1] for row in connection.execute("PRAGMA table_info(workspaces)")
+    }
+    if "display_path" not in columns:
+        connection.execute(
+            "ALTER TABLE workspaces ADD COLUMN display_path TEXT NOT NULL DEFAULT ''"
+        )
+    connection.execute(
+        "UPDATE workspaces SET display_path = local_path WHERE display_path = ''"
+    )
 
 
 def migrate_knowledge_source_event_ids(connection: Any) -> None:
@@ -914,6 +1003,13 @@ def migrate_knowledge_source_event_ids(connection: Any) -> None:
         )
 
 
+def ensure_repository_path_schema(connection: Any, *, postgres: bool = False) -> None:
+    if postgres:
+        connection.execute("ALTER TABLE projects ADD COLUMN IF NOT EXISTS repository_path TEXT NOT NULL DEFAULT ''")
+    elif not any(row["name"] == "repository_path" for row in connection.execute("PRAGMA table_info(projects)").fetchall()):
+        connection.execute("ALTER TABLE projects ADD COLUMN repository_path TEXT NOT NULL DEFAULT ''")
+
+
 def ensure_event_number_schema(connection: Any, *, postgres: bool = False) -> None:
     """Add the Project-scoped event number column and its unique index.
 
@@ -970,6 +1066,36 @@ def ensure_task_assignment_member_column(
         connection.execute(
             "ALTER TABLE task_assignments ADD COLUMN assigned_to_member_id TEXT REFERENCES project_members(id)"
         )
+
+
+def ensure_member_lookup_indexes(connection: Any) -> None:
+    """Create the member-scoped lookup indexes on a fresh or migrated database.
+
+    These were introduced only inside MIGRATIONS, so a brand new install — which
+    never runs them — shipped without them while a migrated database had them.
+    Member listing, credential lookup and assignment views then ran unindexed on
+    exactly the deployments that could least afford it. `CREATE INDEX IF NOT
+    EXISTS` makes this a no-op on an already migrated database.
+    """
+    for statement in (
+        """
+        CREATE INDEX IF NOT EXISTS idx_agent_credentials_member
+        ON agent_credentials(project_id, member_id, revoked_at, expires_at)
+        """,
+        """
+        CREATE INDEX IF NOT EXISTS idx_agent_sessions_member
+        ON agent_sessions(project_id, member_id, created_at)
+        """,
+        """
+        CREATE INDEX IF NOT EXISTS idx_agent_sessions_project_agent_key
+        ON agent_sessions(project_id, agent_key, last_heartbeat DESC)
+        """,
+        """
+        CREATE INDEX IF NOT EXISTS idx_task_assignments_member
+        ON task_assignments(project_id, assigned_to_member_id, status, created_at)
+        """,
+    ):
+        connection.execute(statement)
 
 
 def ensure_project_member_columns(connection: Any, *, postgres: bool = False) -> None:
@@ -1075,11 +1201,45 @@ def ensure_agent_identity_columns(connection: Any, *, postgres: bool = False) ->
     )
 
 
+def _enable_wal(connection: sqlite3.Connection, wait_seconds: float) -> None:
+    """Switch to WAL, waiting out a concurrent initializer that holds the lock.
+
+    ``PRAGMA journal_mode = WAL`` needs the write lock, and the driver's own busy
+    handling does not always cover it, so two processes starting together (GUI plus
+    a stdio bridge) could fail initialization outright.
+    """
+    deadline = time.monotonic() + max(wait_seconds, 0.05)
+    while True:
+        try:
+            connection.execute("PRAGMA journal_mode = WAL")
+            return
+        except sqlite3.OperationalError as error:
+            message = str(error).lower()
+            if (
+                "locked" not in message and "busy" not in message
+            ) or time.monotonic() >= deadline:
+                raise
+            time.sleep(0.05)
+
+
+@contextmanager
+def _unused() -> None:  # pragma: no cover - placeholder guard
+    yield
+
 class Database:
     backend = "sqlite"
 
-    def __init__(self, path: str | Path) -> None:
+    def __init__(
+        self,
+        path: str | Path,
+        *,
+        busy_timeout_seconds: float = SQLITE_BUSY_TIMEOUT_SECONDS,
+    ) -> None:
         self.path = Path(path)
+        # sqlite3 has no separate connect timeout: the driver's ``timeout`` and
+        # ``PRAGMA busy_timeout`` are the same wait, so both come from this one
+        # configured value instead of two hardcoded tens.
+        self.busy_timeout_seconds = float(busy_timeout_seconds)
         self._active_connection: ContextVar[
             tuple[sqlite3.Connection, bool] | None
         ] = ContextVar(f"agentchatroom_connection_{id(self)}", default=None)
@@ -1087,29 +1247,55 @@ class Database:
     def initialize(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self.connect(write=True) as connection:
-            connection.executescript(SCHEMA)
+            # executescript() commits the transaction the driver had already
+            # opened before it runs anything, and this connection is in
+            # autocommit mode (isolation_level=None), so every schema statement,
+            # every ALTER and the schema_meta update used to be committed on its
+            # own. A crash or a single failing statement therefore left the
+            # database half migrated with the version still pointing at the old
+            # schema, and the next start replayed a non-reentrant
+            # `ALTER TABLE ... ADD COLUMN` and failed with "duplicate column
+            # name" - permanently unopenable history. Statements are applied
+            # individually now, so BEGIN IMMEDIATE survives for the whole
+            # migration unit and either all of it or none of it lands.
+            for statement in _iter_statements(SCHEMA):
+                connection.execute(statement)
             ensure_project_member_columns(connection)
             ensure_agent_identity_columns(connection)
             ensure_task_number_schema(connection)
             ensure_task_assignment_member_column(connection)
             ensure_event_number_schema(connection)
-            row = connection.execute("SELECT version FROM schema_meta LIMIT 1").fetchone()
-            if row is None:
-                connection.execute(
-                    "INSERT INTO schema_meta(version) VALUES (?)", (SCHEMA_VERSION,)
-                )
-            elif row["version"] > SCHEMA_VERSION:
+            # After the member_id / agent_key columns are backfilled, so the
+            # index statements below can never reference a missing column.
+            ensure_member_lookup_indexes(connection)
+            # Idempotent by construction, so it belongs with the other ensures
+            # rather than in the version replay loop: a database already stamped
+            # at the current version still needs it (#255).
+            migrate_workspace_display_path(connection)
+            version = read_schema_version(connection)
+            if version is None:
+                write_schema_version(connection, SCHEMA_VERSION)
+            elif version > SCHEMA_VERSION:
                 raise RuntimeError(
-                    f"Unsupported database schema {row['version']}; expected {SCHEMA_VERSION}"
+                    f"Unsupported database schema {version}; expected {SCHEMA_VERSION}"
                 )
+            elif version == SCHEMA_VERSION:
+                # Collapse any duplicate bookkeeping rows an older initialize
+                # could leave behind, so the single-row invariant holds from now
+                # on rather than only after a migration.
+                write_schema_version(connection, version)
             else:
-                version = int(row["version"])
                 while version < SCHEMA_VERSION:
                     target = version + 1
-                    connection.executescript(MIGRATIONS[target])
+                    for statement in _iter_statements(MIGRATIONS[target]):
+                        connection.execute(statement)
                     if target == 25:
                         migrate_knowledge_source_event_ids(connection)
-                    connection.execute("UPDATE schema_meta SET version = ?", (target,))
+                    if target == 26:
+                        ensure_repository_path_schema(connection)
+                    # Same transaction as the statements above: the version may
+                    # only advance once its own migration is fully applied.
+                    write_schema_version(connection, target)
                     version = target
 
     @contextmanager
@@ -1122,22 +1308,67 @@ class Database:
             yield connection
             return
 
-        connection = sqlite3.connect(
-            self.path,
-            timeout=10,
-            isolation_level=None,
-            check_same_thread=False,
-        )
-        connection.row_factory = sqlite3.Row
-        connection.execute("PRAGMA foreign_keys = ON")
-        connection.execute("PRAGMA busy_timeout = 10000")
-        if write:
-            connection.execute("PRAGMA journal_mode = WAL")
+        # Setting up the connection used to sit outside the guard below, so a
+        # failing PRAGMA (journal_mode=WAL is refused while another connection
+        # holds EXCLUSIVE during recovery) leaked the open handle and let a raw
+        # sqlite3.OperationalError escape the adapter layer.
+        connection = None
+        try:
+            connection = sqlite3.connect(
+                self.path,
+                timeout=self.busy_timeout_seconds,
+                isolation_level=None,
+                check_same_thread=False,
+            )
+            connection.row_factory = sqlite3.Row
+            connection.execute("PRAGMA foreign_keys = ON")
+            connection.execute(
+                f"PRAGMA busy_timeout = {int(self.busy_timeout_seconds * 1000)}"
+            )
+            if write:
+                _enable_wal(connection, self.busy_timeout_seconds)
+        except sqlite3.Error as error:
+            if connection is not None:
+                connection.close()
+            message = str(error).lower()
+            if "locked" in message or "busy" in message:
+                raise DomainError(
+                    "database_write_contended",
+                    "The database is busy with another write; retry shortly",
+                    status_code=503,
+                    details={
+                        "required_action": "retry_after_short_backoff",
+                        "busy_timeout_seconds": self.busy_timeout_seconds,
+                    },
+                ) from error
+            raise DomainError(
+                "database_unavailable",
+                "The database could not be prepared for use",
+                status_code=503,
+                details={"required_action": "check_database_configuration"},
+            ) from error
         binding = self._active_connection.set((connection, write))
         try:
             connection.execute("BEGIN IMMEDIATE" if write else "BEGIN")
             yield connection
             connection.commit()
+        except sqlite3.OperationalError as error:
+            connection.rollback()
+            # Lock contention is a normal, retryable outcome of a busy
+            # database, not an internal failure. Surfacing it as a structured
+            # DomainError keeps REST/MCP/CLI answering with the same vocabulary
+            # instead of an opaque 500.
+            if "locked" not in str(error).lower() and "busy" not in str(error).lower():
+                raise
+            raise DomainError(
+                "database_write_contended",
+                "The database is busy with another write; retry shortly",
+                status_code=503,
+                details={
+                    "required_action": "retry_after_short_backoff",
+                    "busy_timeout_seconds": SQLITE_BUSY_TIMEOUT_SECONDS,
+                },
+            ) from error
         except Exception:
             connection.rollback()
             raise
@@ -1151,7 +1382,10 @@ class Database:
 
 def create_database(settings: "Settings") -> DatabaseBackend:
     if settings.database_backend == "sqlite":
-        return Database(settings.database_path)
+        return Database(
+            settings.database_path,
+            busy_timeout_seconds=settings.database_connect_timeout_seconds,
+        )
     if settings.database_backend != "postgresql":
         raise ValueError(f"Unsupported database backend: {settings.database_backend}")
 

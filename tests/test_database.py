@@ -1,6 +1,9 @@
+# audit-allow-file:live_domain_id
 from __future__ import annotations
 
 import sqlite3
+
+import pytest
 
 from agentchatroom.database import Database, SCHEMA, SCHEMA_VERSION
 
@@ -9,6 +12,12 @@ def _schema_without_v9_reliability() -> str:
     return SCHEMA.replace(
         "    last_heartbeat TEXT NOT NULL,\n    left_at TEXT\n",
         "    last_heartbeat TEXT NOT NULL\n",
+    ).replace(
+        # #255 added display_path in schema 26. Every historical schema here is
+        # derived from the current one, so the column has to come back off or
+        # the migration that introduces it fails on a table that already has it.
+        "    local_path TEXT NOT NULL,\n    display_path TEXT NOT NULL DEFAULT '',\n",
+        "    local_path TEXT NOT NULL,\n",
     ).replace(
         """CREATE TABLE IF NOT EXISTS idempotency_records (
     scope TEXT NOT NULL,
@@ -565,3 +574,149 @@ def test_database_migrates_v16_to_v17_intake_and_task_number(settings):
     assert "idx_tasks_project_task_number" in indexes
     assert "idx_task_intakes_project_status" in indexes
     assert numbers == {"task_alpha": 1, "task_beta": 2, "task_gamma": 3}
+
+
+def _scalar(path, sql):
+    with sqlite3.connect(path) as connection:
+        return connection.execute(sql).fetchone()[0]
+
+
+def test_statement_splitter_keeps_literals_and_handles_one_line_scripts():
+    from agentchatroom.database import _iter_statements
+
+    statements = list(
+        _iter_statements(
+            "CREATE TABLE a(x INTEGER DEFAULT '{}'); CREATE TABLE b(y TEXT DEFAULT 'a;b');"
+        )
+    )
+    assert len(statements) == 2
+    assert statements[0].startswith("CREATE TABLE a")
+    assert "'a;b'" in statements[1]
+
+    assert list(_iter_statements("   \n -- only a comment\n")) == []
+
+
+def test_a_failing_migration_leaves_nothing_behind_and_can_be_replayed(
+    tmp_path, monkeypatch
+):
+    """#285: executescript() committed the open transaction, so each statement
+    landed on its own and a halfway failure left a permanently unopenable
+    half-migrated schema behind."""
+    import agentchatroom.database as database_module
+
+    path = tmp_path / "atomic.db"
+    Database(path).initialize()
+    monkeypatch.setitem(
+        database_module.MIGRATIONS,
+        SCHEMA_VERSION,
+        "CREATE TABLE migration_probe_a(x INTEGER); "
+        "CREATE TABLE migration_probe_a(x INTEGER);",
+    )
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            "UPDATE schema_meta SET version = ?", (SCHEMA_VERSION - 1,)
+        )
+
+    with pytest.raises(sqlite3.OperationalError):
+        Database(path).initialize()
+
+    assert _scalar(path, "SELECT version FROM schema_meta") == SCHEMA_VERSION - 1
+    with sqlite3.connect(path) as connection:
+        tables = {
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            )
+        }
+    assert "migration_probe_a" not in tables
+
+    # The same database can now replay the migration it never applied.
+    monkeypatch.setitem(
+        database_module.MIGRATIONS,
+        SCHEMA_VERSION,
+        "CREATE TABLE migration_probe_a(x INTEGER);",
+    )
+    Database(path).initialize()
+    assert _scalar(path, "SELECT version FROM schema_meta") == SCHEMA_VERSION
+    assert _scalar(path, "SELECT COUNT(*) FROM migration_probe_a") == 0
+
+
+def test_schema_meta_is_kept_a_single_row(tmp_path):
+    path = tmp_path / "meta.db"
+    Database(path).initialize()
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            "INSERT INTO schema_meta(version) VALUES (?)", (SCHEMA_VERSION,)
+        )
+    assert _scalar(path, "SELECT COUNT(*) FROM schema_meta") == 2
+
+    Database(path).initialize()
+    assert _scalar(path, "SELECT COUNT(*) FROM schema_meta") == 1
+    assert _scalar(path, "SELECT version FROM schema_meta") == SCHEMA_VERSION
+
+
+def test_initialize_is_reentrant_and_idempotent(tmp_path):
+    path = tmp_path / "reentrant.db"
+    Database(path).initialize()
+    first = _scalar(path, "SELECT COUNT(*) FROM sqlite_master")
+    Database(path).initialize()
+    assert _scalar(path, "SELECT COUNT(*) FROM sqlite_master") == first
+    assert _scalar(path, "SELECT version FROM schema_meta") == SCHEMA_VERSION
+
+
+def test_concurrent_initialization_converges(tmp_path):
+    """A GUI process and a stdio bridge can start together; the write
+    transaction now really is held, so nobody migrates the schema twice."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    path = tmp_path / "race.db"
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        list(pool.map(lambda _: Database(path).initialize(), range(6)))
+
+    assert _scalar(path, "SELECT version FROM schema_meta") == SCHEMA_VERSION
+    assert _scalar(path, "SELECT COUNT(*) FROM schema_meta") == 1
+
+
+def test_the_display_path_migration_can_be_replayed(settings):
+    """#255: a half-migrated database must still start.
+
+    ALTER TABLE ... ADD COLUMN is not reentrant. initialize wraps its migration
+    loop in one transaction so this cannot happen any more, but a database that
+    was already half migrated by an older build replays the same statement, and
+    a bare ADD COLUMN then aborts the start with "duplicate column name".
+    """
+    settings.data_dir.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(settings.database_path) as connection:
+        connection.executescript(SCHEMA)
+        connection.execute("INSERT INTO schema_meta(version) VALUES (26)")
+        # A previous attempt got the column in and stopped before the backfill.
+        connection.execute(
+            """
+            INSERT INTO hosts(id, host_key, name, created_at, updated_at, last_seen_at)
+            VALUES ('host_r', 'r', 'R', '2026-01-01T00:00:00Z',
+                    '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO workspaces(
+                id, project_id, host_id, local_path, display_path,
+                branch, worktree, git_remote, metadata_json, created_at, updated_at
+            ) VALUES ('ws_r', 'p_r', 'host_r', '/srv/app', '/srv/app',
+                      '', '', '', '{}', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')
+            """
+        )
+        connection.execute("UPDATE workspaces SET display_path = ''")
+
+    Database(settings.database_path).initialize()
+
+    with sqlite3.connect(settings.database_path) as connection:
+        columns = {
+            row[1] for row in connection.execute("PRAGMA table_info(workspaces)")
+        }
+        row = connection.execute(
+            "SELECT local_path, display_path FROM workspaces WHERE id = 'ws_r'"
+        ).fetchone()
+    assert "display_path" in columns
+    # The backfill runs even when the column was already there.
+    assert row[1] == row[0]

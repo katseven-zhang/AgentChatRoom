@@ -56,6 +56,7 @@ def _args(**overrides) -> argparse.Namespace:
         "model_display_name": "",
         "cwd": "",
         "keep_session": False,
+        "management_token": "",
     }
 
     payload.update(overrides)
@@ -118,12 +119,14 @@ async def test_submit_posts_message_and_report_with_only_a_credential(
         assert result["ok"] is True
         assert result["left"] is True
         assert result["workspace_id"], "workspace must be auto-registered"
+        # The server, not the CLI, binds the session to the credential's member.
+        assert result["session"]["member_id"] == member["id"]
         # AC3: the one-shot run joins exactly once — no duplicate sessions.
         # (The setup task author session is excluded from the count.)
         agents = app.state.service.snapshot(project["id"])["agents"]
         submit_agents = [a for a in agents if a["name"] != "Author"]
         assert len(submit_agents) == 1
-        assert submit_agents[0]["name"] == "OpenCode"
+        assert submit_agents[0]["name"] == "CLI submit"
         # The message landed in the room.
         events = app.state.service.list_events(project["id"], after=0)["events"]
         messages = [e for e in events if e["event_type"] == "message.message"]
@@ -151,6 +154,7 @@ async def test_submit_requires_explicit_takeover_for_live_same_identity_owner(
     owner = app.state.service.join_room(
         project["id"], name="OpenCode owner", client="opencode", model="unknown",
         member_id=member["id"],
+        manage_member_reference=True,
     )
     task = app.state.service.create_task(
         project["id"],
@@ -233,6 +237,35 @@ async def test_submit_reports_unknown_project_with_known_names(settings, project
         await _stop(server, server_task)
 
 
+@pytest.mark.asyncio
+async def test_submit_refuses_two_projects_that_share_a_name(
+    settings, project_dir, tmp_path
+):
+    """#302: the same display name must not silently select the first Project."""
+    app = create_app(settings)
+    first, _member, _credential = _prepared_project(app, project_dir, name="Shared")
+    other = tmp_path / "other-room"
+    other.mkdir()
+    second, _member2, _credential2 = _prepared_project(app, other, name="Shared")
+
+    server, server_task, url = await _serve(app)
+    try:
+        with pytest.raises(SubmitError) as excinfo:
+            await asyncio.to_thread(
+                run_submit,
+                _args(project="Shared", token=_credential["token"], message="x"),
+                url,
+            )
+        assert excinfo.value.code == "submit_project_ambiguous"
+        assert excinfo.value.required_action == "pass_project_id"
+        assert first["id"] in excinfo.value.message
+        assert second["id"] in excinfo.value.message
+        assert str(first["root_path"]) in excinfo.value.message
+        assert str(second["root_path"]) in excinfo.value.message
+    finally:
+        await _stop(server, server_task)
+
+
 def test_submit_bundle_decoder_round_trips_projects(tmp_path):
     import base64
     import json
@@ -271,6 +304,98 @@ def test_submit_rejects_malformed_test_evidence_spec():
             )
         assert excinfo.value.code == "submit_test_evidence_invalid"
         assert spec in excinfo.value.message
+
+
+@pytest.mark.asyncio
+async def test_submit_rejects_a_forged_secret_the_listing_would_have_accepted(
+    settings, project_dir
+):
+    """The credential id is not proof. The server checks the secret itself."""
+    app = create_app(settings)
+    project, _member, credential = _prepared_project(app, project_dir)
+    forged = credential["token"].rsplit(".", 1)[0] + ".forged-secret-value"
+
+    server, server_task, url = await _serve(app)
+    try:
+        with pytest.raises(SubmitError) as excinfo:
+            await asyncio.to_thread(
+                run_submit,
+                _args(token=forged, message="should not land"),
+                url,
+            )
+        assert excinfo.value.code == "submit_credential_invalid"
+        assert (
+            excinfo.value.required_action
+            == "issue_new_project_token_and_update_bundle"
+        )
+        events = app.state.service.list_events(project["id"], after=0)["events"]
+        assert not [event for event in events if event["event_type"] == "message.message"]
+    finally:
+        await _stop(server, server_task)
+
+
+@pytest.mark.asyncio
+async def test_submit_management_mode_names_the_missing_token(
+    monkeypatch, settings, project_dir
+):
+    monkeypatch.setenv("AGENTCHATROOM_ADMIN_TOKEN", "management-token-value-24")
+    app = create_app(replace(settings, management_auth_required=True))
+    project, member, credential = _prepared_project(app, project_dir)
+
+    server, server_task, url = await _serve(app)
+    try:
+        with pytest.raises(SubmitError) as missing:
+            await asyncio.to_thread(
+                run_submit,
+                _args(token=credential["token"], message="blocked"),
+                url,
+            )
+        assert missing.value.code == "management_auth_required"
+        assert missing.value.required_action == "provide_management_token"
+        events = app.state.service.list_events(project["id"], after=0)["events"]
+        assert not [event for event in events if event["event_type"] == "message.message"]
+
+        result = await asyncio.to_thread(
+            run_submit,
+            _args(
+                token=credential["token"],
+                message="management submit works",
+                management_token="management-token-value-24",
+            ),
+            url,
+        )
+        assert result["ok"] is True
+        assert result["session"]["member_id"] == member["id"]
+    finally:
+        await _stop(server, server_task)
+
+
+def test_join_ignores_a_caller_supplied_member_when_a_token_is_presented(
+    settings, project_dir
+):
+    from fastapi.testclient import TestClient
+
+    app = create_app(settings)
+    project, member, credential = _prepared_project(app, project_dir)
+    other = app.state.service.create_project_member(
+        project["id"], member_key="other-cli", name="Other"
+    )["member"]
+    with TestClient(app) as client:
+        response = client.post(
+            f"/api/v1/projects/{project['id']}/agents/join",
+            json={
+                "name": "CLI submit",
+                "client": "cli-submit",
+                "model": "unknown",
+                "token": credential["token"],
+                "member_id": other["id"],
+                "credential_id": "credential_not_the_real_one",
+            },
+        )
+    assert response.status_code == 201, response.text
+    body = response.json()
+    assert body["identity"]["id"] == member["id"]
+    assert body["identity"]["id"] != other["id"]
 
 
 def test_submit_parses_negative_exit_codes():

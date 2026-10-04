@@ -34,6 +34,7 @@ from .http_identity import decode_http_identity_value
 from .mcp_compat import CompatibleToolManager
 from .presence import LocalPresenceManager
 from .service_lifetime import require_running_service
+from .services import credential_state_error
 from .bootstrap import (
     RuntimeBinding,
     bind_runtime_arguments,
@@ -73,16 +74,43 @@ _runtime_binding: ContextVar[RuntimeBinding | None] = ContextVar(
     default=None,
 )
 _session_bindings: dict[str, RuntimeBinding | None] = {}
+# When each HTTP-transport binding key was last written. A key minted from the
+# ``mcp-session-id`` header has no connection object behind it, so nothing else
+# ever removes it: without this the table only ever grew for the process
+# lifetime. Stdio keys are excluded because ``mcp_session_key`` reclaims them
+# through the weakref callback, and ``stdio:local`` is a fixed singleton.
+_session_binding_written: dict[str, float] = {}
 _session_bindings_lock = threading.RLock()
 # Bounded tombstone table: transport session id -> (Room Session binding, recorded
 # at). It lets a request that presents a reaped mcp-session-id adopt a fresh
 # transport while resuming the same Room Session. The transport id is only a
 # client bookmark; identity is always re-derived from credentials and headers.
 _transport_tombstones: dict[str, tuple[RuntimeBinding, float]] = {}
+# Transport ids the client explicitly tore down with an MCP ``DELETE``. Such a
+# transport is never coming back -- the client stated it is finished with the
+# id -- so retaining a tombstone for it would only spend LRU capacity that a
+# real bookmark awaiting replay needs. Presence reaps these on its own.
+_client_terminated_transports: dict[str, float] = {}
+# Room Session orphaned by a bootstrap that never reached the domain (roots or
+# identity preparation failed). It revives nothing but the next bootstrap's
+# restore path, so the connection keeps no usable binding in the meantime, and it
+# expires under the same window as the adoption tombstones above.
+_pending_restores: dict[str, tuple[RuntimeBinding, float]] = {}
 _TOMBSTONE_DEFAULT_LIMIT = 256
 _TOMBSTONE_DEFAULT_TTL_SECONDS = 86400.0
 _tombstone_limit = _TOMBSTONE_DEFAULT_LIMIT
 _tombstone_ttl_seconds = _TOMBSTONE_DEFAULT_TTL_SECONDS
+# The live binding table gets the same window as the tombstone table: a binding
+# whose client disconnected without a reap is indistinguishable from an adopted
+# one by the time anyone notices, so it ages out on the same schedule.
+_BINDING_DEFAULT_LIMIT = 256
+_BINDING_DEFAULT_TTL_SECONDS = 86400.0
+_binding_limit = _BINDING_DEFAULT_LIMIT
+_binding_ttl_seconds = _BINDING_DEFAULT_TTL_SECONDS
+# Optional (project_id, session_id) -> bool probe telling whether a Room Session
+# is still open. Wired by the HTTP app; absent in stdio and tests, where every
+# tombstone is treated as replayable.
+_tombstone_session_active: Callable[[str, str], bool] | None = None
 _transport_keys: dict[int, tuple[weakref.ReferenceType, str]] = {}
 _active_binding_key: ContextVar[str | None] = ContextVar("mcp_binding_key", default=None)
 _loaded_identity: tuple[str, str, str] | None = None
@@ -118,6 +146,30 @@ HTTP_UNREGISTERED_ROOTS_ACTION = (
 )
 
 
+def _retain_session_leave_binding(payload: Any) -> None:
+    """Say, in place, that a rejected leave changed nothing for this Session.
+
+    The Session Token exists only in this process's memory and is never handed
+    back, so a leave that did not happen must keep the binding, the presence
+    heartbeat and the leases exactly as they were: dropping the binding would make
+    the caller's own Session unaddressable while presence still reports it online,
+    and `task_claim(reclaim=true)` is then refused (`task_owner_session_connected`)
+    with its leases still blocking other Agents until an explicit takeover.
+    """
+    if not isinstance(payload, dict):
+        return
+    error = payload.get("error")
+    if not isinstance(error, dict):
+        return
+    details = error.setdefault("details", {})
+    # Override, not setdefault: since the error catalog started populating
+    # required_action for every code (#348), the generic per-code action would
+    # win here and tell the caller to fetch a new token, which is exactly the
+    # wrong guidance for a leave that kept the current binding alive.
+    details["required_action"] = "retry_leave_or_continue_with_current_binding"
+    details["binding_retained"] = True
+
+
 class ServiceBoundToolManager(CompatibleToolManager):
     def __init__(
         self,
@@ -140,6 +192,7 @@ class ServiceBoundToolManager(CompatibleToolManager):
         http_identity_token = None
         presence_token = None
         restore_token = None
+        leave_succeeded = False
         try:
             session_key = mcp_session_key(context)
         except DomainError as error:
@@ -175,6 +228,11 @@ class ServiceBoundToolManager(CompatibleToolManager):
                     },
                 )
             if name == "room_bootstrap":
+                if restored is None:
+                    # Only this path may revive a Session that a preparation failure
+                    # orphaned, and reviving means restoring it -- every other tool
+                    # still finds no binding here and has to bootstrap again.
+                    restored = lookup_pending_restore(session_key)
                 access = get_access_token() if self.service_provider is not None else None
                 bundled_project_id = None
                 uses_bundle = bool(
@@ -192,26 +250,45 @@ class ServiceBoundToolManager(CompatibleToolManager):
                             "This MCP Session is already bound to another Project; open a new client task Session",
                             status_code=409,
                         )
-                # Rebinding must fail closed, including identity and roots errors.
+                # Rebinding fails closed from here: no tool may act on a workspace
+                # the client can no longer show.
                 persist_runtime_binding(session_key, None)
                 _runtime_binding.set(None)
-                # The pre-clear binding is offered to the domain so a live
-                # runtime restores its existing Session instead of creating a
-                # new one; a failed bootstrap still leaves no binding behind.
-                restore_token = _bootstrap_restore_binding.set(restored)
-                roots_token = _bootstrap_workspace_roots.set(
-                    await collect_mcp_workspace_roots(
+                try:
+                    roots = await collect_mcp_workspace_roots(
                         context,
                         timeout_seconds=get_service().settings.mcp_roots_timeout_seconds,
                         required=not uses_bundle,
                         allow_home_placeholder=bool(uses_bundle and bundled_project_id),
                     )
-                )
+                    http_identity = None
+                    if self.service_provider is not None:
+                        http_identity = _software_identity_from_http(context)
+                except DomainError:
+                    # The attempt never reached the domain -- the client could not
+                    # answer the roots question, or the identity read failed -- so it
+                    # must not cost the caller its Session identity either. Keep that
+                    # restorable while the live binding stays cleared; otherwise the
+                    # next bootstrap reports room_session="created" with no inherited
+                    # task, while the still-online old Session blocks reclaim.
+                    retain_pending_restore(session_key, restored)
+                    raise
+                # The pre-clear binding is offered to the domain so a live
+                # runtime restores its existing Session instead of creating a
+                # new one; a bootstrap the domain then refuses leaves no binding
+                # behind.
+                restore_token = _bootstrap_restore_binding.set(restored)
+                roots_token = _bootstrap_workspace_roots.set(roots)
                 if self.service_provider is not None:
-                    http_identity_token = _bootstrap_http_identity.set(
-                        _software_identity_from_http(context)
-                    )
-            elif name != "room_join":
+                    http_identity_token = _bootstrap_http_identity.set(http_identity)
+            elif name == "room_join" and self.service_provider is not None:
+                # A remote join resolves identity from the same validated
+                # credential/header source as bootstrap, so identity is never a
+                # tool argument and can never be chosen by the caller.
+                http_identity_token = _bootstrap_http_identity.set(
+                    _software_identity_from_http(context)
+                )
+            else:
                 tool = self.get_tool(name)
                 if tool is not None:
                     forwarded = bind_runtime_arguments(
@@ -226,13 +303,39 @@ class ServiceBoundToolManager(CompatibleToolManager):
                 convert_result=convert_result,
             )
             if name == "room_bootstrap":
-                persist_runtime_binding(session_key, _runtime_binding.get())
+                # Read the binding back from the shared registry rather than the
+                # ContextVar: a synchronous tool runs in a worker thread, so a
+                # binding it stored is visible here but its ContextVar write is
+                # not. Re-persisting the stale local value would clear it.
+                persist_runtime_binding(session_key, get_runtime_binding(session_key))
+                if isinstance(result, dict) and result.get("ok") is True:
+                    # The Session is live again under this transport; the orphan
+                    # record that only existed to survive a preparation failure has
+                    # no job left and must not outlive the binding it restored.
+                    drop_pending_restore(session_key)
             elif name == "session_leave":
-                persist_runtime_binding(session_key, None)
-                clear_bindings_for_agent_session(str(forwarded.get("session_id") or ""))
+                # Only a leave the domain actually accepted may destroy the binding.
+                # The tool answers a rejection with a normal `ok: False` envelope, so
+                # without this check a failed leave still erased the sole in-memory
+                # copy of the Session Token while presence kept the Session online.
+                leave_succeeded = bool(
+                    isinstance(result, dict) and result.get("ok") is True
+                )
+                if leave_succeeded:
+                    persist_runtime_binding(session_key, None)
+                    clear_bindings_for_agent_session(
+                        str(forwarded.get("session_id") or "")
+                    )
+                else:
+                    _retain_session_leave_binding(result)
             return result
         except DomainError as error:
-            return {"ok": False, **error.as_dict()}
+            payload = {"ok": False, **error.as_dict()}
+            if name == "session_leave":
+                # Rejected before it ever reached the domain: the credential gate or a
+                # runtime context mismatch is still a leave that did not happen.
+                _retain_session_leave_binding(payload)
+            return payload
         finally:
             if http_identity_token is not None:
                 _bootstrap_http_identity.reset(http_identity_token)
@@ -240,7 +343,7 @@ class ServiceBoundToolManager(CompatibleToolManager):
                 _bootstrap_workspace_roots.reset(roots_token)
             if restore_token is not None:
                 _bootstrap_restore_binding.reset(restore_token)
-            if name == "session_leave":
+            if name == "session_leave" and leave_succeeded:
                 _runtime_binding.set(None)
             else:
                 _runtime_binding.set(previous_binding)
@@ -420,7 +523,7 @@ def mcp_session_key(context: Any = None) -> str:
                     entry = _transport_keys.get(object_id)
                     if entry is not None and entry[0] is reference:
                         _transport_keys.pop(object_id, None)
-                        _session_bindings.pop(key, None)
+                        _drop_session_binding_locked(key)
             try:
                 reference = weakref.ref(session, released)
             except TypeError:
@@ -466,15 +569,40 @@ def configure_transport_tombstones(
     *,
     limit: int | None = None,
     ttl_seconds: float | None = None,
+    session_active: Callable[[str, str], bool] | None = None,
 ) -> None:
     """Bound the adoption tombstone table (count and age)."""
-    global _tombstone_limit, _tombstone_ttl_seconds
+    global _tombstone_limit, _tombstone_ttl_seconds, _tombstone_session_active
     with _session_bindings_lock:
         if limit is not None and limit > 0:
             _tombstone_limit = int(limit)
         if ttl_seconds is not None and ttl_seconds > 0:
             _tombstone_ttl_seconds = float(ttl_seconds)
+        if session_active is not None:
+            _tombstone_session_active = session_active
         _prune_transport_tombstones_locked()
+        _prune_pending_restores_locked()
+
+
+def configure_session_bindings(
+    *,
+    limit: int | None = None,
+    ttl_seconds: float | None = None,
+) -> None:
+    """Bound the live MCP binding table (count and age).
+
+    Separate from :func:`configure_transport_tombstones` because the two tables
+    answer different questions: a tombstone enables adoption, while a stale
+    binding is only ever a leak. The defaults match so an operator who never
+    calls this still gets both bounded.
+    """
+    global _binding_limit, _binding_ttl_seconds
+    with _session_bindings_lock:
+        if limit is not None and limit > 0:
+            _binding_limit = int(limit)
+        if ttl_seconds is not None and ttl_seconds > 0:
+            _binding_ttl_seconds = float(ttl_seconds)
+        _prune_session_bindings_locked()
 
 
 def _prune_transport_tombstones_locked() -> None:
@@ -482,18 +610,99 @@ def _prune_transport_tombstones_locked() -> None:
     for key, (_, recorded) in list(_transport_tombstones.items()):
         if now - recorded > _tombstone_ttl_seconds:
             _transport_tombstones.pop(key, None)
+    for key, recorded in list(_client_terminated_transports.items()):
+        if now - recorded > _tombstone_ttl_seconds:
+            _client_terminated_transports.pop(key, None)
     while len(_transport_tombstones) > _tombstone_limit:
-        oldest = min(_transport_tombstones.items(), key=lambda item: item[1][1])[0]
-        _transport_tombstones.pop(oldest, None)
+        _evict_one_transport_tombstone_locked()
+
+
+def _evict_one_transport_tombstone_locked() -> None:
+    """Drop the least valuable tombstone: unreplayable first, then the oldest.
+
+    A tombstone whose Room Session has already left can never be adopted, so it
+    is worth less than any entry a client may still come back to replay. Age is
+    only the tie-breaker among equally replayable entries: Bridge traffic that
+    opens a transport per call would otherwise push genuinely waiting entries
+    out by sheer volume, which is what breaks transparent adoption.
+    """
+    ranked = [
+        (_tombstone_is_replayable(binding), recorded, key)
+        for key, (binding, recorded) in _transport_tombstones.items()
+    ]
+    replayable, _recorded, victim = min(ranked)
+    _transport_tombstones.pop(victim, None)
+    logger.info(
+        "Evicted transport tombstone %s (replayable=%s, tombstones=%d/%d)",
+        victim,
+        replayable,
+        len(_transport_tombstones),
+        _tombstone_limit,
+    )
+
+
+def _tombstone_is_replayable(binding: RuntimeBinding) -> bool:
+    """Tell whether a tombstone could still be adopted by a returning client.
+
+    Without a liveness probe every entry counts as replayable, so age alone
+    decides -- the pre-#299 behaviour, kept for stdio and tests. A probe that
+    raises is treated as "replayable" rather than "gone": evicting on a guess
+    would cost a client its transparent adoption.
+    """
+    check = _tombstone_session_active
+    if check is None:
+        return True
+    project_id = str(getattr(binding, "project_id", "") or "")
+    session_id = str(getattr(binding, "session_id", "") or "")
+    if not project_id or not session_id:
+        return False
+    try:
+        return bool(check(project_id, session_id))
+    except Exception:
+        logger.debug(
+            "Tombstone liveness probe failed for session %s; keeping entry",
+            session_id,
+            exc_info=True,
+        )
+        return True
+
+
+def note_client_terminated_transport(transport_session_id: str) -> None:
+    """Record that the client explicitly deleted this transport session.
+
+    An MCP ``DELETE`` is the one unambiguous "I will not replay this id"
+    statement a client can make. Remembering it keeps the reaper from turning
+    that transport into a tombstone no client will ever adopt.
+    """
+    if not transport_session_id:
+        return
+    with _session_bindings_lock:
+        _client_terminated_transports[transport_session_id] = time.monotonic()
+        _transport_tombstones.pop(transport_session_id, None)
 
 
 def retain_transport_tombstone(transport_session_id: str) -> RuntimeBinding | None:
-    """Move a reaped transport's Room Session binding into the tombstone table."""
+    """Move a reaped transport's Room Session binding into the tombstone table.
+
+    Transports the client already deleted are dropped instead: their binding is
+    unreachable by definition, so a tombstone for one is pure LRU pressure.
+    """
     if not transport_session_id:
         return None
     key = f"{HTTP_TRANSPORT_KEY_PREFIX}{transport_session_id}"
     with _session_bindings_lock:
         binding = _session_bindings.pop(key, None)
+        # The tombstone table now owns this binding's retention; leaving the
+        # age index entry would let the prune drop a binding that adoption is
+        # about to look up.
+        _session_binding_written.pop(key, None)
+        if binding is not None and transport_session_id in _client_terminated_transports:
+            _client_terminated_transports.pop(transport_session_id, None)
+            logger.debug(
+                "Skipped tombstone for client-terminated transport %s",
+                transport_session_id,
+            )
+            return None
         if binding is not None:
             _transport_tombstones[transport_session_id] = (binding, time.monotonic())
         _prune_transport_tombstones_locked()
@@ -539,6 +748,46 @@ def adopt_transport_binding(
 def clear_transport_tombstones() -> None:
     with _session_bindings_lock:
         _transport_tombstones.clear()
+        _client_terminated_transports.clear()
+        _pending_restores.clear()
+
+
+def _prune_pending_restores_locked() -> None:
+    now = time.monotonic()
+    for key, (_, recorded) in list(_pending_restores.items()):
+        if now - recorded > _tombstone_ttl_seconds:
+            _pending_restores.pop(key, None)
+    while len(_pending_restores) > _tombstone_limit:
+        oldest = min(_pending_restores.items(), key=lambda item: item[1][1])[0]
+        _pending_restores.pop(oldest, None)
+
+
+def retain_pending_restore(session_key: str, binding: RuntimeBinding | None) -> None:
+    """Orphan a bootstrap's Session for the restore path only.
+
+    A preparation failure means the domain never saw this attempt, so the caller
+    should not lose its Session over it -- but the live binding stays cleared, so
+    no tool may act on a workspace the client can no longer show.
+    """
+    if not session_key or binding is None:
+        return
+    with _session_bindings_lock:
+        _prune_pending_restores_locked()
+        _pending_restores[session_key] = (binding, time.monotonic())
+
+
+def lookup_pending_restore(session_key: str) -> RuntimeBinding | None:
+    if not session_key:
+        return None
+    with _session_bindings_lock:
+        _prune_pending_restores_locked()
+        entry = _pending_restores.get(session_key)
+    return entry[0] if entry is not None else None
+
+
+def drop_pending_restore(session_key: str) -> None:
+    with _session_bindings_lock:
+        _pending_restores.pop(session_key, None)
 
 
 def session_transport_state(project_id: str, session_id: str) -> str:
@@ -550,6 +799,12 @@ def session_transport_state(project_id: str, session_id: str) -> str:
     software identity reclaim immediately. Sessions without any HTTP transport
     binding (stdio, tests) are 'unknown' so callers fall back to the heartbeat
     window.
+
+    A tombstone whose Room Session has already left is not evidence of a mere
+    disconnect and must not stand in for one: the session is closed, so letting
+    it answer 'gone' would let a later claim read stale liveness instead of the
+    authoritative session_closed path. Such entries are skipped, leaving
+    'unknown' and the normal heartbeat window in charge.
     """
     with _session_bindings_lock:
         for key, binding in _session_bindings.items():
@@ -560,12 +815,16 @@ def session_transport_state(project_id: str, session_id: str) -> str:
                 and str(getattr(binding, "session_id", "")) == str(session_id)
             ):
                 return "alive"
-        for _transport_id, (binding, _recorded) in _transport_tombstones.items():
-            if (
-                str(getattr(binding, "project_id", "")) == str(project_id)
-                and str(getattr(binding, "session_id", "")) == str(session_id)
-            ):
-                return "gone"
+        candidates = [
+            (transport_id, binding)
+            for transport_id, (binding, _recorded) in _transport_tombstones.items()
+            if str(getattr(binding, "project_id", "")) == str(project_id)
+            and str(getattr(binding, "session_id", "")) == str(session_id)
+        ]
+    if not candidates:
+        return "unknown"
+    if any(_tombstone_is_replayable(binding) for _transport_id, binding in candidates):
+        return "gone"
     return "unknown"
 
 
@@ -595,9 +854,51 @@ def get_runtime_binding(session_key: str | None = None) -> RuntimeBinding | None
     return _runtime_binding.get()
 
 
+def _prune_session_bindings_locked() -> None:
+    """Drop binding keys nothing is going to ask for again.
+
+    A key minted from the ``mcp-session-id`` header is only ever reclaimed when
+    its transport is reaped into the tombstone table, which a client that just
+    disconnects never triggers. Age and count bound it the same way the
+    tombstone table bounds itself, so a long-lived server does not accumulate a
+    binding per HTTP request for the whole process lifetime.
+    """
+    now = time.monotonic()
+    for key, written in list(_session_binding_written.items()):
+        if now - written > _binding_ttl_seconds:
+            _drop_session_binding_locked(key)
+    while len(_session_binding_written) > _binding_limit:
+        oldest = min(_session_binding_written.items(), key=lambda item: item[1])[0]
+        _drop_session_binding_locked(oldest)
+
+
+def _drop_session_binding_locked(session_key: str) -> None:
+    _session_binding_written.pop(session_key, None)
+    _session_bindings.pop(session_key, None)
+
+
+def _binding_key_needs_pruning(session_key: str) -> bool:
+    """Whether this key's only reclamation path is the periodic prune.
+
+    A stdio key backed by a live connection object owns itself through the
+    weakref callback in :func:`mcp_session_key`, and ``stdio:local`` is one
+    fixed singleton, so neither is tracked. Everything else - HTTP transport
+    keys from a client header, and stdio keys for objects that cannot be
+    weak-referenced - has to be bounded here or not at all.
+    """
+    if session_key == "stdio:local":
+        return False
+    return not any(key == session_key for _ref, key in _transport_keys.values())
+
+
 def persist_runtime_binding(session_key: str, binding: RuntimeBinding | None) -> None:
     with _session_bindings_lock:
         _session_bindings[session_key] = binding
+        if _binding_key_needs_pruning(session_key):
+            _session_binding_written[session_key] = time.monotonic()
+            _prune_session_bindings_locked()
+        else:
+            _session_binding_written.pop(session_key, None)
 
 
 def set_runtime_binding(
@@ -613,9 +914,13 @@ def clear_runtime_binding(session_key: str | None = None) -> None:
     if session_key is None:
         with _session_bindings_lock:
             _session_bindings.clear()
+            _session_binding_written.clear()
             _transport_tombstones.clear()
+            _client_terminated_transports.clear()
+            _pending_restores.clear()
         return
     persist_runtime_binding(session_key, None)
+    drop_pending_restore(session_key)
 
 
 def clear_bindings_for_agent_session(session_id: str) -> None:
@@ -625,6 +930,12 @@ def clear_bindings_for_agent_session(session_id: str) -> None:
         for key, binding in list(_session_bindings.items()):
             if binding is not None and binding.session_id == session_id:
                 _session_bindings[key] = None
+                # The binding is dead, so its age index entry would only keep the
+                # key alive until the prune runs; drop both together.
+                _session_binding_written.pop(key, None)
+        for key, (pending, _) in list(_pending_restores.items()):
+            if pending.session_id == session_id:
+                _pending_restores.pop(key, None)
     current = _runtime_binding.get()
     if current is not None and current.session_id == session_id:
         _runtime_binding.set(None)
@@ -638,8 +949,25 @@ def _http_roots_required_error(message: str) -> DomainError:
         details={
             "required_action": REQUIRED_ACTIONS["ambiguous_workspace"],
             "http_correct_action": HTTP_UNREGISTERED_ROOTS_ACTION,
+            "session_restorable": True,
         },
     )
+
+
+# Not a bootstrap status, so it is not in REQUIRED_ACTIONS (that table is
+# contract-tested against BOOTSTRAP_STATES); this is the adapter's own next step.
+ROOTS_PREP_REQUIRED_ACTION = "restore_client_connection_and_retry_bootstrap"
+
+
+def _roots_prep_details(required_action: str) -> dict[str, Any]:
+    """Roots never reached the domain, so this connection lost no authority gain.
+
+    The live binding is cleared either way -- no tool may act on a workspace the
+    client can no longer show -- but the Room Session is kept restorable: restore
+    the client connection (or advertise one usable workspace) and bootstrap again
+    to get the same Session back, with its tasks and leases intact.
+    """
+    return {"required_action": required_action, "session_restorable": True}
 
 
 async def collect_mcp_workspace_roots(
@@ -679,9 +1007,19 @@ async def collect_mcp_workspace_roots(
     try:
         result = await asyncio.wait_for(list_roots(), timeout=timeout_seconds)
     except TimeoutError as error:
-        raise DomainError("workspace_roots_unavailable", "Workspace roots timed out; restore the client connection before bootstrap", status_code=409) from error
+        raise DomainError(
+            "workspace_roots_unavailable",
+            "Workspace roots timed out; restore the client connection before bootstrap",
+            status_code=409,
+            details=_roots_prep_details(ROOTS_PREP_REQUIRED_ACTION),
+        ) from error
     except Exception as error:
-        raise DomainError("workspace_roots_unavailable", "Workspace roots failed; restore the client connection before bootstrap", status_code=409) from error
+        raise DomainError(
+            "workspace_roots_unavailable",
+            "Workspace roots failed; restore the client connection before bootstrap",
+            status_code=409,
+            details=_roots_prep_details(ROOTS_PREP_REQUIRED_ACTION),
+        ) from error
     advertised_roots = list(getattr(result, "roots", None) or [])
     roots: list[Path] = []
     for root in advertised_roots:
@@ -690,9 +1028,19 @@ async def collect_mcp_workspace_roots(
         if path is not None:
             roots.append(path)
         else:
-            raise DomainError("workspace_roots_unavailable", "Workspace root is not a valid file URI", status_code=409)
+            raise DomainError(
+                "workspace_roots_unavailable",
+                "Workspace root is not a valid file URI",
+                status_code=409,
+                details=_roots_prep_details(REQUIRED_ACTIONS["ambiguous_workspace"]),
+            )
     if not roots:
-        raise DomainError("workspace_roots_unavailable", "Client supplied an empty workspace", status_code=409)
+        raise DomainError(
+            "workspace_roots_unavailable",
+            "Client supplied an empty workspace",
+            status_code=409,
+            details=_roots_prep_details(REQUIRED_ACTIONS["ambiguous_workspace"]),
+        )
     if allow_home_placeholder and len(roots) == 1:
         # Some clients advertise homedir() as a hardcoded "home" root, even
         # when the conversation is in another workspace. Treat that exact
@@ -776,6 +1124,9 @@ def _check_stdio_lifetime() -> None:
         with _session_bindings_lock:
             for key in _session_bindings:
                 _session_bindings[key] = None
+            # Nor an orphaned one waiting to be restored: it belonged to the
+            # service generation that just stopped.
+            _pending_restores.clear()
         _runtime_binding.set(None)
         _stdio_generation = generation
 
@@ -805,8 +1156,21 @@ def _mcp_request_id(request_id: str) -> str:
     return request_id.strip() or new_id("request")
 
 
+def _active_presence_manager() -> LocalPresenceManager | None:
+    """The keepalive registry for this call.
+
+    The HTTP/Bridge adapters bind a per-transport manager before running a tool;
+    stdio has one process-wide manager. Every presence touchpoint must resolve
+    through here or the two shapes diverge: an explicit leave under HTTP would
+    close the Room Session in the domain while the manager that still holds the
+    registration -- and, in that form, is the only manager there is -- never learns,
+    so the keepalive keeps refreshing a closed Session until a heartbeat fails.
+    """
+    return _bound_presence_manager.get() or presence_manager
+
+
 def _register_local_presence(payload: dict[str, Any]) -> None:
-    manager = _bound_presence_manager.get() or presence_manager
+    manager = _active_presence_manager()
     if manager is None:
         return
     project = payload.get("project") or {}
@@ -831,13 +1195,22 @@ def _ensure_local_presence(project_id: str, session_id: str, token: str) -> None
     tool call proves this process still owns the session, so use it to resume
     the background heartbeat keepalive automatically.
     """
-    manager = _bound_presence_manager.get() or presence_manager
+    manager = _active_presence_manager()
     if manager is None:
         return
+    binding = get_runtime_binding()
+    agent_key = ""
+    if (
+        binding is not None
+        and binding.session_id == session_id
+        and binding.project_id == project_id
+    ):
+        agent_key = binding.agent_key
     manager.ensure_registered(
         project_id,
         session_id,
         token,
+        agent_key=agent_key,
         transport_key=_active_binding_key.get() or "",
     )
 
@@ -886,25 +1259,14 @@ def _bundle_project_for_name(access: AccessToken, project_name: str) -> str:
     unavailable_item = unavailable.get(requested)
     if isinstance(unavailable_item, dict):
         reason = str(unavailable_item.get("reason") or "agent_token_invalid")
-        if reason == "agent_token_expired":
-            code = "project_credential_expired"
-            action = "renew_project_token"
-            message = "The selected Project Token has expired"
-        elif reason == "agent_token_revoked":
-            code = "project_credential_revoked"
-            action = "issue_new_project_token_and_update_bundle"
-            message = "The selected Project Token has been revoked"
-        else:
-            code = "project_credential_invalid"
-            action = "replace_project_token_in_bundle"
-            message = "The selected Project Token is invalid"
+        failure = credential_state_error(reason)
         raise DomainError(
-            code,
-            message,
+            failure.code,
+            failure.message,
             status_code=403,
             details={
                 "project_name": requested,
-                "required_action": action,
+                "required_action": failure.details["required_action"],
                 "available_project_names": available_names,
                 "configured_project_names": configured_names,
             },
@@ -980,25 +1342,14 @@ def _authorize_remote(
                 touch=True,
             )
         except DomainError as error:
-            if error.code == "agent_token_expired":
-                code = "project_credential_expired"
-                action = "renew_project_token"
-                message = "The selected Project Token has expired"
-            elif error.code == "agent_token_revoked":
-                code = "project_credential_revoked"
-                action = "issue_new_project_token_and_update_bundle"
-                message = "The selected Project Token has been revoked"
-            else:
-                code = "project_credential_invalid"
-                action = "replace_project_token_in_bundle"
-                message = "The selected Project Token is invalid"
+            failure = credential_state_error(error.code)
             raise DomainError(
-                code,
-                message,
+                failure.code,
+                failure.message,
                 status_code=403,
                 details={
                     "project_name": profile_name,
-                    "required_action": action,
+                    "required_action": failure.details["required_action"],
                 },
             ) from error
         if str(credential.get("project_id") or "") != project_id:
@@ -1195,8 +1546,12 @@ def room_bootstrap(model: str = "", project_name: str = "") -> dict[str, Any]:
         details = {
             "required_action": payload.get("required_action"),
         }
-        if bound:
+        if bound and payload.get("status") not in {
+            "identity_mismatch",
+            "credential_conflict",
+        }:
             details["http_correct_action"] = HTTP_UNREGISTERED_ROOTS_ACTION
+        if bound:
             payload["details"] = {**(payload.get("details") or {}), **details}
         return {
             "ok": False,
@@ -1232,12 +1587,13 @@ def room_join(
     host_key: str = "",
     host_name: str = "",
     git_remote: str = "",
-    member_id: str = "",
-    agent_key: str = "",
-    agent_name: str = "",
-    client: str = "",
 ) -> dict[str, Any]:
-    """Join as this MCP process's configured software identity."""
+    """Join as this MCP process's configured software identity.
+
+    Identity is never a parameter: the local process takes it from validated
+    client configuration, and a remote join takes it from the presented
+    credential. There is deliberately no way to name another project member.
+    """
     try:
         room_service = get_service()
         access = get_access_token()
@@ -1257,15 +1613,22 @@ def room_join(
                     "remote_host_required",
                     "Remote room_join requires host_key and host_name",
                 )
+            remote_identity = _bootstrap_http_identity.get()
+            if remote_identity is None:
+                raise DomainError(
+                    "software_identity_not_configured",
+                    "Remote room_join requires a configured software identity on "
+                    "the credential or the software identity headers",
+                )
             joined = room_service.join_remote_room(
                 project_id,
                 agent_token=agent_token,
                 host_key=host_key,
                 host_name=host_name,
                 workspace_path=worktree or project_path,
-                agent_key=agent_key,
-                name=agent_name,
-                client=client,
+                software_key=remote_identity[0],
+                name=remote_identity[1],
+                client=remote_identity[2],
                 model=model,
                 role=role,
                 branch=branch,
@@ -1308,7 +1671,6 @@ def room_join(
         )
         joined = room_service.join_room(
             project["id"],
-            agent_key=agent_key,
             software_key=effective_software_key,
             name=effective_name,
             client=effective_client,
@@ -1317,7 +1679,6 @@ def room_join(
             branch=branch,
             worktree=worktree or workspace_path,
             capabilities=capabilities or {"mcp": True},
-            member_id=member_id or None,
             host_id=registered["host"]["id"],
             workspace_id=registered["workspace"]["id"],
         )
@@ -1404,8 +1765,14 @@ def session_leave(
         token,
         request_id=_mcp_request_id(request_id),
     )
-    if result.get("ok") and presence_manager is not None:
-        presence_manager.unregister(session_id)
+    if not result.get("ok"):
+        # A rejected leave must change nothing about this Session's state: the
+        # caller keeps its binding, presence keeps heartbeating, and the leases
+        # stay held until a leave that the domain actually accepts.
+        return result
+    manager = _active_presence_manager()
+    if manager is not None:
+        manager.unregister(session_id)
     binding = get_runtime_binding()
     if binding is not None and binding.session_id == session_id:
         clear_bindings_for_agent_session(session_id)
@@ -1428,7 +1795,12 @@ def message_post(
     channel: str = "public",
     request_id: str = "",
 ) -> dict[str, Any]:
-    """Post a message with the client-visible model used for this response."""
+    """Post a message with the client-visible model used for this response.
+
+    kind is one of message, decision or blocker. The system kind is reserved for
+    the operator: it never enters an Agent's context, so an Agent may not
+    choose it and hide a message from its peers.
+    """
     try:
         _authorize_remote(project_id, "message:write")
     except DomainError as error:
@@ -1544,21 +1916,29 @@ def project_document_upsert(
     kind: str = "binding",
     title: str = "",
     content: str = "",
+    expected_version: int | None = None,
+    request_id: str = "",
 ) -> dict[str, Any]:
-    """Create a new immutable version of a project document (binding or reference)."""
-    try:
-        _authorize_remote(project_id, "document:write")
-    except DomainError as error:
-        return {"ok": False, **error.as_dict()}
-    return _tool_result(
-        get_service().upsert_project_document,
-        project_id,
-        doc_key=doc_key,
-        kind=kind,
-        title=title,
-        content=content,
-        actor="agent",
-    )
+    """Create a new immutable version of a project document (binding or reference).
+
+    Management-only. A binding document is injected verbatim into every Agent's
+    task response, so an Agent that could write one could hand every other Agent
+    instructions of its own choosing. The management surface is REST; this tool
+    reports the refusal rather than pretending the permission exists.
+    """
+    return {
+        "ok": False,
+        "error": {
+            "code": "management_auth_required",
+            "message": (
+                "Writing a project document requires management authority; "
+                "use the authenticated management REST route"
+            ),
+            "details": {
+                "required_action": "write_the_project_document_from_the_console"
+            },
+        },
+    }
 
 
 @mcp.tool()
@@ -1568,14 +1948,18 @@ def task_get(project_id: str = "", task_id: str = "") -> dict[str, Any]:
         _authorize_remote(project_id, "room:read")
     except DomainError as error:
         return {"ok": False, **error.as_dict()}
-    def _get_with_documents(pid: str, tid: str) -> dict[str, Any]:
-        service = get_service()
-        task = service.get_task(pid, tid)
-        # Additive injection: keeps the historical task-object contract intact.
-        task["project_documents"] = service.injectable_project_documents(pid)
+    # One domain method and one connection, so the task and its documents are a
+    # single snapshot - the third private copy of this assembly is gone. The tool
+    # still answers with the bare task object it has always returned: the
+    # document payload rides inside it, and the historical shape is what Agents
+    # and the compatibility harness read.
+    def _task_with_documents(pid: str, tid: str) -> dict[str, Any]:
+        payload = get_service().get_task_with_documents(pid, tid)
+        task = dict(payload["task"])
+        task["project_documents"] = payload["project_documents"]
         return task
 
-    return _tool_result(_get_with_documents, project_id, task_id)
+    return _tool_result(_task_with_documents, project_id, task_id)
 
 
 @mcp.tool()
@@ -1719,6 +2103,8 @@ def task_intake_reassign(
     target_session_id: str = "",
     note: str = "",
     request_id: str = "",
+    session_id: str = "",
+    token: str = "",
 ) -> dict[str, Any]:
     """Redirect an undefined user task intake to another available Agent."""
     try:
@@ -1732,6 +2118,39 @@ def task_intake_reassign(
         target_member_id=target_member_id,
         target_session_id=target_session_id or None,
         note=note,
+        session_id=session_id or None,
+        token=token or None,
+        request_id=_mcp_request_id(request_id),
+    )
+
+
+@mcp.tool()
+def task_intake_cancel(
+    project_id: str = "",
+    intake_id: str = "",
+    reason: str = "",
+    request_id: str = "",
+    session_id: str = "",
+    token: str = "",
+) -> dict[str, Any]:
+    """Retire a user task intake that will not become a formal task.
+
+    Cancelling another identity's intake is a management action, so it needs
+    either the target Session's own credentials or an authenticated management
+    request; an unauthenticated caller is refused by the domain layer exactly
+    as it is for task_intake_reassign.
+    """
+    try:
+        _authorize_remote(project_id, "task:write")
+    except DomainError as error:
+        return {"ok": False, **error.as_dict()}
+    return _tool_result(
+        get_service().cancel_task_intake,
+        project_id,
+        intake_id,
+        reason=reason,
+        session_id=session_id or None,
+        token=token or None,
         request_id=_mcp_request_id(request_id),
     )
 
@@ -2141,17 +2560,23 @@ def task_update(
     token: str = "",
     status: str = "",
     title: str = "",
-    description: str = "",
+    description: str | None = None,
     acceptance_criteria: list[str] | None = None,
     depends_on: list[str] | None = None,
     priority: int | None = None,
     progress_percent: int | None = None,
-    current_step: str = "",
-    blocker_reason: str = "",
-    next_step: str = "",
+    current_step: str | None = None,
+    blocker_reason: str | None = None,
+    next_step: str | None = None,
     request_id: str = "",
 ) -> dict[str, Any]:
-    """Update owned task status or details within the server-side state machine."""
+    """Update owned task status or details within the server-side state machine.
+
+    `current_step`, `blocker_reason`, `next_step` and `description` keep the
+    domain's own convention: omitting the argument leaves the field as it is,
+    while an explicit empty string clears it. `title` is not clearable (the domain
+    rejects an empty title), so it still treats an empty string as "not supplied".
+    """
     try:
         _authorize_remote(project_id, "task:write")
     except DomainError as error:
@@ -2162,14 +2587,14 @@ def task_update(
         task_id,
         status=status or None,
         title=title or None,
-        description=description or None,
+        description=description,
         acceptance_criteria=acceptance_criteria,
         depends_on=depends_on,
         priority=priority,
         progress_percent=progress_percent,
-        current_step=current_step or None,
-        blocker_reason=blocker_reason or None,
-        next_step=next_step or None,
+        current_step=current_step,
+        blocker_reason=blocker_reason,
+        next_step=next_step,
         session_id=session_id,
         token=token,
         request_id=_mcp_request_id(request_id),
@@ -2186,9 +2611,14 @@ def lease_acquire(
     task_id: str = "",
     reason: str = "",
     ttl_seconds: int | None = None,
+    takeover: bool = False,
     request_id: str = "",
 ) -> dict[str, Any]:
-    """Acquire a time-limited file or glob lease and report overlap conflicts."""
+    """Acquire a time-limited file or glob lease and report overlap conflicts.
+
+    Set takeover=true to preempt a lease a live Session of the same software
+    identity still holds; without it such a request is refused.
+    """
     try:
         _authorize_remote(project_id, "lease:write")
     except DomainError as error:
@@ -2203,6 +2633,7 @@ def lease_acquire(
         task_id=task_id or None,
         reason=reason,
         ttl_seconds=ttl_seconds,
+        takeover=takeover,
         request_id=_mcp_request_id(request_id),
     )
 
@@ -2379,9 +2810,15 @@ def knowledge_review(
     verdict: str = "",
     criteria: list[ReviewCriterion] | None = None,
     notes: str = "",
+    expected_version_id: str = "",
     request_id: str = "",
 ) -> dict[str, Any]:
-    """Review a candidate Knowledge Asset version with an independent verdict."""
+    """Review a candidate Knowledge Asset version with an independent verdict.
+
+    Pass ``expected_version_id`` (from ``knowledge_get``) to pin the review to
+    the content that was actually read; a newer version rejects the review with
+    ``knowledge_version_stale`` instead of inheriting these criteria.
+    """
     try:
         _authorize_remote(project_id, "review:write")
     except DomainError as error:
@@ -2395,6 +2832,7 @@ def knowledge_review(
         verdict=verdict,
         criteria=criteria or [],
         notes=notes,
+        expected_version_id=expected_version_id,
         request_id=_mcp_request_id(request_id),
     )
 

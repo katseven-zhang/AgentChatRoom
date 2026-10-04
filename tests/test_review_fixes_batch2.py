@@ -419,14 +419,17 @@ def test_knowledge_review_supersede_archive_optimistic_locks(service, project):
             token=reviewer["token"],
             verdict="approved",
             criteria=[{"criterion": "c", "status": "passed"}],
+            expected_version_id=str(asset["current_version"]["version_id"]),
         )
-    # 实际实现：状态守卫在 review 前置检查里报 knowledge_not_reviewable
-    # （带并发保护时同样只会是这一族 409 错误码）。
-    assert review_error.value.code in {
-        "knowledge_not_reviewable",
-        "knowledge_invalid_transition",
-        "knowledge_concurrent_transition",
-    }
+    # Exactly one code, and deliberately not knowledge_concurrent_transition.
+    # This path cannot reach the rowcount guard: the status guard runs on the
+    # same read that the guarded UPDATE re-checks, so within one transaction the
+    # pre-check always fires first. Accepting a set of codes here is what let
+    # #133's rowcount check be deleted while this test stayed green - the
+    # assertion has to name the code that actually fires, or it pins nothing.
+    # The rowcount guard is covered where it can be reached, by
+    # test_knowledge_review_rowcount_guard_rejects_a_lost_race below.
+    assert review_error.value.code == "knowledge_not_reviewable"
 
     # supersede/archive on a terminal asset must refuse with the transition
     # contract, which now also carries the rowcount guard.
@@ -445,6 +448,148 @@ def test_knowledge_review_supersede_archive_optimistic_locks(service, project):
         assert supersede_error.value.code == "knowledge_invalid_transition"
 
 
+def test_knowledge_review_rowcount_guard_rejects_a_lost_race(service, project):
+    """#133: the guarded UPDATE's rowcount check is what stops a lost race.
+
+    The status pre-check and the guarded UPDATE read the same value inside one
+    transaction, so the pre-check always fires first and the rowcount guard is
+    unreachable through the public entry point. That is exactly why asserting a
+    set of codes let the guard be deleted unnoticed: the assertion passed
+    without it.
+
+    Here the race is forced deterministically by making the guarded UPDATE
+    report zero rows affected - the same signal a concurrent committed writer
+    produces between the read and the write. Deleting the ``rowcount != 1``
+    check makes this test fail, which is the detection power the sibling test
+    lacks.
+    """
+    registered = service.register_workspace(
+        project["id"],
+        host_key="host:race",
+        host_name="Race",
+        local_path=str(service.settings.data_dir),
+    )
+    # Approval requires a verified source task by default; that gate is not what
+    # this test is about, and it fires before the guarded UPDATE.
+    import dataclasses
+
+    service.settings = dataclasses.replace(
+        service.settings, knowledge_require_verified_task=False
+    )
+    creator = service.join_room(
+        project["id"],
+        name="Race creator",
+        client="codex",
+        model="unknown",
+        host_id=registered["host"]["id"],
+        workspace_id=registered["workspace"]["id"],
+    )
+    reviewer = service.join_room(
+        project["id"], name="Race reviewer", client="qoder", model="unknown"
+    )
+    task = service.create_task(
+        project["id"], title="Race asset", acceptance_criteria=["c"],
+        actor_session_id=reviewer["agent"]["id"], token=reviewer["token"],
+    )["task"]
+    service.claim_task(
+        project["id"], task["id"], creator["agent"]["id"], creator["token"]
+    )
+    service.submit_work_report(
+        project["id"], task["id"],
+        session_id=creator["agent"]["id"], token=creator["token"],
+        summary="Body",
+        files=["src/k.md"],
+        tests=[{"command": "pytest", "exit_code": 0}],
+    )
+    submitted = service.submit_knowledge_candidate(
+        project["id"],
+        session_id=creator["agent"]["id"], token=creator["token"],
+        title="Race asset", body="Body", kind="procedure",
+        source_task_id=task["id"],
+    )
+    asset_id = (
+        submitted["asset"]["id"] if "asset" in submitted
+        else submitted["candidate"]["asset_id"]
+    )
+    asset = service.get_knowledge_asset(project["id"], asset_id)
+    version_id = str(
+        asset["current_version_id"] if "current_version_id" in asset
+        else asset["asset"]["current_version_id"]
+    )
+
+    # Wrap the write connection so the guarded UPDATE reports a lost race while
+    # every other statement behaves normally. sqlite3.Connection.execute is
+    # read-only, so this substitutes a proxy rather than patching the attribute.
+    real_connect = service.database.connect
+
+    class _ZeroRowResult:
+        """Stands in for a cursor whose UPDATE matched nothing.
+
+        sqlite3 exposes ``rowcount`` read-only, so the lost-race signal is
+        returned as a substitute object rather than assigned onto the real one.
+        """
+
+        rowcount = 0
+
+        def __init__(self, inner) -> None:
+            self._inner = inner
+
+        def __getattr__(self, name):  # type: ignore[no-untyped-def]
+            return getattr(self._inner, name)
+
+    class _ConnectionProxy:
+        def __init__(self, inner) -> None:
+            self._inner = inner
+
+        def execute(self, sql, params=()):  # type: ignore[no-untyped-def]
+            result = self._inner.execute(sql, params)
+            normalised = " ".join(str(sql).split()).upper()
+            if (
+                normalised.startswith("UPDATE KNOWLEDGE_ASSETS")
+                and "WHERE ID = ?" in normalised
+                and getattr(result, "rowcount", 1) == 1
+            ):
+                # Report what a concurrent committed writer would produce.
+                return _ZeroRowResult(result)
+            return result
+
+        def __getattr__(self, name):  # type: ignore[no-untyped-def]
+            return getattr(self._inner, name)
+
+    class _LostRace:
+        def __init__(self, inner) -> None:
+            self._inner = inner
+
+        def __enter__(self):
+            return _ConnectionProxy(self._inner.__enter__())
+
+        def __exit__(self, *exc_info):
+            return self._inner.__exit__(*exc_info)
+
+    def spy_connect(*, write: bool = False):  # type: ignore[no-untyped-def]
+        inner = real_connect(write=write)
+        return _LostRace(inner) if write else inner
+
+    service.database.connect = spy_connect  # type: ignore[method-assign]
+    try:
+        with pytest.raises(DomainError) as lost:
+            service.submit_knowledge_review(
+                project["id"], asset_id,
+                reviewer_session_id=reviewer["agent"]["id"],
+                token=reviewer["token"],
+                verdict="approved",
+                criteria=[{"criterion": "c", "status": "passed"}],
+                expected_version_id=version_id,
+            )
+    finally:
+        service.database.connect = real_connect  # type: ignore[method-assign]
+
+    # This is the code the rowcount guard raises; nothing else produces it here.
+    assert lost.value.code == "knowledge_concurrent_transition"
+    # And the review was not recorded, so the asset is not left approved.
+    assert service.get_knowledge_asset(project["id"], asset_id)["status"] == "candidate"
+
+
 def test_intake_define_concurrent_lock_prevents_duplicate_tasks(service, project):
     """#133：并发 define 不得生成多余任务——第二次 define 被 409 拒绝。"""
     member = service.create_project_member(
@@ -460,6 +605,7 @@ def test_intake_define_concurrent_lock_prevents_duplicate_tasks(service, project
         client="opencode",
         model="unknown",
         member_id=member["id"],
+        manage_member_reference=True,
     )
     service.acknowledge_task_intake(
         project["id"],
@@ -503,14 +649,18 @@ def test_intake_define_concurrent_lock_prevents_duplicate_tasks(service, project
 def test_upsert_project_document_revives_archived_document(service, project):
     """#134：upsert 已归档文档后 archived_at 复位，普通列表可检索。"""
     service.upsert_project_document(
-        project["id"], doc_key="standards", kind="binding", title="V1", content="c1"
+        project["id"], doc_key="standards", kind="binding", title="V1", content="c1",
+        management_authorized=True,
     )
-    service.archive_project_document(project["id"], "standards")
+    service.archive_project_document(
+        project["id"], "standards", management_authorized=True
+    )
     archived_list = service.list_project_documents(project["id"])
     assert all(d["doc_key"] != "standards" for d in archived_list["documents"])
 
     service.upsert_project_document(
-        project["id"], doc_key="standards", kind="binding", title="V2", content="c2"
+        project["id"], doc_key="standards", kind="binding", title="V2", content="c2",
+        management_authorized=True,
     )
     active = service.list_project_documents(project["id"])["documents"]
     revived = next(d for d in active if d["doc_key"] == "standards")

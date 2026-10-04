@@ -1,3 +1,4 @@
+# audit-allow-file:private_lan_address
 from __future__ import annotations
 
 import os
@@ -26,6 +27,7 @@ port = 9100
 mcp_http_json_response = false
 mcp_http_session_idle_timeout_seconds = 90
 mcp_bridge_command = "python-from-file"
+mcp_bridge_args = ["-m", "agentchatroom.mcp_bridge"]
 
 [database]
 backend = "postgresql"
@@ -463,6 +465,7 @@ def test_every_config_file_schema_key_maps_into_settings(monkeypatch, tmp_path):
             "mcp_http_tombstone_limit": 32,
             "mcp_http_tombstone_ttl_seconds": 3600.0,
             "mcp_bridge_command": "python3",
+            "mcp_bridge_args": ["-m", "agentchatroom.mcp_bridge"],
             "external_base_url": "",
             "trusted_proxy_headers": False,
             "trusted_proxy_ips": "10.0.0.9",
@@ -480,6 +483,7 @@ def test_every_config_file_schema_key_maps_into_settings(monkeypatch, tmp_path):
         },
         "coordination": {
             "mcp_roots_timeout_seconds": 4.0,
+            "git_scope_recheck_ttl_seconds": 12.5,
             "heartbeat_timeout_seconds": 60,
             "presence_keepalive_enabled": True,
             "presence_keepalive_interval_seconds": 15.0,
@@ -500,12 +504,23 @@ def test_every_config_file_schema_key_maps_into_settings(monkeypatch, tmp_path):
             "test_entry_notes_max_length": 512,
             "project_document_max_bytes": 4096,
             "snapshot_recent_limit": 50,
+            "snapshot_session_limit": 40,
+            "snapshot_lease_limit": 30,
+            "lease_list_limit": 300,
+            "export_event_limit": 1000,
             "idempotency_retention_days": 7,
+            "retention_sweep_interval_seconds": 45.0,
+            "repository_scan_max_depth": 2,
+            "repository_scan_max_directories": 64,
+            "repository_scan_timeout_seconds": 2.5,
+            "repository_scan_excludes": ["cache", "generated"],
+            "repository_evidence_max_file_bytes": 4096,
             # mcp_message_context_limit is an alias; covered in a dedicated load below.
         },
         "security": {
             "agent_token_ttl_seconds": 3600,
             "max_agent_token_ttl_seconds": 7200,
+            "min_agent_token_ttl_seconds": 60,
             "mcp_http_auth_required": False,
             "management_auth_required": False,
             "management_token_env": "ROOM_TEST_ADMIN_TOKEN",
@@ -571,7 +586,7 @@ def test_every_config_file_schema_key_maps_into_settings(monkeypatch, tmp_path):
         for key, file_value in values.items():
             attr = _settings_attr_for(section, key)
             expected = file_value
-            if attr == "knowledge_kinds":
+            if attr in {"knowledge_kinds", "repository_scan_excludes"}:
                 expected = tuple(file_value)  # type: ignore[arg-type]
             assert getattr(settings, attr) == expected, (
                 f"[{section}].{key} did not map to Settings.{attr}"

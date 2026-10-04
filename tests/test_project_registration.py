@@ -1,3 +1,4 @@
+# audit-allow-file:windows_absolute_path
 from __future__ import annotations
 
 import json
@@ -558,6 +559,46 @@ def test_checkout_registration_supports_derived_logical_subprojects_and_removal(
     assert load_checkout_registration(web_dir, logical_path=web_logical) is not None
 
 
+def test_failed_registration_removal_names_a_required_action(service, tmp_path, monkeypatch):
+    root = tmp_path / "checkout"
+    root.mkdir()
+    project = service.create_project(root_path=str(root), name="cleanup-target")
+    register_checkout_project(root, project)
+
+    def locked(self, missing_ok=False):
+        raise OSError("locked")
+
+    monkeypatch.setattr(Path, "unlink", locked)
+    with pytest.raises(DomainError) as caught:
+        remove_checkout_project_registration(
+            root,
+            project_key=project["project_key"],
+            logical_path="",
+        )
+    assert caught.value.code == "project_registration_write_failed"
+    assert caught.value.details["required_action"] == (
+        "retry_checkout_cleanup_or_remove_the_registration_file"
+    )
+
+
+def test_cleanup_failure_fills_required_action_when_the_domain_error_omits_it():
+    from agentchatroom.api import _cleanup_failure
+
+    payload = _cleanup_failure(
+        DomainError(
+            "project_registration_write_failed",
+            "Checkout Project registration could not be written",
+            status_code=500,
+            details={"path": "registration.json"},
+        )
+    )
+    assert payload["code"] == "project_registration_write_failed"
+    assert payload["details"]["path"] == "registration.json"
+    assert payload["details"]["required_action"] == (
+        "retry_checkout_cleanup_or_remove_the_generated_files"
+    )
+
+
 def test_local_mcp_join_creates_then_joins_one_room(monkeypatch, service, project_dir):
     monkeypatch.setattr(mcp_server, "service", service)
     _configure_local_software(
@@ -568,12 +609,10 @@ def test_local_mcp_join_creates_then_joins_one_room(monkeypatch, service, projec
     )
 
     first = mcp_server.room_join(
-        project_path=str(project_dir), model="unknown", agent_key="first-main",
-        agent_name="First Agent", client="generic-client"
+        project_path=str(project_dir), model="unknown"
     )
     second = mcp_server.room_join(
-        project_path=str(project_dir), model="unknown", agent_key="second-main",
-        agent_name="Second Agent", client="generic-client"
+        project_path=str(project_dir), model="unknown"
     )
 
     assert first["ok"] is True
@@ -613,16 +652,13 @@ def test_local_mcp_join_derives_monorepo_subproject_from_project_path(
     )
 
     root_join = mcp_server.room_join(
-        project_path=str(repository), model="unknown", agent_key="root-main",
-        agent_name="Root Agent", client="generic-client"
+        project_path=str(repository), model="unknown"
     )
     api_join = mcp_server.room_join(
-        project_path=str(api_dir), model="unknown", agent_key="api-main",
-        agent_name="API Agent", client="generic-client"
+        project_path=str(api_dir), model="unknown"
     )
     api_repeat = mcp_server.room_join(
-        project_path=str(api_dir), model="unknown", agent_key="api-review",
-        agent_name="API Reviewer", client="generic-client"
+        project_path=str(api_dir), model="unknown"
     )
 
     expected = "packages/api"
@@ -644,8 +680,7 @@ def test_orphaned_checkout_registration_does_not_recreate_deleted_project(
     service.delete_project(project["id"])
 
     response = mcp_server.room_join(
-        project_path=str(project_dir), model="unknown", agent_key="trae-main",
-        agent_name="Trae", client="trae"
+        project_path=str(project_dir), model="unknown"
     )
 
     assert response["ok"] is False
@@ -667,8 +702,7 @@ def test_backend_refreshes_registration_after_project_key_migration(
     path.write_text(json.dumps(document), encoding="utf-8")
 
     joined = mcp_server.room_join(
-        project_path=str(project_dir), model="unknown", agent_key="codex-main",
-        agent_name="Codex", client="codex"
+        project_path=str(project_dir), model="unknown"
     )
 
     assert joined["ok"] is True
@@ -684,3 +718,107 @@ def test_mcp_schema_does_not_accept_agent_supplied_project_identity():
     assert "project_key" not in room_join.parameters["properties"]
     assert "logical_path" not in room_join.parameters["properties"]
     assert "Agents also do not supply logical_path" in mcp_server.MCP_INSTRUCTIONS
+
+
+def test_remote_less_monorepo_subproject_converges_on_one_room(
+    monkeypatch, service, tmp_path
+):
+    """#237: the candidate scope uses the git top level while the stored scope
+    used the selected subdirectory, so a monorepo subproject without an origin
+    never matched its own Room and every join created another Project."""
+    repository = tmp_path / "repository"
+    api_dir = repository / "packages" / "api"
+    api_dir.mkdir(parents=True)
+    subprocess.run(
+        ["git", "-C", str(repository), "init"], check=True, capture_output=True
+    )
+    monkeypatch.setattr(mcp_server, "service", service)
+    _configure_local_software(
+        monkeypatch,
+        key="generic-client",
+        name="Generic Client",
+        client="generic-client",
+    )
+
+    first = mcp_server.room_join(project_path=str(api_dir), model="unknown")
+    second = mcp_server.room_join(project_path=str(api_dir), model="unknown")
+
+    assert first["ok"] is True, first
+    assert second["ok"] is True, second
+    assert (
+        second["result"]["project"]["id"] == first["result"]["project"]["id"]
+    ), "a remote-less subproject must re-enter its own Room"
+    assert len(service.list_projects()) == 1, [
+        project["root_path"] for project in service.list_projects()
+    ]
+    project = first["result"]["project"]
+    assert str(project["git_remote"] or "") == ""
+    assert project["logical_path"] == "packages/api"
+    registration = load_checkout_registration(api_dir, logical_path="packages/api")
+    assert registration is not None, "the subproject checkout must stay registered"
+    assert registration["project_key"] == project["project_key"]
+    assert registration["scope"] == checkout_scope(
+        api_dir, logical_path="packages/api"
+    )
+
+
+def test_path_scope_helpers_agree_with_and_without_a_logical_path():
+    from agentchatroom.services import _project_scope, _stored_project_scope
+
+    repository = Path("/repo")
+    for logical, root in (
+        ("", repository),
+        ("packages/api", repository / "packages" / "api"),
+        (Path("packages/nested/svc").as_posix(), repository / "packages" / "nested" / "svc"),
+    ):
+        candidate = _project_scope("", repository, logical)
+        stored = _stored_project_scope(
+            {
+                "root_path": str(root),
+                "git_remote": "",
+                "logical_path": logical,
+            }
+        )
+        assert candidate == stored, (logical, candidate, stored)
+
+    git_scoped = _stored_project_scope(
+        {
+            "root_path": str(repository / "packages" / "api"),
+            "git_remote": "https://example.invalid/team/repo.git",
+            "logical_path": "packages/api",
+        }
+    )
+    assert git_scoped == _project_scope(
+        "https://example.invalid/team/repo.git", repository, "packages/api"
+    )
+
+
+def test_path_to_git_upgrade_recognises_a_monorepo_subproject(tmp_path):
+    from agentchatroom.project_registration import _is_path_to_git_upgrade
+
+    repository = (tmp_path / "repository").resolve()
+    api_dir = repository / "packages" / "api"
+    api_dir.mkdir(parents=True)
+    registered_path_scope = {
+        "kind": "path",
+        "identity": os.path.normcase(str(repository)),
+        "logical_path": "packages/api",
+    }
+    upgraded_git_scope = {
+        "kind": "git",
+        "identity": "https://example.invalid/team/mono.git",
+        "logical_path": "packages/api",
+    }
+
+    assert (
+        _is_path_to_git_upgrade(api_dir, registered_path_scope, upgraded_git_scope)
+        is True
+    ), "adding an origin to the repository must still heal the subproject Room"
+
+    unrelated = dict(
+        registered_path_scope,
+        identity=os.path.normcase(str((tmp_path / "other-repository").resolve())),
+    )
+    assert (
+        _is_path_to_git_upgrade(api_dir, unrelated, upgraded_git_scope) is False
+    ), "a checkout inside another repository must never heal into this Room"

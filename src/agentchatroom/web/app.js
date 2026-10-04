@@ -4,6 +4,7 @@ const state = {
   integrationFormat: "generic",
   integrationOnboardingMode: "first_setup",
   integrationTransport: "http",
+  issuedPromptRequest: 0,
   pendingHttpSetup: null,
   issuedHttpSetup: null,
   integrationLocalPlan: null,
@@ -65,6 +66,9 @@ const elements = Object.fromEntries(
     "message-form", "message-input", "send-message-button", "onboarding", "new-message-notice",
     "project-dialog", "project-form", "project-name-input", "project-path-input",
     "project-folder-picker-button", "project-form-error",
+    "project-repository-inspect", "project-repository-select", "project-repository-input", "project-repository-hint",
+    "settings-workspace-root", "settings-repository-inspect", "settings-repository-select",
+    "settings-repository-input", "settings-repository-hint", "settings-repository-save", "settings-repository-error",
     "task-dialog", "task-form", "task-raw-description-input", "task-target-agent-input",
     "task-target-agent-empty", "task-intake-submit", "task-intake-list", "task-table",
     "task-sort-controls",
@@ -88,6 +92,8 @@ const elements = Object.fromEntries(
     "integration-local-reload", "integration-local-facts", "integration-local-backup",
     "integration-local-refresh", "integration-local-apply",
     "integration-transport-tabs", "integration-http-token-guide", "integration-open-token-button",
+    "integration-client-profile", "integration-client-profile-hint",
+    "integration-transport-hint",
     "integration-http-action-title", "integration-http-action-description", "integration-http-action-steps",
     "integration-target-project",
     "member-list", "refresh-audit-button", "audit-event-filter",
@@ -452,12 +458,11 @@ function assignmentStatus(assignment) {
   if (typeof assignment === "string") {
     return { pending: "待确认", accepted: "已接受", declined: "已拒绝", blocked: "受阻", cancelled: "已取消" }[assignment] || assignment;
   }
-  // 指派生命周期与任务生命周期分离：cancelled 需要区分
-  // 「因释放/改派失效」与「目标明确取消受理」，不能都显示成已取消。
-  const note = String(assignment.response_note || "");
+  // 失效原因是稳定代码（task_release / reassignment），不是后端说明文案。
+  const reason = String(assignment.cancellation_reason || assignment.response_note || "");
   if (assignment.status === "cancelled") {
-    if (note.includes("task release")) return "因任务释放失效";
-    if (note.includes("superseded by reassignment")) return "因改派失效";
+    if (reason === "task_release" || reason.startsWith("task_release:")) return "因任务释放失效";
+    if (reason === "reassignment") return "因改派失效";
   }
   return assignmentStatus(assignment.status);
 }
@@ -468,16 +473,6 @@ function integrationResult(result) {
 
 function textLines(value) {
   return String(value || "").split("\n").map((item) => item.trim()).filter(Boolean);
-}
-
-function parseTestLines(value) {
-  return textLines(value).map((line) => {
-    const separator = line.lastIndexOf("::");
-    if (separator < 1) throw new Error(`无效测试记录：${line}`);
-    const exitCode = Number(line.slice(separator + 2));
-    if (!Number.isInteger(exitCode)) throw new Error(`无效测试退出码：${line}`);
-    return { command: line.slice(0, separator).trim(), exit_code: exitCode };
-  });
 }
 
 function eventLabel(type) {
@@ -498,10 +493,12 @@ function eventLabel(type) {
     "task.updated": "更新了任务", "task.blocked": "阻塞了任务",
     "task.intake_submitted": "提交了任务意图", "task.intake_acknowledged": "受理了任务意图",
     "task.intake_reassigned": "改派了任务意图", "task.intake_defined": "正式定义了任务",
+    "task.intake_cancelled": "撤销了任务意图",
     "task.unblocked": "解除了任务阻塞", "task.released": "释放了任务",
     "task.cancelled": "取消了任务", "lease.acquired": "占用了文件范围",
     "lease.released": "释放了文件范围", "lease.conflict": "检测到文件冲突",
     "lease.pre_commit_blocked": "提交前检查被文件占用阻断",
+    "lease.mode_changed": "调整了文件租约模式",
     "work.reported": "提交了工作证据",
     "work.commit_unverified": "工作证据提交时未核验 Commit",
     "work_report.commit_unverified": "工作证据提交时未核验 Commit",
@@ -681,7 +678,7 @@ function renderMessageBodySafely(eventId, body) {
 function renderMessageBody(eventId, body) {
   const text = String(body || "");
   const lines = text.split("\n");
-  const expanded = state.expandedEvents.has(eventId);
+  const expanded = eventIsExpanded("feed", eventId);
   if (lines.length <= MESSAGE_COLLAPSE_LINES || expanded) {
     const toggle = lines.length > MESSAGE_COLLAPSE_LINES
       ? `<button class="expand-toggle" type="button" data-collapse-event="${eventId}">收起</button>`
@@ -768,11 +765,22 @@ function withBusy(work) {
     });
 }
 
-function rememberExpandedEvent(eventId) {
-  state.expandedEvents.add(Number(eventId));
-  if (state.expandedEvents.size <= 80) return;
-  const oldest = [...state.expandedEvents][0];
-  state.expandedEvents.delete(oldest);
+function expansionKey(namespace, eventId) {
+  return `${namespace}:${Number(eventId)}`;
+}
+
+function eventIsExpanded(namespace, eventId) {
+  return state.expandedEvents.has(expansionKey(namespace, eventId));
+}
+
+function rememberExpandedEvent(namespace, eventId) {
+  // Feed rows are keyed by the physical event id. History rows are keyed by
+  // project_seq (stored as event_id on the history item). The two number
+  // spaces overlap, so each view keeps its own prefix and its own cap (#327).
+  state.expandedEvents.add(expansionKey(namespace, eventId));
+  const own = [...state.expandedEvents].filter((item) => String(item).startsWith(`${namespace}:`));
+  if (own.length <= 80) return;
+  state.expandedEvents.delete(own[0]);
 }
 
 function resetProjectFilters() {
@@ -786,14 +794,26 @@ function resetProjectFilters() {
 }
 
 function taskReleaseVisible(task) {
-  // 释放按钮只在可释放的执行阶段显示；终态与待验收阶段不换执行者。
-  return ["claimed", "in_progress", "blocked"].includes(task.execution_status);
+  // 释放只在领域判定为可释放时显示：服务端的 task_release 只接受
+  // claimed / in_progress / blocked 三个执行阶段。
+  return taskActionAvailable(task, "release", ["claimed", "in_progress", "blocked"].includes(task.execution_status));
 }
 
 function taskCancelVisible(task) {
-  // 取消入口与服务端状态转换表一致：done 是终态不可取消，已取消无需重复取消。
+  // 取消入口取服务端判定：done 是终态不可取消，已取消无需重复取消。
   const phase = taskView(task).phase;
-  return phase !== "done" && phase !== "cancelled";
+  return taskActionAvailable(task, "cancel", phase !== "done" && phase !== "cancelled");
+}
+
+// Which actions the service will accept for this task. The server publishes
+// `available_actions` per task; the local fallbacks only apply to a task
+// object that predates that field, so a stale snapshot can never hide a
+// control the domain actually accepts. Declared here (function declarations
+// hoist) so it travels with the two visibility rules it serves.
+function taskActionAvailable(task, action, fallback) {
+  const published = task?.available_actions;
+  if (Array.isArray(published)) return published.includes(action);
+  return fallback;
 }
 
 async function cancelTask(task) {
@@ -829,12 +849,14 @@ function clearDialogDrafts(dialog) {
   if (dialog.id === "task-edit-dialog") state.editingTaskId = null;
 }
 
-function fetchSnapshotDirect(projectId) {
-  const minCursor = Number(arguments[1] || 0);
+function fetchSnapshotDirect(projectId, options = {}) {
+  const minCursor = Number(options.minCursor || 0);
   if (!projectId) return Promise.resolve(null);
-  const request = { projectId, promise: null };
+  const request = { projectId, promise: null, minCursor };
   const cacheBuster = `_=${Date.now()}`;
-  const query = minCursor ? `?min_cursor=${minCursor}&${cacheBuster}` : `?${cacheBuster}`;
+  // The snapshot endpoint has no min_cursor query. A caller that already holds
+  // a new enough cursor skips the request in refreshSnapshot (#329).
+  const query = `?${cacheBuster}`;
   request.promise = api(`/api/v1/projects/${projectId}/snapshot${query}`, {
     cache: "no-store",
     headers: { "Cache-Control": "no-cache, no-store" },
@@ -845,24 +867,24 @@ function fetchSnapshotDirect(projectId) {
   return request.promise;
 }
 
-function refreshSnapshot(projectId) {
-  const minCursor = Number(arguments[1] || 0);
+function refreshSnapshot(projectId, options = {}) {
+  const minCursor = Number(options.minCursor || 0);
   if (!projectId) return Promise.resolve(null);
   if (minCursor > 0 && state.snapshot && Number(state.snapshot.cursor || 0) >= minCursor) {
     return Promise.resolve(state.snapshot);
   }
   if (state.snapshotInFlight && state.snapshotInFlight.projectId === projectId) {
-    if (!minCursor) {
+    if (!minCursor || Number(state.snapshotInFlight.minCursor || 0) >= minCursor) {
       return state.snapshotInFlight.promise;
     }
     return state.snapshotInFlight.promise.then((snapshot) => {
       if (snapshot && Number(snapshot.cursor || 0) >= minCursor) {
         return snapshot;
       }
-      return refreshSnapshot(projectId, minCursor);
+      return refreshSnapshot(projectId, { minCursor });
     });
   }
-  return fetchSnapshotDirect(projectId, minCursor);
+  return fetchSnapshotDirect(projectId, { minCursor });
 }
 
 async function api(path, options = {}) {
@@ -898,6 +920,7 @@ function showLoginDialog(notice) {
 // 失效 Cookie 打出 401 死循环），改为主动探测鉴权状态后决定重连方式。
 let streamRetryTimer = null;
 let streamRetryDelayMs = 1000;
+let streamOnline = false;
 
 function scheduleStreamRetry(projectId, after) {
   if (streamRetryTimer) clearTimeout(streamRetryTimer);
@@ -1049,11 +1072,15 @@ async function resetAuditPages(projectId, eventType) {
 
 async function loadOlderAuditEvents() {
   if (!state.projectId || !state.auditHasOlder || !state.auditEvents.length) return;
-  const eventType = elements["audit-event-filter"].value;
-  const page = await api(auditQueryUrl(state.projectId, {
+  const anchor = auditAnchor();
+  const eventType = anchor.eventType;
+  const page = await api(auditQueryUrl(anchor.projectId, {
     before: state.auditEvents[0].project_seq,
     eventType,
   }));
+  if (!withinRequestScope(anchor) || anchor.eventType !== elements["audit-event-filter"].value) {
+    return;
+  }
   if (!page.events.length) {
     state.auditHasOlder = false;
     renderAudit();
@@ -1061,18 +1088,25 @@ async function loadOlderAuditEvents() {
   }
   state.auditEvents = page.events;
   state.auditHasOlder = page.has_older;
-  state.auditHasNewer = true;
+  // Both edges belong to the window the server just returned: inventing
+  // "there is newer stuff" here re-opens the page we came from even when this
+  // page already is the newest one (#317).
+  state.auditHasNewer = Boolean(page.has_newer);
   state.auditPage += 1;
   renderAudit();
 }
 
 async function loadNewerAuditEvents() {
   if (!state.projectId || !state.auditHasNewer || !state.auditEvents.length) return;
-  const eventType = elements["audit-event-filter"].value;
-  const page = await api(auditQueryUrl(state.projectId, {
+  const anchor = auditAnchor();
+  const eventType = anchor.eventType;
+  const page = await api(auditQueryUrl(anchor.projectId, {
     after: state.auditEvents[state.auditEvents.length - 1].project_seq,
     eventType,
   }));
+  if (!withinRequestScope(anchor) || anchor.eventType !== elements["audit-event-filter"].value) {
+    return;
+  }
   if (!page.events.length) {
     state.auditHasNewer = false;
     renderAudit();
@@ -1080,7 +1114,7 @@ async function loadNewerAuditEvents() {
   }
   state.auditEvents = page.events;
   state.auditHasNewer = page.has_newer;
-  state.auditHasOlder = true;
+  state.auditHasOlder = Boolean(page.has_older);
   state.auditPage = Math.max(1, state.auditPage - 1);
   renderAudit();
 }
@@ -1108,6 +1142,8 @@ async function selectProject(projectId) {
     state.projectId = projectId;
     localStorage.setItem("agentchatroom.projectId", projectId);
     resetProjectFilters();
+    // 缓存虽已按项目分区，切项目仍要清空：离开的项目不该把正文长期留在内存里。
+    state.documentContentCache = {};
     state.events = [];
     state.eventIds = new Set();
     state.snapshot = snapshot;
@@ -1124,11 +1160,11 @@ async function selectProject(projectId) {
     state.runtime = runtime;
     state.managedBackups = backups.backups || [];
     state.autoBackupInfo = backups.auto_backup || null;
+    state.lastBackupFailure = backups.last_failure || null;
     mergeEvents(eventPage.events);
     renderProjects();
     renderAll();
     connectEvents(eventPage.cursor);
-    startPresenceRefresh();
   } catch (error) {
     if (generation !== state.selectGeneration) return;
     if (previousId && previousId !== projectId) {
@@ -1141,6 +1177,10 @@ async function selectProject(projectId) {
 }
 
 function mergeEvents(events) {
+  // project_seq is dense inside one Project, so an arrival that jumps past the
+  // right edge means the stream handed us a later event while skipping the ones
+  // before it (#313). The edge has to be read before anything is merged.
+  const previousEdge = streamWatermark();
   for (const event of events) {
     if (!state.eventIds.has(event.id)) {
       state.eventIds.add(event.id);
@@ -1148,6 +1188,11 @@ function mergeEvents(events) {
     }
   }
   state.events.sort((a, b) => a.id - b.id);
+  const incomingEdge = events.reduce(
+    (highest, event) => Math.max(highest, Number(event.project_seq || 0)),
+    0
+  );
+  if (previousEdge && incomingEdge > previousEdge + 1) catchUpStream(previousEdge);
   if (state.events.length > 500) {
     state.events = state.events.slice(-500);
     state.eventIds = new Set(state.events.map((event) => event.id));
@@ -1155,6 +1200,7 @@ function mergeEvents(events) {
 }
 
 function closeEventSource() {
+  streamOnline = false;
   if (state.eventSource) state.eventSource.close();
   state.eventSource = null;
   if (streamRetryTimer) {
@@ -1170,7 +1216,10 @@ function stopPresenceRefresh() {
 
 function startPresenceRefresh() {
   stopPresenceRefresh();
-  const interval = Math.max(250, Number(state.config?.presence_refresh_interval_seconds || 1) * 1000);
+  if (streamOnline) return;
+  if (typeof document !== "undefined" && document.hidden) return;
+  const configured = Number(state.config?.presence_refresh_interval_seconds || 5);
+  const interval = Math.max(5000, (Number.isFinite(configured) ? configured : 5) * 1000);
   state.presenceTimer = setInterval(refreshPresence, interval);
 }
 
@@ -1265,6 +1314,37 @@ function renderForEvent(event) {
   renderAll();
 }
 
+function streamWatermark() {
+  // /events?after= and the SSE stream speak project_seq (the same space the
+  // server uses for Last-Event-ID), not the physical event id the feed keys its
+  // own de-duplication on. Mixing the two resumes from a mark that means
+  // something else entirely.
+  return state.events.reduce(
+    (highest, event) => Math.max(highest, Number(event.project_seq || 0)),
+    0
+  );
+}
+
+async function catchUpStream(fromSeq) {
+  // Backfill whatever the stream missed, one request at a time; the merged rows
+  // are re-checked by mergeEvents itself if a hole is still left.
+  if (!state.projectId || !fromSeq || state.streamCatchUpInFlight) return;
+  const projectId = state.projectId;
+  state.streamCatchUpInFlight = true;
+  try {
+    const page = await api(`/api/v1/projects/${projectId}/events?after=${fromSeq}&limit=200`);
+    if (projectId !== state.projectId) return;
+    const events = page.events || [];
+    if (!events.length) return;
+    mergeEvents(events);
+    renderAll();
+  } catch (error) {
+    showToast(error.message, "error");
+  } finally {
+    state.streamCatchUpInFlight = false;
+  }
+}
+
 function connectEvents(after) {
   if (!state.projectId) return;
   const projectId = state.projectId;
@@ -1273,21 +1353,33 @@ function connectEvents(after) {
   state.eventSource = source;
   source.onopen = () => {
     streamRetryDelayMs = 1000;
+    streamOnline = true;
+    stopPresenceRefresh();
     setConnection("online", "浏览器已连接");
     if (state.streamHadError) {
       state.streamHadError = false;
+      // Reconnecting only starts pushing events newer than the cursor we asked
+      // for: whatever landed while the socket was down is still missing, so the
+      // feed has to go and fetch it (#313).
+      const missedFrom = streamWatermark();
       refreshSnapshot(state.projectId).then((snapshot) => {
         if (!applySnapshotIfCurrent(state.projectId, snapshot)) return;
         renderAll();
       }).catch((error) => showToast(error.message, "error"));
+      catchUpStream(missedFrom);
     }
   };
   source.onerror = () => {
     state.streamHadError = true;
+    streamOnline = false;
+    startPresenceRefresh();
     setConnection("offline", "浏览器正在重连");
     source.close();
     if (state.eventSource === source) state.eventSource = null;
-    probeAuthAndReconnect(projectId, state.snapshot?.cursor || after).catch(() => scheduleStreamRetry(projectId, after));
+    const resumeAfter = Math.max(streamWatermark(), Number(after || 0));
+    probeAuthAndReconnect(projectId, resumeAfter).catch(() =>
+      scheduleStreamRetry(projectId, resumeAfter)
+    );
   };
   source.addEventListener("room_event", async (message) => {
     const capturedProjectId = projectId;
@@ -1302,7 +1394,7 @@ function connectEvents(after) {
     mergeEvents([event]);
     try {
       const minCursor = Number(event?.id || 0);
-      const snapshot = await refreshSnapshot(capturedProjectId, minCursor);
+      const snapshot = await refreshSnapshot(capturedProjectId, { minCursor });
       if (!applySnapshotIfCurrent(capturedProjectId, snapshot)) return;
       renderForEvent(event);
     } catch (error) {
@@ -1355,6 +1447,7 @@ function renderProjects() {
 function renderEmptyRoom() {
   stopPresenceRefresh();
   state.snapshot = null;
+  state.documentContentCache = {};
   state.events = [];
   state.members = [];
   state.credentials = [];
@@ -1389,7 +1482,9 @@ function renderAll() {
   state.projects = state.projects.map((item) => item.id === project.id ? project : item);
   renderProjects();
   elements["room-name"].textContent = project.name;
-  elements["room-path"].textContent = project.root_path;
+  elements["room-path"].textContent = project.repository_path
+    ? `工作区：${project.root_path} · 仓库：${project.repository_root || project.project_path}`
+    : project.root_path;
   elements["chat-subtitle"].textContent = `${connectedAgentCount(agentIdentities)} 当前连接 / ${agentIdentities.length} 个 Agent`;
   elements["chat-subtitle"].title = `${connectedAgentCount(agentIdentities)} 当前连接 / ${agentIdentities.length} 个 Agent / 累计 ${agents.length} 次接入 · 游标 ${state.snapshot.cursor}`;
   elements["onboarding"].classList.add("is-hidden");
@@ -1547,10 +1642,13 @@ function taskNavigationEntries(tasks) {
     if (view.needs_attention) attentionIds.add(task.id);
   }
   counts.attention = attentionIds.size;
+  // 常驻导航组来自服务端发布的 groups；unclassified 只在有数据时追加，
+  // 因此这里显式排除它，而不是让前端的数组顺序决定谁常驻。
+  const residentGroups = (config?.groups || []).filter((group) => group !== "unclassified");
   const entries = [
     { key: "", label: "全部任务", count: tasks.length, kind: "reset" },
     { key: "attention", label: config?.attention_label || "需要处理", count: counts.attention || 0, kind: "attention" },
-    ...["claimable", "active", "review", "integration", "done", "cancelled"]
+    ...residentGroups
       .map((group) => ({ key: group, label: viewGroupLabel(group), count: counts[group] || 0, kind: "group" })),
   ];
   const unclassified = counts.unclassified || 0;
@@ -1569,11 +1667,13 @@ function activeSubgroupRank(phase) {
 function sortForEntry(tasks, entry) {
   const sorted = [...tasks];
   if (entry.key === "attention") {
-    const phaseOrder = { integration_failed: 0, changes_requested: 1, blocked: 2 };
+    // 收件箱排序用服务端发布的 attention_phases，顺序即其发布顺序。
+    const attentionOrder = taskViewConfig()?.attention_phase_order || ["integration_failed", "changes_requested", "blocked"];
+    const phaseOrder = Object.fromEntries(attentionOrder.map((phase, index) => [phase, index]));
     sorted.sort((left, right) => {
       const leftPhase = taskView(left).phase;
       const rightPhase = taskView(right).phase;
-      return (phaseOrder[leftPhase] ?? 9) - (phaseOrder[rightPhase] ?? 9);
+      return (phaseOrder[leftPhase] ?? 99) - (phaseOrder[rightPhase] ?? 99);
     });
     return sorted;
   }
@@ -1637,10 +1737,38 @@ function renderTaskNavigation(tasks) {
     </button>`).join("");
 }
 
+function taskExpertFilterSignature(tasks, expert) {
+  const owners = [...new Set(tasks.map((task) => task.owner_session_id).filter(Boolean))].sort();
+  const phaseCounts = {};
+  for (const task of tasks) {
+    const phase = taskView(task).phase;
+    phaseCounts[phase] = (phaseCounts[phase] || 0) + 1;
+  }
+  return JSON.stringify({
+    owners,
+    phaseCounts,
+    execution: expert.execution || "",
+    verification: expert.verification || "",
+    integration: expert.integration || "",
+    priority: expert.priority,
+    owner: expert.owner || "",
+    phase: expert.phase || "",
+  });
+}
+
 function renderTaskExpertFilters(tasks) {
   const container = document.getElementById("task-expert-filters");
   if (!container) return;
   const expert = state.taskExpert;
+  const signature = taskExpertFilterSignature(tasks, expert);
+  const numberInput = container.querySelector('[data-expert="number"]');
+  const numberFocused = Boolean(numberInput) && document.activeElement === numberInput;
+  const selectionStart = numberFocused ? numberInput.selectionStart : null;
+  const selectionEnd = numberFocused ? numberInput.selectionEnd : null;
+  // The task-number box is rebuilt only when the option set or the counts
+  // change. Keystrokes and a busy-room refresh keep the same <input> (#320).
+  if (container.dataset.filterSignature === signature) return;
+  container.dataset.filterSignature = signature;
   const names = Object.fromEntries((state.snapshot?.agents || []).map((agent) => [agent.id, agent.name]));
   const owners = [...new Set(tasks.map((task) => task.owner_session_id).filter(Boolean))]
     .map((id) => `<option value="${escapeHtml(id)}" ${expert.owner === id ? "selected" : ""}>${escapeHtml(names[id] || shortId(id))}</option>`)
@@ -1660,17 +1788,25 @@ function renderTaskExpertFilters(tasks) {
     .map((code) => `<option value="${escapeHtml(code)}" ${expert.phase === code ? "selected" : ""}>${escapeHtml(viewLabel(code))} (${phaseCounts[code] || 0})</option>`)
     .join("");
   const phases = taskViewConfig()?.phases || [];
-  const executionCodes = taskViewConfig()?.phases
-    ? ["todo", "claimed", "in_progress", "blocked", "completed", "cancelled"]
-    : [];
+  // 三个状态面的候选值取自服务端发布的标签表键集，顺序即发布顺序；
+  // 优先级区间同样由服务端发布，前端不再自己数 0..4。
+  const faceCodes = (kind) => Object.keys(taskViewConfig()?.[`${kind}_labels`] || {});
+  const priorityRange = taskViewConfig()?.task_priority_range || [];
   container.innerHTML = `
-    <label>执行<select data-expert="execution"><option value="">全部</option>${options("execution", executionCodes)}</select></label>
-    <label>验收<select data-expert="verification"><option value="">全部</option>${options("verification", ["not_required", "pending", "changes_requested", "approved"])}</select></label>
-    <label>集成<select data-expert="integration"><option value="">全部</option>${options("integration", ["pending", "done", "failed"])}</select></label>
-    <label>优先级<select data-expert="priority"><option value="">全部</option>${[0, 1, 2, 3, 4].map((value) => `<option value="${value}" ${expert.priority !== "" && String(expert.priority) === String(value) ? "selected" : ""}>P${value}</option>`).join("")}</select></label>
+    <label>执行<select data-expert="execution"><option value="">全部</option>${options("execution", faceCodes("execution"))}</select></label>
+    <label>验收<select data-expert="verification"><option value="">全部</option>${options("verification", faceCodes("verification"))}</select></label>
+    <label>集成<select data-expert="integration"><option value="">全部</option>${options("integration", faceCodes("integration"))}</select></label>
+    <label>优先级<select data-expert="priority"><option value="">全部</option>${priorityRange.map((value) => `<option value="${value}" ${expert.priority !== "" && String(expert.priority) === String(value) ? "selected" : ""}>P${value}</option>`).join("")}</select></label>
     <label>负责人<select data-expert="owner"><option value="">全部</option>${owners}</select></label>
     <label>任务号<input type="search" inputmode="numeric" placeholder="#号" data-expert="number" value="${escapeHtml(expert.number)}"></label>
     ${phases.length ? `<label>精确状态<select data-expert="phase"><option value="">全部</option>${phaseOptions(phases)}</select></label>` : ""}`;
+  if (!numberFocused) return;
+  const restored = container.querySelector('[data-expert="number"]');
+  if (!restored) return;
+  restored.focus();
+  if (selectionStart != null && restored.setSelectionRange) {
+    restored.setSelectionRange(selectionStart, selectionEnd);
+  }
 }
 
 function renderTaskSortControls() {
@@ -1739,11 +1875,33 @@ function intakeTargetName(intake) {
   return target?.name || intake.target_member_id || "未指定 Agent";
 }
 
+function taskIntakeConfig() {
+  return state.config?.domain?.task_intake || null;
+}
+
 function taskIntakeStatus(status) {
-  return {
-    pending: "待 Agent 受理", accepted: "已受理待定义", defined: "已正式定义",
-    declined: "Agent 已拒绝", blocked: "受理受阻", cancelled: "已取消",
-  }[status] || status;
+  const labels = taskIntakeConfig()?.status_labels || {};
+  return labels[status] || status;
+}
+
+function taskIntakeActiveStatuses() {
+  const published = taskIntakeConfig()?.active_statuses;
+  return Array.isArray(published) ? published : ["pending", "accepted"];
+}
+
+// `cancelled` 是已发布的状态与服务端转移，但此前没有任何入口能写入它：
+// 一个目标 Agent 永不受理的意图会永远停在 pending。撤销入口按服务端转移
+// 表判定；`cancelled` 的自环只是幂等语义，不构成「仍可撤销」，所以已经
+// 撤销或已定义的条目不再显示入口。
+function taskIntakeCancellable(intake) {
+  if (intake.status === "cancelled") return false;
+  const transitions = taskIntakeConfig()?.transitions || {};
+  return (transitions[intake.status] || []).includes("cancelled");
+}
+
+function taskIntakeCancelButton(intake) {
+  if (!taskIntakeCancellable(intake)) return "";
+  return `<button type="button" class="link-button" data-intake-cancel-id="${escapeHtml(intake.id)}">撤销意图</button>`;
 }
 
 function taskIntakeTaskReference(intake) {
@@ -1756,12 +1914,12 @@ function taskIntakeTaskReference(intake) {
 }
 
 function renderTaskIntakes() {
-  const activeStatuses = new Set(["pending", "accepted"]);
+  const activeStatuses = new Set(taskIntakeActiveStatuses());
   const active = state.taskIntakes.filter((intake) => activeStatuses.has(intake.status));
   const archived = state.taskIntakes.filter((intake) => !activeStatuses.has(intake.status));
   const renderItem = (intake) => `
       <article class="task-intake-item">
-        <div class="task-intake-meta"><span class="status-badge ${escapeHtml(intake.status)}">${escapeHtml(taskIntakeStatus(intake.status))}</span><span class="secondary-text">受理 Agent：${escapeHtml(intakeTargetName(intake))}</span></div>
+        <div class="task-intake-meta"><span class="status-badge ${escapeHtml(intake.status)}">${escapeHtml(taskIntakeStatus(intake.status))}</span><span class="secondary-text">受理 Agent：${escapeHtml(intakeTargetName(intake))}</span>${taskIntakeCancelButton(intake)}</div>
         <p>${escapeHtml(intake.raw_description)}</p>
         ${intake.note ? `<small>${escapeHtml(intake.note)}</small>` : ""}
         ${taskIntakeTaskReference(intake)}
@@ -1847,11 +2005,15 @@ function memberStatusClass(status) {
 
 function renderTokenMemberOptions(selected = "") {
   const activeMembers = state.members.filter((member) => member.status === "active");
+  const selectedMissing = Boolean(selected) && !activeMembers.some((member) => member.id === selected);
   elements["token-member"].innerHTML = [
     '<option value="">不关联；首次连接时按下面填写的显示名称自动创建成员</option>',
+    ...(selectedMissing
+      ? [`<option value="${escapeHtml(selected)}">先前选择的成员已不在有效列表中，请重新选择</option>`]
+      : []),
     ...activeMembers.map((member) => `<option value="${escapeHtml(member.id)}">${escapeHtml(member.name)} · ${escapeHtml(member.member_key)}</option>`),
   ].join("");
-  if (activeMembers.some((member) => member.id === selected)) {
+  if (selectedMissing || activeMembers.some((member) => member.id === selected)) {
     elements["token-member"].value = selected;
   }
 }
@@ -1885,8 +2047,12 @@ const BACKUP_PAGE_SIZE = 5;
 
 function renderBackups() {
   const autoBackup = state.autoBackupInfo;
+  const failure = state.lastBackupFailure;
+  const failureNote = failure
+    ? `最近一次自动或手动备份失败（${escapeHtml(failure.payload?.reason || "backup_failed")}），请查看服务日志后重试。`
+    : "";
   const autoSummary = autoBackup
-    ? `自动备份：${autoBackup.enabled ? `已开启 · 每 ${Math.round(autoBackup.interval_seconds / 60)} 分钟 · 保留 ${autoBackup.max_kept} 份` : "未开启（可在系统设置或配置 [backup] 开启）"}`
+    ? `自动备份：${autoBackup.enabled ? `已开启 · 每 ${Math.round(autoBackup.interval_seconds / 60)} 分钟 · 保留 ${autoBackup.max_kept} 份` : "未开启（可在系统设置或配置 [backup] 开启）"}${failureNote ? `。${failureNote}` : ""}`
     : "";
   const total = state.managedBackups.length;
   const pages = Math.max(1, Math.ceil(total / BACKUP_PAGE_SIZE));
@@ -2105,13 +2271,24 @@ function renderWorkspaces() {
     : '<div class="empty-state">Agent 远程加入后会自动登记 Workspace</div>';
 }
 
-function documentCacheEntry(docKey, version) {
-  const cached = state.documentContentCache[docKey];
+function documentCacheKey(projectId, docKey) {
+  return `${projectId}|${docKey}`;
+}
+
+function documentCacheEntry(projectId, docKey, version) {
+  const cached = state.documentContentCache[documentCacheKey(projectId, docKey)];
   return cached && String(cached.version) === String(version) ? cached : null;
 }
 
+function documentErrorHtml(docKey, message) {
+  return `<span class="state-title">文档加载失败</span><span>${escapeHtml(message || "未知错误")}</span><button type="button" class="secondary-button state-retry" data-doc-retry="${escapeHtml(docKey)}">重试</button>`;
+}
+
 function documentBodyHtml(doc) {
-  const cached = documentCacheEntry(doc.doc_key, doc.version);
+  const cached = documentCacheEntry(state.projectId, doc.doc_key, doc.version);
+  if (cached && cached.failed) {
+    return `<div class="state-box error-state" data-doc-content="${escapeHtml(doc.doc_key)}">${documentErrorHtml(doc.doc_key, cached.message)}</div>`;
+  }
   if (cached) {
     return `<pre class="code-block project-doc-content" data-doc-content="${escapeHtml(doc.doc_key)}">${escapeHtml(cached.content)}</pre>`;
   }
@@ -2136,12 +2313,12 @@ function renderDocuments() {
         </summary>
         <div class="project-doc-body">
           ${documentBodyHtml(doc)}
-          <div class="doc-history secondary-text">${escapeHtml(documentHistoryText(documentCacheEntry(doc.doc_key, doc.version) || {}))}</div>
+          <div class="doc-history secondary-text">${escapeHtml(documentHistoryText(documentCacheEntry(state.projectId, doc.doc_key, doc.version) || {}))}</div>
         </div>
       </details>`).join("")
     : '<div class="empty-state">还没有项目文档。规范（binding）会在 Agent 认领任务时自动注入上下文并盖版本回执。</div>';
   docs.forEach((doc) => {
-    if (!documentCacheEntry(doc.doc_key, doc.version)) refreshDocumentBody(doc).catch(() => {});
+    if (!documentCacheEntry(state.projectId, doc.doc_key, doc.version)) refreshDocumentBody(doc);
   });
 }
 
@@ -2160,9 +2337,29 @@ function patchDocumentBody(loaded) {
 }
 
 async function refreshDocumentBody(doc) {
-  const result = await api(`/api/v1/projects/${state.projectId}/documents/${encodeURIComponent(doc.doc_key)}`);
-  const loaded = result.document;
-  state.documentContentCache[doc.doc_key] = loaded;
+  const requestedProject = state.projectId;
+  const cacheKey = documentCacheKey(requestedProject, doc.doc_key);
+  let loaded;
+  try {
+    const result = await api(`/api/v1/projects/${requestedProject}/documents/${encodeURIComponent(doc.doc_key)}`);
+    loaded = result.document;
+  } catch (error) {
+    if (state.projectId !== requestedProject) return null;
+    // 失败态按 (项目, doc_key, 版本) 记住：既不把同一注定失败的请求在每次渲染
+    // 时重发，也让界面给出可重试的错误态而不是一直“正在加载文档…”。
+    state.documentContentCache[cacheKey] = {
+      doc_key: doc.doc_key,
+      version: doc.version,
+      failed: true,
+      message: error && error.message ? error.message : "未知错误",
+    };
+    showDocumentError(doc.doc_key, error);
+    return null;
+  }
+  // 响应到达时项目可能已经切换：晚到的正文属于上一个项目，写进缓存或界面都会
+  // 让项目 B 显示项目 A 的文档。
+  if (state.projectId !== requestedProject) return null;
+  state.documentContentCache[cacheKey] = loaded;
   patchDocumentBody(loaded);
   return loaded;
 }
@@ -2173,7 +2370,7 @@ function showDocumentError(docKey, error) {
   const box = document.createElement("div");
   box.className = "state-box error-state";
   box.dataset.docContent = docKey;
-  box.innerHTML = `<span class="state-title">文档加载失败</span><span>${escapeHtml(error.message || "未知错误")}</span><button type="button" class="secondary-button state-retry" data-doc-retry="${escapeHtml(docKey)}">重试</button>`;
+  box.innerHTML = documentErrorHtml(docKey, error && error.message);
   container.replaceWith(box);
 }
 
@@ -2188,7 +2385,10 @@ function wireDocumentList() {
       loading.dataset.docContent = docKey;
       loading.textContent = "正在加载文档…";
       retryButton.closest(".state-box").replaceWith(loading);
-      if (doc) refreshDocumentBody(doc).catch((error) => showDocumentError(docKey, error));
+      // 失败记录会挡住同一 (doc_key, 版本) 的自动加载，重试必须先清除它，
+      // 否则下一次渲染会立刻还原成错误态而不是重新取文。
+      delete state.documentContentCache[documentCacheKey(state.projectId, docKey)];
+      if (doc) refreshDocumentBody(doc);
       return;
     }
   });
@@ -2222,9 +2422,30 @@ function renderAudit() {
     + auditPager();
 }
 
+// 异步响应落地时用户可能已经切走项目：这些回调写的是全局 state，缺项目/代次
+// 校验就会把上一个项目的成员、Token、Workspace 与审计窗口盖到新项目上（#317）。
+function requestAnchor() {
+  return { projectId: state.projectId, generation: state.selectGeneration };
+}
+
+function withinRequestScope(anchor) {
+  return (
+    anchor.projectId === state.projectId && anchor.generation === state.selectGeneration
+  );
+}
+
+// Audit paging carries the filter too: a page fetched for one event type must
+// not land in a view the user has since re-filtered (#317).
+function auditAnchor() {
+  return { ...requestAnchor(), eventType: elements["audit-event-filter"].value };
+}
+
 async function refreshManagement() {
   if (!state.projectId) return;
+  const anchor = requestAnchor();
+  const projectId = anchor.projectId;
   const eventType = elements["audit-event-filter"].value;
+  anchor.eventType = eventType;
   // #196: keep the window open to the right — do not clamp after/before to the
   // already-rendered set. Same filter + data: probe for events newer than the
   // current right edge. Filter change or empty list: reset to the live tail.
@@ -2234,19 +2455,22 @@ async function refreshManagement() {
     : 0;
   const viewingLiveTail = !state.auditHasNewer;
   const auditRefresh = hasLoadedWindow
-    ? api(auditQueryUrl(state.projectId, {
+    ? api(auditQueryUrl(projectId, {
         after: latestId,
         eventType,
       }))
-    : fetchAuditTail(state.projectId, eventType);
+    : fetchAuditTail(projectId, eventType);
   const [members, credentials, workspaces, audit, runtime, backups] = await Promise.all([
-    api(`/api/v1/projects/${state.projectId}/members`),
-    api(`/api/v1/projects/${state.projectId}/agent-tokens`),
-    api(`/api/v1/projects/${state.projectId}/workspaces`),
+    api(`/api/v1/projects/${projectId}/members`),
+    api(`/api/v1/projects/${projectId}/agent-tokens`),
+    api(`/api/v1/projects/${projectId}/workspaces`),
     auditRefresh,
     api("/api/v1/admin/runtime?lines=80"),
     api("/api/v1/admin/backups"),
   ]);
+  if (!withinRequestScope(anchor) || anchor.eventType !== elements["audit-event-filter"].value) {
+    return;
+  }
   state.members = members.members;
   state.credentials = credentials.credentials;
   state.workspaces = workspaces.workspaces;
@@ -2269,16 +2493,23 @@ async function refreshManagement() {
       const overflow = Math.max(0, merged.length - AUDIT_PAGE_SIZE);
       state.auditEvents = overflow ? merged.slice(overflow) : merged;
       if (overflow) state.auditHasOlder = true;
-      state.auditHasNewer = false;
-      state.auditPage = 1;
+      // The server already answered for this exact window. A burst bigger than
+      // one page leaves newer events past the right edge, so the merged view
+      // must not claim the tail: that disables 「下一页」 and hides the rest of
+      // the burst until a later refresh (#319).
+      state.auditHasNewer = Boolean(audit.has_newer);
+      if (!state.auditHasNewer) state.auditPage = 1;
     } else {
-      // mid-history view: new events exist beyond the preserved window; do not jump pages
-      state.auditHasNewer = fresh.length > 0 || state.auditHasNewer;
+      // Mid-history view: the same server answer applies. Counting the fresh
+      // rows instead would report "at the end" whenever this refresh happened
+      // to return nothing, even though the tail is still to the right (#319).
+      state.auditHasNewer = Boolean(audit.has_newer);
     }
   }
   state.runtime = runtime;
   state.managedBackups = backups.backups || [];
   state.autoBackupInfo = backups.auto_backup || null;
+  state.lastBackupFailure = backups.last_failure || null;
   renderManagement();
 }
 
@@ -2387,10 +2618,11 @@ elements["project-folder-picker-button"].addEventListener("click", async () => {
     button.disabled = !state.config?.capabilities?.local_folder_picker;
   }
 });
-document.getElementById("create-task-button").addEventListener("click", async () => {
+document.getElementById("create-task-button").addEventListener("click", () => {
   if (!state.projectId) return;
-  await refreshTaskIntakeTargets();
-  elements["task-dialog"].showModal();
+  refreshTaskIntakeTargets()
+    .then(() => elements["task-dialog"].showModal())
+    .catch(handleError);
 });
 document.getElementById("archive-project-button").addEventListener("click", () => {
   if (!state.snapshot) return;
@@ -2402,6 +2634,13 @@ document.getElementById("archive-project-button").addEventListener("click", () =
 document.getElementById("project-settings-button").addEventListener("click", () => {
   if (!state.snapshot) return;
   const { project } = state.snapshot;
+  elements["settings-workspace-root"].textContent = `工作区：${project.root_path}`;
+  elements["settings-repository-input"].value = project.repository_path || "";
+  elements["settings-repository-select"].innerHTML = '<option value="__pending__">点击重新检查</option>';
+  elements["settings-repository-hint"].textContent = project.repository_path
+    ? `已关联：${project.repository_path}。关联保留本 Room 的历史和会话。`
+    : "尚未选择子仓库；重新检查后可关联实际仓库，保留当前 Room 历史。";
+  setDialogFormError(elements["settings-repository-error"], "");
   elements["settings-project-name"].value = project.name;
   elements["settings-lease-policy"].value = project.settings.lease_conflict_policy;
   elements["settings-roles"].value = project.settings.roles.join("\n");
@@ -2416,10 +2655,20 @@ document.getElementById("project-settings-button").addEventListener("click", () 
   );
   elements["settings-dialog"].showModal();
 });
+
+function parseKeptCount(value) {
+  const text = String(value ?? "").trim();
+  if (!/^[1-9]\d*$/.test(text)) return null;
+  const number = Number(text);
+  return Number.isSafeInteger(number) && number >= 1 ? number : null;
+}
+
+let backupSettingsRequest = 0;
 elements["system-settings-button"].addEventListener("click", () => {
-  // #146：全局运维（自动备份策略、运行状态、全库备份）收拢在系统设置弹窗。
   elements["system-settings-dialog"].showModal();
+  const requestId = ++backupSettingsRequest;
   api("/api/v1/admin/backup-settings").then((settings) => {
+    if (requestId !== backupSettingsRequest) return;
     elements["settings-auto-backup"].checked = !!settings.auto_backup_enabled;
     elements["settings-backup-max-kept"].value = settings.auto_backup_max_kept ?? 10;
     elements["settings-backup-hint"].textContent = `${settings.effective || ""} · 配置文件：${settings.config_path || "-"}`;
@@ -2427,17 +2676,31 @@ elements["system-settings-button"].addEventListener("click", () => {
   if (state.projectId) refreshManagement().catch(handleError);
 });
 elements["save-backup-policy-button"].addEventListener("click", async () => {
+  const maxKept = parseKeptCount(elements["settings-backup-max-kept"].value);
+  if (maxKept == null) {
+    showToast("保留份数必须是大于等于 1 的整数", "error");
+    return;
+  }
+  const button = elements["save-backup-policy-button"];
+  button.disabled = true;
   try {
-    await api("/api/v1/admin/backup-settings", {
+    const saved = await api("/api/v1/admin/backup-settings", {
       method: "PUT",
       body: JSON.stringify({
         auto_backup_enabled: elements["settings-auto-backup"].checked,
-        auto_backup_max_kept: Number(elements["settings-backup-max-kept"].value),
+        auto_backup_max_kept: maxKept,
       }),
     });
+    state.autoBackupInfo = {
+      enabled: !!saved.auto_backup_enabled,
+      interval_seconds: saved.auto_backup_interval_seconds,
+      max_kept: saved.auto_backup_max_kept,
+    };
     showToast("备份策略已保存");
   } catch (error) {
     handleError(error);
+  } finally {
+    button.disabled = false;
   }
 });
 elements["export-audit-data-button"].addEventListener("click", () => downloadProjectExport().catch(handleError));
@@ -2523,6 +2786,25 @@ elements["task-cancel-button"].addEventListener("click", () => {
   cancelTask(task);
 });
 
+// 释放原因码与文案由服务端版本化配置给出；配置未到达时保留空占位，
+// 提交前的非空校验会拦住，不会发出一个服务端必然拒绝的原因码。
+function renderReleaseReasonOptions() {
+  const select = elements["task-release-reason"];
+  if (!select) return;
+  const labels = state.config?.domain?.task_release_reason_labels || {};
+  const codes = state.config?.domain?.task_release_reason_codes || [];
+  if (!codes.length) return;
+  const signature = codes.join("|");
+  if (select.dataset.reasonSignature === signature) return;
+  select.dataset.reasonSignature = signature;
+  select.innerHTML = [
+    '<option value="">选择原因…</option>',
+    ...codes.map(
+      (code) => `<option value="${escapeHtml(code)}">${escapeHtml(labels[code] || code)}</option>`,
+    ),
+  ].join("");
+}
+
 elements["task-release-button"].addEventListener("click", () => {
   const task = state.snapshot?.tasks.find((item) => item.id === state.editingTaskId);
   if (!task || !state.projectId) return;
@@ -2568,6 +2850,18 @@ elements["token-secret-close"].addEventListener("click", () => {
   elements["token-secret-dialog"].close();
 });
 
+// 一次性 Secret 只在签发那一次给出。原生 <dialog> 按 Escape 会先触发 cancel 再触发
+// close，而 close 监听会把内容清空——按一个键就永久丢掉刚签发的凭据，只能再签一个。
+// 取消事件必须挡下来，只留下显式的「我已保存」出口（#321）。
+elements["token-secret-dialog"].addEventListener("cancel", (event) => {
+  event.preventDefault();
+  showToast("这个 Secret 只显示一次，请按「我已保存」确认后再关闭");
+});
+
+elements["login-dialog"].addEventListener("cancel", (event) => {
+  event.preventDefault();
+});
+
 elements["token-secret-dialog"].addEventListener("close", () => {
   state.issuedHttpSetup = null;
   elements["token-secret-section"].hidden = false;
@@ -2611,13 +2905,29 @@ document.getElementById("integration-onboarding-mode").addEventListener("change"
   if (state.integrationOnboardingMode === "first_setup") void refreshLocalMcpPlan();
 });
 
+elements["integration-client-profile"].addEventListener("change", (event) => {
+  if (!state.integration?.profiles?.[event.target.value]) return;
+  state.integrationFormat = event.target.value;
+  // A profile switch invalidates any detection result: the plan is per profile.
+  state.integrationLocalRequest += 1;
+  state.integrationLocalPlan = null;
+  state.integrationLocalApplyResult = null;
+  renderIntegrationTabs();
+  renderIntegrationConfig();
+  renderOnboardingPrompt();
+  renderHttpTokenGuide();
+  renderLocalMcpPlan();
+  if (state.integrationTransport === "local") void refreshLocalMcpPlan();
+});
+
 elements["integration-transport-tabs"].addEventListener("click", (event) => {
   const button = event.target.closest("[data-integration-transport]");
-  if (!button) return;
+  if (!button || button.hidden) return;
   state.integrationTransport = button.dataset.integrationTransport;
   document.querySelectorAll("[data-integration-transport]").forEach((item) => {
     item.classList.toggle("is-active", item === button);
   });
+  renderIntegrationTransportHint();
   renderIntegrationConfig();
   renderOnboardingPrompt();
   state.integrationLocalPlan = null;
@@ -2706,13 +3016,13 @@ elements["project-list"].addEventListener("click", (event) => {
 elements["chat-stream"].addEventListener("click", (event) => {
   const expand = event.target.closest("[data-expand-event]");
   if (expand) {
-    rememberExpandedEvent(expand.dataset.expandEvent);
+    rememberExpandedEvent("feed", expand.dataset.expandEvent);
     if (state.snapshot) renderEvents(state.snapshot.agents, state.snapshot.tasks);
     return;
   }
   const collapse = event.target.closest("[data-collapse-event]");
   if (collapse) {
-    state.expandedEvents.delete(Number(collapse.dataset.collapseEvent));
+    state.expandedEvents.delete(expansionKey("feed", collapse.dataset.collapseEvent));
     if (state.snapshot) renderEvents(state.snapshot.agents, state.snapshot.tasks);
   }
 });
@@ -2755,6 +3065,11 @@ elements["task-table"].addEventListener("click", (event) => {
 });
 
 elements["task-intake-list"].addEventListener("click", (event) => {
+  const cancelButton = event.target.closest("[data-intake-cancel-id]");
+  if (cancelButton) {
+    cancelTaskIntake(cancelButton.dataset.intakeCancelId).catch(handleError);
+    return;
+  }
   const button = event.target.closest("[data-task-id]");
   if (button) openTaskDetails(button.dataset.taskId).catch(handleError);
 });
@@ -3014,8 +3329,8 @@ elements["task-timeline"].addEventListener("click", (event) => {
   const expand = event.target.closest("[data-expand-history]");
   if (expand) {
     const eventId = Number(expand.dataset.expandHistory);
-    if (state.expandedEvents.has(eventId)) state.expandedEvents.delete(eventId);
-    else rememberExpandedEvent(eventId);
+    if (eventIsExpanded("seq", eventId)) state.expandedEvents.delete(expansionKey("seq", eventId));
+    else rememberExpandedEvent("seq", eventId);
     const task = state.snapshot?.tasks.find((item) => item.id === state.editingTaskId);
     if (task) renderTaskTimeline(task);
     return;
@@ -3049,14 +3364,85 @@ elements["event-hide-system"].addEventListener("change", () => {
   if (state.snapshot) renderEvents(state.snapshot.agents, state.snapshot.tasks);
 });
 
+function renderRepositoryCandidates(prefix, result) {
+  const select = elements[`${prefix}-repository-select`];
+  const direct = result.candidates.some((candidate) => candidate.relative_path === "");
+  const options = [
+    ...(direct || result.complete && !result.candidates.length ? [] : ['<option value="__pending__">请明确选择仓库或保留本地目录</option>']),
+    `<option value="">${direct ? "当前目录的 Git 仓库" : "保留父目录为本地路径项目"}</option>`,
+    ...result.candidates.filter((candidate) => candidate.relative_path).map((candidate) =>
+      `<option value="${escapeHtml(candidate.relative_path)}">${escapeHtml(candidate.relative_path)} · ${escapeHtml(projectSource(candidate))}</option>`),
+  ];
+  select.innerHTML = options.join("");
+  select.dataset.inspectedRoot = result.workspace_root;
+  elements[`${prefix}-repository-hint`].textContent = `${result.candidates.length} 个仓库候选。${result.complete
+    ? "选择仓库后确认；不会自动选中第一个子仓库。"
+    : "检查未覆盖全部目录，可填写具体相对路径或明确保留本地目录。"}`;
+}
+
+async function inspectProjectRepositories() {
+  const root = elements["project-path-input"].value.trim();
+  const result = await api("/api/v1/local/repositories/inspect", {
+    method: "POST", body: JSON.stringify({ root_path: root }),
+  });
+  renderRepositoryCandidates("project", result);
+  elements["project-repository-select"].dataset.inputRoot = root;
+  return result;
+}
+
+for (const prefix of ["project", "settings"]) {
+  elements[`${prefix}-repository-select`].addEventListener("change", () => {
+    const value = elements[`${prefix}-repository-select`].value;
+    if (value !== "__pending__") elements[`${prefix}-repository-input`].value = value;
+  });
+}
+function resetProjectRepositorySelection() {
+  delete elements["project-repository-select"].dataset.inputRoot;
+  delete elements["project-repository-select"].dataset.inspectedRoot;
+  elements["project-repository-input"].value = "";
+  elements["project-repository-select"].innerHTML = '<option value="__pending__">先检查项目文件夹</option>';
+  elements["project-repository-hint"].textContent = "";
+}
+elements["project-path-input"].addEventListener("input", resetProjectRepositorySelection);
+elements["project-repository-inspect"].addEventListener("click", () =>
+  withBusy(inspectProjectRepositories).catch((error) => setProjectFormError(error.message)));
+elements["settings-repository-inspect"].addEventListener("click", () => withBusy(async () => {
+  const result = await api(`/api/v1/projects/${state.projectId}/repository/inspect`, { method: "POST" });
+  renderRepositoryCandidates("settings", result);
+}).catch((error) => setDialogFormError(elements["settings-repository-error"], error.message)));
+elements["settings-repository-save"].addEventListener("click", () => withBusy(async () => {
+  const selection = elements["settings-repository-input"].value.trim();
+  if (!selection && elements["settings-repository-select"].value === "__pending__") {
+    throw new Error("请检查并选择实际仓库，或明确选择保留本地目录");
+  }
+  await api(`/api/v1/projects/${state.projectId}/repository`, {
+    method: "PUT", body: JSON.stringify({ repository_path: selection }),
+  });
+  setDialogFormError(elements["settings-repository-error"], "");
+  showToast("仓库已关联，Room 历史已保留");
+  await loadProjects(state.projectId);
+}).catch((error) => setDialogFormError(elements["settings-repository-error"], error.message)));
+
 async function submitProjectForm() {
   setProjectFormError("");
+  const submit = elements["project-form"].querySelector("[type=submit]");
+  if (submit) submit.disabled = true;
   try {
+    const select = elements["project-repository-select"];
+    if (select.dataset.inputRoot !== elements["project-path-input"].value.trim()) {
+      await withBusy(inspectProjectRepositories);
+    }
+    const selection = elements["project-repository-input"].value.trim();
+    if (!selection && select.value === "__pending__") {
+      setProjectFormError("已检测到子仓库或检查未完成。请明确选择实际仓库，或保留父目录为本地项目。");
+      return;
+    }
     const project = await withBusy(() => api("/api/v1/projects", {
       method: "POST",
       body: JSON.stringify({
         name: elements["project-name-input"].value.trim() || null,
         root_path: elements["project-path-input"].value.trim(),
+        repository_path: selection,
       }),
     }));
     elements["project-dialog"].close();
@@ -3068,7 +3454,12 @@ async function submitProjectForm() {
   } catch (error) {
     // #163：失败时保持弹窗打开、输入原样保留，错误写进弹窗内横幅；
     // 底层页面 toast 会被 dialog::backdrop 模糊遮住（与 #142 同机制）。
-    setProjectFormError(error.message || "项目添加失败");
+    // 弹窗若已经关闭，内联横幅没人能看见，改走全局 toast（#321）。
+    const message = error.message || "项目添加失败";
+    if (!elements["project-dialog"].open) showToast(message, "error");
+    else setProjectFormError(message);
+  } finally {
+    if (submit) submit.disabled = false;
   }
 }
 
@@ -3079,12 +3470,17 @@ elements["project-form"].addEventListener("submit", async (event) => {
 });
 
 // 关闭弹窗（成功、取消或右上角 ×）时清掉错误横幅，下次打开是干净状态。
-elements["project-dialog"].addEventListener("close", () => setProjectFormError(""));
+elements["project-dialog"].addEventListener("close", () => {
+  setProjectFormError("");
+  resetProjectRepositorySelection();
+});
 
 
 elements["settings-form"].addEventListener("submit", async (event) => {
   event.preventDefault();
   if (!state.snapshot) return;
+  const submit = event.submitter || elements["settings-form"].querySelector("[type=submit]");
+  if (submit) submit.disabled = true;
   try {
     await api(`/api/v1/projects/${state.projectId}`, {
       method: "PATCH",
@@ -3105,8 +3501,26 @@ elements["settings-form"].addEventListener("submit", async (event) => {
     await refreshSnapshot(state.projectId);
   } catch (error) {
     handleError(error);
+  } finally {
+    if (submit) submit.disabled = false;
   }
 });
+
+async function cancelTaskIntake(intakeId) {
+  if (!state.projectId || !intakeId) return;
+  const intake = state.taskIntakes.find((item) => item.id === intakeId);
+  const confirmed = window.confirm(
+    "撤销后该任务意图不再进入受理流程，历史记录保留。确定要撤销吗？"
+    + (intake?.raw_description ? `\n\n${intake.raw_description}` : ""),
+  );
+  if (!confirmed) return;
+  await api(
+    `/api/v1/projects/${state.projectId}/task-intakes/${encodeURIComponent(intakeId)}/cancel`,
+    { method: "POST", body: JSON.stringify({}) },
+  );
+  await refreshTaskIntakeData();
+  showToast("任务意图已撤销");
+}
 
 elements["task-form"].addEventListener("submit", async (event) => {
   event.preventDefault();
@@ -3138,16 +3552,40 @@ elements["archive-form"].addEventListener("submit", async (event) => {
   event.preventDefault();
   if (!state.projectId) return;
   const permanent = elements["permanent-delete-input"].checked;
+  const confirmDelete = typeof window !== "undefined" && typeof window.confirm === "function"
+    ? window.confirm.bind(window)
+    : null;
+  if (permanent && confirmDelete && !confirmDelete("永久删除会移除这个项目的 Room 数据，而且不能恢复。确定继续？")) {
+    return;
+  }
+  const submit = elements["remove-project-submit"];
+  if (submit) submit.disabled = true;
   try {
+    const result = await api(`/api/v1/projects/${state.projectId}${permanent ? "?permanent=true" : ""}`, { method: "DELETE" });
+    // 只有确认项目已归档/删除之后才允许断流：失败时事件流保持在线（#328）。
     closeEventSource();
-    await api(`/api/v1/projects/${state.projectId}${permanent ? "?permanent=true" : ""}`, { method: "DELETE" });
     elements["archive-dialog"].close();
     localStorage.removeItem("agentchatroom.projectId");
     state.projectId = null;
     await loadProjects();
-    showToast(permanent ? "项目数据已永久删除" : "项目已归档");
+    const cleanupErrors = [
+      ...(result?.project_registration?.cleanup_errors || []),
+      ...(result?.project_instructions?.cleanup_errors || []),
+    ];
+    if (cleanupErrors.length) {
+      const first = cleanupErrors[0];
+      const action = first.details && first.details.required_action;
+      showToast(
+        `项目已删除，但有 ${cleanupErrors.length} 项清理没有完成：${first.message || first.code || "未知错误"}${action ? `。下一步：${action}` : ""}`,
+        "error",
+      );
+    } else {
+      showToast(permanent ? "项目数据已永久删除" : "项目已归档");
+    }
   } catch (error) {
     handleError(error);
+  } finally {
+    if (submit) submit.disabled = false;
   }
 });
 
@@ -3186,6 +3624,8 @@ elements["message-form"].addEventListener("submit", async (event) => {
 
 elements["login-form"].addEventListener("submit", async (event) => {
   event.preventDefault();
+  const submit = event.submitter || elements["login-form"].querySelector("[type=submit]");
+  if (submit) submit.disabled = true;
   elements["login-error"].textContent = "";
   try {
     await withBusy(() => api("/api/v1/auth/login", {
@@ -3198,7 +3638,11 @@ elements["login-form"].addEventListener("submit", async (event) => {
     elements["logout-button"].classList.remove("is-hidden");
     await loadAuthenticatedApp();
   } catch (error) {
-    elements["login-error"].textContent = error.message || "登录失败";
+    const message = error.message || "登录失败";
+    elements["login-error"].textContent = message;
+    if (!elements["login-dialog"].open) showToast(message, "error");
+  } finally {
+    if (submit) submit.disabled = false;
   }
 });
 
@@ -3220,7 +3664,14 @@ function deriveTokenCredentialName(member) {
 
 elements["token-form"].addEventListener("submit", async (event) => {
   event.preventDefault();
-  if (!state.projectId) return;
+  if (!state.projectId || state.tokenSubmitInFlight) return;
+  state.tokenSubmitInFlight = true;
+  const submit = event.submitter || elements["token-form"].querySelector("[type=submit]");
+  if (submit) submit.disabled = true;
+  const releaseTokenSubmit = () => {
+    state.tokenSubmitInFlight = false;
+    if (submit) submit.disabled = false;
+  };
   setTokenFormError("");
   const projectId = state.projectId;
   const setup = state.pendingHttpSetup;
@@ -3230,6 +3681,11 @@ elements["token-form"].addEventListener("submit", async (event) => {
   }
   const memberId = elements["token-member"].value;
   const member = state.members.find((item) => item.id === memberId);
+  if (memberId && (!member || member.status !== "active")) {
+    setTokenFormError("所选成员已不在有效列表中。请改选有效成员，或改为不关联并填写 Agent 显示名称。不会签发不关联凭据。");
+    releaseTokenSubmit();
+    return;
+  }
   let softwareIdentity = null;
   if (setup?.projectId === projectId) {
     let selectedIdentity;
@@ -3237,6 +3693,7 @@ elements["token-form"].addEventListener("submit", async (event) => {
       selectedIdentity = softwareIdentityForMember(member);
     } catch (error) {
       setTokenFormError(error.message || "所选项目成员的软件身份不完整");
+      releaseTokenSubmit();
       return;
     }
     if (selectedIdentity) {
@@ -3244,6 +3701,7 @@ elements["token-form"].addEventListener("submit", async (event) => {
       softwareIdentity = selectedIdentity;
     } else if (member) {
       setTokenFormError("所选项目成员的软件身份不完整，请改选成员，或改为不关联并填写 Agent 显示名称");
+      releaseTokenSubmit();
       return;
     } else if (setup.mode === "add_project") {
       // 已配置软件增量加入 Project：客户端原身份由 Agent 在本地保留，
@@ -3258,6 +3716,7 @@ elements["token-form"].addEventListener("submit", async (event) => {
         );
       } catch (error) {
         setTokenFormError(error.message || "Agent 显示名称无效，请填写实际接入端名称");
+        releaseTokenSubmit();
         return;
       }
       const typedName = elements["token-agent-name"].value.trim().toLocaleLowerCase();
@@ -3269,6 +3728,7 @@ elements["token-form"].addEventListener("submit", async (event) => {
         setTokenFormError(
           `项目中已有同名成员「${nameOwner.name}」（软件身份 ${nameOwner.metadata?.software_key || "未知"}）。请在成员下拉中选择该项以沿用现有身份合并接入，或为本次接入换一个显示名称。`,
         );
+        releaseTokenSubmit();
         return;
       }
     }
@@ -3277,6 +3737,7 @@ elements["token-form"].addEventListener("submit", async (event) => {
     .map((input) => input.value);
   if (!permissions.length) {
     setTokenFormError("至少选择一项权限");
+    releaseTokenSubmit();
     return;
   }
   try {
@@ -3307,7 +3768,14 @@ elements["token-form"].addEventListener("submit", async (event) => {
     }
     await refreshManagement();
   } catch (error) {
-    setTokenFormError(error.message || "签发失败，请稍后重试");
+    const message = error.message || "签发失败，请稍后重试";
+    if (!elements["token-dialog"].open) {
+      showToast(message, "error");
+    } else {
+      setTokenFormError(message);
+    }
+  } finally {
+    releaseTokenSubmit();
   }
 });
 
@@ -3389,9 +3857,14 @@ function showIssuedHttpResult(setup) {
   if (!elements["token-secret-dialog"].open) elements["token-secret-dialog"].showModal();
 }
 
-function renderIssuedHttpConfig() {
+// 签发后的提示词由服务端单一生成器产出（integrations
+// .build_issued_credential_prompt）。Web 只负责把本次签发的真实凭据包传上去，
+// 并把结果原样显示：两份手写副本曾导致 service_unavailable 约束只存在于其中
+// 一份，且把凭据槽描述成"替换为显示名称"。
+async function renderIssuedHttpConfig() {
   const setup = state.issuedHttpSetup;
-  const profile = setup?.profiles?.[elements["token-config-format"].value];
+  const profileId = elements["token-config-format"].value;
+  const profile = setup?.profiles?.[profileId];
   if (!profile) return;
   if (setup.mode === "reconnect") {
     elements["token-config-heading"].textContent = "恢复连接提示词";
@@ -3409,20 +3882,51 @@ function renderIssuedHttpConfig() {
     elements["token-config-heading"].textContent = "增量接入提示词（交给已配置的 Agent）";
     elements["token-config-copy"].textContent = "复制增量提示词";
     elements["token-config-hint"].textContent = "包含新 Project Token 明文，只整体复制给已配置过 agentchatroom 的那个 Agent；Agent 会在客户端本地保留旧配置并自行合并，不要发送到 Room、日志或仓库。";
-    elements["token-config-value"].textContent = incrementalHttpPrompt(profile, setup);
-    elements["token-config-path"].textContent = `${profile.config_path_hint || "客户端 MCP 配置"}；MCP Server 标准名称：agentchatroom（Agent 更新现有条目，不新增）`;
+    elements["token-config-value"].textContent = "正在生成接入提示词…";
+    elements["token-config-path"].textContent = `${profile.resolved_config_path || profile.config_path_hint || "客户端 MCP 配置"}；MCP Server 标准名称：agentchatroom（Agent 更新现有条目，不新增）`;
     elements["token-config-projects"].textContent = setup.projectPath
       ? `目标 Project：${setup.projectName}（工作区：${setup.projectPath}）；客户端原有 Project 凭据由 Agent 在本地保留`
       : `目标 Project：${setup.projectName}；客户端原有 Project 凭据由 Agent 在本地保留`;
+    await loadIssuedServerPrompt(setup, profileId, "add_project");
     return;
   }
   elements["token-config-heading"].textContent = "完整 HTTP 接入提示词";
   elements["token-config-copy"].textContent = "复制完整提示词";
   elements["token-config-hint"].textContent = "内容包含 Project 与 Token 的明文对应关系，只交给负责配置该客户端的 Agent；不要发送到 Room、日志或仓库。";
-  elements["token-config-value"].textContent = issuedHttpPrompt(profile, setup);
-  elements["token-config-path"].textContent = `${profile.config_path_hint || "客户端 MCP 配置"}；MCP Server 标准名称：agentchatroom`;
+  elements["token-config-value"].textContent = "正在生成接入提示词…";
+  elements["token-config-path"].textContent = `${profile.resolved_config_path || profile.config_path_hint || "客户端 MCP 配置"}；MCP Server 标准名称：agentchatroom`;
   const projectPathHint = setup.projectPath ? `（当前工作区：${setup.projectPath}）` : "";
   elements["token-config-projects"].textContent = `已包含 ${setup.projectCredentials.length} 个 Project：${setup.projectCredentials.map((item) => item.name).join("、")}${projectPathHint}`;
+  await loadIssuedServerPrompt(setup, profileId, "first_setup");
+}
+
+// 提示词请求带代次校验：切换客户端或关闭弹窗后到达的旧响应整份丢弃，不会把
+// 上一个客户端的提示词显示到当前对话框里。
+async function loadIssuedServerPrompt(setup, profileId, mode) {
+  const projectId = setup?.projectId || state.projectId;
+  const requestId = ++state.issuedPromptRequest;
+  try {
+    const result = await api(`/api/v1/projects/${projectId}/integrations/mcp/issued-prompt`, {
+      method: "POST",
+      body: JSON.stringify({
+        profile_id: profileId,
+        mode,
+        project_name: setup.projectName || "",
+        project_credentials: validateProjectCredentials(setup.projectCredentials),
+        software_identity: normalizedSoftwareIdentity(setup.softwareIdentity),
+        linked_member_name: setup.member?.name || "",
+      }),
+    });
+    if (requestId !== state.issuedPromptRequest) return;
+    if (elements["token-config-format"].value !== profileId) return;
+    elements["token-config-value"].textContent = result.prompt;
+    state.issuedHttpSetup.generatedConfigText = result.config_text;
+  } catch (error) {
+    if (requestId !== state.issuedPromptRequest) return;
+    elements["token-config-value"].textContent =
+      "接入提示词生成失败，请重新签发或更新服务后重试。未生成任何配置。";
+    handleError(error);
+  }
 }
 
 const PROJECT_CREDENTIAL_BUNDLE_PREFIX = "acrb.v1.";
@@ -3621,121 +4125,6 @@ function mergeProjectCredentials(existing, added) {
   return validateProjectCredentials(merged);
 }
 
-function issuedHttpPrompt(profile, setup) {
-  const projectCredentials = validateProjectCredentials(setup.projectCredentials);
-  const config = issuedHttpConfig(profile, projectCredentials, setup.softwareIdentity);
-  const mode = setup.mode === "add_project" ? "add_project" : "first_setup";
-  const bootstrapProjectName = String(setup.projectName || "").trim();
-  const projectPath = String(setup.projectPath || "").trim();
-  const modeLabel = mode === "add_project" ? "已配置软件，加入本项目" : "首次配置软件";
-  const mapping = projectCredentials.flatMap((item, index) => [
-    `project_name_${index + 1}=${JSON.stringify(item.name)}`,
-    `project_token_${index + 1}=${JSON.stringify(item.token)}`,
-  ]).join("\n");
-  const targetProjectLine = projectPath
-    ? `目标 Project：${bootstrapProjectName}（本地工作区根目录 root_path: ${projectPath}）`
-    : `目标 Project：${bootstrapProjectName}`;
-  const verifyStep = projectPath
-    ? `3. 在目标 Project 本地工作区（${projectPath}）中调用 room_bootstrap(project_name=${JSON.stringify(bootstrapProjectName)})，核对返回的 Project 名称与 root_path 与当前工作区一致，再执行写操作。`
-    : `3. 调用 room_bootstrap(project_name=${JSON.stringify(bootstrapProjectName)})，核对返回的 Project 名称与 root_path 与当前工作区一致，再执行写操作。`;
-  // #143：极简 3 步结构——写入配置 -> 重启/重载 MCP -> bootstrap 核对。
-  return [
-    `请完成 AgentChatRoom HTTP MCP 接入（${modeLabel}）。${targetProjectLine}。`,
-    "",
-    "Project 与 Token 对应关系（按名称保留，不得混用）：",
-    mapping,
-    "",
-    "1. 把下面的 MCP 配置写入客户端（服务器名固定 agentchatroom；客户端格式不同时只转换语法，保留 URL、Authorization 与软件身份字段）：",
-    "",
-    config,
-    "",
-    "2. 写入后重启或重新加载客户端 MCP，使配置生效。",
-    verifyStep,
-    "",
-    "不要把 Token 发布到 Room、日志或仓库。",
-  ].join("\n");
-}
-
-function incrementalHttpPrompt(profile, setup) {
-  const credential = validateProjectCredentials(setup.projectCredentials)[0];
-  const projectName = String(setup.projectName || credential.name).trim();
-  const projectPath = String(setup.projectPath || "").trim();
-  const configHint = profile.config_path_hint || "客户端 MCP 配置文件";
-  const linkedIdentity = setup.member
-    ? normalizedSoftwareIdentity(setup.softwareIdentity)
-    : null;
-  const identityLine = linkedIdentity
-    ? `本次 Token 已关联成员 ${JSON.stringify(setup.member.name)}：现有配置的软件身份 Header 若存在，三字段必须与 Key=${JSON.stringify(linkedIdentity.softwareKey)} 的身份一致。`
-    : "本次 Token 未关联成员：原样保留客户端现有的软件身份三字段。";
-  const targetProjectLine = projectPath
-    ? `目标 Project：${projectName}（本地工作区根目录 root_path: ${projectPath}）`
-    : `目标 Project：${projectName}`;
-  const verifyStep = projectPath
-    ? `3. 在目标 Project 本地工作区（${projectPath}）中调用 room_bootstrap(project_name=${JSON.stringify(projectName)})，核对返回的 Project 名称与 root_path 与当前工作区一致，再执行写操作；无法读取本地配置时停止并向用户报告。`
-    : `3. 调用 room_bootstrap(project_name=${JSON.stringify(projectName)})，核对返回的 Project 名称与 root_path 与当前工作区一致，再执行写操作；无法读取本地配置时停止并向用户报告。`;
-  // #143：极简 3 步——合并凭据 -> 重启/重载 MCP -> bootstrap 核对。
-  return [
-    "该客户端已配置过 agentchatroom HTTP MCP。请把本次签发的新 Project 凭据增量合并进现有配置；不新建第二个 agentchatroom 连接器。",
-    "",
-    targetProjectLine,
-    "",
-    "本次签发凭据：",
-    `project_name_1=${JSON.stringify(credential.name)}`,
-    `project_token_1=${JSON.stringify(credential.token)}`,
-    `合并条目：{"name": ${JSON.stringify(credential.name)}, "token": ${JSON.stringify(credential.token)}}`,
-    "",
-    identityLine,
-    "",
-    `1. 打开客户端现有 agentchatroom 条目（配置位置参考：${configHint}），保留其 url、Authorization 凭据包与软件身份字段，把上面的 {"name":...,"token":...} 合并进 acrb.v1 凭据包后写回同一条目。`,
-    "2. 保存后重启或重新加载客户端 MCP。",
-    verifyStep,
-    "",
-    "不要把 Token 发布到 Room、日志或仓库。",
-  ].join("\n");
-}
-
-function issuedHttpConfig(profile, projectCredentials, softwareIdentity) {
-  let config = profile.streamable_http_config_text || "";
-  const bundle = encodeProjectCredentialBundle(projectCredentials);
-  const identity = normalizedSoftwareIdentity(softwareIdentity);
-  if (!identity) throw new Error("HTTP 接入配置缺少软件身份");
-  // Only the one-time result dialog receives this text. It is never stored in
-  // shared integration state, browser storage, Room messages, or logs.
-  if (profile.format === "json") {
-    const parsed = JSON.parse(config);
-    for (const server of Object.values(parsed.mcpServers || {})) {
-      server.headers.Authorization = `Bearer ${bundle}`;
-      server.headers["X-AgentChatRoom-Software-Key"] = encodeHttpIdentityHeaderValue(identity.softwareKey);
-      server.headers["X-AgentChatRoom-Software-Name"] = encodeHttpIdentityHeaderValue(identity.softwareName);
-      server.headers["X-AgentChatRoom-Software-Client"] = encodeHttpIdentityHeaderValue(identity.softwareClient);
-    }
-    return JSON.stringify(parsed, null, 2);
-  }
-  const authorization = `Authorization = ${JSON.stringify(`Bearer ${bundle}`)}`;
-  const identityHeaders = {"X-AgentChatRoom-Software-Key": encodeHttpIdentityHeaderValue(identity.softwareKey),
-    "X-AgentChatRoom-Software-Name": encodeHttpIdentityHeaderValue(identity.softwareName),
-    "X-AgentChatRoom-Software-Client": encodeHttpIdentityHeaderValue(identity.softwareClient)};
-  for (const [key, value] of Object.entries(identityHeaders)) {
-      const line = `${key} = ${JSON.stringify(value)}`;
-      const existing = new RegExp(`^${key} = .*$`, "m");
-      if (existing.test(config)) {
-        config = config.replace(existing, () => line);
-      } else {
-        config = config.replace(
-          /(\[mcp_servers\.[^\]\n]+\.(?:http_headers|headers)\])/,
-          `$1\n${line}`,
-        );
-      }
-  }
-  config = config.replace(/^bearer_token_env_var = .*\r?\n/gm, "");
-  if (/^Authorization = /m.test(config)) {
-    config = config.replace(/^Authorization = .*$/m, () => authorization);
-  } else {
-    config = config.replace(/(\[mcp_servers\.[^\]\n]+\.(?:http_headers|headers)\])/, `$1\n${authorization}`);
-  }
-  return config;
-}
-
 function handleError(error) {
   showToast(error.message || "发生未知错误", "error");
 }
@@ -3751,7 +4140,12 @@ async function loadTaskEvents(projectId, taskId) {
 
 async function refreshTaskIntakeTargets() {
   if (!state.projectId) return;
-  const result = await api(`/api/v1/projects/${state.projectId}/task-intakes/targets`);
+  const anchor = requestAnchor();
+  const result = await api(`/api/v1/projects/${anchor.projectId}/task-intakes/targets`);
+  // A target list belongs to the project it was queried for: writing it after a
+  // project switch would offer another project's Agents as reassign targets and
+  // enable submit for them (#329).
+  if (!withinRequestScope(anchor)) return false;
   state.taskIntakeTargets = result.targets || [];
   const options = state.taskIntakeTargets
     .map((target) => {
@@ -3847,7 +4241,7 @@ function renderHistoryEvidence(item) {
   return (item.evidence_sections || []).map((section, index) => {
     const sectionId = `history-${item.event_id}-sec-${index}`;
     if (section.kind === "message") {
-      const expanded = state.expandedEvents.has(item.event_id);
+      const expanded = eventIsExpanded("seq", item.event_id);
       const body = String((section.items || [])[0] || "");
       const lines = body.split("\n");
       const canToggle = section.expandable;
@@ -3950,8 +4344,12 @@ async function loadTaskHistory(taskId, { direction } = {}) {
     total: page.total,
     next_after: items[items.length - 1]?.event_id || page.next_after,
     next_before: items[0]?.event_id || page.next_before,
-    has_more_after: direction === "later" ? Boolean(page.has_more_after) : direction === "earlier" ? true : Boolean(page.has_more_after),
-    has_more_before: direction === "earlier" ? Boolean(page.has_more_before) : direction === "later" ? true : Boolean(page.has_more_before),
+    // The server answers both directions for the window it actually returned,
+    // so the opposite flag must not be synthesised as "more exists": at the
+    // oldest or newest edge that keeps a pager button enabled forever and the
+    // next click fetches an empty page (#266).
+    has_more_after: Boolean(page.has_more_after),
+    has_more_before: Boolean(page.has_more_before),
     eventType,
   };
 }
@@ -4002,10 +4400,32 @@ function renderTaskContract(task) {
 async function openTaskDetails(taskId, options = {}) {
   const task = state.snapshot?.tasks.find((item) => item.id === taskId);
   if (!task || !state.projectId) return;
+  const dialog = elements["task-edit-dialog"];
+  const alreadyOpen = Boolean(dialog.open);
+  const sameTask = alreadyOpen && state.editingTaskId === taskId;
   state.editingTaskId = taskId;
   state.focusEventId = Number(options.focusEventId || 0);
   if (options.eventType !== undefined) {
     elements["task-history-filter"].value = options.eventType || "";
+  }
+  renderTaskContract(task);
+  renderTaskAssignments(task);
+  // 指派可用性取服务端 available_actions（服务端按 execution_status 拒绝
+  // completed / cancelled），不再按 phase 猜测。没有该字段的旧快照退回
+  // 与领域守卫同口径的本地判定。
+  const assignable = Array.isArray(task.available_actions)
+    ? task.available_actions.includes("assign")
+    : !["completed", "cancelled"].includes(task.execution_status);
+  elements["task-assign-button"].disabled = !assignable;
+  elements["task-release-button"].classList.toggle("is-hidden", !taskReleaseVisible(task));
+  elements["task-cancel-button"].classList.toggle("is-hidden", !taskCancelVisible(task));
+  // showModal throws InvalidStateError when the dialog is already open.
+  // The history window is reset only after that guard, and never for the
+  // task that is already on screen (#316).
+  if (!alreadyOpen) dialog.showModal();
+  if (sameTask) {
+    renderTaskTimeline(task);
+    return;
   }
   state.taskHistory = {
     taskId,
@@ -4014,13 +4434,7 @@ async function openTaskDetails(taskId, options = {}) {
     has_more_after: false,
     has_more_before: false,
   };
-  renderTaskContract(task);
-  renderTaskAssignments(task);
   renderTaskTimeline(task);
-  elements["task-assign-button"].disabled = ["done", "cancelled"].includes(taskView(task).phase);
-  elements["task-release-button"].classList.toggle("is-hidden", !taskReleaseVisible(task));
-  elements["task-cancel-button"].classList.toggle("is-hidden", !taskCancelVisible(task));
-  elements["task-edit-dialog"].showModal();
   try {
     await loadTaskHistory(taskId);
     if (state.focusEventId && !(state.taskHistory.items || []).some((item) => item.event_id === state.focusEventId || item.project_seq === state.focusEventId)) {
@@ -4049,10 +4463,16 @@ async function loadTaskHistoryUntil(taskId, eventSeq) {
 
 async function copyEventReference(eventId, taskNumber, projectSeq) {
   // 用户可读编号与深链都使用 project_seq；全局 id 不再对外暴露。
+  // replaceState updates the shareable hash without firing hashchange, so
+  // copying a reference inside the open dialog does not reopen it (#316).
   const seq = Number(projectSeq) || Number(eventId);
   const label = Number.isFinite(seq) && seq > 0 ? `事件 #${seq}` : "事件";
   const text = taskNumber ? `任务 #${taskNumber} / ${label}` : label;
-  location.hash = `event-${seq}`;
+  if (Number.isFinite(seq) && seq > 0 && typeof history !== "undefined" && history.replaceState) {
+    const next = new URL(location.href);
+    next.hash = `event-${seq}`;
+    history.replaceState(history.state, "", next);
+  }
   try {
     await navigator.clipboard.writeText(text);
     showToast("已复制事件引用");
@@ -4116,13 +4536,66 @@ async function downloadProjectExport() {
   showToast("审计数据已导出 (JSON)");
 }
 
-function renderIntegrationTabs() {
-  // 配置助手只保留通用标准 MCP 接入（具名客户端预设仅在后端 CLI 里），
-  // 单一选项不再渲染切换行；profile 仍经 state.integrationFormat 使用。
-  if (!state.integration?.profiles) return;
-  if (!Object.keys(state.integration.profiles).includes(state.integrationFormat)) {
+// 目标客户端选择器。profile 列表来自服务端发布的 integrations.profiles，
+// 顺序即发布顺序；带 local_config 的客户端才有本机配置助手。
+function renderIntegrationProfileOptions() {
+  const select = elements["integration-client-profile"];
+  if (!select || !state.integration?.profiles) return;
+  const profiles = state.integration.profiles;
+  if (!Object.keys(profiles).includes(state.integrationFormat)) {
     state.integrationFormat = "generic";
   }
+  const signature = Object.keys(profiles).join("|");
+  if (select.dataset.profileSignature !== signature) {
+    select.dataset.profileSignature = signature;
+    select.innerHTML = Object.entries(profiles).map(([profileId, profile]) => {
+      const managed = profile.local_config ? "（支持本机配置助手）" : "";
+      return `<option value="${escapeHtml(profileId)}">${escapeHtml(profile.label || profileId)}${escapeHtml(managed)}</option>`;
+    }).join("");
+  }
+  select.value = state.integrationFormat;
+  const profile = profiles[state.integrationFormat] || {};
+  const hint = elements["integration-client-profile-hint"];
+  if (hint) {
+    hint.textContent = profile.local_config
+      ? `${profile.config_path_hint || ""}该客户端支持由服务端检测并写入本机配置。`.trim()
+      : `${profile.config_path_hint || ""}该客户端没有可托管的本机配置文件路径，本机 stdio 需手动写入。`.trim();
+  }
+}
+
+function renderIntegrationTabs() {
+  renderIntegrationProfileOptions();
+  const transports = state.integration?.transports || {};
+  // 传输方式的可用性由服务端发布，冻结 EXE 也据此隐藏用不了的入口。
+  const available = [
+    ["http", transports.streamable_http?.enabled !== false],
+    ["local", true],
+    ["remote", transports.remote_stdio_bridge?.enabled !== false],
+  ].filter(([, enabled]) => enabled).map(([transport]) => transport);
+  document.querySelectorAll("[data-integration-transport]").forEach((item) => {
+    item.hidden = !available.includes(item.dataset.integrationTransport);
+  });
+  if (!available.includes(state.integrationTransport)) {
+    state.integrationTransport = available[0] || "http";
+  }
+  document.querySelectorAll("[data-integration-transport]").forEach((item) => {
+    item.classList.toggle("is-active", item.dataset.integrationTransport === state.integrationTransport);
+  });
+  renderIntegrationTransportHint();
+}
+
+function renderIntegrationTransportHint() {
+  const hint = elements["integration-transport-hint"];
+  if (!hint) return;
+  const profile = state.integration?.profiles?.[state.integrationFormat] || {};
+  const text = {
+    http: "HTTP 直连是主路径：共用一个服务，不为每条连接拉起适配器进程。",
+    local: profile.local_config
+      ? "本机 stdio 由本进程拉起适配器；该客户端的配置文件可由服务端检测、备份后写入。"
+      : "本机 stdio 由本进程拉起适配器；该客户端没有可托管的配置路径，需按下方配置手动写入。",
+    remote: "远程 Bridge 在 Agent 计算机上把本地 stdio 转发到中心，只适合客户端只能拉起本地进程的场景。",
+  };
+  hint.textContent = text[state.integrationTransport] || text.http;
 }
 
 function localMcpAssistantSupported() {
@@ -4507,6 +4980,7 @@ function initializeAppearance() {
 
 function applyPublicConfig() {
   applyAppearanceTheme();
+  renderReleaseReasonOptions();
   elements["product-name"].textContent = state.config.product_name;
   document.title = state.config.product_name;
   const folderPickerEnabled = Boolean(state.config.capabilities?.local_folder_picker);
@@ -4528,6 +5002,14 @@ async function loadAuthenticatedApp() {
 window.addEventListener("beforeunload", () => {
   closeEventSource();
   stopPresenceRefresh();
+});
+
+document.addEventListener("visibilitychange", () => {
+  if (document.hidden) {
+    stopPresenceRefresh();
+    return;
+  }
+  if (state.projectId && !streamOnline) startPresenceRefresh();
 });
 
 async function bootstrap() {

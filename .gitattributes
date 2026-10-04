@@ -3,3 +3,7 @@
 *.png binary
 *.db binary
 *.whl binary
+
+# Windows launcher scripts are GBK + CRLF by design (python/regen_launcher_cmds.py);
+# without this rule git normalises the checked-in bytes back to LF.
+*.cmd text eol=crlf
