@@ -29,6 +29,7 @@ from agentchatroom.gui import (
     tray_degraded_hint,
     update_config_values,
 )
+from tests.conftest import boot_gui_or_skip, require_tk_runtime
 
 CHECKOUT_ROOT = Path(__file__).resolve().parents[1]
 STARTED_URL = "http://127.0.0.1:8765"
@@ -150,37 +151,9 @@ def install_fake_pystray(monkeypatch, behaviour: str = "ready"):
     return created
 
 
-def boot_run_gui() -> None:
-    """Run the real entry point, skipping on this machine's broken Tcl/Tk build.
-
-    The Tk probe above can succeed while the probe inside ``run_gui`` still
-    hits the missing ``init.tcl``/``tk.tcl`` runtime; that is an environment
-    fault, not a GUI regression, so only a SystemExit caused by a TclError
-    becomes a skip and anything else still fails the test.
-    """
-    import tkinter as tk
-
-    try:
-        gui_module.run_gui()
-    except SystemExit as error:
-        if not isinstance(error.__cause__, tk.TclError):
-            raise
-        pytest.skip(f"Tcl/Tk runtime unavailable during boot: {error}")
-    except tk.TclError as error:
-        # The window itself dying on Tcl_Init is the same broken runtime.
-        pytest.skip(f"Tcl/Tk runtime unavailable while building the window: {error}")
-
-
 def open_window(monkeypatch, settings):
     """Boot the real controller window with the reader threads faked out."""
-    try:
-        import tkinter as tk
-
-        probe = tk.Tk()
-        probe.withdraw()
-        probe.destroy()
-    except Exception as error:  # pragma: no cover - headless Tk runtime
-        pytest.skip(f"Tk display unavailable: {error}")
+    tk = require_tk_runtime()
 
     windows: list = []
     monkeypatch.setattr(gui_module, "load_settings", lambda _config: settings)
@@ -191,7 +164,7 @@ def open_window(monkeypatch, settings):
         gui_module, "create_tray_icon", lambda _handler, **_kwargs: None
     )
     monkeypatch.setattr(tk.Tk, "mainloop", lambda self: windows.append(self))
-    boot_run_gui()
+    boot_gui_or_skip(gui_module, tk)
     return windows[0]
 
 
@@ -308,14 +281,7 @@ def test_run_gui_stops_the_tray_loop_when_the_mainloop_exits(monkeypatch, settin
     created = install_fake_pystray(monkeypatch)
     window = None
     windows: list = []
-    try:
-        import tkinter as tk
-
-        probe = tk.Tk()
-        probe.withdraw()
-        probe.destroy()
-    except Exception as error:  # pragma: no cover - headless Tk runtime
-        pytest.skip(f"Tk display unavailable: {error}")
+    tk = require_tk_runtime()
 
     real_create = gui_module.create_tray_icon
     monkeypatch.setattr(
@@ -331,7 +297,7 @@ def test_run_gui_stops_the_tray_loop_when_the_mainloop_exits(monkeypatch, settin
     monkeypatch.setattr(gui_module, "GuiInstanceGuard", _Guard)
     monkeypatch.setattr(tk.Tk, "mainloop", lambda self: windows.append(self))
 
-    boot_run_gui()
+    boot_gui_or_skip(gui_module, tk)
     window = windows[0]
     icon = window.tray
     assert icon is not None
@@ -347,14 +313,7 @@ def test_run_gui_stops_the_tray_loop_when_the_mainloop_exits(monkeypatch, settin
 def test_run_gui_reports_tray_degradation_without_the_generic_hint(
     monkeypatch, settings
 ) -> None:
-    try:
-        import tkinter as tk
-
-        probe = tk.Tk()
-        probe.withdraw()
-        probe.destroy()
-    except Exception as error:  # pragma: no cover - headless Tk runtime
-        pytest.skip(f"Tk display unavailable: {error}")
+    tk = require_tk_runtime()
 
     created = install_fake_pystray(monkeypatch, behaviour="never_ready")
     real_create = gui_module.create_tray_icon
@@ -372,7 +331,7 @@ def test_run_gui_reports_tray_degradation_without_the_generic_hint(
     monkeypatch.setattr(gui_module, "GuiInstanceGuard", _Guard)
     monkeypatch.setattr(tk.Tk, "mainloop", lambda self: windows.append(self))
 
-    boot_run_gui()
+    boot_gui_or_skip(gui_module, tk)
     window = windows[0]
     try:
         shown = window.log_view.get("1.0", "end")

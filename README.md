@@ -910,6 +910,8 @@ pytest 的临时目录（`--basetemp` / `tmp_path`）必须放在本 checkout �
 
 浏览器端 `index.html` 里 `app.js` / `app.css` / `favicon.svg` 的 `?v=` 缓存版本参数由服务端按资产文件内容的 sha256 指纹自动注入（`Cache-Control: no-cache`），资产内容一变缓存键即变，部署新前端后无需人工 bump 版本号，浏览器也不会再命中旧缓存中的过期脚本。
 
+需要真实 Tk 窗口的用例（`tests/test_gui.py`、`tests/test_gui_tray_and_config.py`）统一走 `tests/conftest.py` 的 `require_tk_runtime()` / `boot_gui_or_skip()`：`import tkinter` 成功并不代表 Tcl/Tk 运行库可用，只有真正构造 `Tk()` 才会去读 `init.tcl` / `tk.tcl`，而 Python 装在用户目录下时，全负载并发下读取这两个文件会瞬时失败（`_tkinter.TclError: couldn't read file`）。这类故障是瞬时的，helper 先带退避重试若干次再判定不可用，因此负载下的偶发读取失败不再让用例随机变红或被跳过；只有连续重试仍失败时才 skip，且只把 TclError 判为环境问题，真实回归依旧照常失败。窗口创建后不再进入真实 `mainloop`（`mainloop` 被替换为立即返回），断言全部同步完成，因此这些用例不依赖计时器或调度延迟。
+
 其他门禁：
 
 ```powershell

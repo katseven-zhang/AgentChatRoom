@@ -109,6 +109,76 @@ def pytest_configure(config: pytest.Config) -> None:
     _warn_if_tempdir_inside_checkout(config)
 
 
+# 真实 Tcl/Tk 初始化的重试预算。这个机器的 CPython 装在用户配置目录下，
+# 全负载并发时读取 tcl/tk8.6 下的 init.tcl / tk.tcl 会间歇性失败
+# （_tkinter.TclError: couldn't read file）。故障是瞬时的，因此重试远快于
+# 直接把整条用例判为环境不可用。
+_TK_INIT_ATTEMPTS = 8
+_TK_INIT_RETRY_SECONDS = 0.05
+
+
+def _new_tk_root(tk):
+    """Create and immediately destroy a Tk root, retrying transient init faults."""
+    fault = None
+    for _ in range(_TK_INIT_ATTEMPTS):
+        try:
+            root = tk.Tk()
+        except tk.TclError as error:
+            fault = error
+            time.sleep(_TK_INIT_RETRY_SECONDS)
+            continue
+        root.withdraw()
+        root.destroy()
+        return
+    raise fault
+
+
+def require_tk_runtime():
+    """Return a usable ``tkinter`` module, skipping only when Tk stays broken.
+
+    Importing tkinter proves nothing about the Tcl/Tk runtime: ``tk.Tk()`` is
+    what actually reads ``init.tcl``/``tk.tcl``. Callers that need a real Tk
+    window must go through here (and through :func:`boot_gui_or_skip`) instead
+    of each test writing its own probe, because a single probe is only a
+    sample — under load it can pass while the very next ``Tk()`` still fails.
+    """
+    try:
+        import tkinter as tk
+    except ImportError as error:
+        pytest.skip(f"Tk display unavailable: {error}")
+    try:
+        _new_tk_root(tk)
+    except tk.TclError as error:
+        pytest.skip(f"Tcl/Tk runtime unavailable: {error}")
+    return tk
+
+
+def boot_gui_or_skip(gui_module, tk, **run_kwargs) -> None:
+    """Run the real GUI entry point, skipping this machine's broken Tcl/Tk.
+
+    Only a TclError fault becomes a skip, so a genuine regression keeps
+    failing the test. ``run_gui`` raises ``SystemExit`` from TclError when its
+    own internal probe cannot initialise Tcl/Tk; that happens before any
+    settings load or tail start, so retrying the whole call is side-effect
+    free and worth doing. A bare TclError means the window itself died later,
+    where a retry would re-run ``load_settings`` and corrupt the call counts
+    these tests assert on, so that case skips immediately.
+    """
+    for attempt in range(_TK_INIT_ATTEMPTS):
+        try:
+            gui_module.run_gui(**run_kwargs)
+            return
+        except SystemExit as error:
+            if not isinstance(error.__cause__, tk.TclError):
+                raise
+            fault = error
+        except tk.TclError as error:
+            pytest.skip(f"Tcl/Tk runtime unavailable while building the window: {error}")
+        if attempt + 1 < _TK_INIT_ATTEMPTS:
+            time.sleep(_TK_INIT_RETRY_SECONDS)
+    pytest.skip(f"Tcl/Tk runtime unavailable during boot: {fault}")
+
+
 @pytest.fixture()
 def settings(tmp_path):
     return Settings(
