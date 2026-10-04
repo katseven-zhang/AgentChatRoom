@@ -1359,8 +1359,12 @@ def room_bootstrap(model: str = "", project_name: str = "") -> dict[str, Any]:
         details = {
             "required_action": payload.get("required_action"),
         }
-        if bound:
+        if bound and payload.get("status") not in {
+            "identity_mismatch",
+            "credential_conflict",
+        }:
             details["http_correct_action"] = HTTP_UNREGISTERED_ROOTS_ACTION
+        if bound:
             payload["details"] = {**(payload.get("details") or {}), **details}
         return {
             "ok": False,

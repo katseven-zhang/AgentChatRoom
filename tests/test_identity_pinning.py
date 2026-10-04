@@ -145,8 +145,13 @@ def test_bootstrap_local_room_rejects_drifted_identity_for_linked_credential(
         credential_id=credential["id"],
     )
     assert drifted.binding is None
-    details = (drifted.public.get("details") or {}).get("code")
-    assert details == "software_identity_mismatch"
+    assert drifted.public["status"] == "identity_mismatch"
+    assert drifted.public["required_action"] == (
+        "restore_linked_software_identity_or_issue_unlinked_token"
+    )
+    assert drifted.public["details"]["code"] == "software_identity_mismatch"
+    assert drifted.public["details"]["status_code"] == 403
+    assert "pinned to a different software" in drifted.public["details"]["message"]
 
 
 def test_default_credential_name_auto_renamed_to_real_agent_name(
