@@ -67,7 +67,7 @@ from .contracts import (
     task_view,
 )
 from .database import SCHEMA_VERSION, DatabaseBackend
-from .redaction import SENSITIVE_KEYS
+from .redaction import SENSITIVE_KEYS, redact_value
 from .errors import DomainError
 from .project_registration import (
     detect_git_info,
@@ -1434,7 +1434,7 @@ class AgentChatRoomService:
         self, row: Mapping[str, Any], connection: Any | None = None
     ) -> dict[str, Any]:
         data = dict(row)
-        data["payload"] = json_load(data.pop("payload_json"), {})
+        data["payload"] = redact_value(json_load(data.pop("payload_json"), {}))
         if connection is not None and data.get("task_id"):
             task = connection.execute(
                 "SELECT task_number FROM tasks WHERE id = ?",
@@ -1455,8 +1455,11 @@ class AgentChatRoomService:
         # name — one event, one citable number, on every adapter.
         data.pop("id", None)
         seq = data.get("project_seq")
+        # Always emit the key. A consumer reading event.id must not get
+        # undefined because a row happened to carry no public number, and a
+        # missing key is indistinguishable from a projection bug.
+        data["id"] = int(seq) if seq is not None else None
         if seq is not None:
-            data["id"] = int(seq)
             data["project_seq"] = int(seq)
         return data
 
