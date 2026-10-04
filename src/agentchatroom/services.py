@@ -2341,6 +2341,13 @@ class AgentChatRoomService:
     def _workspace_dict(self, row: Mapping[str, Any]) -> dict[str, Any]:
         data = dict(row)
         data["metadata"] = json_load(data.pop("metadata_json"), {})
+        # The stored local_path is the canonical identity key (#255); the string
+        # the caller typed is what listings and the API have always shown, so the
+        # projection swaps the display form back in and exposes the key beside it.
+        display = str(data.pop("display_path", "") or "")
+        if display:
+            data["path_key"] = str(data.get("local_path", ""))
+            data["local_path"] = display
         return data
 
     def _task_intake_dict(self, row: Mapping[str, Any]) -> dict[str, Any]:
@@ -4541,6 +4548,26 @@ Attach a workspace to a host, creating the host row if it is new.
         workspace_metadata = self._workspace_evidence_metadata(
             workspace_metadata, server_verified=server_verified
         )
+        # The selected repository a workspace belongs to is server-owned state:
+        # a caller-supplied ``repository_path`` never reaches storage, and a
+        # workspace rooted directly at the selected repository needs no
+        # sub-path at all (#367).
+        with self.database.connect() as connection:
+            project_for_workspace = dict(
+                self._require_project(connection, project_id)
+            )
+        selection = str(project_for_workspace.get("repository_path") or "")
+        sanitized = dict(workspace_metadata)
+        if selection:
+            local_root = Path(local_path).expanduser().resolve()
+            if local_root.is_dir():
+                direct_scope = checkout_scope(local_root, repository_path="")
+                if direct_scope == stored_project_scope(project_for_workspace):
+                    selection = ""
+            sanitized["repository_path"] = selection
+        else:
+            sanitized.pop("repository_path", None)
+        workspace_metadata = sanitized
         now = iso_now()
         with self.database.connect(write=True) as connection:
             self._require_project(connection, project_id)
@@ -12732,9 +12759,12 @@ Attach a workspace to a host, creating the host row if it is new.
                         connection, project_id, session_id, token or ""
                     )
             else:
-                actor_row = self._authenticate(
-                    connection, project_id, session_id, token or ""
-                )
+                # Authenticating first would answer a no-credential caller with
+                # invalid_session_token, hiding the actual contract violation:
+                # a caller that brings no management authority at all - and no
+                # Agent credentials either - must hear management_auth_required.
+                if session_id and token:
+                    self._authenticate(connection, project_id, session_id, token or "")
                 raise _management_authorization_required(
                     "write a project document"
                 )

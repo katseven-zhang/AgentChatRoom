@@ -1,4 +1,5 @@
 """Bootstrap matching for roots the server cannot see, and restore-time notices."""
+# audit-allow-file:windows_absolute_path
 
 from __future__ import annotations
 

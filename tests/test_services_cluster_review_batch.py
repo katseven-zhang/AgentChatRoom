@@ -245,6 +245,7 @@ def test_project_document_content_byte_limit(service, project):
         kind="binding",
         title="Standards",
         content="x" * min(64, max_bytes),
+        management_authorized=True,
     )
 
 

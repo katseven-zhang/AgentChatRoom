@@ -76,10 +76,9 @@ def test_reading_an_event_back_does_not_hand_out_the_secret(service, project):
         ).fetchall()
         assert rows, "the message produced no event"
 
-        for row in rows:
-            payload = service._event_dict(row)
-            body = json.dumps(payload, ensure_ascii=False)
-            assert secret not in body, f"secret survived in {payload}"
+        for projected in service._project_events(connection, rows):
+            body = json.dumps(projected, ensure_ascii=False)
+            assert secret not in body, f"secret survived in {projected}"
             assert "[REDACTED]" in body
 
 
@@ -138,7 +137,7 @@ def test_a_redacted_event_still_carries_the_public_number(service, project):
 
         shaped = dict(row)
         shaped["project_seq"] = None
-        projected = service._event_dict(shaped)
+        (projected,) = service._project_events(connection, [shaped])
         assert "id" in projected, "the id key disappeared again"
         assert projected["id"] is None
 

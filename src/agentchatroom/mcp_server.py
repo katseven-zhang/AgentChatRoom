@@ -162,9 +162,11 @@ def _retain_session_leave_binding(payload: Any) -> None:
     if not isinstance(error, dict):
         return
     details = error.setdefault("details", {})
-    details.setdefault(
-        "required_action", "retry_leave_or_continue_with_current_binding"
-    )
+    # Override, not setdefault: since the error catalog started populating
+    # required_action for every code (#348), the generic per-code action would
+    # win here and tell the caller to fetch a new token, which is exactly the
+    # wrong guidance for a leave that kept the current binding alive.
+    details["required_action"] = "retry_leave_or_continue_with_current_binding"
     details["binding_retained"] = True
 
 

@@ -439,9 +439,9 @@ def stored_project_scope(project: Mapping[str, Any]) -> dict[str, str]:
         }
     root = Path(str(project.get("root_path", ""))).expanduser().resolve()
     root = root / str(project.get("repository_path") or "")
-    # Local monorepo identity is the repository root, not its scoped subdirectory.
-    for _part in PurePosixPath(logical).parts:
-        root = root.parent
+    # Local monorepo identity is the repository root, not its scoped
+    # subdirectory. repository_root_from_logical already walks up by the logical
+    # parts; walking here as well would overshoot by that many levels again.
     return {
         "kind": "path",
         "identity": os.path.normcase(

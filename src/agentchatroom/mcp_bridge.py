@@ -95,7 +95,12 @@ AUTO_IDEMPOTENCY_TOOL_NAMES = frozenset(
 # Every other tool that advertises request_id is covered above. Presence is the
 # one deliberate exception: a replayed heartbeat must not be answered from the
 # idempotency cache, or the connection would stop looking alive.
-AUTO_IDEMPOTENCY_EXCLUDED_TOOL_NAMES = frozenset({"session_heartbeat"})
+# task_intake_cancel is deliberately idempotent in the domain (a repeated
+# cancel of the same intake writes nothing new), so the bridge gains nothing
+# from replaying a cached response for it.
+AUTO_IDEMPOTENCY_EXCLUDED_TOOL_NAMES = frozenset(
+    {"session_heartbeat", "task_intake_cancel"}
+)
 ResultT = TypeVar("ResultT")
 RETRYABLE_HTTP_STATUS_CODES = frozenset({408, 425, 429, 500, 502, 503, 504})
 # An expired upstream MCP session may be re-initialised automatically, but only

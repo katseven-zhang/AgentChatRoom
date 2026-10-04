@@ -1,4 +1,5 @@
 """#308 guard: workspace path comparison folds separators and case.
+# audit-allow-file:windows_absolute_path
 
 ``workspace_path_keys`` unconditionally produced three forms of every path
 (``raw``, ``raw`` with forward slashes, ``raw`` with backslashes), and

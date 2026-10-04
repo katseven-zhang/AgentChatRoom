@@ -39,6 +39,11 @@ function buildContext({apiBehavior, dialogOpen = true}) {
     },
     'project-form-error': {textContent: '', hidden: true},
     'token-form-error': {textContent: '', hidden: true},
+    // #367 added repository-selection controls to the project dialog; the
+    // submit path only skips them when the inspected root no longer matches,
+    // so the stubs mirror an inspected (or untouched) dialog.
+    'project-repository-select': {dataset: {inputRoot: 'D:/definitely/missing/path'}},
+    'project-repository-input': {value: ''},
   };
   const context = {
     elements,

@@ -1,4 +1,5 @@
 """#290 guard: the server must not resolve() a client-declared workspace root.
+# audit-allow-file:windows_absolute_path
 
 Mode B/C let a client advertise workspace roots that the server cannot see. The
 server used to run ``Path(raw).expanduser().resolve()`` on that declaration,
