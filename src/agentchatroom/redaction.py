@@ -58,10 +58,16 @@ _TOKENISH = "token"
 
 _CREDENTIAL_VALUE = r"[^\s,;}\]&\"']+"
 
-# AgentChatRoom's own credential shape: acr.<id>.<secret>. The release audit
-# reports this same pattern, so a live credential can neither survive a log nor
-# stay invisible to the publish check.
-AGENTCHATROOM_CREDENTIAL_PATTERN = re.compile(r"\bacr\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b")
+# AgentChatRoom's own credential shapes. Both the bare token
+# (acr.<id>.<secret>) and the credential bundle the MCP connector carries
+# (acrb.v1.<base64>) are live values: the bundle is what the client sends on
+# every call, so a pattern that stops at "acr." lets the whole bundle through.
+# The release audit reports the same shapes, so a live credential can neither
+# survive a log nor stay invisible to the publish check.
+AGENTCHATROOM_CREDENTIAL_PATTERN = re.compile(
+    r"\bacrb?\.v?\d*\.[A-Za-z0-9_-]{8,}(?:\.[A-Za-z0-9_-]+)*\b"
+    r"|\bacr\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b"
+)
 
 # Value-pattern redaction: credentials embedded in free-form text must not leak
 # even under a benign key such as "body" or "summary" (review #44, criterion 12).
