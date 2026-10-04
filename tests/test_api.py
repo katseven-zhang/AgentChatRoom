@@ -1352,7 +1352,7 @@ def test_api_returns_stable_domain_error(settings, project_dir):
             "error": {
                 "code": "invalid_session_token",
                 "message": "Agent session or token is invalid",
-                "details": {},
+                "details": {"required_action": "rejoin_the_room_for_a_fresh_session"},
             }
         }
 
