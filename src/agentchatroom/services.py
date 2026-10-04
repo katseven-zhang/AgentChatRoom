@@ -10012,7 +10012,8 @@ Attach a workspace to a host, creating the host row if it is new.
             for report_row in connection.execute(
                 """
                 SELECT payload_json FROM events
-                WHERE project_id = ? AND task_id = ? AND event_type = 'work.report'
+                WHERE project_id = ? AND task_id = ?
+                  AND event_type IN ('work.reported', 'work.report')
                 ORDER BY id DESC LIMIT 1
                 """,
                 (project_id, task_id),
