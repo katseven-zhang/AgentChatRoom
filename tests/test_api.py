@@ -1499,6 +1499,58 @@ def test_management_auth_protects_remote_admin_api(
         assert bearer.status_code == 200
 
 
+def test_project_management_routes_name_their_authority(
+    monkeypatch, settings, tmp_path
+):
+    """#373: DELETE/PATCH /projects carry the management contract themselves.
+
+    The global middleware gates the whole API surface when management auth is
+    required; these routes additionally name ``_require_management`` so the two
+    most destructive project operations never depend on that single layer.
+    """
+    admin_token = "test-management-token-with-adequate-length"
+    monkeypatch.setenv("TEST_AGENTCHATROOM_ADMIN_TOKEN", admin_token)
+    protected_settings = replace(
+        settings,
+        management_auth_required=True,
+        management_token_env="TEST_AGENTCHATROOM_ADMIN_TOKEN",
+    )
+    with TestClient(create_app(protected_settings)) as client:
+        room = tmp_path / "room"
+        room.mkdir()
+        created = client.post(
+            "/api/v1/projects",
+            json={"root_path": str(room)},
+            headers={"Authorization": f"Bearer {admin_token}"},
+        )
+        assert created.status_code == 201
+        project_id = created.json()["id"]
+
+        rejected_delete = client.delete(f"/api/v1/projects/{project_id}")
+        assert rejected_delete.status_code == 401
+        assert rejected_delete.json()["error"]["code"] == "management_auth_required"
+
+        rejected_patch = client.patch(
+            f"/api/v1/projects/{project_id}", json={"name": "Nope"}
+        )
+        assert rejected_patch.status_code == 401
+        assert rejected_patch.json()["error"]["code"] == "management_auth_required"
+
+        authorized = {"Authorization": f"Bearer {admin_token}"}
+        patched = client.patch(
+            f"/api/v1/projects/{project_id}",
+            json={"name": "Renamed by operator"},
+            headers=authorized,
+        )
+        assert patched.status_code == 200
+
+        archived = client.delete(
+            f"/api/v1/projects/{project_id}", headers=authorized
+        )
+        assert archived.status_code == 200
+        assert archived.json()["archived"] is True
+
+
 def test_management_auth_requires_configured_secret(settings):
     protected_settings = replace(
         settings,

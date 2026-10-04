@@ -2086,7 +2086,12 @@ def create_app(
         return service.inspect_repository_candidates(project["root_path"])
 
     @app.put("/api/v1/projects/{project_id}/repository")
-    def select_project_repository(project_id: str, body: RepositorySelection) -> dict[str, Any]:
+    def select_project_repository(
+        request: Request, project_id: str, body: RepositorySelection
+    ) -> dict[str, Any]:
+        # Rebiding which repository a Project identifies with rewrites its scope,
+        # so it is a management decision like every other project mutation.
+        _require_management(request)
         return service.select_project_repository(project_id, body.repository_path)
 
     @app.post("/api/v1/projects", status_code=201)
@@ -2099,9 +2104,15 @@ def create_app(
 
     @app.delete("/api/v1/projects/{project_id}")
     def remove_project(
+        request: Request,
         project_id: str,
         permanent: bool = Query(False),
     ) -> dict[str, Any]:
+        # Archiving or deleting a Room is the most destructive management act in
+        # the API: permanent=True also unlinks checkout registrations. Like the
+        # other destructive routes it names its authority requirement itself
+        # instead of relying only on the global management middleware (#373).
+        _require_management(request)
         if permanent:
             # Which checkouts this Project may own is a domain decision; Session
             # worktrees are caller-reported strings and must not widen the set.
@@ -2141,7 +2152,13 @@ def create_app(
         return service.archive_project(project_id)
 
     @app.patch("/api/v1/projects/{project_id}")
-    def update_project(project_id: str, body: ProjectUpdate) -> dict[str, Any]:
+    def update_project(
+        request: Request, project_id: str, body: ProjectUpdate
+    ) -> dict[str, Any]:
+        # Renaming a Project rewrites its coordination instructions on every
+        # checkout, so the route carries the same management contract as DELETE
+        # (#373).
+        _require_management(request)
         if body.name is not None:
             current = service.get_project(project_id)
             validate_project_coordination_instructions(current["root_path"])
