@@ -676,8 +676,16 @@ def bootstrap_local_room(
         except DomainError:
             pass
         try:
-            reg = load_checkout_registration(checkout)
+            # The registration of a monorepo subproject is stored under its
+            # derived ``logical_path``, so the self-heal lookup has to ask for
+            # that same key.  Looking it up with the empty default never
+            # matches, which rewrote project.json on every bootstrap and paid
+            # two extra git probes for it.
             expected_scope = checkout_scope(checkout)
+            reg = load_checkout_registration(
+                checkout,
+                logical_path=str(expected_scope.get("logical_path", "") or ""),
+            )
             if reg is None or reg.get("scope") != expected_scope:
                 register_checkout_project(checkout, project, replace_existing=True)
         except DomainError:
@@ -703,12 +711,19 @@ def bootstrap_local_room(
             )
             if restored_outcome is not None:
                 if credential_id and restored_outcome.binding is not None:
-                    with service.database.connect(write=False) as conn:
-                        srow = conn.execute(
-                            "SELECT member_id FROM agent_sessions WHERE id = ?",
-                            (restored_outcome.binding.session_id,),
-                        ).fetchone()
-                        member_id = str(srow["member_id"]) if srow and srow["member_id"] else ""
+                    # Ask the domain service for the authenticated row instead
+                    # of issuing a project-unfiltered SELECT here: the Session
+                    # token is already in hand, and verify_session keeps the
+                    # lookup bound to this Project.
+                    try:
+                        verified = service.verify_session(
+                            project["id"],
+                            restored_outcome.binding.session_id,
+                            restored_outcome.binding.token,
+                        )
+                    except DomainError:
+                        verified = {}
+                    member_id = str(verified.get("member_id") or "")
                     if member_id:
                         # A credential already pinned to another member is a
                         # real identity mismatch, not a recoverable naming

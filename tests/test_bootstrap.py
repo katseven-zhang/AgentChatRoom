@@ -3,13 +3,15 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
+import subprocess
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
-from agentchatroom import mcp_server
+from agentchatroom import bootstrap, mcp_server
 from agentchatroom.bootstrap import (
     BOOTSTRAP_STATES,
     PROJECT_PATH_ENV,
@@ -1529,6 +1531,124 @@ def test_runtime_binding_restore_requires_the_same_project_and_identity():
         )
         is None
     )
+
+
+def test_monorepo_subproject_bootstrap_does_not_rewrite_the_registration(
+    monkeypatch, service, tmp_path
+):
+    """#307：子项目登记按 logical_path 存放，自愈查空键会每次 bootstrap 重写。"""
+    _configure_software(monkeypatch)
+    repository = tmp_path / "repository"
+    api_dir = repository / "packages" / "api"
+    api_dir.mkdir(parents=True)
+    subprocess.run(["git", "-C", str(repository), "init"], check=True, capture_output=True)
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(repository),
+            "remote",
+            "add",
+            "origin",
+            "git@example.invalid:team/repo.git",
+        ],
+        check=True,
+        capture_output=True,
+    )
+    project = service.create_project(root_path=str(api_dir), name="Bootstrap Api")
+    register_checkout_project(api_dir, project)
+    assert project["logical_path"] == "packages/api"
+    registration_path = api_dir / ".agentchatroom" / "project.json"
+
+    # The rewrite is byte-identical, so count the atomic replace instead of
+    # comparing content or mtime.
+    writes: list[Path] = []
+    original_replace = Path.replace
+
+    def counting_replace(self, target, *args, **kwargs):
+        writes.append(Path(target))
+        return original_replace(self, target, *args, **kwargs)
+
+    first = _bootstrap(service, api_dir)
+    assert first.public["status"] == "ready"
+    monkeypatch.setattr(Path, "replace", counting_replace)
+    try:
+        for _ in range(2):
+            again = _bootstrap(service, api_dir)
+            assert again.public["status"] == "ready"
+    finally:
+        monkeypatch.undo()
+    assert registration_path not in writes
+
+
+def test_bootstrap_registration_self_heal_still_repairs_a_drifted_scope(
+    monkeypatch, service, project_dir
+):
+    """#307：真实漂移（scope 变化）仍必须重写登记。"""
+    _configure_software(monkeypatch)
+    project = _register_project(service, project_dir)
+    registration_path = project_dir / ".agentchatroom" / "project.json"
+    document = json.loads(registration_path.read_text(encoding="utf-8"))
+    drifted = {"kind": "git", "identity": "drifted", "logical_path": ""}
+    document["registrations"][0]["scope"] = drifted
+    registration_path.write_text(
+        json.dumps(document, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+
+    # selected_project_id resolves the checkout from the stored root, so the
+    # self-heal block is the only thing that can repair the drifted scope.
+    outcome = _bootstrap(
+        service,
+        project_dir,
+        workspace_roots=[],
+        selected_project_id=project["id"],
+    )
+
+    assert outcome.public["status"] == "ready"
+    repaired = json.loads(registration_path.read_text(encoding="utf-8"))
+    assert repaired["registrations"][0]["scope"] != drifted
+    assert repaired["registrations"][0]["project_key"] == project["project_key"]
+
+
+def test_bootstrap_adapter_issues_no_bare_session_select():
+    """#307：bootstrap 适配层不得绕过域服务手写不限定项目的 SQL。"""
+    source = Path(bootstrap.__file__).read_text(encoding="utf-8")
+    assert not re.search(
+        r"SELECT\s+.*?\s+FROM\s+agent_sessions", source, re.IGNORECASE | re.DOTALL
+    )
+    assert "service.database.connect" not in source
+
+
+def test_restored_session_links_credential_to_its_own_member(
+    monkeypatch, service, project_dir
+):
+    """#307：恢复路径的凭据关联改走 verify_session，member_id 仍要取到。"""
+    _configure_software(monkeypatch)
+    project = _register_project(service, project_dir)
+    first = _bootstrap(service, project_dir)
+    assert first.binding is not None
+    credential = service.issue_agent_token(
+        project["id"], name="Restored credential"
+    )["credential"]
+
+    restored = _bootstrap(
+        service,
+        project_dir,
+        restore_binding=first.binding,
+        credential_id=credential["id"],
+    )
+
+    assert restored.binding is not None
+    assert restored.binding.session_id == first.binding.session_id
+    linked = next(
+        item
+        for item in service.list_agent_tokens(project["id"])
+        if item["id"] == credential["id"]
+    )
+    session = service.verify_session(
+        project["id"], first.binding.session_id, first.binding.token
+    )
+    assert linked["member_id"] == session["member_id"]
 
 
 def test_bind_runtime_arguments_derives_actor_session_id_with_token():
