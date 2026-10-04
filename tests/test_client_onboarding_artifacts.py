@@ -238,7 +238,15 @@ def _run_cli(monkeypatch, tmp_path, argv):
         capture_output=True,
         text=True,
         encoding="utf-8",
-        env={**__import__("os").environ, "PYTHONPATH": str(REPO / "src")},
+        env={
+            **__import__("os").environ,
+            "PYTHONPATH": str(REPO / "src"),
+            # The CLI prints profile labels that are not ASCII; without these
+            # the child speaks the console code page while the parent decodes
+            # UTF-8, and the mismatch raises instead of testing the CLI (#374).
+            "PYTHONUTF8": "1",
+            "PYTHONIOENCODING": "utf-8",
+        },
     )
     assert completed.returncode == 0, completed.stderr
     return completed.stdout
