@@ -11669,9 +11669,12 @@ class AgentChatRoomService:
                         connection, project_id, session_id, token or ""
                     )
             else:
-                actor_row = self._authenticate(
-                    connection, project_id, session_id, token or ""
-                )
+                # Authenticating first would answer a no-credential caller with
+                # invalid_session_token, hiding the actual contract violation:
+                # a caller that brings no management authority at all - and no
+                # Agent credentials either - must hear management_auth_required.
+                if session_id and token:
+                    self._authenticate(connection, project_id, session_id, token or "")
                 raise _management_authorization_required(
                     "write a project document"
                 )

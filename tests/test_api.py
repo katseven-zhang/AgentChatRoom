@@ -30,6 +30,7 @@ from agentchatroom.project_registration import (
     PROJECT_INSTRUCTIONS_END,
     project_instructions_path,
 )
+from agentchatroom.services import canonical_workspace_key
 
 
 class _ExpectedProactorDisconnectHandle:
@@ -1283,7 +1284,11 @@ def test_api_manages_agent_tokens_and_workspaces(settings, project_dir):
         )
         assert registered.status_code == 201
         assert registered.json()["host"]["host_key"] == "desktop-fingerprint"
-        assert registered.json()["workspace"]["local_path"] == "D:/work/project"
+        # #255: local_path is the canonical identity key; the caller-typed text
+        # is preserved beside it and is what the API shows.
+        workspace = registered.json()["workspace"]
+        assert workspace["display_path"] == "D:/work/project"
+        assert workspace["local_path"] == canonical_workspace_key("D:/work/project")
         workspaces = client.get(
             f"/api/v1/projects/{project['id']}/workspaces"
         ).json()["workspaces"]

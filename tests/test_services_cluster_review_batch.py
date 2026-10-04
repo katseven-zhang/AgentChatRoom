@@ -19,7 +19,12 @@ from agentchatroom.project_registration import (
     logical_paths_equal,
     validate_logical_path,
 )
-from agentchatroom.services import AgentChatRoomService, iso_now, utc_now
+from agentchatroom.services import (
+    AgentChatRoomService,
+    canonical_workspace_key,
+    iso_now,
+    utc_now,
+)
 from agentchatroom.task_history import history_detail_kind
 
 
@@ -245,6 +250,7 @@ def test_project_document_content_byte_limit(service, project):
         kind="binding",
         title="Standards",
         content="x" * min(64, max_bytes),
+        management_authorized=True,
     )
 
 
@@ -897,7 +903,13 @@ def test_register_workspace_rejects_unc_paths(service, project):
         host_name="H",
         local_path=r"C:\workspace\project",
     )
-    assert local_ok["workspace"]["local_path"] == r"C:\workspace\project"
+    # #255: local_path is the canonical identity key a workspace is looked up
+    # and matched under; the string the caller typed is kept beside it, because
+    # the point of the key is that case and separators stop creating duplicates.
+    assert local_ok["workspace"]["display_path"] == r"C:\workspace\project"
+    assert local_ok["workspace"]["local_path"] == canonical_workspace_key(
+        r"C:\workspace\project"
+    )
 
     posix = service.register_workspace(
         project["id"],
@@ -905,7 +917,8 @@ def test_register_workspace_rejects_unc_paths(service, project):
         host_name="H",
         local_path="/var/lib/project",
     )
-    assert posix["workspace"]["local_path"] == "/var/lib/project"
+    # Same contract: the typed path is what a reader is shown, on either OS.
+    assert posix["workspace"]["display_path"] == "/var/lib/project"
 
 
 # ---------------------------------------------------------------------------

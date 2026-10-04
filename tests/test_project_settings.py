@@ -196,6 +196,7 @@ def test_purge_defers_the_event_behind_a_task_spec_receipt(service, project, tmp
         title="工程规范",
         content="先取租约再改共享文件。",
         actor="management",
+        management_authorized=True,
     )
     task = service.create_task(
         project["id"],

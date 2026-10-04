@@ -505,14 +505,18 @@ def test_intake_define_concurrent_lock_prevents_duplicate_tasks(service, project
 def test_upsert_project_document_revives_archived_document(service, project):
     """#134：upsert 已归档文档后 archived_at 复位，普通列表可检索。"""
     service.upsert_project_document(
-        project["id"], doc_key="standards", kind="binding", title="V1", content="c1"
+        project["id"], doc_key="standards", kind="binding", title="V1", content="c1",
+        management_authorized=True,
     )
-    service.archive_project_document(project["id"], "standards")
+    service.archive_project_document(
+        project["id"], "standards", management_authorized=True
+    )
     archived_list = service.list_project_documents(project["id"])
     assert all(d["doc_key"] != "standards" for d in archived_list["documents"])
 
     service.upsert_project_document(
-        project["id"], doc_key="standards", kind="binding", title="V2", content="c2"
+        project["id"], doc_key="standards", kind="binding", title="V2", content="c2",
+        management_authorized=True,
     )
     active = service.list_project_documents(project["id"])["documents"]
     revived = next(d for d in active if d["doc_key"] == "standards")
