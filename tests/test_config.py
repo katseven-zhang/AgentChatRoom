@@ -510,6 +510,11 @@ def test_every_config_file_schema_key_maps_into_settings(monkeypatch, tmp_path):
             "export_event_limit": 1000,
             "idempotency_retention_days": 7,
             "retention_sweep_interval_seconds": 45.0,
+            "repository_scan_max_depth": 2,
+            "repository_scan_max_directories": 64,
+            "repository_scan_timeout_seconds": 2.5,
+            "repository_scan_excludes": ["cache", "generated"],
+            "repository_evidence_max_file_bytes": 4096,
             # mcp_message_context_limit is an alias; covered in a dedicated load below.
         },
         "security": {
@@ -581,7 +586,7 @@ def test_every_config_file_schema_key_maps_into_settings(monkeypatch, tmp_path):
         for key, file_value in values.items():
             attr = _settings_attr_for(section, key)
             expected = file_value
-            if attr == "knowledge_kinds":
+            if attr in {"knowledge_kinds", "repository_scan_excludes"}:
                 expected = tuple(file_value)  # type: ignore[arg-type]
             assert getattr(settings, attr) == expected, (
                 f"[{section}].{key} did not map to Settings.{attr}"

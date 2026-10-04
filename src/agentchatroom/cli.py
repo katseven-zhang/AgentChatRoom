@@ -1059,6 +1059,13 @@ def build_parser() -> argparse.ArgumentParser:
     project = commands.add_parser("project-add", help="Add a project")
     project.add_argument("root_path")
     project.add_argument("--name")
+    project.add_argument("--repository-path", help="Explicit workspace-relative repository; empty keeps a local directory")
+
+    repository_inspect = commands.add_parser("repository-inspect", help="Inspect repository candidates in a workspace")
+    repository_inspect.add_argument("root_path")
+    repository_select = commands.add_parser("repository-select", help="Associate an existing Room with a selected repository")
+    repository_select.add_argument("project_id")
+    repository_select.add_argument("repository_path")
 
     commands.add_parser("project-list", help="List projects")
 
@@ -1840,8 +1847,13 @@ def main(argv: list[str] | None = None) -> None:
         result = call_api(
             "POST",
             "/api/v1/projects",
-            {"root_path": args.root_path, "name": args.name},
+            {"root_path": args.root_path, "name": args.name, "repository_path": args.repository_path},
         )
+    elif args.command == "repository-inspect":
+        result = call_api("POST", "/api/v1/local/repositories/inspect", {"root_path": args.root_path})
+    elif args.command == "repository-select":
+        result = call_api("PUT", f"/api/v1/projects/{args.project_id}/repository",
+                          {"repository_path": args.repository_path})
     elif args.command == "project-list":
         result = call_api("GET", "/api/v1/projects")
     elif args.command == "project-update":

@@ -49,6 +49,11 @@ CONFIG_FILE_SCHEMA: dict[str, dict[str, tuple[type, ...]]] = {
         "require_verified_task": (bool,),
     },
     "coordination": {
+        "repository_scan_max_depth": (int,),
+        "repository_scan_max_directories": (int,),
+        "repository_scan_timeout_seconds": (int, float),
+        "repository_scan_excludes": (list,),
+        "repository_evidence_max_file_bytes": (int,),
         "mcp_roots_timeout_seconds": (int, float),
         "git_scope_recheck_ttl_seconds": (int, float),
         "heartbeat_timeout_seconds": (int,),
@@ -361,6 +366,13 @@ class Settings:
     export_event_limit: int = 5000
     idempotency_retention_days: int = 30
     retention_sweep_interval_seconds: float = 3600.0
+    repository_scan_max_depth: int = 3
+    repository_scan_max_directories: int = 256
+    repository_scan_timeout_seconds: float = 5.0
+    repository_scan_excludes: tuple[str, ...] = (
+        ".git", ".agentchatroom", ".venv", "node_modules", "build", "dist",
+    )
+    repository_evidence_max_file_bytes: int = 8388608
 
     @property
     def mcp_message_context_limit(self) -> int:
@@ -455,6 +467,11 @@ def _merge_toml(path: Path) -> dict[str, Any]:
         "knowledge_require_verified_task": raw.get("knowledge", {}).get(
             "require_verified_task"
         ),
+        "repository_scan_max_depth": raw.get("coordination", {}).get("repository_scan_max_depth"),
+        "repository_scan_max_directories": raw.get("coordination", {}).get("repository_scan_max_directories"),
+        "repository_scan_timeout_seconds": raw.get("coordination", {}).get("repository_scan_timeout_seconds"),
+        "repository_scan_excludes": raw.get("coordination", {}).get("repository_scan_excludes"),
+        "repository_evidence_max_file_bytes": raw.get("coordination", {}).get("repository_evidence_max_file_bytes"),
         "mcp_roots_timeout_seconds": raw.get("coordination", {}).get("mcp_roots_timeout_seconds"),
         "git_scope_recheck_ttl_seconds": raw.get("coordination", {}).get(
             "git_scope_recheck_ttl_seconds"
@@ -956,6 +973,30 @@ def load_settings(
             )
         ),
     }
+    for key, default in (
+        ("repository_scan_max_depth", 3),
+        ("repository_scan_max_directories", 256),
+        ("repository_evidence_max_file_bytes", 8388608),
+    ):
+        values[key] = int(os.getenv(f"AGENTCHATROOM_{key.upper()}", file_values.get(key, default)))
+        if values[key] <= 0:
+            raise ValueError(f"{key} must be positive")
+    values["repository_scan_timeout_seconds"] = float(os.getenv(
+        "AGENTCHATROOM_REPOSITORY_SCAN_TIMEOUT_SECONDS",
+        file_values.get("repository_scan_timeout_seconds", 5.0),
+    ))
+    if not 0 < values["repository_scan_timeout_seconds"] <= 60:
+        raise ValueError("repository_scan_timeout_seconds must be between 0 and 60")
+    excludes = os.getenv("AGENTCHATROOM_REPOSITORY_SCAN_EXCLUDES")
+    excludes = excludes.split(",") if excludes is not None else file_values.get(
+        "repository_scan_excludes", [".git", ".agentchatroom", ".venv", "node_modules", "build", "dist"]
+    )
+    if not isinstance(excludes, list) or any(
+        not isinstance(value, str) or not value.strip() or "/" in value or "\\" in value
+        for value in excludes
+    ):
+        raise ValueError("repository_scan_excludes must contain directory names")
+    values["repository_scan_excludes"] = tuple(value.strip() for value in excludes)
     if values["message_max_body_length"] <= 0:
         raise ValueError("message_max_body_length must be positive")
     if values["task_text_max_length"] <= 0:

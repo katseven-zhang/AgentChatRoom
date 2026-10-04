@@ -93,6 +93,11 @@ lease_list_limit = 500
 # export_project returns at most this many events and declares the window under
 # window.events (#359).
 export_event_limit = 5000
+repository_scan_max_depth = 3
+repository_scan_max_directories = 256
+repository_scan_timeout_seconds = 5.0
+repository_scan_excludes = [".git", ".agentchatroom", ".venv", "node_modules", "build", "dist"]
+repository_evidence_max_file_bytes = 8388608
 # Idempotency record retention in days; 0 = keep forever (#200).
 idempotency_retention_days = 30
 retention_sweep_interval_seconds = 3600.0
