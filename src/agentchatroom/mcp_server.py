@@ -86,6 +86,11 @@ _session_bindings_lock = threading.RLock()
 # transport while resuming the same Room Session. The transport id is only a
 # client bookmark; identity is always re-derived from credentials and headers.
 _transport_tombstones: dict[str, tuple[RuntimeBinding, float]] = {}
+# Transport ids the client explicitly tore down with an MCP ``DELETE``. Such a
+# transport is never coming back -- the client stated it is finished with the
+# id -- so retaining a tombstone for it would only spend LRU capacity that a
+# real bookmark awaiting replay needs. Presence reaps these on its own.
+_client_terminated_transports: dict[str, float] = {}
 # Room Session orphaned by a bootstrap that never reached the domain (roots or
 # identity preparation failed). It revives nothing but the next bootstrap's
 # restore path, so the connection keeps no usable binding in the meantime, and it
@@ -102,6 +107,10 @@ _BINDING_DEFAULT_LIMIT = 256
 _BINDING_DEFAULT_TTL_SECONDS = 86400.0
 _binding_limit = _BINDING_DEFAULT_LIMIT
 _binding_ttl_seconds = _BINDING_DEFAULT_TTL_SECONDS
+# Optional (project_id, session_id) -> bool probe telling whether a Room Session
+# is still open. Wired by the HTTP app; absent in stdio and tests, where every
+# tombstone is treated as replayable.
+_tombstone_session_active: Callable[[str, str], bool] | None = None
 _transport_keys: dict[int, tuple[weakref.ReferenceType, str]] = {}
 _active_binding_key: ContextVar[str | None] = ContextVar("mcp_binding_key", default=None)
 _loaded_identity: tuple[str, str, str] | None = None
@@ -558,14 +567,17 @@ def configure_transport_tombstones(
     *,
     limit: int | None = None,
     ttl_seconds: float | None = None,
+    session_active: Callable[[str, str], bool] | None = None,
 ) -> None:
     """Bound the adoption tombstone table (count and age)."""
-    global _tombstone_limit, _tombstone_ttl_seconds
+    global _tombstone_limit, _tombstone_ttl_seconds, _tombstone_session_active
     with _session_bindings_lock:
         if limit is not None and limit > 0:
             _tombstone_limit = int(limit)
         if ttl_seconds is not None and ttl_seconds > 0:
             _tombstone_ttl_seconds = float(ttl_seconds)
+        if session_active is not None:
+            _tombstone_session_active = session_active
         _prune_transport_tombstones_locked()
         _prune_pending_restores_locked()
 
@@ -596,13 +608,83 @@ def _prune_transport_tombstones_locked() -> None:
     for key, (_, recorded) in list(_transport_tombstones.items()):
         if now - recorded > _tombstone_ttl_seconds:
             _transport_tombstones.pop(key, None)
+    for key, recorded in list(_client_terminated_transports.items()):
+        if now - recorded > _tombstone_ttl_seconds:
+            _client_terminated_transports.pop(key, None)
     while len(_transport_tombstones) > _tombstone_limit:
-        oldest = min(_transport_tombstones.items(), key=lambda item: item[1][1])[0]
-        _transport_tombstones.pop(oldest, None)
+        _evict_one_transport_tombstone_locked()
+
+
+def _evict_one_transport_tombstone_locked() -> None:
+    """Drop the least valuable tombstone: unreplayable first, then the oldest.
+
+    A tombstone whose Room Session has already left can never be adopted, so it
+    is worth less than any entry a client may still come back to replay. Age is
+    only the tie-breaker among equally replayable entries: Bridge traffic that
+    opens a transport per call would otherwise push genuinely waiting entries
+    out by sheer volume, which is what breaks transparent adoption.
+    """
+    ranked = [
+        (_tombstone_is_replayable(binding), recorded, key)
+        for key, (binding, recorded) in _transport_tombstones.items()
+    ]
+    replayable, _recorded, victim = min(ranked)
+    _transport_tombstones.pop(victim, None)
+    logger.info(
+        "Evicted transport tombstone %s (replayable=%s, tombstones=%d/%d)",
+        victim,
+        replayable,
+        len(_transport_tombstones),
+        _tombstone_limit,
+    )
+
+
+def _tombstone_is_replayable(binding: RuntimeBinding) -> bool:
+    """Tell whether a tombstone could still be adopted by a returning client.
+
+    Without a liveness probe every entry counts as replayable, so age alone
+    decides -- the pre-#299 behaviour, kept for stdio and tests. A probe that
+    raises is treated as "replayable" rather than "gone": evicting on a guess
+    would cost a client its transparent adoption.
+    """
+    check = _tombstone_session_active
+    if check is None:
+        return True
+    project_id = str(getattr(binding, "project_id", "") or "")
+    session_id = str(getattr(binding, "session_id", "") or "")
+    if not project_id or not session_id:
+        return False
+    try:
+        return bool(check(project_id, session_id))
+    except Exception:
+        logger.debug(
+            "Tombstone liveness probe failed for session %s; keeping entry",
+            session_id,
+            exc_info=True,
+        )
+        return True
+
+
+def note_client_terminated_transport(transport_session_id: str) -> None:
+    """Record that the client explicitly deleted this transport session.
+
+    An MCP ``DELETE`` is the one unambiguous "I will not replay this id"
+    statement a client can make. Remembering it keeps the reaper from turning
+    that transport into a tombstone no client will ever adopt.
+    """
+    if not transport_session_id:
+        return
+    with _session_bindings_lock:
+        _client_terminated_transports[transport_session_id] = time.monotonic()
+        _transport_tombstones.pop(transport_session_id, None)
 
 
 def retain_transport_tombstone(transport_session_id: str) -> RuntimeBinding | None:
-    """Move a reaped transport's Room Session binding into the tombstone table."""
+    """Move a reaped transport's Room Session binding into the tombstone table.
+
+    Transports the client already deleted are dropped instead: their binding is
+    unreachable by definition, so a tombstone for one is pure LRU pressure.
+    """
     if not transport_session_id:
         return None
     key = f"{HTTP_TRANSPORT_KEY_PREFIX}{transport_session_id}"
@@ -612,6 +694,13 @@ def retain_transport_tombstone(transport_session_id: str) -> RuntimeBinding | No
         # age index entry would let the prune drop a binding that adoption is
         # about to look up.
         _session_binding_written.pop(key, None)
+        if binding is not None and transport_session_id in _client_terminated_transports:
+            _client_terminated_transports.pop(transport_session_id, None)
+            logger.debug(
+                "Skipped tombstone for client-terminated transport %s",
+                transport_session_id,
+            )
+            return None
         if binding is not None:
             _transport_tombstones[transport_session_id] = (binding, time.monotonic())
         _prune_transport_tombstones_locked()
@@ -657,6 +746,7 @@ def adopt_transport_binding(
 def clear_transport_tombstones() -> None:
     with _session_bindings_lock:
         _transport_tombstones.clear()
+        _client_terminated_transports.clear()
         _pending_restores.clear()
 
 
@@ -707,6 +797,12 @@ def session_transport_state(project_id: str, session_id: str) -> str:
     software identity reclaim immediately. Sessions without any HTTP transport
     binding (stdio, tests) are 'unknown' so callers fall back to the heartbeat
     window.
+
+    A tombstone whose Room Session has already left is not evidence of a mere
+    disconnect and must not stand in for one: the session is closed, so letting
+    it answer 'gone' would let a later claim read stale liveness instead of the
+    authoritative session_closed path. Such entries are skipped, leaving
+    'unknown' and the normal heartbeat window in charge.
     """
     with _session_bindings_lock:
         for key, binding in _session_bindings.items():
@@ -717,12 +813,16 @@ def session_transport_state(project_id: str, session_id: str) -> str:
                 and str(getattr(binding, "session_id", "")) == str(session_id)
             ):
                 return "alive"
-        for _transport_id, (binding, _recorded) in _transport_tombstones.items():
-            if (
-                str(getattr(binding, "project_id", "")) == str(project_id)
-                and str(getattr(binding, "session_id", "")) == str(session_id)
-            ):
-                return "gone"
+        candidates = [
+            (transport_id, binding)
+            for transport_id, (binding, _recorded) in _transport_tombstones.items()
+            if str(getattr(binding, "project_id", "")) == str(project_id)
+            and str(getattr(binding, "session_id", "")) == str(session_id)
+        ]
+    if not candidates:
+        return "unknown"
+    if any(_tombstone_is_replayable(binding) for _transport_id, binding in candidates):
+        return "gone"
     return "unknown"
 
 
@@ -814,6 +914,7 @@ def clear_runtime_binding(session_key: str | None = None) -> None:
             _session_bindings.clear()
             _session_binding_written.clear()
             _transport_tombstones.clear()
+            _client_terminated_transports.clear()
             _pending_restores.clear()
         return
     persist_runtime_binding(session_key, None)

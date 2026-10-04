@@ -41,6 +41,7 @@ from .mcp_server import (
     create_mcp,
     http_transport_binding_alive,
     lookup_transport_tombstone,
+    note_client_terminated_transport,
     retain_transport_tombstone,
     session_transport_state,
     transport_session_active,
@@ -1392,6 +1393,7 @@ def create_app(
         configure_transport_tombstones(
             limit=resolved.mcp_http_tombstone_limit,
             ttl_seconds=resolved.mcp_http_tombstone_ttl_seconds,
+            session_active=service.session_active,
         )
         # The live binding table answers the same lifetime question as the
         # tombstone table, so it takes the same configured window: a client that
@@ -1422,6 +1424,7 @@ def create_app(
                 ),
                 lookup_binding=_adoption_binding,
                 adopt_binding=adopt_transport_binding,
+                note_terminated=note_client_terminated_transport,
                 map_limit=resolved.mcp_http_tombstone_limit,
                 map_ttl_seconds=resolved.mcp_http_tombstone_ttl_seconds,
             )
