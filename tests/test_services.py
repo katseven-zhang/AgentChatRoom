@@ -1792,6 +1792,195 @@ def test_work_must_be_independently_reviewed(service, project, joined_agents):
     assert review_event["project_seq"] < integration_event["project_seq"]
 
 
+def test_reviewer_independence_survives_the_owner_changing_or_disappearing(
+    service, project, joined_agents
+):
+    """Independence is judged on who wrote the task, not on who owns it now.
+
+    Ownership is not authorship. The old check compared the reviewer only with
+    ``tasks.owner_session_id``, so any transition that cleared or moved that one
+    column - a release, a reassignment, a Session that ended - silently made the
+    executing identity an acceptable reviewer of its own code. Each case below
+    ends with the owner in a state where that one comparison has nothing to
+    reject on, and each must still refuse: the durable record of authorship is
+    the set of Sessions in ``work_reports``.
+    """
+    author, reviewer = joined_agents
+    task = service.create_task(
+        project["id"],
+        title="Implement payments",
+        acceptance_criteria=["Charges run"],
+        actor_session_id=author["agent"]["id"],
+        token=author["token"],
+    )["task"]
+    service.claim_task(
+        project["id"], task["id"], author["agent"]["id"], author["token"]
+    )
+    service.update_task(
+        project["id"], task["id"], status="in_progress",
+        session_id=author["agent"]["id"], token=author["token"],
+    )
+    service.submit_work_report(
+        project["id"], task["id"],
+        session_id=author["agent"]["id"], token=author["token"],
+        summary="Implemented charges",
+        files=["src/payments.py"],
+        tests=[{"command": "pytest", "exit_code": 0}],
+    )
+    # Sanity: with the owner intact the author is refused, which is the
+    # behaviour that already worked. Everything below is the case that did not.
+    with pytest.raises(DomainError) as intact:
+        service.submit_review(
+            project["id"], task["id"],
+            reviewer_session_id=author["agent"]["id"], token=author["token"],
+            verdict="approved", criteria=[{"criterion": "Charges run", "status": "passed"}],
+        )
+    assert intact.value.code == "reviewer_not_independent"
+
+    # The owner goes away; the author remains the only party who wrote the task.
+    with service.database.connect(write=True) as connection:
+        connection.execute(
+            "UPDATE tasks SET owner_session_id = NULL WHERE id = ?", (task["id"],)
+        )
+    with pytest.raises(DomainError) as after_release:
+        service.submit_review(
+            project["id"], task["id"],
+            reviewer_session_id=author["agent"]["id"], token=author["token"],
+            verdict="approved", criteria=[{"criterion": "Charges run", "status": "passed"}],
+        )
+    # Not "independent because there is nothing to compare" - refused as the
+    # author it is.
+    assert after_release.value.code == "reviewer_not_independent"
+    assert author["agent"]["id"] in (
+        after_release.value.details["contributing_session_ids"]
+    )
+    # And the refusal left the task awaiting review rather than verified.
+    with service.database.connect() as connection:
+        row = connection.execute(
+            "SELECT verification_status FROM tasks WHERE id = ?", (task["id"],)
+        ).fetchone()
+    assert row["verification_status"] == "pending"
+
+    # A reviewer who genuinely did not write the task is still accepted, so the
+    # rule rejects authorship and not reviews.
+    approved = service.submit_review(
+        project["id"], task["id"],
+        reviewer_session_id=reviewer["agent"]["id"], token=reviewer["token"],
+        verdict="approved", criteria=[{"criterion": "Charges run", "status": "passed"}],
+    )
+    assert approved["verification_status"] == "approved"
+
+
+def test_review_is_refused_when_no_work_report_records_the_author(
+    service, project, joined_agents
+):
+    """No authorship record means independence cannot be shown, so refuse.
+
+    Defaulting to "independent" whenever the comparison has nothing to compare
+    is what let a cleared owner pass review. With the record absent there is no
+    second party to demonstrate, so the honest answer is to refuse and say what
+    is missing.
+    """
+    author, reviewer = joined_agents
+    task = service.create_task(
+        project["id"],
+        title="Implement refunds",
+        acceptance_criteria=["Refunds run"],
+        actor_session_id=author["agent"]["id"],
+        token=author["token"],
+    )["task"]
+    service.claim_task(
+        project["id"], task["id"], author["agent"]["id"], author["token"]
+    )
+    service.update_task(
+        project["id"], task["id"], status="in_progress",
+        session_id=author["agent"]["id"], token=author["token"],
+    )
+    service.submit_work_report(
+        project["id"], task["id"],
+        session_id=author["agent"]["id"], token=author["token"],
+        summary="Implemented refunds",
+        files=["src/refunds.py"],
+        tests=[{"command": "pytest", "exit_code": 0}],
+    )
+    with service.database.connect(write=True) as connection:
+        connection.execute(
+            "DELETE FROM work_reports WHERE task_id = ?", (task["id"],)
+        )
+        connection.execute(
+            "UPDATE tasks SET owner_session_id = NULL WHERE id = ?", (task["id"],)
+        )
+
+    # Even a reviewer who did not write the task is refused: nothing here can
+    # establish who did, so approving would record an independence that was
+    # never demonstrated.
+    with pytest.raises(DomainError) as unprovable:
+        service.submit_review(
+            project["id"], task["id"],
+            reviewer_session_id=reviewer["agent"]["id"], token=reviewer["token"],
+            verdict="approved", criteria=[{"criterion": "Refunds run", "status": "passed"}],
+        )
+    assert unprovable.value.code == "reviewer_independence_unprovable"
+    assert unprovable.value.details["required_action"] == "restore_work_report"
+
+
+def test_review_is_refused_when_a_reporting_session_carries_no_identity(
+    service, project, joined_agents
+):
+    """A contributing Session that cannot be named blocks the review too.
+
+    ``agent_sessions.member_id`` is nullable and ``agent_key`` defaults to
+    empty, so a Session row can exist while naming no software identity at all.
+    An identity that cannot be named also cannot be excluded from the review -
+    and that is precisely the identity a reviewer might turn out to be.
+    Refusing is the only answer that does not record an independence nobody
+    actually checked.
+    """
+    author, reviewer = joined_agents
+    task = service.create_task(
+        project["id"],
+        title="Implement webhooks",
+        acceptance_criteria=["Webhooks fire"],
+        actor_session_id=author["agent"]["id"],
+        token=author["token"],
+    )["task"]
+    service.claim_task(
+        project["id"], task["id"], author["agent"]["id"], author["token"]
+    )
+    service.update_task(
+        project["id"], task["id"], status="in_progress",
+        session_id=author["agent"]["id"], token=author["token"],
+    )
+    service.submit_work_report(
+        project["id"], task["id"],
+        session_id=author["agent"]["id"], token=author["token"],
+        summary="Implemented webhooks",
+        files=["src/webhooks.py"],
+        tests=[{"command": "pytest", "exit_code": 0}],
+    )
+    # The reporting Session exists but names no identity: the row survived some
+    # cleanup while its link to a durable member did not.
+    with service.database.connect(write=True) as connection:
+        connection.execute(
+            "UPDATE agent_sessions SET member_id = NULL, agent_key = '' WHERE id = ?",
+            (author["agent"]["id"],),
+        )
+
+    with pytest.raises(DomainError) as unresolvable:
+        service.submit_review(
+            project["id"], task["id"],
+            reviewer_session_id=reviewer["agent"]["id"], token=reviewer["token"],
+            verdict="approved", criteria=[{"criterion": "Webhooks fire", "status": "passed"}],
+        )
+    assert unresolvable.value.code == "reviewer_independence_unprovable"
+    assert author["agent"]["id"] in (
+        unresolvable.value.details["unresolvable_report_sessions"]
+    )
+    assert unresolvable.value.details["required_action"] == (
+        "restore_session_or_reassign_task"
+    )
+
+
 def test_same_software_cannot_become_an_independent_reviewer_by_reconnecting(
     service, project
 ):
@@ -3093,10 +3282,17 @@ def test_agent_stays_online_with_recent_activity_despite_stale_heartbeat(
     assert current["status"] != "offline"
 
 
-def test_silent_owner_lease_stays_enforced_until_ttl_or_same_member_takeover(
+def test_live_owner_lease_is_not_silently_taken_over_by_the_same_identity(
     service, project, joined_agents
 ):
-    """#119: presence 窗口不再使租约失效；同成员新会话接管，他成员仍被挡。"""
+    """A live Session of the same identity keeps its lease until it says so.
+
+    Joining the room is not consent to lose work: ``join_room`` explicitly
+    promises it never closes another Session nor moves its work. A successor
+    that wants the scope must therefore say ``takeover=True`` (or wait for the
+    predecessor to release). Only the very last assertion below - a Session the
+    liveness evidence proves gone - is allowed to transfer silently.
+    """
     first, second = joined_agents
     lease = service.acquire_lease(
         project["id"],
@@ -3104,6 +3300,9 @@ def test_silent_owner_lease_stays_enforced_until_ttl_or_same_member_takeover(
         token=first["token"],
         path_pattern="src/reclaimable/**",
     )["lease"]
+
+    # Presence is display-only, so a stale heartbeat alone does not invalidate
+    # the lease: the predecessor is still the owner and still connected.
     stale = (
         utc_now() - timedelta(seconds=service.settings.heartbeat_timeout_seconds + 1)
     ).isoformat().replace("+00:00", "Z")
@@ -3127,7 +3326,95 @@ def test_silent_owner_lease_stays_enforced_until_ttl_or_same_member_takeover(
         )
     assert excinfo.value.code == "lease_conflict"
 
-    # 同一软件身份的新会话接管同成员遗留租约（自动释放旧租约并授予新租约）。
+    successor = service.join_room(
+        project["id"],
+        name="Builder successor",
+        client="codex",
+        model="test-model",
+        role="executor",
+    )
+    # Same identity, live predecessor, no explicit intent: refused, and the
+    # predecessor's lease survives the refusal untouched.
+    with pytest.raises(DomainError) as live_owner:
+        service.acquire_lease(
+            project["id"],
+            session_id=successor["agent"]["id"],
+            token=successor["token"],
+            path_pattern="src/reclaimable/**",
+        )
+    assert live_owner.value.code == "lease_owner_session_connected"
+    assert live_owner.value.details["owner_session_id"] == first["agent"]["id"]
+    assert (
+        live_owner.value.details["required_action"]
+        == "release_lease_or_takeover_true"
+    )
+    still_held = next(
+        item
+        for item in service.list_leases(project["id"], include_inactive=True)
+        if item["id"] == lease["id"]
+    )
+    assert still_held["released_at"] is None
+    assert not any(
+        (event.get("payload") or {}).get("reason", "").startswith("same_member_takeover")
+        for event in service.list_events(project["id"], after=0)["events"]
+        if event["event_type"] == "lease.released"
+    )
+
+    # The explicit, audited path: takeover=True preempts the live owner and
+    # records which predecessor it displaced and why.
+    acquired = service.acquire_lease(
+        project["id"],
+        session_id=successor["agent"]["id"],
+        token=successor["token"],
+        # Acquiring a narrower scope must NOT retire the identity's broader
+        # lease (#235); that direction is covered in tests/test_lease_scope.py.
+        path_pattern="src/reclaimable/**",
+        takeover=True,
+    )
+    assert acquired["lease"]["active"] is True
+
+    history = service.list_leases(project["id"], include_inactive=True)
+    released = next(item for item in history if item["id"] == lease["id"])
+    assert released["released_at"] is not None
+    takeover_event = next(
+        event
+        for event in service.list_events(project["id"], after=0)["events"]
+        if event["event_type"] == "lease.released"
+        and (event.get("payload") or {}).get("lease_id") == lease["id"]
+    )
+    assert takeover_event["actor_session_id"] == successor["agent"]["id"]
+    payload = takeover_event["payload"]
+    assert payload["reason"] == "same_member_takeover_explicit"
+    # Attributable: the log names the displaced Session, so an operator can
+    # tell which conversation lost the scope rather than only that it did.
+    assert payload["predecessor_session_id"] == first["agent"]["id"]
+    assert payload["predecessor_proven_gone"] is False
+
+
+def test_lease_of_a_session_with_a_reaped_transport_transfers_without_a_takeover_flag(
+    service, project, joined_agents
+):
+    """A predecessor whose transport is reaped needs no takeover flag.
+
+    This is the one silent case that stays. A dead transport cannot release
+    anything, so requiring an explicit flag from the successor would strand the
+    scope until the TTL lapsed - the takeover flag would be unobtainable in
+    exactly the case it exists for. It is still recorded, and recorded
+    differently from the deliberate takeover above, so reading the log tells the
+    two apart. Note the predecessor never leaves the room here: it crashed.
+    """
+    first, _ = joined_agents
+    lease = service.acquire_lease(
+        project["id"],
+        session_id=first["agent"]["id"],
+        token=first["token"],
+        path_pattern="src/recoverable/**",
+    )["lease"]
+
+    # A crashed Session: still inside the heartbeat window, so silence alone
+    # proves nothing, but the transport probe positively reports it gone.
+    service.transport_liveness_check = lambda project_id, session_id: "gone"
+
     successor = service.join_room(
         project["id"],
         name="Builder successor",
@@ -3139,23 +3426,74 @@ def test_silent_owner_lease_stays_enforced_until_ttl_or_same_member_takeover(
         project["id"],
         session_id=successor["agent"]["id"],
         token=successor["token"],
-        # The successor takes over the same scope it replaces. Acquiring a
-        # narrower scope must NOT retire the identity's broader lease (#235);
-        # that direction is covered in tests/test_lease_scope.py.
-        path_pattern="src/reclaimable/**",
+        path_pattern="src/recoverable/**",
     )
     assert acquired["lease"]["active"] is True
 
-    history = service.list_leases(project["id"], include_inactive=True)
-    released = next(item for item in history if item["id"] == lease["id"])
-    assert released["released_at"] is not None
     takeover_event = next(
         event
         for event in service.list_events(project["id"], after=0)["events"]
         if event["event_type"] == "lease.released"
-        and (event.get("payload") or {}).get("reason") == "same_member_takeover"
+        and (event.get("payload") or {}).get("lease_id") == lease["id"]
     )
     assert takeover_event["actor_session_id"] == successor["agent"]["id"]
+    assert takeover_event["payload"]["reason"] == "same_member_takeover"
+    assert takeover_event["payload"]["predecessor_session_id"] == first["agent"]["id"]
+    assert takeover_event["payload"]["predecessor_proven_gone"] is True
+    assert takeover_event["payload"]["predecessor_transport_state"] == "gone"
+
+
+def test_a_silent_predecessor_is_not_treated_as_proven_gone(
+    service, project, joined_agents
+):
+    """Silence plus no transport probe is absence of evidence, not evidence.
+
+    This is the negative case that keeps the exemption honest: with the probe
+    reporting nothing, a predecessor that merely went quiet must still block a
+    same-identity successor, otherwise the exemption above would quietly become
+    "any timeout transfers the lease" and AC1 would be unmet in practice.
+    """
+    first, _ = joined_agents
+    lease = service.acquire_lease(
+        project["id"],
+        session_id=first["agent"]["id"],
+        token=first["token"],
+        path_pattern="src/quiet/**",
+    )["lease"]
+    stale = (
+        utc_now() - timedelta(seconds=service.settings.heartbeat_timeout_seconds + 1)
+    ).isoformat().replace("+00:00", "Z")
+    with service.database.connect(write=True) as connection:
+        connection.execute(
+            "UPDATE agent_sessions SET last_heartbeat = ? WHERE id = ?",
+            (stale, first["agent"]["id"]),
+        )
+
+    successor = service.join_room(
+        project["id"],
+        name="Builder successor",
+        client="codex",
+        model="test-model",
+        role="executor",
+    )
+    with pytest.raises(DomainError) as quiet_owner:
+        service.acquire_lease(
+            project["id"],
+            session_id=successor["agent"]["id"],
+            token=successor["token"],
+            path_pattern="src/quiet/**",
+        )
+    assert quiet_owner.value.code == "lease_owner_session_connected"
+    assert quiet_owner.value.details["owner_transport_state"] in {
+        "unavailable",
+        "not_checked",
+    }
+    still_held = next(
+        item
+        for item in service.list_leases(project["id"], include_inactive=True)
+        if item["id"] == lease["id"]
+    )
+    assert still_held["released_at"] is None
 
 
 def test_git_worktrees_share_room_and_logical_projects_remain_distinct(

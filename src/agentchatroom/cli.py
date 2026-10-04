@@ -1511,6 +1511,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     lease.add_argument("--ttl", type=int)
     lease.add_argument("--reason", default="")
+    lease.add_argument(
+        "--takeover",
+        action="store_true",
+        help="Preempt a lease a live Session of the same identity still holds",
+    )
 
     release = commands.add_parser("lease-release", help="Release a file lease")
     release.add_argument("project_id")
@@ -2254,6 +2259,7 @@ def main(argv: list[str] | None = None) -> None:
                 "task_id": args.task_id,
                 "ttl_seconds": args.ttl,
                 "reason": args.reason,
+                "takeover": args.takeover,
             },
         )
     elif args.command == "lease-release":

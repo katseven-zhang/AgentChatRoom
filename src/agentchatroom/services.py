@@ -2163,6 +2163,83 @@ class AgentChatRoomService:
         second_key = str(second_data.get("agent_key") or "").strip()
         return bool(first_key and second_key and first_key == second_key)
 
+    def _require_independent_reviewer(
+        self,
+        connection: Any,
+        project_id: str,
+        task: Mapping[str, Any],
+        reviewer: Mapping[str, Any],
+    ) -> None:
+        """Refuse a review by any software identity that authored the work.
+
+        Independence has to be judged against who *wrote* the task, not against
+        whoever owns it right now. Ownership moves - a report is rejected, the
+        task is reassigned, the owner Session ends - and every one of those
+        transitions used to turn the executing identity into an acceptable
+        reviewer of its own code. ``work_reports`` is the durable record of
+        authorship, so the whole set of contributing identities is compared.
+
+        The set being empty, or a contributing Session no longer resolving to a
+        row, is treated as "cannot show independence" rather than "independent":
+        a review that cannot prove a second party was involved must not be
+        recorded as if it had.
+        """
+        task_id = str(task["id"])
+        contributors = connection.execute(
+            """
+            SELECT DISTINCT r.session_id AS session_id,
+                   a.member_id AS member_id, a.agent_key AS agent_key
+            FROM work_reports r
+            LEFT JOIN agent_sessions a ON a.id = r.session_id
+            WHERE r.task_id = ? AND r.project_id = ?
+            """,
+            (task_id, project_id),
+        ).fetchall()
+        if not contributors:
+            raise DomainError(
+                "reviewer_independence_unprovable",
+                "No work report records who authored this task, so no reviewer "
+                "can be shown independent of it",
+                status_code=409,
+                details={"task_id": task_id, "required_action": "restore_work_report"},
+            )
+        unresolvable = sorted(
+            str(row["session_id"])
+            for row in contributors
+            if row["session_id"] is None
+            or (row["member_id"] is None and not (row["agent_key"] or "").strip())
+        )
+        if unresolvable:
+            # A missing Session row means the contributing identity can no
+            # longer be named, so it also cannot be excluded. Defaulting to
+            # independent here is exactly the hole this closes.
+            raise DomainError(
+                "reviewer_independence_unprovable",
+                "A Session that reported work on this task no longer resolves to "
+                "a software identity, so independence cannot be established",
+                status_code=409,
+                details={
+                    "task_id": task_id,
+                    "unresolvable_report_sessions": unresolvable,
+                    "required_action": "restore_session_or_reassign_task",
+                },
+            )
+        if any(
+            self._same_agent_identity(row, reviewer) for row in contributors
+        ):
+            raise DomainError(
+                "reviewer_not_independent",
+                "A software identity that reported work on this task cannot "
+                "independently verify it",
+                status_code=409,
+                details={
+                    "task_id": task_id,
+                    "contributing_session_ids": sorted(
+                        str(row["session_id"]) for row in contributors
+                    ),
+                },
+            )
+
     def _owner_liveness(
         self,
         connection: Any,
@@ -5706,6 +5783,30 @@ class AgentChatRoomService:
     ) -> dict[str, Any]:
         if kind not in MESSAGE_KINDS:
             raise DomainError("invalid_message_kind", "Unsupported message kind")
+        if kind == "system" and session_id:
+            # `system` never enters an Agent's context window
+            # (MCP_CONTEXT_EVENT_TYPES), so letting an Agent choose it lets any
+            # Agent write a message the rest of the room can never see - a
+            # blocker or a warning that silently reaches nobody. The kind is
+            # reserved for the operator path, which posts without an Agent
+            # Session and is accountable to the deployment rather than to a
+            # peer that can be impersonated.
+            raise DomainError(
+                "agent_may_not_post_system_message",
+                "The system kind is reserved for the operator; Agents post "
+                "message, decision or blocker, all of which every other Agent "
+                "can see",
+                status_code=403,
+                details={
+                    "requested_kind": kind,
+                    "agent_visible_kinds": sorted(
+                        kind
+                        for kind in MESSAGE_KINDS
+                        if kind != "system"
+                    ),
+                    "required_action": "post_message_decision_or_blocker",
+                },
+            )
         if not body.strip():
             raise DomainError("empty_message", "Message body is required")
         if len(body) > self.settings.message_max_body_length:
@@ -8655,6 +8756,7 @@ class AgentChatRoomService:
         task_id: str | None = None,
         reason: str = "",
         ttl_seconds: int | None = None,
+        takeover: bool = False,
     ) -> dict[str, Any]:
         pattern = normalize_pattern(path_pattern)
         if mode not in LEASE_MODES:
@@ -8713,12 +8815,56 @@ class AgentChatRoomService:
                     and row["owner_member_id"]
                     and row["owner_member_id"] == claimant_member_id
                 ):
-                    # Same software identity, new session: the successor
-                    # transparently takes over the stale lease of its own
-                    # identity (a reaped transport cannot release it itself) -
-                    # but only where the new scope actually replaces the old one.
+                    # Same software identity, new session. This is a transfer of
+                    # working state, so it follows the same contract task_claim
+                    # and the assignment-accept path enforce: an ordinary
+                    # request never preempts a live owner. Only a Session the
+                    # liveness evidence proves gone may be replaced silently,
+                    # and that case is still recorded as an attributable event
+                    # below. Otherwise the caller has to say takeover=true.
                     if _pattern_covers(pattern, row["path_pattern"]):
-                        superseded.append(dict(row))
+                        successor_liveness = self._owner_liveness(
+                            connection, project_id, str(row["session_id"])
+                        )
+                        # Only positive evidence of death counts as consent to
+                        # transfer: the Session left, its row is gone, or the
+                        # transport probe says the connection was reaped. A stale
+                        # heartbeat is merely an absence of evidence - the
+                        # Session may be mid long edit - so it is not enough,
+                        # and neither is an unavailable probe. In those cases
+                        # the caller has to say takeover=True, which is cheap
+                        # and auditable, while a wrong silent transfer silently
+                        # removes another conversation's protection.
+                        predecessor_gone = (
+                            successor_liveness["owner"] is None
+                            or successor_liveness["owner"]["left_at"] is not None
+                            or str(successor_liveness["transport_state"]) == "gone"
+                        )
+                        if not predecessor_gone and not takeover:
+                            raise DomainError(
+                                "lease_owner_session_connected",
+                                "A Session of this software identity still holds "
+                                f"the lease on {row['path_pattern']}; release it, or "
+                                "take it over explicitly with takeover=true",
+                                status_code=409,
+                                details={
+                                    "lease_id": row["id"],
+                                    "owner_session_id": str(row["session_id"]),
+                                    "owner_transport_state": successor_liveness[
+                                        "transport_state"
+                                    ],
+                                    "required_action": "release_lease_or_takeover_true",
+                                },
+                            )
+                        superseded.append(
+                            {
+                                **dict(row),
+                                "owner_gone": predecessor_gone,
+                                "owner_transport_state": str(
+                                    successor_liveness["transport_state"]
+                                ),
+                            }
+                        )
                     continue
                 conflicts.append(
                     {
@@ -8753,6 +8899,15 @@ class AgentChatRoomService:
                         "UPDATE file_leases SET released_at = ? WHERE id = ?",
                         (format_instant(now), stale["id"]),
                     )
+                    # The reason has to say which of the two admitted paths ran,
+                    # so an operator reading the log can tell an audited
+                    # deliberate takeover from a predecessor this service
+                    # positively knows is gone.
+                    takeover_reason = (
+                        "same_member_takeover"
+                        if stale.get("owner_gone")
+                        else "same_member_takeover_explicit"
+                    )
                     self._emit(
                         connection,
                         project_id,
@@ -8761,7 +8916,12 @@ class AgentChatRoomService:
                         payload={
                             "lease_id": stale["id"],
                             "path_pattern": stale["path_pattern"],
-                            "reason": "same_member_takeover",
+                            "reason": takeover_reason,
+                            "predecessor_session_id": str(stale["session_id"]),
+                            "predecessor_proven_gone": bool(stale.get("owner_gone")),
+                            "predecessor_transport_state": stale.get(
+                                "owner_transport_state", "not_checked"
+                            ),
                         },
                     )
                 # 幂等：同一 Session 对同一（归一化）范围的活跃租约重复申请
@@ -9323,16 +9483,9 @@ class AgentChatRoomService:
                 raise DomainError(
                     "invalid_transition", "Task is not awaiting review", status_code=409
                 )
-            owner = connection.execute(
-                "SELECT * FROM agent_sessions WHERE id = ?",
-                (task["owner_session_id"],),
-            ).fetchone()
-            if self._same_agent_identity(owner, reviewer):
-                raise DomainError(
-                    "reviewer_not_independent",
-                    "The executing software identity cannot independently verify its own work",
-                    status_code=409,
-                )
+            self._require_independent_reviewer(
+                connection, project_id, task, reviewer
+            )
             expected = json_load(task["acceptance_criteria_json"], [])
             if verdict == "approved" and (
                 any(assessed.get(item) != "passed" for item in expected)

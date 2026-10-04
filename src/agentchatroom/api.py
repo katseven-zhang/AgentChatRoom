@@ -968,6 +968,7 @@ class LeaseCreate(StrictModel):
     task_id: str | None = None
     reason: str = ""
     ttl_seconds: int | None = None
+    takeover: bool = False
 
 
 class LeaseRelease(StrictModel):
