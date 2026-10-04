@@ -34,6 +34,8 @@ BOOTSTRAP_STATES = (
     "registration_invalid",
     "ambiguous_workspace",
     "project_workspace_mismatch",
+    "identity_mismatch",
+    "credential_conflict",
     "room_unavailable",
     "session_expired",
 )
@@ -45,9 +47,14 @@ REQUIRED_ACTIONS = {
     "registration_invalid": "recreate_checkout_registration_via_web",
     "ambiguous_workspace": "open_one_workspace_folder",
     "project_workspace_mismatch": "open_matching_workspace_or_select_matching_project",
+    "identity_mismatch": "restore_linked_software_identity_or_issue_unlinked_token",
+    "credential_conflict": "use_the_member_this_credential_is_linked_to_or_issue_a_new_credential",
     "room_unavailable": "restore_or_wait_for_room",
     "session_expired": "call_room_bootstrap",
 }
+
+_IDENTITY_ERROR_CODES = {"software_identity_mismatch"}
+_CREDENTIAL_ERROR_CODES = {"credential_already_linked"}
 
 
 @dataclass(frozen=True, slots=True)
@@ -144,21 +151,64 @@ def find_registered_checkout(start: str | Path) -> Path | None:
     return None
 
 
-def workspace_path_keys(value: str | Path) -> set[str]:
-    """Comparable keys for a workspace path that may not exist on this host."""
-    raw = str(value or "").strip()
-    if not raw:
-        return set()
-    keys = {
-        os.path.normcase(raw),
-        os.path.normcase(raw.replace("/", "\\")),
-        os.path.normcase(raw.replace("\\", "/")),
-    }
+def normalized_workspace_key(value: str | Path) -> str:
+    """One comparable key for a path that may not exist on this host.
+
+    Separators and case are folded. The value is not resolved, so a Windows
+    client path is not joined onto a POSIX server's working directory.
+    """
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    if text.lower().startswith("file:"):
+        parsed = urlparse(text)
+        if (parsed.scheme or "").lower() == "file":
+            path = unquote(parsed.path or "")
+            if os.name == "nt" and len(path) >= 3 and path[0] == "/" and path[2] == ":":
+                path = path[1:]
+            text = path or text
+    text = text.replace("\\", "/").rstrip("/")
+    return text.casefold()
+
+
+def _visible_directory(value: str | Path) -> Path | None:
     try:
-        keys.add(os.path.normcase(str(Path(raw).expanduser().resolve())))
+        candidate = Path(value).expanduser()
+        if candidate.is_dir():
+            return candidate.resolve()
     except (OSError, RuntimeError, ValueError):
-        pass
-    return {key for key in keys if key}
+        return None
+    return None
+
+
+def _domain_bootstrap_failure(error: DomainError) -> BootstrapOutcome:
+    """Keep identity and credential failures out of the room-unavailable bucket."""
+    if error.code in _IDENTITY_ERROR_CODES:
+        status = "identity_mismatch"
+    elif error.code in _CREDENTIAL_ERROR_CODES:
+        status = "credential_conflict"
+    elif error.code in {"session_token_expired", "session_closed", "invalid_session_token"}:
+        status = "session_expired"
+    else:
+        status = "room_unavailable"
+    details = {
+        "code": error.code,
+        "message": error.message,
+        "status_code": error.status_code,
+    }
+    for key, value in (error.details or {}).items():
+        details.setdefault(key, value)
+    return BootstrapOutcome(bootstrap_status_payload(status, details=details))
+
+
+def _with_extra_notices(
+    outcome: BootstrapOutcome, extra: list[dict[str, Any]]
+) -> BootstrapOutcome:
+    if not extra:
+        return outcome
+    public = dict(outcome.public)
+    public["notices"] = [*(public.get("notices") or []), *extra]
+    return BootstrapOutcome(public, outcome.binding)
 
 
 def match_registered_projects(
@@ -176,13 +226,13 @@ def match_registered_projects(
         return []
     indexed: list[tuple[dict[str, Any], set[str]]] = []
     for project in projects:
-        keys = workspace_path_keys(project.get("root_path", ""))
+        keys = {normalized_workspace_key(project.get("root_path", ""))}
         try:
             for workspace in service.list_workspaces(str(project["id"])):
-                keys |= workspace_path_keys(workspace.get("local_path", ""))
+                keys.add(normalized_workspace_key(workspace.get("local_path", "")))
         except DomainError:
             pass
-        indexed.append((project, keys))
+        indexed.append((project, {key for key in keys if key}))
 
     matched: list[tuple[dict[str, Any], Path]] = []
     seen_ids: set[str] = set()
@@ -190,30 +240,30 @@ def match_registered_projects(
         raw = str(root or "").strip()
         if not raw:
             continue
-        try:
-            client_path = Path(raw).expanduser().resolve()
-        except (OSError, RuntimeError, ValueError):
-            client_path = Path(raw)
-        client_keys = workspace_path_keys(raw) | workspace_path_keys(client_path)
+        visible = _visible_directory(raw)
+        client_key = normalized_workspace_key(raw)
         found: list[dict[str, Any]] = []
         for project, keys in indexed:
-            if client_keys & keys:
+            same_scope = False
+            if visible is not None:
+                try:
+                    same_scope = stored_project_scope(project) == checkout_scope(visible)
+                except (DomainError, OSError):
+                    same_scope = False
+            if same_scope or (client_key and client_key in keys):
                 found.append(project)
-        if not found:
-            try:
-                if client_path.exists():
-                    scope = checkout_scope(client_path)
-                    for project, _keys in indexed:
-                        if stored_project_scope(project) == scope:
-                            found.append(project)
-            except (DomainError, OSError):
-                found = []
         for project in found:
             # Keep every matching project: the caller must reject ambiguity,
-            # rather than selecting by database iteration order.
+            # rather than selecting by database iteration order. A root this
+            # server cannot see stays the database row's path; it is not
+            # resolved against the server working directory.
             if str(project["id"]) not in seen_ids:
                 seen_ids.add(str(project["id"]))
-                matched.append((project, client_path))
+                if visible is not None:
+                    checkout = visible
+                else:
+                    checkout = Path(str(project.get("root_path") or raw))
+                matched.append((project, checkout))
     return matched
 
 
@@ -507,12 +557,7 @@ def bootstrap_local_room(
         try:
             project = service.get_project(selected_project_id)
         except DomainError as error:
-            return BootstrapOutcome(
-                bootstrap_status_payload(
-                    "room_unavailable",
-                    details={"code": error.code},
-                )
-            )
+            return _domain_bootstrap_failure(error)
         workspace_candidates: list[Path] = []
         db_matches = match_registered_projects(service, roots) if roots else []
         if roots:
@@ -641,38 +686,29 @@ def bootstrap_local_room(
                 registered_project_key=project_key,
             )
         except DomainError as error:
-            if error.code in {"project_archived", "project_not_found"}:
-                return BootstrapOutcome(
-                    bootstrap_status_payload(
-                        "room_unavailable",
-                        details={"code": error.code},
-                    )
-                )
             if error.code.startswith("project_registration"):
                 return BootstrapOutcome(bootstrap_status_payload("registration_invalid"))
-            return BootstrapOutcome(
-                bootstrap_status_payload(
-                    "room_unavailable",
-                    details={"code": error.code},
-                )
-            )
+            return _domain_bootstrap_failure(error)
 
-    instructions_notice = None
-    if checkout is not None:
+    file_notices: list[dict[str, Any]] = []
+    logical_path = str(project.get("logical_path") or "")
+    if checkout is not None and _visible_directory(checkout) is not None:
         # 老项目的 checkout 可能登记于本能力上线之前：绑定即确保托管协作块
-        # 存在并与最新规则一致（幂等，内容未变时不写盘）；云端不可达根目录
-        # 或只读目录静默跳过，绝不阻塞绑定。
+        # 存在并与最新规则一致（幂等，内容未变时不写盘）。服务端看不见的
+        # 客户端根目录不在这里 resolve，也不做文件自愈。
         try:
             instructions = write_project_coordination_instructions(checkout, project)
             action = instructions.get("action")
             if action and action != "unchanged":
-                instructions_notice = {
-                    "code": f"project_instructions_{action}",
-                    "message": (
-                        "Project AGENTS.md AgentChatRoom coordination block was "
-                        f"{action} for this checkout"
-                    ),
-                }
+                file_notices.append(
+                    {
+                        "code": f"project_instructions_{action}",
+                        "message": (
+                            "Project AGENTS.md AgentChatRoom coordination block was "
+                            f"{action} for this checkout"
+                        ),
+                    }
+                )
         except DomainError:
             pass
         try:
@@ -688,6 +724,14 @@ def bootstrap_local_room(
             )
             if reg is None or reg.get("scope") != expected_scope:
                 register_checkout_project(checkout, project, replace_existing=True)
+                file_notices.append(
+                    {
+                        "code": "project_registration_refreshed",
+                        "message": (
+                            "Checkout project.json was rewritten to match the current Project scope"
+                        ),
+                    }
+                )
         except DomainError:
             pass
 
@@ -731,7 +775,17 @@ def bootstrap_local_room(
                         service.link_credential_member(
                             project["id"], credential_id, member_id
                         )
-                return restored_outcome
+                ignored_on_restore = (
+                    _configured_path_ignored_notice(
+                        workspace_candidates, configured_checkout, checkout, project
+                    )
+                    if checkout is not None
+                    else None
+                )
+                extra = list(file_notices)
+                if ignored_on_restore is not None:
+                    extra.append(ignored_on_restore)
+                return _with_extra_notices(restored_outcome, extra)
         registered = (
             service.register_workspace(
                 project["id"],
@@ -813,14 +867,7 @@ def bootstrap_local_room(
             initial_inject=True,
         )
     except DomainError as error:
-        if error.code in {"session_token_expired", "session_closed", "invalid_session_token"}:
-            return BootstrapOutcome(bootstrap_status_payload("session_expired"))
-        return BootstrapOutcome(
-            bootstrap_status_payload(
-                "room_unavailable",
-                details={"code": error.code},
-            )
-        )
+        return _domain_bootstrap_failure(error)
 
     token = str(joined["token"])
     cursor = int(synced.get("cursor") or joined.get("cursor") or 0)
@@ -832,6 +879,7 @@ def bootstrap_local_room(
         else None
     )
     notices = [ignored_notice] if ignored_notice is not None else []
+    notices.extend(file_notices)
     if used_selected_project_root:
         notices.append(
             {
@@ -842,8 +890,6 @@ def bootstrap_local_room(
                 ),
             }
         )
-    if instructions_notice is not None:
-        notices.append(instructions_notice)
     return _ready_outcome(
         project=project,
         session_id=str(joined["agent"]["id"]),

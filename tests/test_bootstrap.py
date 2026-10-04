@@ -1399,8 +1399,11 @@ def test_bootstrap_rejects_restoring_with_credential_pinned_to_another_member(
         restore_binding=first.binding,
         credential_id=credential["id"],
     )
-    assert rejected.public["status"] == "room_unavailable"
+    assert rejected.public["status"] == "credential_conflict"
+    assert rejected.public["required_action"] == REQUIRED_ACTIONS["credential_conflict"]
     assert rejected.public["details"]["code"] == "credential_already_linked"
+    assert rejected.public["details"]["message"]
+    assert rejected.public["details"]["status_code"] == 409
     assert rejected.binding is None
     assert service.list_agent_tokens(project["id"])[0]["member_id"] == other["id"]
 
