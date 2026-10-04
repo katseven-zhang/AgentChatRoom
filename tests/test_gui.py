@@ -15,11 +15,15 @@ from queue import Queue
 import pytest
 
 from agentchatroom.cli import build_parser, process_is_running, service_url
+from agentchatroom.config import Settings
 from agentchatroom.gui import (
     CLOSE,
     KEEP_RUNNING,
     LogTail,
     HostError,
+    PORT_FREE,
+    PORT_OCCUPIED,
+    PORT_RESERVED,
     PortError,
     STAY,
     STOP_AND_CLOSE,
@@ -29,9 +33,12 @@ from agentchatroom.gui import (
     button_states,
     close_action,
     config_file_path,
+    duplicate_instance_notice,
     format_worker_error,
     host_requires_management_auth,
     port_is_free,
+    port_probe_state,
+    port_unavailable_message,
     redact_line,
     restart_steps,
     resolve_frontend_url,
@@ -46,7 +53,8 @@ from agentchatroom.gui import (
     validate_port,
 )
 from agentchatroom.gui_autostart import (
-    GuiInstanceGuard, LoginStartup, is_temporary_executable, startup_command,
+    GuiInstanceGuard, LoginStartup, instance_guard_name, is_temporary_executable,
+    startup_command,
 )
 from agentchatroom.gui_event_log import (
     RoomEventTail, format_room_event, format_service_line, sanitize_gui_text,
@@ -77,7 +85,8 @@ def isolated_gui_instance_guard(monkeypatch) -> None:
     import agentchatroom.gui as gui_module
 
     class Guard:
-        def __init__(self, *, window_title: str):
+        def __init__(self, *, name: str, window_title: str):
+            assert name
             assert window_title
 
         def acquire(self) -> bool:
@@ -156,6 +165,140 @@ def test_second_gui_launch_restores_minimized_window() -> None:
     finally:
         contender.release()
         owner.release()
+        window.destroy()
+
+
+def test_instance_guard_name_scopes_the_lock_to_one_data_directory(tmp_path) -> None:
+    """A dev checkout and a packaged release must not exclude each other.
+
+    They manage different databases, pid files and log files, so the second one
+    refusing to start because the first holds the lock is a defect, not the
+    single-instance contract the README describes.
+    """
+    development = instance_guard_name(tmp_path / "dev-runtime")
+    release = instance_guard_name(tmp_path / "release-runtime")
+
+    assert development != release
+    assert development == instance_guard_name(tmp_path / "dev-runtime")
+    # Windows object names carry no path separators.
+    assert "\\" not in development and "/" not in development
+    assert development == instance_guard_name(Path(str(tmp_path / "dev-runtime")))
+
+
+def test_instance_guard_name_survives_an_unresolvable_data_directory() -> None:
+    assert instance_guard_name(None) == instance_guard_name(None)
+    assert instance_guard_name(None) != instance_guard_name("some-directory")
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows named mutex and event")
+def test_two_data_directories_can_run_a_console_at_the_same_time(tmp_path) -> None:
+    development = GuiInstanceGuard(instance_guard_name(tmp_path / "dev"))
+    release = GuiInstanceGuard(instance_guard_name(tmp_path / "release"))
+    same_directory = GuiInstanceGuard(instance_guard_name(tmp_path / "dev"))
+    try:
+        assert development.acquire() is True
+        assert release.acquire() is True
+        assert same_directory.acquire() is False
+    finally:
+        same_directory.release()
+        release.release()
+        development.release()
+
+
+def test_duplicate_instance_notice_says_where_the_window_went() -> None:
+    notice = duplicate_instance_notice("AgentChatRoom")
+    assert "AgentChatRoom 控制台" in notice
+    assert "系统托盘" in notice
+    assert "不同的数据目录" in notice
+
+
+def test_run_gui_reports_a_duplicate_instance_instead_of_returning_silently(
+    monkeypatch, settings, capsys
+) -> None:
+    import agentchatroom.gui as gui_module
+
+    try:
+        import tkinter as tk
+    except ImportError as error:
+        pytest.skip(f"Tk unavailable: {error}")
+
+    monkeypatch.setattr(gui_module, "load_settings", lambda _config: settings)
+
+    class DuplicateGuard:
+        def __init__(self, **_kwargs) -> None:
+            pass
+
+        def acquire(self) -> bool:
+            return False
+
+    monkeypatch.setattr(gui_module, "GuiInstanceGuard", DuplicateGuard)
+    monkeypatch.setattr(
+        gui_module,
+        "create_tray_icon",
+        lambda *_a, **_k: pytest.fail("no window may be built for a duplicate"),
+    )
+
+    boot_gui_or_skip(gui_module, tk)
+
+    # A silent return is indistinguishable from a program that refused to
+    # start; the user is told a console is already running and where to find it.
+    assert "控制台正在运行" in capsys.readouterr().err
+
+
+def test_run_gui_opens_the_window_when_the_database_cannot_be_opened(
+    monkeypatch, settings
+) -> None:
+    """A missing PostgreSQL URL is a fixable config error, not a missing GUI.
+
+    ``create_database`` raises while the Room event tail is being constructed;
+    before #331 that exception escaped ``run_gui`` before any window existed, so
+    the user saw the program silently fail to start with no diagnostic at all.
+    """
+    import agentchatroom.gui as gui_module
+
+    try:
+        import tkinter as tk
+        probe = tk.Tk()
+        probe.withdraw()
+        probe.destroy()
+    except (ImportError, tk.TclError) as error:
+        pytest.skip(f"Tk display unavailable: {error}")
+
+    missing_url_env = "AGENTCHATROOM_TEST_MISSING_DATABASE_URL"
+    postgres = replace(
+        settings, database_backend="postgresql", database_url_env=missing_url_env
+    )
+    monkeypatch.delenv(missing_url_env, raising=False)
+    monkeypatch.setattr(gui_module, "load_settings", lambda _config: postgres)
+
+    class RecordingLogTail:
+        def __init__(self, path, _sink, stop_event):
+            self.path = path
+            self.stop_event = stop_event
+            self.started = False
+
+        def start(self):
+            self.started = True
+
+    monkeypatch.setattr(gui_module, "LogTail", RecordingLogTail)
+    monkeypatch.setattr(
+        gui_module, "create_tray_icon", lambda _action, **_kwargs: None
+    )
+
+    windows: list = []
+    monkeypatch.setattr(tk.Tk, "mainloop", lambda self: windows.append(self))
+    boot_gui_or_skip(gui_module, tk)
+
+    assert windows, "the window must appear even when the database cannot open"
+    window = windows[0]
+    try:
+        log_text = window.log_view.get("1.0", "end")
+        assert missing_url_env in log_text
+        assert "Room 事件读取器未启动" in log_text
+        # The failed reader must not leave the controls stuck mid-action.
+        assert window.action_active is False
+        assert window.start_button.instate(["!disabled"])
+    finally:
         window.destroy()
 
 
@@ -465,8 +608,9 @@ def test_login_autostart_config_error_keeps_gui_open_for_retry(
             pass
 
     class FakeRoomTail:
-        def __init__(self, active_settings, _sink, stop_event):
+        def __init__(self, active_settings, _sink, stop_event, *, service=None):
             self.settings, self.stop_event = active_settings, stop_event
+            self.service = service
             self.cursors, self.presence = {}, {}
             room_tails.append(self)
 
@@ -500,6 +644,95 @@ def test_login_autostart_config_error_keeps_gui_open_for_retry(
         assert room_tails[1].settings.database_path == settings.database_path
         assert log_tails[-1].path == settings.data_dir / "server.log"
         assert room_tails[0].stop_event.is_set()
+    finally:
+        window.destroy()
+
+
+def test_config_retry_keeps_the_old_room_reader_when_the_rebuild_fails(
+    monkeypatch, settings, isolated_gui_instance_guard
+) -> None:
+    """Stopping the old reader before building its replacement is what made
+    the panel permanently blank: a rebuild that raised left nothing running.
+    """
+    try:
+        import tkinter as tk
+        probe = tk.Tk()
+        probe.withdraw()
+        probe.destroy()
+    except (ImportError, tk.TclError) as error:
+        pytest.skip(f"Tk display unavailable: {error}")
+
+    import agentchatroom.gui as gui_module
+
+    fallback = replace(settings, data_dir=settings.data_dir / "fallback")
+    attempts = []
+
+    def load(_path):
+        attempts.append(1)
+        if len(attempts) == 1:
+            raise ValueError("invalid port")
+        return settings
+
+    log_tails = []
+    room_tails = []
+
+    class FakeLogTail:
+        def __init__(self, path, _sink, stop_event):
+            self.path, self.stop_event = path, stop_event
+            log_tails.append(self)
+
+        def start(self):
+            pass
+
+    class FakeRoomTail:
+        def __init__(self, active_settings, _sink, stop_event, *, service=None):
+            self.settings, self.stop_event = active_settings, stop_event
+            self.service = service
+            self.cursors, self.presence = {}, {}
+            room_tails.append(self)
+
+        def start(self):
+            pass
+
+    def exploding_room_tail(active_settings, sink, stop_event, *, service=None):
+        # Same failure create_database raises for a postgresql backend whose
+        # connection URL is missing.
+        if room_tails:
+            raise ValueError("AGENTCHATROOM_TEST_URL must contain a connection URL")
+        return FakeRoomTail(active_settings, sink, stop_event, service=service)
+
+    windows = []
+    observed: dict = {}
+
+    def mainloop(window):
+        windows.append(window)
+        assert window._retry_config_load() is True
+        # Sampled here: once run_gui returns, its shutdown stops every reader.
+        observed["room_stopped"] = room_tails[0].stop_event.is_set()
+        observed["old_log_stopped"] = log_tails[0].stop_event.is_set()
+        observed["log_count"] = len(log_tails)
+
+    monkeypatch.setattr(gui_module, "load_settings", load)
+    monkeypatch.setattr(gui_module, "default_data_dir", lambda: fallback.data_dir)
+    monkeypatch.setattr(gui_module, "LogTail", FakeLogTail)
+    monkeypatch.setattr(gui_module, "RoomEventTail", exploding_room_tail)
+    monkeypatch.setattr(
+        gui_module, "create_tray_icon", lambda _action, **_kwargs: None
+    )
+    monkeypatch.setattr(tk.Tk, "mainloop", mainloop)
+    boot_gui_or_skip(gui_module, tk, autostart=True)
+    window = windows[0]
+    try:
+        assert len(room_tails) == 1
+        # The reader that was already running is still running: only the log
+        # reader, whose data directory genuinely changed, was rebuilt.
+        assert observed["room_stopped"] is False
+        assert observed["old_log_stopped"] is True
+        assert observed["log_count"] == 2
+        text = window.log_view.get("1.0", "end")
+        assert "Room 事件读取器未启动" in text
+        assert "配置已重新加载" in text
+        assert window.action_active is False
     finally:
         window.destroy()
 
@@ -824,7 +1057,6 @@ def test_port_probe_rejects_live_reusable_listener() -> None:
         assert port_is_free("127.0.0.1", listener.getsockname()[1]) is False
 
 
-@pytest.mark.skipif(os.name == "nt", reason="POSIX TCP TIME_WAIT restart semantics")
 def test_port_probe_allows_restart_after_server_active_close() -> None:
     with socket.socket() as listener:
         listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -840,7 +1072,90 @@ def test_port_probe_allows_restart_after_server_active_close() -> None:
                 assert client.recv(1) == b""
                 client.shutdown(socket.SHUT_WR)
                 assert peer.recv(1) == b""
-    assert port_is_free(*address) is True
+    # Both platforms must allow the immediate rebind a restart needs. POSIX
+    # gets it from SO_REUSEADDR; Windows allows binding over a TIME_WAIT
+    # reservation by default, and the probe no longer treats the leftover
+    # reservation as a listener because nothing answers a connect on it.
+    assert port_probe_state(*address) == PORT_FREE
+
+
+def test_port_probe_names_a_live_listener_as_occupied() -> None:
+    with socket.socket() as listener:
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(1)
+        assert port_probe_state("127.0.0.1", listener.getsockname()[1]) == PORT_OCCUPIED
+
+
+def test_port_probe_separates_a_reservation_from_a_listener(monkeypatch) -> None:
+    """A refused bind that nothing answers must not be reported as occupied.
+
+    Windows holds a just-closed connection in TIME_WAIT and refuses the bind
+    without any process listening, so telling the user to stop a service or
+    change the port sends them after a fix that cannot work.
+    """
+    import agentchatroom.gui as gui_module
+
+    attempts: list[int] = []
+
+    def refuse(_host, _port):
+        attempts.append(1)
+        return False
+
+    monkeypatch.setattr(gui_module, "_bind_probe", refuse)
+    monkeypatch.setattr(gui_module, "_listener_reachable", lambda *_a, **_k: False)
+    monkeypatch.setattr(gui_module.time, "sleep", lambda _seconds: None)
+
+    assert port_probe_state("127.0.0.1", 9100) == PORT_RESERVED
+    # One bind to classify, then the bounded retries that give a reservation
+    # the chance to clear before the user is told anything.
+    assert len(attempts) == gui_module.PORT_PROBE_ATTEMPTS
+    assert port_is_free("127.0.0.1", 9100) is False
+
+
+def test_port_probe_retry_recovers_once_the_reservation_clears(monkeypatch) -> None:
+    """The bounded retry is what makes a restart racing the OS release work."""
+    import agentchatroom.gui as gui_module
+
+    binds: list[int] = []
+
+    def bind_after_two(_host, _port):
+        binds.append(1)
+        return len(binds) > 2
+
+    monkeypatch.setattr(gui_module, "_bind_probe", bind_after_two)
+    monkeypatch.setattr(gui_module, "_listener_reachable", lambda *_a, **_k: False)
+    monkeypatch.setattr(gui_module.time, "sleep", lambda _seconds: None)
+
+    assert port_probe_state("127.0.0.1", 9100) == PORT_FREE
+    assert len(binds) == 3
+    assert port_is_free("127.0.0.1", 9100) is True
+
+
+def test_reserved_port_advice_says_wait_not_change_port() -> None:
+    reserved = port_unavailable_message(9100, PORT_RESERVED)
+    assert "已被占用" not in reserved
+    assert "更换端口不能解决" in reserved
+    assert "已被占用" in port_unavailable_message(9100, PORT_OCCUPIED)
+
+
+def test_start_worker_explains_a_reserved_port_without_guessing(monkeypatch) -> None:
+    """The default probe classifies, so a TIME_WAIT refusal is not called occupied."""
+    import agentchatroom.gui as gui_module
+
+    sink: Queue = Queue()
+    monkeypatch.setattr(gui_module, "port_probe_state", lambda _h, _p: PORT_RESERVED)
+
+    run_start_worker(
+        sink,
+        host="127.0.0.1",
+        port=9100,
+        settings=Settings(data_dir=Path("unused")),
+        start_fn=lambda _h, _p: pytest.fail("must not start on a reserved port"),
+    )
+
+    kind, message = sink.get_nowait()
+    assert kind == "start_failed"
+    assert "更换端口不能解决" in message
 
 
 def test_gui_service_controller_reuses_cli_lifecycle(settings) -> None:
@@ -1276,3 +1591,102 @@ def test_entry_app_routes_service_subcommands_to_cli(monkeypatch) -> None:
     entry_app.main()
 
     assert calls == ["cli"]
+
+
+def test_log_tail_recovers_after_a_transient_read_failure(tmp_path) -> None:
+    """#324: one unreadable read must not end the log panel for the session.
+
+    A share or an antivirus can take the file away between the stat and the
+    readline. The thread used to die there, silently, and the panel simply
+    stopped updating.
+    """
+    log = tmp_path / "server.log"
+    log.write_text("INFO: Uvicorn running on http://127.0.0.1:8765\n", encoding="utf-8")
+
+    sink: Queue = Queue()
+    stop_event = threading.Event()
+    tail = LogTail(log, sink, stop_event)
+
+    original_open = Path.open
+    fail_once = {"armed": True}
+
+    def patched(self, *args, **kwargs):
+        if self == log and fail_once["armed"] and args and args[0] == "r":
+            fail_once["armed"] = False
+            raise PermissionError(13, "used by another process", str(self))
+        return original_open(self, *args, **kwargs)
+
+    Path.open = patched  # type: ignore[method-assign]
+    try:
+        worker = threading.Thread(target=tail.run, daemon=True)
+        worker.start()
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            if any("稍后自动重试" in str(item) for item in list(sink.queue)):
+                break
+            time.sleep(0.05)
+        stop_event.set()
+        worker.join(timeout=5)
+    finally:
+        Path.open = original_open  # type: ignore[method-assign]
+
+    messages = [str(item) for item in list(sink.queue)]
+    assert any("稍后自动重试" in message for message in messages), messages
+    assert worker.is_alive() is False, "the tail thread died instead of retrying"
+
+
+def test_log_tail_reports_an_unreadable_file_once_per_outage(tmp_path) -> None:
+    """A share that stays unreachable must not fill the panel with repeats."""
+    log = tmp_path / "server.log"
+    log.write_text("INFO: line\n", encoding="utf-8")
+    sink: Queue = Queue()
+
+    tail = LogTail(log, sink, threading.Event())
+
+    original_open = Path.open
+
+    def always_denied(self, *args, **kwargs):
+        raise PermissionError(13, "denied", str(self))
+
+    Path.open = always_denied  # type: ignore[method-assign]
+    try:
+        for _ in range(5):
+            assert tail._open() is None
+    finally:
+        Path.open = original_open  # type: ignore[method-assign]
+
+    notices = [str(item) for item in list(sink.queue)]
+    assert len(notices) == 1, notices
+
+
+def test_a_second_exit_request_while_stopping_is_ignored() -> None:
+    """#324: the double tray quit must not reach the stop-confirmation dialog.
+
+    Reaching it would ask the user to confirm a stop that already finished,
+    because the second stop_detached_server call has nothing left to stop and
+    answers stopped=False / not_running.
+    """
+    calls: list[str] = []
+
+    class FakeWindow:
+        action_active = False
+        pending_exit_after_stop = False
+
+        def __init__(self) -> None:
+            self.tray = object()
+
+        def _guard(self) -> bool:
+            if self.action_active or self.pending_exit_after_stop:
+                return True
+            calls.append("proceeded")
+            return False
+
+    window = FakeWindow()
+    # The guard both exit entries start with, verbatim.
+    assert window._guard() is False
+    window.action_active = True
+    assert window._guard() is True
+    window.action_active = False
+    window.pending_exit_after_stop = True
+    assert window._guard() is True
+    assert calls == ["proceeded"], "a guarded request still reached the dialog"

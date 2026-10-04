@@ -14,6 +14,7 @@ import threading
 import time
 import traceback
 from contextlib import asynccontextmanager
+from functools import partial
 from pathlib import Path
 from typing import Any, Callable, Literal, Mapping
 
@@ -34,6 +35,7 @@ from .local_mcp import LocalMcpConfigurator
 from .runtime_log import tail_text_lines
 from .mcp_server import (
     adopt_transport_binding,
+    configure_session_bindings,
     configure_transport_tombstones,
     create_mcp,
     http_transport_binding_alive,
@@ -428,6 +430,11 @@ _CREDENTIAL_VALUE = r"[^\s,;}\]&\"'\[]+"
 # Stand-in for the marker while the rules run. It contains a NUL, which no
 # rule's value class accepts, so a rule cannot match another rule's output.
 _REDACTION_SENTINEL = "\x00redacted\x00"
+
+# How long the backup scheduler sleeps between reschedule checks. Short enough
+# that a shortened interval takes effect within a second of the save, long
+# enough that a period spanning hours still costs a handful of wakeups.
+BACKUP_TICK_SLICE_SECONDS = 1.0
 
 
 def redact_log_line(line: str) -> str:
@@ -1155,23 +1162,56 @@ def auto_backup_worker(
     settings: Any,
     stop_event: "threading.Event",
     overrides: Mapping[str, Any] | None = None,
+    *,
+    reschedule: "threading.Event | None" = None,
 ) -> None:
     """Backup loop: re-reads effective settings every cycle, so management
-    toggles (enable / interval / retention) apply without a restart."""
-    while not stop_event.wait(
-        timeout=max(
-            60,
-            int(
-                effective_backup_settings(settings, overrides)[
-                    "auto_backup_interval_seconds"
-                ]
-            ),
-        )
-    ):
+    toggles (enable / interval / retention) apply without a restart.
+
+    A management save signals ``reschedule`` so a shortened interval takes
+    effect on the next tick instead of after the old, longer one expires. The
+    wait is split into short slices only when such a signal exists to observe:
+    a single ``wait(timeout=interval)`` evaluates its timeout once, on entry,
+    which is exactly why lowering the interval appeared to do nothing for up to
+    a full period. Without a reschedule signal there is nothing to poll, so the
+    wait stays whole.
+    """
+    while True:
+        state = effective_backup_settings(settings, overrides)
+        interval = max(60, int(state["auto_backup_interval_seconds"]))
+        if reschedule is None:
+            if stop_event.wait(timeout=interval):
+                return
+        elif _wait_for_backup_tick(stop_event, reschedule, interval):
+            return
         state = effective_backup_settings(settings, overrides)
         if not state["auto_backup_enabled"]:
             continue
         run_auto_backup_cycle(service, state["auto_backup_max_kept"])
+
+
+def _wait_for_backup_tick(
+    stop_event: "threading.Event",
+    reschedule: "threading.Event",
+    interval_seconds: int,
+) -> bool:
+    """Sleep out one backup period in slices; True when the worker must stop.
+
+    The deadline is recomputed from the wall clock on every slice so a signal
+    that arrives part-way through does not extend the period, and a settings
+    change that lands while the worker is running a backup is still observed
+    before the next wait begins.
+    """
+    deadline = time.monotonic() + interval_seconds
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        if stop_event.wait(timeout=min(remaining, BACKUP_TICK_SLICE_SECONDS)):
+            return True
+        if reschedule.is_set():
+            reschedule.clear()
+            return False
 
 
 def start_auto_backup_worker(
@@ -1179,10 +1219,17 @@ def start_auto_backup_worker(
     settings: Any,
     stop_event: "threading.Event",
     overrides: dict[str, Any] | None = None,
+    *,
+    reschedule: "threading.Event | None" = None,
 ) -> "threading.Thread":
     """Start the daemon backup worker; per-cycle gating happens in the loop."""
+    # functools.partial rather than a keyword on Thread: the reschedule signal
+    # belongs to the worker's own signature, and Thread takes no such keyword.
+    target = auto_backup_worker
+    if reschedule is not None:
+        target = partial(auto_backup_worker, reschedule=reschedule)
     worker = threading.Thread(
-        target=auto_backup_worker,
+        target=target,
         args=(service, settings, stop_event, overrides),
         name="agentchatroom-auto-backup",
         daemon=True,
@@ -1262,6 +1309,14 @@ def create_app(
             limit=resolved.mcp_http_tombstone_limit,
             ttl_seconds=resolved.mcp_http_tombstone_ttl_seconds,
         )
+        # The live binding table answers the same lifetime question as the
+        # tombstone table, so it takes the same configured window: a client that
+        # disconnects without a reap would otherwise leave one entry behind for
+        # the whole process lifetime.
+        configure_session_bindings(
+            limit=resolved.mcp_http_tombstone_limit,
+            ttl_seconds=resolved.mcp_http_tombstone_ttl_seconds,
+        )
         # Tolerant adoption sits inside the #116 expiry contract: in the default
         # mode an unknown/reaped bookmark is adopted transparently (200, same
         # Room Session when the identity matches), while strict mode lets the
@@ -1289,6 +1344,9 @@ def create_app(
         )
 
     auto_backup_stop = threading.Event()
+    # Signalled by the management save so a shortened interval is re-evaluated
+    # immediately instead of after the period that was already in flight.
+    auto_backup_reschedule = threading.Event()
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
@@ -1299,7 +1357,11 @@ def create_app(
                 _windows_http_exception_handler(previous_exception_handler)
             )
         auto_backup_worker = start_auto_backup_worker(
-            service, resolved, auto_backup_stop, backup_settings_override
+            service,
+            resolved,
+            auto_backup_stop,
+            backup_settings_override,
+            reschedule=auto_backup_reschedule,
         )
         try:
             with running_service(resolved):
@@ -2247,9 +2309,17 @@ def create_app(
 
     @app.post("/api/v1/projects/{project_id}/workspaces", status_code=201)
     def register_workspace(
-        project_id: str, body: WorkspaceRegister
+        project_id: str, body: WorkspaceRegister, request: Request
     ) -> dict[str, Any]:
-        return service.register_workspace(project_id, **body.model_dump())
+        # The hosts table is shared by every Project, so renaming an existing
+        # host is a Room-wide change: only an authenticated management surface
+        # may ask for it. Anyone else refreshes last_seen_at and nothing else.
+        _require_management(request)
+        return service.register_workspace(
+            project_id,
+            **body.model_dump(),
+            host_updates_allowed=True,
+        )
 
     def _backup_settings_payload() -> dict[str, Any]:
         effective = effective_backup_settings(resolved, backup_settings_override)
@@ -2262,7 +2332,7 @@ def create_app(
                 if resolved.config_path
                 else Path(resolved.data_dir) / "config.toml"
             ),
-            "effective": "保存即写入配置文件 [backup]（与自动备份调度共用同一来源）；调度线程在服务重启后的下一个周期按新配置执行",
+            "effective": "保存即写入配置文件 [backup]（与自动备份调度共用同一来源）；调度线程收到信号后按新间隔重新计时，无需重启服务",
         }
 
     @app.get("/api/v1/admin/backup-settings")
@@ -2301,6 +2371,10 @@ def create_app(
             lambda current: upsert_toml_section(current, "backup", applied),
         )
         backup_settings_override.update(applied)
+        # Wake the scheduler so a shortened interval takes effect now rather
+        # than after the old period; the retention prune below already applies
+        # its new cap immediately.
+        auto_backup_reschedule.set()
         payload = _backup_settings_payload()
         # 保留份数立即生效：保存即按新上限清理现存备份，无需等下一次备份。
         payload["pruned"] = service.enforce_backup_retention(

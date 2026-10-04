@@ -14,6 +14,7 @@ import re
 import socket
 import sys
 import threading
+import time
 import tomllib
 import webbrowser
 from collections.abc import Callable
@@ -37,7 +38,7 @@ from .config import (
     rewrite_config_text,
 )
 from .errors import DomainError
-from .gui_autostart import GuiInstanceGuard, LoginStartup
+from .gui_autostart import GuiInstanceGuard, LoginStartup, instance_guard_name
 from .gui_event_log import RoomEventTail, format_service_line, sanitize_gui_text
 from .runtime_log import running_url_from_log as _running_url_from_log
 from .runtime_log import tail_text_lines
@@ -62,6 +63,19 @@ CLOSE = "close"
 STOP_AND_CLOSE = "stop_and_close"
 KEEP_RUNNING = "keep_running"
 STAY = "stay"
+
+# Why a port cannot be bound, which decides whether waiting or changing the
+# port is the right advice: a listener answers a connect, a bare TIME_WAIT
+# reservation does not.
+PORT_FREE = "free"
+PORT_OCCUPIED = "occupied"
+PORT_RESERVED = "reserved"
+
+# A refused bind that no listener answers is retried briefly before the user
+# is told anything, so a restart racing a socket the OS is still releasing
+# succeeds on its own.
+PORT_PROBE_ATTEMPTS = 4
+PORT_PROBE_BACKOFF_SECONDS = 0.15
 
 
 class PortError(ValueError):
@@ -115,8 +129,8 @@ def resolve_frontend_url(running_url: str | None, host: str, port: int) -> str:
     return running_url if running_url else service_url(host, port)
 
 
-def port_is_free(host: str, port: int) -> bool:
-    """Return True when nothing is listening on the address yet."""
+def _bind_probe(host: str, port: int) -> bool:
+    """Try to bind and listen once; False when the address refuses us."""
     family = socket.AF_INET6 if ":" in (host or "") else socket.AF_INET
     with socket.socket(family, socket.SOCK_STREAM) as probe:
         try:
@@ -129,6 +143,64 @@ def port_is_free(host: str, port: int) -> bool:
         except OSError:
             return False
     return True
+
+
+def _listener_reachable(host: str, port: int, timeout: float = 0.25) -> bool:
+    """Whether anything already accepts connections on the address.
+
+    A refused bind on its own cannot tell a running service apart from a
+    lingering TIME_WAIT reservation, and the two need opposite advice. A
+    successful connect proves a live listener is the cause.
+    """
+    family = socket.AF_INET6 if ":" in (host or "") else socket.AF_INET
+    try:
+        with socket.socket(family, socket.SOCK_STREAM) as probe:
+            probe.settimeout(timeout)
+            probe.connect((host or "127.0.0.1", port))
+    except OSError:
+        return False
+    return True
+
+
+def port_probe_state(host: str, port: int) -> str:
+    """Classify the address as free, occupied by a listener, or not bindable.
+
+    A refused bind on its own cannot tell a running service apart from a
+    lingering TIME_WAIT reservation, and the two need opposite advice: stop
+    the service, or simply wait. A successful connect proves a live listener
+    is the cause, so that case is decided without any retry.
+    """
+    if _bind_probe(host, port):
+        return PORT_FREE
+    if _listener_reachable(host, port):
+        return PORT_OCCUPIED
+    # Nothing is listening, so the refusal is a reservation the OS has not
+    # released yet. Retry it briefly so a restart racing that release
+    # succeeds on its own instead of telling the user to pick another port.
+    for attempt in range(1, PORT_PROBE_ATTEMPTS):
+        time.sleep(PORT_PROBE_BACKOFF_SECONDS)
+        if _bind_probe(host, port):
+            return PORT_FREE
+        if _listener_reachable(host, port):
+            return PORT_OCCUPIED
+    return PORT_RESERVED
+
+
+def port_is_free(host: str, port: int) -> bool:
+    """Return True when nothing is listening on the address yet."""
+    return port_probe_state(host, port) == PORT_FREE
+
+
+def port_unavailable_message(port: int, state: str) -> str:
+    """Explain an unusable port without sending the user down a dead end."""
+    if state == PORT_RESERVED:
+        # No listener holds the address, so a different port cannot help; only
+        # waiting for the OS to release the reservation can.
+        return (
+            f"端口 {port} 当前无法绑定，但没有服务在监听：通常是上次运行的连接"
+            "仍处于 TCP 保留期，请稍候重试；更换端口不能解决这个问题。"
+        )
+    return f"端口 {port} 已被占用：可能已有一个服务在运行，请先停止或更换端口。"
 
 
 def redact_line(line: str) -> str:
@@ -321,6 +393,9 @@ class LogTail(threading.Thread):
         self.sink = sink
         self.stop_event = stop_event
         self.tail_lines = tail_lines
+        # One line per failure streak rather than one per poll tick: a share
+        # that stays unreachable for an hour must not fill the panel.
+        self._read_error_reported = False
 
     def run(self) -> None:
         handle = None
@@ -331,7 +406,10 @@ class LogTail(threading.Thread):
                     if not self.path.exists():
                         self.stop_event.wait(0.5)
                         continue
-                    handle = self.path.open("r", encoding="utf-8", errors="replace")
+                    handle = self._open()
+                    if handle is None:
+                        self.stop_event.wait(1.0)
+                        continue
                     for line in handle.read().splitlines()[-self.tail_lines :]:
                         formatted = format_service_line(line.rstrip("\r\n"))
                         if formatted:
@@ -351,7 +429,17 @@ class LogTail(threading.Thread):
                     handle.close()
                     handle = None
                     continue
-                line = handle.readline()
+                try:
+                    line = handle.readline()
+                except OSError:
+                    # Antivirus, OneDrive and network shares all take the file
+                    # away for a moment. Losing the thread here would freeze the
+                    # log panel for the rest of the session with no explanation,
+                    # so drop the handle, say so once, and reopen on the next
+                    # pass - the same shape RoomEventTail uses.
+                    self._report_read_error(handle)
+                    handle = None
+                    continue
                 if line:
                     formatted = format_service_line(line.rstrip("\r\n"))
                     if formatted:
@@ -360,7 +448,36 @@ class LogTail(threading.Thread):
                     self.stop_event.wait(0.2)
         finally:
             if handle is not None:
-                handle.close()
+                try:
+                    handle.close()
+                except OSError:
+                    pass
+
+    def _open(self):
+        """Open the log, tolerating a file that is temporarily unavailable."""
+        try:
+            handle = self.path.open("r", encoding="utf-8", errors="replace")
+        except OSError:
+            self._note_unavailable()
+            return None
+        self._read_error_reported = False
+        return handle
+
+    def _note_unavailable(self) -> None:
+        if self._read_error_reported:
+            return
+        self._read_error_reported = True
+        self.sink.put(
+            ("log", "[服务日志] 暂时无法读取日志文件，稍后自动重试。")
+        )
+
+    def _report_read_error(self, handle: Any) -> None:
+        """Close what we have and say once that the panel is still retrying."""
+        try:
+            handle.close()
+        except OSError:
+            pass
+        self._note_unavailable()
 
 
 def _drain(sink: Queue, *, limit: int = 200) -> list[Any]:
@@ -383,16 +500,17 @@ def run_start_worker(
     port_probe: Callable[[str, int], bool] | None = None,
 ) -> None:
     """Start the detached service; always emit a terminal sink event (#191)."""
-    probe = port_probe if port_probe is not None else port_is_free
     try:
-        if not probe(host, port):
-            sink.put(
-                (
-                    "start_failed",
-                    f"端口 {port} 已被占用：可能已有一个服务在运行，"
-                    "请先停止或更换端口。",
-                )
-            )
+        if port_probe is None:
+            state = port_probe_state(host, port)
+            available = state == PORT_FREE
+        else:
+            # An injected probe only answers free/taken, so the reason behind a
+            # refusal stays unknown and gets the generic occupied wording.
+            available = port_probe(host, port)
+            state = PORT_FREE if available else PORT_OCCUPIED
+        if not available:
+            sink.put(("start_failed", port_unavailable_message(port, state)))
             return
         result = start_fn(host, port)
         sink.put(("started", result))
@@ -659,6 +777,42 @@ def _show_fatal_gui_dialog(message: str) -> None:
         pass
 
 
+def duplicate_instance_notice(product_name: str) -> str:
+    """Return what the user is told when another console already owns this data dir.
+
+    Returning quietly is the worst outcome available: the second launch looks
+    like a program that refused to start, and the user has no way to tell that
+    from a crash or a broken install.
+    """
+    return (
+        f"已有一个 {product_name} 控制台正在运行（同一数据目录），本次启动已退出。"
+        "\n\n已运行的控制台窗口已尝试恢复到前台；若找不到它，请从系统托盘图标"
+        "重新打开，或先结束该进程。\n\n"
+        "如需同时运行多个控制台，请为它们配置不同的数据目录"
+        "（AGENTCHATROOM_DATA_DIR 或配置文件中的 data_dir）。"
+    )
+
+
+def notify_duplicate_instance(product_name: str, *, show=None) -> str:
+    """Show the duplicate-instance notice through whichever channel exists.
+
+    ``run_gui`` returns without a window here, so tkinter is not a usable
+    channel yet. The native dialog covers the packaged windowed exe, stderr
+    covers a console run, and ``show`` lets a caller that already has a Tk
+    root present the message itself.
+    """
+    notice = duplicate_instance_notice(product_name)
+    _show_fatal_gui_dialog(notice)
+    print(notice, file=sys.stderr)
+    if show is not None:
+        try:
+            show(notice)
+        except Exception:
+            # A failing notice must not turn a clean handoff into a crash.
+            pass
+    return notice
+
+
 def run_gui(config_path: str | None = None, *, autostart: bool = False) -> None:
     """Open the local GUI window (requires tkinter, imported lazily)."""
     os.environ.setdefault("AGENTCHATROOM_ACCESS_LOG", "0")
@@ -707,9 +861,13 @@ def run_gui(config_path: str | None = None, *, autostart: bool = False) -> None:
             config_path=Path(config_path) if config_path else None,
         )
     instance_guard = GuiInstanceGuard(
-        window_title=f"{settings.product_name} 控制台"
+        name=instance_guard_name(settings.data_dir),
+        window_title=f"{settings.product_name} 控制台",
     )
     if not instance_guard.acquire():
+        # Returning silently looks exactly like a program that refused to
+        # start, so say what happened and where to look for the window.
+        notify_duplicate_instance(settings.product_name)
         return
     controller = ServiceController(settings)
     login_startup = LoginStartup()
@@ -724,7 +882,20 @@ def run_gui(config_path: str | None = None, *, autostart: bool = False) -> None:
                 if isinstance(thread, threading.Thread) and thread.is_alive():
                     thread.join(timeout=2)
 
-    def start_tails(active_settings: Settings, *, previous_settings: Settings | None = None) -> None:
+    def start_tails(
+        active_settings: Settings,
+        *,
+        previous_settings: Settings | None = None,
+        report: Callable[[str], None] | None = None,
+    ) -> None:
+        """Point the log and Room-event readers at ``active_settings``.
+
+        The replacements are constructed before anything is stopped: a
+        database that cannot be opened (an unset PostgreSQL URL, a locked
+        file) must leave the previous readers running and must never keep the
+        window from opening. Whatever could not be built is reported through
+        ``report`` so the user learns why a panel went quiet.
+        """
         old_room = tails.get("room")
         old_log = tails.get("log")
         reuse_log = bool(
@@ -732,37 +903,73 @@ def run_gui(config_path: str | None = None, *, autostart: bool = False) -> None:
             and not old_log[0].is_set()
             and previous_settings.data_dir == active_settings.data_dir
         )
-        if reuse_log and old_room is not None:
-            old_room[0].set()
-            thread = old_room[1]
-            if isinstance(thread, threading.Thread) and thread.is_alive():
-                thread.join(timeout=2)
-        else:
-            stop_tails(wait=True)
         if reuse_log and old_log is not None:
             log_stop, log_tail = old_log
         else:
             log_stop = threading.Event()
             log_tail = LogTail(active_settings.data_dir / "server.log", sink, log_stop)
+        # Reuse the live service when the retry points at the same database.
+        # RoomEventTail builds its own AgentChatRoomService otherwise, and each
+        # one of those owns a database handle plus a registered TokenTouchBuffer
+        # worker, so a config retry used to stack a second set per attempt and
+        # leave the previous one's atexit entry pointing at a closed database.
+        previous_room = old_room[1] if old_room is not None else None
+        previous_service = getattr(previous_room, "service", None)
+        same_database = bool(
+            previous_service is not None
+            and previous_settings is not None
+            and previous_settings.database_path == active_settings.database_path
+            and previous_settings.database_backend == active_settings.database_backend
+        )
         room_stop = threading.Event()
-        room_events = RoomEventTail(active_settings, sink, room_stop)
-        if (old_room is not None and previous_settings is not None
-                and previous_settings.database_path == active_settings.database_path
-                and previous_settings.database_backend == active_settings.database_backend
-                and (not isinstance(old_room[1], threading.Thread)
-                     or not old_room[1].is_alive())):
+        try:
+            room_events: RoomEventTail | None = RoomEventTail(
+                active_settings,
+                sink,
+                room_stop,
+                service=previous_service if same_database else None,
+            )
+        except Exception as error:
+            # create_database raises here for a postgresql backend with no
+            # connection URL; that is a configuration problem the user can fix
+            # in this very window, not a reason to refuse to show the window.
+            room_events = None
+            if report is not None:
+                report(
+                    f"Room 事件读取器未启动：{type(error).__name__}: {error}。"
+                    "服务日志与启停功能不受影响；修复 [database] 配置后点击"
+                    "「启动服务」即可重试。"
+                )
+        if room_events is not None and same_database and (
+            not isinstance(previous_room, threading.Thread)
+            or not previous_room.is_alive()
+        ):
             # A configuration retry using the same database must not drop events
             # between the old tail stopping and the new one beginning.
-            previous_room = old_room[1]
             room_events.cursors = previous_room.cursors.copy()
             room_events.presence = {
                 key: value.copy() for key, value in previous_room.presence.items()
             }
+        # Retire the previous readers only now that a replacement exists for
+        # each of them, so a failed rebuild cannot silence the panel for good.
+        # The log reader is carried over by ``reuse_log``; the Room reader is
+        # always rebuilt, so it survives only when the rebuild failed.
+        keep = {"log"} if reuse_log else set()
+        if room_events is None:
+            keep.add("room")
+        stale = [entry for key, entry in tails.items() if key not in keep]
+        for stop_event, _thread in stale:
+            stop_event.set()
+        for _stop_event, thread in stale:
+            if isinstance(thread, threading.Thread) and thread.is_alive():
+                thread.join(timeout=2)
         tails["log"] = (log_stop, log_tail)
-        tails["room"] = (room_stop, room_events)
+        if room_events is not None:
+            tails["room"] = (room_stop, room_events)
         if not reuse_log:
             log_tail.start()
-        room_events.start()
+        if room_events is not None:
+            room_events.start()
 
     class ControllerWindow(tk.Tk):
         def __init__(self) -> None:
@@ -895,7 +1102,9 @@ def run_gui(config_path: str | None = None, *, autostart: bool = False) -> None:
             previous_settings = settings
             settings = refreshed
             controller.settings = refreshed
-            start_tails(refreshed, previous_settings=previous_settings)
+            start_tails(
+                refreshed, previous_settings=previous_settings, report=self.append_log
+            )
             startup_config_error = None
             self.host_entry.delete(0, "end")
             self.host_entry.insert(0, refreshed.host)
@@ -1138,6 +1347,12 @@ def run_gui(config_path: str | None = None, *, autostart: bool = False) -> None:
             run_stop_worker(sink, stop_fn=controller.stop)
 
         def on_close(self) -> None:
+            # A second close while a stop is already in flight reaches
+            # finish_exit_after_stop with nothing left to stop, and the user is
+            # asked to confirm a stop that already finished. Every other exit
+            # entry guards on this pair; these two did not.
+            if self.action_active or self.pending_exit_after_stop:
+                return
             if self.tray is not None:
                 self.hide_to_tray()
                 return
@@ -1206,6 +1421,8 @@ def run_gui(config_path: str | None = None, *, autostart: bool = False) -> None:
                 self.on_tray_quit()
 
         def on_tray_quit(self) -> None:
+            if self.action_active or self.pending_exit_after_stop:
+                return
             running = controller.is_running()
             choice: str | None = None
             if running:
@@ -1234,6 +1451,12 @@ def run_gui(config_path: str | None = None, *, autostart: bool = False) -> None:
             if stopped:
                 self.shutdown_app()
                 return
+            # A queued worker event can land after the window is gone. Asking a
+            # destroyed window a question raises TclError on the worker thread
+            # and the user never learns the stop did not finish, so treat it as
+            # the end of the line instead.
+            if not self._window_alive():
+                return
             force = messagebox.askyesno(
                 "停止未完成",
                 "服务停止未完成。稍后可运行「关闭 AgentChatRoom.cmd」清理残留进程。\n\n"
@@ -1245,13 +1468,20 @@ def run_gui(config_path: str | None = None, *, autostart: bool = False) -> None:
                 self.action_active = False
                 self.refresh_state()
 
+        def _window_alive(self) -> bool:
+            """Whether this window still exists to receive a dialog."""
+            try:
+                return bool(self.winfo_exists())
+            except Exception:  # noqa: BLE001 - a dead Tk must not raise here
+                return False
+
         def shutdown_app(self) -> None:
             stop_tails()
             stop_tray_icon(self.tray)
             self.destroy()
 
-    start_tails(settings)
     window = ControllerWindow()
+    start_tails(settings, report=window.append_log)
 
     def restore_on_second_launch() -> None:
         if instance_guard.activation_requested():

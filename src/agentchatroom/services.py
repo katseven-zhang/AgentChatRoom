@@ -277,6 +277,11 @@ class TokenTouchBuffer:
         self._wakeup = threading.Event()
         self._backoff_seconds = 0.05
         self._thread: threading.Thread | None = None
+        # Registered so an interpreter that exits without close() still flushes,
+        # and unregistered by close() so the buffer stops being reachable from
+        # the atexit registry - otherwise every rebuilt service (a config retry,
+        # a second create_app in one process) left a live callback behind that
+        # would touch an already-closed database at exit.
         atexit.register(self.flush)
 
     def note(self, credential_id: str) -> None:
@@ -284,6 +289,11 @@ class TokenTouchBuffer:
             return
         used_at = iso_now()
         with self._lock:
+            if self._closed:
+                # Re-checked under the lock: close() sets the flag inside it, so
+                # a note that raced the close would otherwise queue work for a
+                # worker that is about to stop and never run it.
+                return
             self._pending[credential_id] = used_at
             self._calls_since_flush += 1
             due = (
@@ -296,6 +306,8 @@ class TokenTouchBuffer:
 
     def flush(self) -> None:
         with self._lock:
+            if self._closed and not self._pending:
+                return
             pending = self._pending
             self._pending = {}
             self._calls_since_flush = 0
@@ -318,16 +330,29 @@ class TokenTouchBuffer:
         except Exception:
             logger.exception("Failed to flush Agent token last_used_at updates")
             with self._lock:
-                for credential_id, used_at in pending.items():
-                    self._pending.setdefault(credential_id, used_at)
+                # A closed buffer has no worker left to retry, so re-queueing
+                # would only strand the update: the caller's own note() path
+                # will re-touch the credential, and nothing is lost that a later
+                # verification would not record anyway.
+                if not self._closed:
+                    for credential_id, used_at in pending.items():
+                        self._pending.setdefault(credential_id, used_at)
             self._backoff_seconds = min(self._backoff_seconds * 2, 5.0)
             if not self._closed:
                 time.sleep(self._backoff_seconds)
 
     def close(self) -> None:
-        self._closed = True
+        with self._lock:
+            self._closed = True
+            thread = self._thread
         self._wakeup.set()
+        # Join before the final flush: the worker is the other writer of
+        # _pending, so flushing while it is still running lets it re-queue an
+        # update behind this one and exit without writing it.
+        if isinstance(thread, threading.Thread) and thread.is_alive():
+            thread.join(timeout=5)
         self.flush()
+        atexit.unregister(self.flush)
 
     def _ensure_thread_locked(self) -> None:
         if self._thread is None or not self._thread.is_alive():
@@ -1127,12 +1152,49 @@ class AgentChatRoomService:
         )
         request_hash = hashlib.sha256(canonical_request.encode()).hexdigest()
         scope = f"project:{project_id}"
+        # Liveness is decided before any write transaction opens. Reading it
+        # inside one holds the SQLite write lock (or the PostgreSQL advisory
+        # lock) across a second connection's query, so a replay check that
+        # touched agent_sessions or file_leases serialised every other writer
+        # for the length of that read - and the answer cannot change between
+        # the two statements anyway.
+        recorded = self._idempotency_record(scope, clean_request_id)
+        replay_live: bool | None = None
+        if recorded is not None:
+            if (
+                recorded["operation"] != operation
+                or recorded["request_hash"] != request_hash
+            ):
+                raise DomainError(
+                    "idempotency_conflict",
+                    "Request ID was already used for different input",
+                    status_code=409,
+                    details={"request_id": clean_request_id},
+                )
+            if not recorded["response_json"]:
+                raise DomainError(
+                    "idempotency_in_progress",
+                    "The original request is still being processed",
+                    status_code=409,
+                    details={"request_id": clean_request_id},
+                )
+            replay = json_load(recorded["response_json"], {})
+            replay_live = replay_guard is None or replay_guard(replay)
+            if replay_live:
+                return {
+                    **replay,
+                    "request_id": clean_request_id,
+                    "idempotent_replay": True,
+                }
         # The reservation is deliberately its own short transaction. The action
         # can run git subprocesses and touch disk, so holding the database write
         # lock across it stalls every other writer — and freezes the
         # Streamable-HTTP event loop — for as long as that work takes.
         with self.database.connect(write=True) as connection:
             self._require_project(connection, project_id)
+            # Re-read under the write lock: another writer may have completed or
+            # replaced this request_id since the liveness read, and only the
+            # state inside the transaction may decide what to do with it.
             existing = connection.execute(
                 """
                 SELECT operation, request_hash, response_json
@@ -1159,27 +1221,31 @@ class AgentChatRoomService:
                         status_code=409,
                         details={"request_id": clean_request_id},
                     )
-                replay = json_load(existing["response_json"], {})
-                if replay_guard is not None and not replay_guard(replay):
-                    # The recorded effect has expired (a lapsed lease, a
-                    # heartbeat that stopped keeping the Session alive).
-                    # Replaying it would report success for protection the
-                    # caller no longer has, so drop the record and run the
-                    # action again to produce a live effect.
-                    connection.execute(
-                        """
-                        DELETE FROM idempotency_records
-                        WHERE scope = ? AND request_id = ?
-                        """,
-                        (scope, clean_request_id),
-                    )
-                    existing = None
-                else:
-                    return {
-                        **replay,
-                        "request_id": clean_request_id,
-                        "idempotent_replay": True,
-                    }
+                if replay_live is None or existing["response_json"] == (
+                    recorded["response_json"] if recorded is not None else None
+                ):
+                    # Nothing raced this request while liveness was being read,
+                    # so the answer computed outside the transaction still holds.
+                    replay = json_load(existing["response_json"], {})
+                    if replay_guard is None or replay_guard(replay):
+                        return {
+                            **replay,
+                            "request_id": clean_request_id,
+                            "idempotent_replay": True,
+                        }
+                # The recorded effect has expired (a lapsed lease, a heartbeat
+                # that stopped keeping the Session alive). Replaying it would
+                # report success for protection the caller no longer has, so
+                # drop the record and run the action again to produce a live
+                # effect.
+                connection.execute(
+                    """
+                    DELETE FROM idempotency_records
+                    WHERE scope = ? AND request_id = ?
+                    """,
+                    (scope, clean_request_id),
+                )
+                existing = None
 
             now = iso_now()
             connection.execute(
@@ -1223,6 +1289,25 @@ class AgentChatRoomService:
             "request_id": clean_request_id,
             "idempotent_replay": False,
         }
+
+    def _idempotency_record(
+        self, scope: str, request_id: str
+    ) -> Mapping[str, Any] | None:
+        """Read one idempotency record without taking the write lock.
+
+        The replay guard that consumes this result queries leases or sessions,
+        and that read has to happen outside the write transaction; see
+        ``_execute_idempotent``.
+        """
+        with self.database.connect() as connection:
+            return connection.execute(
+                """
+                SELECT operation, request_hash, response_json
+                FROM idempotency_records
+                WHERE scope = ? AND request_id = ?
+                """,
+                (scope, request_id),
+            ).fetchone()
 
     def _lease_replay_is_live(self, response: Mapping[str, Any]) -> bool:
         """True while the recorded lease still exists unreleased and unexpired.
@@ -4076,11 +4161,21 @@ class AgentChatRoomService:
         git_remote: str = "",
         host_metadata: dict[str, Any] | None = None,
         workspace_metadata: dict[str, Any] | None = None,
+        host_updates_allowed: bool = False,
     ) -> dict[str, Any]:
+        """Attach a workspace to a host, creating the host row if it is new.
+
+        ``hosts`` has no project scope: one row is shared by every Project on
+        the Room. So an existing row only gets ``last_seen_at`` refreshed here.
+        Rewriting its ``name``/``metadata`` would let any Project - through any
+        Agent that can call room_bootstrap - rename a host another Project
+        displays, and ``list_workspaces`` shows that name verbatim. A caller that
+        actually holds management authority passes ``host_updates_allowed``.
+        """
         if not host_key.strip() or not host_name.strip() or not local_path.strip():
             raise DomainError(
                 "invalid_workspace",
-                "Host key, Host name, and local workspace path are required",
+                "Host key, Host name, and Local workspace path are required",
             )
         # The registered path is a key, so it is canonicalised; the text the
         # caller typed is kept beside it for display. Storing the raw string
@@ -4121,7 +4216,7 @@ class AgentChatRoomService:
                         now,
                     ),
                 )
-            else:
+            elif host_updates_allowed:
                 host_id = host["id"]
                 connection.execute(
                     """
@@ -4136,6 +4231,15 @@ class AgentChatRoomService:
                         now,
                         host_id,
                     ),
+                )
+            else:
+                # last_seen_at only. Rewriting the shared row's identity fields
+                # from an ordinary Project registration is how one Project's
+                # Agent ended up renaming another Project's host.
+                host_id = host["id"]
+                connection.execute(
+                    "UPDATE hosts SET last_seen_at = ? WHERE id = ?",
+                    (now, host_id),
                 )
             workspace = connection.execute(
                 """
@@ -4200,6 +4304,13 @@ class AgentChatRoomService:
                     "host_created": host_created,
                     "workspace_id": workspace_id,
                     "local_path": local_path.strip(),
+                    # A caller that asked to rename a host it does not own is
+                    # refused, and the refusal is part of the event rather than
+                    # a silent no-op the caller cannot tell from success.
+                    "host_renamed": host_created or host_updates_allowed,
+                    "host_rename_refused": (
+                        not host_created and not host_updates_allowed
+                    ),
                 },
             )
             host = connection.execute(
