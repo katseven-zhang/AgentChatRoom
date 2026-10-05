@@ -250,6 +250,8 @@ def match_registered_projects(
                     same_scope = stored_project_scope(project) == checkout_scope(visible)
                 except (DomainError, OSError):
                     same_scope = False
+                if not same_scope and client_key not in keys:
+                    same_scope = service.matches_contained_project_worktree(project, visible)
             if same_scope or (client_key and client_key in keys):
                 found.append(project)
         for project in found:
@@ -689,6 +691,15 @@ def bootstrap_local_room(
             if error.code.startswith("project_registration"):
                 return BootstrapOutcome(bootstrap_status_payload("registration_invalid"))
             return _domain_bootstrap_failure(error)
+
+    # Local stdio resolves the parent checkout registration first. Keep its
+    # Project identity, but inspect the actual advertised linked worktree.
+    if not selected_project_id and not db_matches and len(roots) == 1:
+        visible = _visible_directory(roots[0])
+        if (visible is not None and visible != checkout and
+                service.matches_contained_project_worktree(project, visible)):
+            checkout = visible
+            workspace_candidates = [visible]
 
     file_notices: list[dict[str, Any]] = []
     logical_path = str(project.get("logical_path") or "")

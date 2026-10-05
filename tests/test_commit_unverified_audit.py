@@ -9,6 +9,8 @@ could resolve.
 
 from __future__ import annotations
 
+import subprocess
+
 import pytest
 
 from agentchatroom.errors import DomainError
@@ -53,10 +55,14 @@ def _rejections(service, project_id, task_id):
 
 
 @pytest.mark.parametrize("with_request_id", [True, False])
+@pytest.mark.parametrize("has_repository", [True, False])
 def test_rejection_is_persisted_and_its_event_id_resolves(
-    service, project, joined_agents, with_request_id
+    service, project, joined_agents, with_request_id, has_repository
 ):
     """Persistence must not depend on whether the caller sent a request id."""
+    if has_repository:
+        subprocess.run(["git", "-C", project["root_path"], "init", "-q"], check=True,
+                       creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
     project_id, executor, task = _setup(service, project, joined_agents)
     kwargs = {"commit_hash": BOGUS_COMMIT}
     if with_request_id:
@@ -64,7 +70,8 @@ def test_rejection_is_persisted_and_its_event_id_resolves(
 
     with pytest.raises(DomainError) as refused:
         _report(service, project_id, task, executor, **kwargs)
-    assert refused.value.code == "invalid_commit_hash"
+    assert refused.value.code == ("invalid_commit_hash" if has_repository else "repository_selection_required")
+    assert refused.value.details["reported_commit_hash"] == BOGUS_COMMIT
     event_id = refused.value.details["event_id"]
     assert event_id
 

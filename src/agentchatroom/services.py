@@ -878,6 +878,25 @@ def run_git_capture(
     )
 
 
+def _same_git_repository(first: Path, second: Path) -> bool:
+    """Linked worktrees share a common Git directory, independent clones do not."""
+    identities = []
+    for worktree in (first, second):
+        code, common, _stderr = run_git_capture(
+            ["git", "-C", str(worktree), "rev-parse", "--git-common-dir"]
+        )
+        if code != 0 or not common:
+            return False
+        try:
+            path = Path(common)
+            if not path.is_absolute():
+                path = worktree / path
+            identities.append(os.path.normcase(str(path.resolve())))
+        except (OSError, ValueError, RuntimeError):
+            return False
+    return identities[0] == identities[1]
+
+
 def is_strict_int(value: Any) -> bool:
     """True only for a genuine integer.
 
@@ -4554,9 +4573,10 @@ Attach a workspace to a host, creating the host row if it is new.
         sanitized = dict(workspace_metadata)
         if selection:
             local_root = Path(local_path).expanduser().resolve()
-            if local_root.is_dir():
+            if server_verified and local_root.is_dir():
                 direct_scope = checkout_scope(local_root, repository_path="")
-                if direct_scope == stored_project_scope(project_for_workspace):
+                if (direct_scope == stored_project_scope(project_for_workspace) or
+                        self.matches_contained_project_worktree(project_for_workspace, local_root)):
                     selection = ""
             sanitized["repository_path"] = selection
         else:
@@ -9638,11 +9658,31 @@ Attach a workspace to a host, creating the host row if it is new.
                         "reason": system_evidence.get("reason") or "unverified_commit",
                     },
                 )
+            reason = system_evidence.get("reason") or "unverified_commit"
+            details = {
+                "commit_hash": "unknown",
+                "reported_commit_hash": commit_hash.strip(),
+                "event_id": event_id,
+                "reason": reason,
+            }
+            if reason == "not_a_git_worktree":
+                has_selection = bool(str(dict(project).get("repository_path") or ""))
+                details["required_action"] = (
+                    "recheck_repository_in_project_settings" if has_selection else
+                    "inspect_and_select_repository_in_project_settings"
+                )
+                raise DomainError(
+                    "repository_not_found" if has_selection else "repository_selection_required",
+                    "已关联仓库不可用，请在项目设置中重新检查仓库" if has_selection else
+                    "工作区尚未关联 Git 仓库，请在项目设置中重新检查并明确选择子仓库",
+                    status_code=409,
+                    details=details,
+                )
             raise DomainError(
                 "invalid_commit_hash",
                 "Reported commit_hash could not be verified in the registered worktree",
                 status_code=400,
-                details={"commit_hash": "unknown", "event_id": event_id},
+                details=details,
             )
         with self.database.connect(write=True) as connection:
             self._authenticate(connection, project_id, session_id, token)
@@ -11071,6 +11111,26 @@ Attach a workspace to a host, creating the host row if it is new.
             return WORKSPACE_EVIDENCE_SERVER_VERIFIED
         return WORKSPACE_EVIDENCE_CLIENT_ASSERTED
 
+    def matches_contained_project_worktree(self, project: Mapping[str, Any], checkout: Path) -> bool:
+        """Match a contained linked worktree to the operator's repository selection."""
+        try:
+            project_data = dict(project)
+            root = Path(str(project_data["root_path"])).expanduser().resolve()
+            checkout = checkout.expanduser().resolve()
+            checkout.relative_to(root)
+            registration = load_checkout_registration(checkout)
+            if registration and registration.get("project_key") != project_data.get("project_key"):
+                return False
+            selected = repository_directory(root, str(project_data.get("repository_path") or ""))
+            _remote, git_root, inside = _project_git_info(checkout)
+            if not inside or derive_logical_path(checkout, git_root).casefold() != str(
+                project_data.get("logical_path") or ""
+            ).casefold():
+                return False
+            return _same_git_repository(checkout, selected)
+        except (DomainError, OSError, ValueError, RuntimeError):
+            return False
+
     def _trusted_worktree(
         self,
         connection: Any,
@@ -11126,22 +11186,20 @@ Attach a workspace to a host, creating the host row if it is new.
                 status_code=403,
                 details={"workspace_id": workspace["id"]},
             ) from error
+        if evidence_source != WORKSPACE_EVIDENCE_SERVER_VERIFIED:
+            return reported, evidence_source
         selection = str(dict(project).get("repository_path") or "")
         if selection:
             selection = str(json_load(workspace["metadata_json"], {}).get("repository_path", selection))
             selected = repository_directory(root, selection)
             if reported != root:
-                try:
-                    reported.relative_to(selected)
-                except ValueError as error:
-                    raise DomainError("untrusted_repository", "Session worktree is outside the selected repository",
-                                      status_code=403, details={"required_action": "use_selected_repository"}) from error
-                # A deeper independent repository is a different scope even inside the selected path.
-                _remote, actual_root, inside = _project_git_info(reported)
-                _selected_remote, selected_root, _selected_inside = _project_git_info(selected)
-                if inside and actual_root != selected_root:
-                    raise DomainError("untrusted_repository", "Session worktree belongs to a nested independent repository",
-                                      status_code=403, details={"required_action": "use_a_separate_repository_room"})
+                # Containment was checked against the registered workspace.
+                # A linked worktree can be its selected repository's sibling;
+                # matching remotes or directory nesting cannot prove ownership.
+                if not _same_git_repository(reported, selected):
+                    raise DomainError("untrusted_repository", "Session worktree does not belong to the selected repository",
+                                      status_code=403, details={"required_action": "use_selected_repository"})
+                return reported, evidence_source
             return selected, evidence_source
         return reported, evidence_source
 
@@ -11198,6 +11256,8 @@ Attach a workspace to a host, creating the host row if it is new.
             identity_matches = (normalize_remote(remote) == stored_scope["identity"]
                                 if stored_scope["kind"] == "git" else
                                 os.path.normcase(str(git_root)) == stored_scope["identity"])
+            if not identity_matches and stored_scope["kind"] == "path":
+                identity_matches = _same_git_repository(resolved, Path(stored_scope["identity"]))
             scope_matches = (logical.casefold() == expected_logical.casefold() or
                              logical.casefold().startswith(expected_logical.casefold() + "/") or
                              not expected_logical)

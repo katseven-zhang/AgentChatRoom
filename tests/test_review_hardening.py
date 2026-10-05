@@ -217,8 +217,10 @@ def test_work_report_rejects_unregistered_and_untrusted_worktrees(
             tests=[{"command": "pytest", "exit_code": 0}],
             commit_hash="abc123",
         )
-    assert forged.value.code == "invalid_commit_hash"
+    assert forged.value.code == "repository_selection_required"
     assert forged.value.details["commit_hash"] == "unknown"
+    assert forged.value.details["reported_commit_hash"] == "abc123"
+    assert forged.value.details["reason"] == "not_a_git_worktree"
     audit = service.query_audit(
         project["id"],
         task_id=hashed["id"],

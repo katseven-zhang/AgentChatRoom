@@ -200,6 +200,7 @@ def test_other_child_commit_is_not_accepted_in_selected_repository(service, proj
     with pytest.raises(DomainError) as error:
         report(service, project, task, joined, other_commit)
     assert error.value.code == "invalid_commit_hash"
+    assert error.value.details["reported_commit_hash"] == other_commit
     assert not service.snapshot(project["id"])["reports"]
 
 
@@ -209,8 +210,63 @@ def test_plain_parent_report_is_not_silently_bound_to_child(service, project_dir
     task, joined = claim(service, project)
     with pytest.raises(DomainError) as error:
         report(service, project, task, joined, commit)
-    assert error.value.code == "invalid_commit_hash"
+    assert error.value.code == "repository_selection_required"
+    assert error.value.details["reported_commit_hash"] == commit
+    assert error.value.details["reason"] == "not_a_git_worktree"
+    assert error.value.details["required_action"] == "inspect_and_select_repository_in_project_settings"
     assert service.get_project(project["id"])["repository_path"] == ""
+
+
+def test_unavailable_selected_repository_reports_configuration_error(service, project_dir):
+    child = project_dir / "selected"
+    commit = repository(child)
+    project = service.create_project(root_path=str(project_dir), repository_path="selected")
+    task, joined = claim(service, project)
+    (child / ".git").rename(child / ".git-unavailable")
+    with pytest.raises(DomainError) as error:
+        report(service, project, task, joined, commit)
+    assert error.value.code == "repository_not_found"
+    assert error.value.details["reported_commit_hash"] == commit
+    assert error.value.details["required_action"] == "recheck_repository_in_project_settings"
+    assert not service.snapshot(project["id"])["reports"]
+
+
+@pytest.mark.parametrize("remote", [False, True])
+@pytest.mark.parametrize("relative", ["branches/feature", "selected/feature"])
+def test_parent_workspace_reports_actual_linked_worktree(service, project_dir, remote, relative):
+    child = project_dir / "selected"
+    main_head = repository(child, remote=remote)
+    project = service.create_project(root_path=str(project_dir), repository_path="selected")
+    branch = project_dir / relative
+    git(child, "worktree", "add", "-qb", "fixture-feature", str(branch))
+    (branch / "code.txt").write_text("worktree changed\n", encoding="utf-8")
+    git(branch, "add", "code.txt")
+    git(branch, "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid",
+        "commit", "-qm", "worktree change")
+    commit = git(branch, "rev-parse", "HEAD")
+    assert main_head != commit and git(child, "rev-parse", "HEAD") == main_head
+    assert (branch / ".git").is_file()
+    task, joined = claim(service, project, worktree=str(branch))
+    report(service, project, task, joined, commit)
+    evidence = service.snapshot(project["id"])["reports"][0]["system_evidence"]
+    assert evidence["reported_commit_exists"] is True
+    assert evidence["worktree"] == str(branch)
+    assert evidence["head"] == commit
+    code = next(item for item in evidence["file_evidence"] if item["path"] == "code.txt")
+    assert code["sha256"] == hashlib.sha256((branch / "code.txt").read_bytes()).hexdigest()
+
+
+def test_same_remote_independent_clone_is_not_a_selected_worktree(service, project_dir):
+    child = project_dir / "selected"
+    repository(child, remote=True)
+    project = service.create_project(root_path=str(project_dir), repository_path="selected")
+    clone = project_dir / "clone"
+    git(project_dir, "clone", "-q", str(child), str(clone))
+    git(clone, "remote", "set-url", "origin", "https://example.invalid/fixture/selected.git")
+    task, joined = claim(service, project, worktree=str(clone))
+    with pytest.raises(DomainError) as error:
+        report(service, project, task, joined, git(clone, "rev-parse", "HEAD"))
+    assert error.value.code == "untrusted_repository"
 
 
 def test_root_git_and_monorepo_subproject_stay_distinct(service, project_dir):
@@ -235,6 +291,55 @@ def test_bootstrap_from_parent_keeps_selected_repository(service, project_dir):
     assert outcome.public["status"] == "ready"
     assert outcome.binding.project_id == project["id"]
     assert service.get_project(project["id"])["repository_path"] == "repo"
+
+
+@pytest.mark.parametrize("remote", [False, True])
+@pytest.mark.parametrize("database_first", [False, True])
+def test_bootstrap_from_contained_worktree_collects_its_actual_files(service, project_dir, remote, database_first):
+    child = project_dir / "selected"
+    repository(child, remote=remote)
+    project = service.create_project(root_path=str(project_dir), repository_path="selected")
+    register_checkout_project(project_dir, project)
+    branch = project_dir / "branches" / "feature"
+    git(child, "worktree", "add", "-qb", "fixture-feature", str(branch))
+    (branch / "code.txt").write_text("bootstrap worktree change\n", encoding="utf-8")
+    git(branch, "add", "code.txt")
+    git(branch, "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid",
+        "commit", "-qm", "worktree change")
+    outcome = bootstrap_local_room(service, software_key="fixture-client", software_name="Fixture",
+                                   client="test-client", workspace_roots=[branch], database_first=database_first,
+                                   selected_project_id=project["id"] if database_first else None)
+    assert outcome.public["status"] == "ready"
+    binding = outcome.binding
+    task = service.create_task(project["id"], title="Bootstrapped worktree",
+                               acceptance_criteria=["Actual worktree files"],
+                               actor_session_id=binding.session_id, token=binding.token)["task"]
+    service.claim_task(project["id"], task["id"], binding.session_id, binding.token)
+    service.submit_work_report(project["id"], task["id"], session_id=binding.session_id,
+                               token=binding.token, summary="Actual contained worktree evidence",
+                               files=["code.txt"], tests=[{"command":"fixture validation", "exit_code":0}],
+                               commit_hash=git(branch, "rev-parse", "HEAD"))
+    evidence = service.snapshot(project["id"])["reports"][0]["system_evidence"]
+    assert evidence["worktree"] == str(branch)
+    assert evidence["file_evidence"][0]["sha256"] == hashlib.sha256((branch / "code.txt").read_bytes()).hexdigest()
+    assert service.get_project(project["id"])["root_path"] == str(project_dir)
+
+
+def test_contained_worktree_registered_to_another_room_is_not_rebound(service, project_dir):
+    child = project_dir / "selected"
+    repository(child)
+    project = service.create_project(root_path=str(project_dir), repository_path="selected")
+    branch = project_dir / "branches" / "feature"
+    git(child, "worktree", "add", "-qb", "fixture-feature", str(branch))
+    other = service.create_project(root_path=str(branch), name="Worktree Room")
+    register_checkout_project(branch, other)
+    registration = (branch / ".agentchatroom/project.json").read_bytes()
+    assert not service.matches_contained_project_worktree(project, branch)
+    outcome = bootstrap_local_room(service, software_key="fixture-client", software_name="Fixture",
+                                   client="test-client", workspace_roots=[branch], database_first=True,
+                                   selected_project_id=project["id"])
+    assert outcome.public["status"] == "project_workspace_mismatch"
+    assert (branch / ".agentchatroom/project.json").read_bytes() == registration
 
 
 def test_bounded_discovery_signals_partial_results_and_does_not_poll(service, project_dir, monkeypatch):
