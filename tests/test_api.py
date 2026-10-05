@@ -3159,3 +3159,102 @@ async def _asgi_get(app, path: str) -> int:
     }
     await app(scope, receive, send)
     return status_holder.get("status", 0)
+
+
+def test_idle_sse_wait_and_disconnect_cleanup_do_not_block_http(
+    settings, project_dir, monkeypatch
+):
+    """An idle browser and its last-subscriber teardown must leave HTTP usable."""
+    from agentchatroom.database import create_database
+    from agentchatroom.event_hub import ProjectEventHub, Subscriber
+    from agentchatroom.services import AgentChatRoomService
+
+    limited = replace(settings, sse_poll_interval_seconds=0.5)
+    setup = AgentChatRoomService(create_database(limited), limited)
+    setup.initialize()
+    project = setup.create_project(root_path=str(project_dir), name="Idle SSE")
+    joined = setup.join_room(
+        project["id"], name="Streamer", client="codex", model="test-model"
+    )
+    auth = _sse_auth_headers(joined)
+    path = f"/api/v1/projects/{project['id']}/events/stream"
+    waiting = threading.Event()
+    retiring = threading.Event()
+    release_cleanup = threading.Event()
+    loop_calls = []
+    hubs = []
+    released_slots = []
+    original_get = Subscriber.get
+    original_unsubscribe = ProjectEventHub.unsubscribe
+    original_release = SSELimiter.release
+
+    def record_loop(stage):
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            loop_calls.append((stage, False))
+        else:
+            loop_calls.append((stage, True))
+
+    def get(subscriber, timeout):
+        record_loop("wait")
+        waiting.set()
+        return original_get(subscriber, timeout)
+
+    def unsubscribe(hub, subscriber):
+        record_loop("cleanup")
+        hubs.append(hub)
+        retiring.set()
+        # Simulate a poller still finishing a slow database read on disconnect.
+        release_cleanup.wait(timeout=2)
+        return original_unsubscribe(hub, subscriber)
+
+    def release(limiter, project_id, client_ip):
+        released_slots.append(project_id)
+        return original_release(limiter, project_id, client_ip)
+
+    monkeypatch.setattr(Subscriber, "get", get)
+    monkeypatch.setattr(ProjectEventHub, "unsubscribe", unsubscribe)
+    monkeypatch.setattr(SSELimiter, "release", release)
+    app = create_app(limited)
+
+    async def run():
+        async with app.router.lifespan_context(app):
+            disconnect = asyncio.Event()
+            connected = asyncio.Event()
+            request_sent = False
+
+            async def receive():
+                nonlocal request_sent
+                if not request_sent:
+                    request_sent = True
+                    return {"type": "http.request", "body": b"", "more_body": False}
+                await disconnect.wait()
+                return {"type": "http.disconnect"}
+
+            async def send(message):
+                if b"connected" in message.get("body", b""):
+                    connected.set()
+
+            stream = asyncio.create_task(app(_sse_asgi_scope(path, auth), receive, send))
+            try:
+                await asyncio.wait_for(connected.wait(), timeout=5)
+                assert await asyncio.to_thread(waiting.wait, 5)
+                start = time.perf_counter()
+                assert await _asgi_get(app, "/health") == 200
+                assert time.perf_counter() - start < 0.2
+                disconnect.set()
+                assert await asyncio.to_thread(retiring.wait, 5)
+                start = time.perf_counter()
+                assert await _asgi_get(app, "/health") == 200
+                assert time.perf_counter() - start < 0.2
+            finally:
+                release_cleanup.set()
+                disconnect.set()
+                await asyncio.wait_for(stream, timeout=5)
+
+    asyncio.run(run())
+    assert loop_calls and not any(on_loop for _, on_loop in loop_calls), loop_calls
+    assert {stage for stage, _ in loop_calls} == {"wait", "cleanup"}
+    assert released_slots == [project["id"]]
+    assert hubs[0].subscriber_count() == 0

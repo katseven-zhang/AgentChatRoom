@@ -18,6 +18,7 @@ from functools import partial
 from pathlib import Path
 from typing import Any, Callable, Literal, Mapping
 
+from anyio import CancelScope
 from fastapi import FastAPI, Query, Request, Response
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
@@ -2329,7 +2330,9 @@ def create_app(
                 yield ": connected\n\n"
                 interval = max(0.01, resolved.sse_poll_interval_seconds)
                 while not await request.is_disconnected():
-                    item = subscriber.get(interval)
+                    # Queue.get waits for the entire idle interval. Waiting on
+                    # the ASGI loop serializes all HTTP/MCP requests behind SSE.
+                    item = await asyncio.to_thread(subscriber.get, interval)
                     if item is CLOSED:
                         break
                     if item is TIMEOUT:
@@ -2358,8 +2361,14 @@ def create_app(
                     yield f"id: {cursor}\nevent: room_event\ndata: {payload}\n\n"
                     await asyncio.sleep(0)
             finally:
-                event_hub.unsubscribe(subscriber)
-                release_slot()
+                try:
+                    # The last unsubscribe can join the poller. Finish cleanup
+                    # even inside StreamingResponse's cancelled task group,
+                    # without moving that blocking join onto the event loop.
+                    with CancelScope(shield=True):
+                        await asyncio.to_thread(event_hub.unsubscribe, subscriber)
+                finally:
+                    release_slot()
 
         class _EnsureCloseStreamingResponse(StreamingResponse):
             """Always aclose the body iterator so generator finally runs, then
