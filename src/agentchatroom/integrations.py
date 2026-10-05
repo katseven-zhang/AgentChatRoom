@@ -9,6 +9,7 @@ from typing import Any, Mapping
 
 from .config import Settings, build_service_base_url
 from .credential_bundle import encode_project_credential_bundle
+from .errors import DomainError
 from .http_identity import encode_http_identity_value
 
 
@@ -845,7 +846,7 @@ def build_issued_credential_prompt(
     project_name: str,
     root_path: str = "",
     project_credentials: list[Mapping[str, Any]],
-    software_identity: Mapping[str, str],
+    software_identity: Mapping[str, str] | None,
     linked_member_name: str = "",
 ) -> dict[str, Any]:
     """The single generator for every prompt handed out after a token is issued.
@@ -859,12 +860,30 @@ def build_issued_credential_prompt(
     """
     if mode not in {"first_setup", "add_project"}:
         raise ValueError("issued-credential prompts cover first_setup and add_project")
+    identity_complete = bool(software_identity) and all(
+        str(software_identity.get(field) or "").strip()
+        for field in ("software_key", "software_name", "software_client")
+    )
+    if (software_identity and not identity_complete) or (
+        not identity_complete and (mode == "first_setup" or linked_member_name)
+    ):
+        raise DomainError(
+            "software_identity_required",
+            "Prompt software identity requires Key, Name and Client together",
+            status_code=422,
+        )
     client_label = str(profile.get("label", profile_id)).strip() or profile_id
     config_hint = resolve_config_path_hint(profile)
-    config_text = issued_http_config_text(
-        profile,
-        project_credentials=project_credentials,
-        software_identity=software_identity,
+    # The existing client owns its identity and configuration. Incremental
+    # onboarding must never manufacture blank identity headers or a connector.
+    encode_project_credential_bundle(project_credentials)
+    config_text = (
+        issued_http_config_text(
+            profile,
+            project_credentials=project_credentials,
+            software_identity=software_identity,
+        )
+        if software_identity else ""
     )
     target_line = (
         f"目标 Project：{project_name}（本地工作区根目录 root_path: {root_path}）"

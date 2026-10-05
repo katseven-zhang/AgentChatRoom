@@ -3867,6 +3867,7 @@ async function renderIssuedHttpConfig() {
   const profile = setup?.profiles?.[profileId];
   if (!profile) return;
   if (setup.mode === "reconnect") {
+    elements["token-config-copy"].disabled = false;
     elements["token-config-heading"].textContent = "恢复连接提示词";
     elements["token-config-copy"].textContent = "复制恢复提示词";
     elements["token-config-hint"].textContent = "本场景不签发新 Token，使用客户端已有的 agentchatroom HTTP 配置恢复连接。";
@@ -3905,7 +3906,9 @@ async function renderIssuedHttpConfig() {
 async function loadIssuedServerPrompt(setup, profileId, mode) {
   const projectId = setup?.projectId || state.projectId;
   const requestId = ++state.issuedPromptRequest;
+  elements["token-config-copy"].disabled = true;
   try {
+    const identity = normalizedSoftwareIdentity(setup.softwareIdentity);
     const result = await api(`/api/v1/projects/${projectId}/integrations/mcp/issued-prompt`, {
       method: "POST",
       body: JSON.stringify({
@@ -3913,18 +3916,28 @@ async function loadIssuedServerPrompt(setup, profileId, mode) {
         mode,
         project_name: setup.projectName || "",
         project_credentials: validateProjectCredentials(setup.projectCredentials),
-        software_identity: normalizedSoftwareIdentity(setup.softwareIdentity),
+        software_identity: identity ? {
+          software_key: identity.softwareKey,
+          software_name: identity.softwareName,
+          software_client: identity.softwareClient,
+        } : null,
         linked_member_name: setup.member?.name || "",
       }),
     });
     if (requestId !== state.issuedPromptRequest) return;
     if (elements["token-config-format"].value !== profileId) return;
     elements["token-config-value"].textContent = result.prompt;
+    elements["token-config-copy"].disabled = false;
+    elements["token-secret-section"].hidden = true;
+    elements["token-secret-copy"].hidden = true;
     state.issuedHttpSetup.generatedConfigText = result.config_text;
   } catch (error) {
     if (requestId !== state.issuedPromptRequest) return;
     elements["token-config-value"].textContent =
-      "接入提示词生成失败，请重新签发或更新服务后重试。未生成任何配置。";
+      "Token 已签发，但接入提示词生成失败。可切换客户端重新生成；不要重复签发。";
+    elements["token-secret-value"].textContent = setup.projectCredentials[0]?.token || "";
+    elements["token-secret-section"].hidden = false;
+    elements["token-secret-copy"].hidden = false;
     handleError(error);
   }
 }

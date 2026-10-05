@@ -876,7 +876,7 @@ class McpIssuedPrompt(StrictModel):
     mode: str = "first_setup"
     project_name: str = ""
     project_credentials: list[dict[str, str]]
-    software_identity: dict[str, str]
+    software_identity: dict[str, str] | None = None
     linked_member_name: str = ""
 
 

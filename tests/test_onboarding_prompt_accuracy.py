@@ -19,6 +19,7 @@ Three ways the handoff text could mislead the Agent reading it:
 from __future__ import annotations
 
 import json
+import subprocess
 import re
 import tomllib
 from pathlib import Path
@@ -402,6 +403,78 @@ def test_rest_endpoint_refuses_an_unknown_profile(settings, tmp_path):
         )
     assert response.status_code == 404
     assert response.json()["error"]["code"] == "mcp_profile_unknown"
+
+
+@pytest.mark.parametrize("profile_id", ["workbuddy", "trae", "codex", "grok_build", "generic"])
+def test_issue_unlinked_token_then_generate_incremental_prompt(settings, tmp_path, profile_id):
+    from fastapi.testclient import TestClient
+    from agentchatroom.api import create_app
+
+    checkout = tmp_path / "incremental-checkout"
+    checkout.mkdir()
+    with TestClient(create_app(settings)) as client:
+        project = client.post("/api/v1/projects", json={
+            "root_path": str(checkout), "name": "Incremental Room",
+        }).json()
+        issued = client.post(f"/api/v1/projects/{project['id']}/agent-tokens", json={
+            "name": "Existing client", "member_id": None,
+            "permissions": ["room:read"], "expires_in_seconds": settings.min_agent_token_ttl_seconds,
+        })
+        assert issued.status_code == 201
+        token = issued.json()["token"]
+        response = client.post(
+            f"/api/v1/projects/{project['id']}/integrations/mcp/issued-prompt",
+            json={"profile_id": profile_id, "mode": "add_project",
+                  "project_credentials": [{"name": project['name'], "token": token}],
+                  "software_identity": None},
+        )
+        assert response.status_code == 200, response.text
+        result = response.json()
+        assert token in result["prompt"]
+        assert "原样保留客户端现有的软件身份三字段" in result["prompt"]
+        assert "不新建第二个 agentchatroom 连接器" in result["prompt"]
+        assert result["config_text"] == ""
+        assert len(client.get(f"/api/v1/projects/{project['id']}/agent-tokens").json()["credentials"]) == 1
+
+
+@pytest.mark.parametrize("mode,linked", [("first_setup", ""), ("add_project", "Existing")])
+def test_missing_identity_still_refuses_first_setup_or_linked_member(settings, tmp_path, mode, linked):
+    from fastapi.testclient import TestClient
+    from agentchatroom.api import create_app
+
+    checkout = tmp_path / "identity-checkout"
+    checkout.mkdir()
+    with TestClient(create_app(settings)) as client:
+        project = client.post("/api/v1/projects", json={"root_path": str(checkout), "name": "Demo"}).json()
+        response = client.post(
+            f"/api/v1/projects/{project['id']}/integrations/mcp/issued-prompt",
+            json={"profile_id": "codex", "mode": mode,
+                  "project_credentials": CREDENTIALS, "software_identity": None,
+                  "linked_member_name": linked},
+        )
+        assert response.status_code == 422
+        assert response.json()["error"]["code"] == "software_identity_required"
+
+
+def test_browser_identity_transport_and_secret_recovery():
+    result = subprocess.run(
+        ["node", str(Path(__file__).with_name("issued_prompt_transport.cjs"))],
+        capture_output=True, text=True, timeout=20,
+    )
+    assert result.returncode == 0, result.stderr
+
+
+@pytest.mark.parametrize("identity", [{"softwareKey": "worker", "softwareName": "Worker", "softwareClient": "client"}, {"software_key": "worker"}])
+def test_issued_generator_refuses_incomplete_or_wrong_case_identity(tmp_path, identity):
+    from agentchatroom.errors import DomainError
+
+    profile = _integration(tmp_path, PROJECT)["profiles"]["codex"]
+    with pytest.raises(DomainError) as caught:
+        build_issued_credential_prompt(
+            "codex", profile, mode="first_setup", project_name=PROJECT['name'],
+            project_credentials=CREDENTIALS, software_identity=identity,
+        )
+    assert caught.value.code == "software_identity_required"
 
 
 def test_no_prompt_anywhere_tells_an_agent_to_name_the_bearer_slot():

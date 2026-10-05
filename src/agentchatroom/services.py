@@ -17,6 +17,7 @@ import subprocess
 import threading
 import time
 import uuid
+from bisect import bisect_right
 from contextlib import contextmanager
 from functools import wraps
 from datetime import UTC, datetime, timedelta
@@ -11430,12 +11431,11 @@ Attach a workspace to a host, creating the host row if it is new.
     ) -> tuple[list[dict[str, Any]], int]:
         """Sessions for one Project with activity/unread counters attached.
 
-        Both counters used to be correlated subqueries in the ``SELECT`` list,
-        so the statement was evaluated once per Session row and every snapshot
-        or presence poll paid Sessions x 2 extra event scans. They are now two
-        grouped aggregates joined onto the Session row, and the Session list is
-        bounded newest-first: a Project accumulates one Session per agent
-        process for its whole life, so an unbounded read only ever grew.
+        Activity is aggregated once. Unread counts use one ordered read of
+        event numbers and a binary search per returned Session. A grouped
+        Session/event range join still materialized Sessions x unread events,
+        including old Sessions beyond the page limit, and stalled presence
+        polling after a busy Project accumulated history.
         Returns ``(rows, total_sessions)`` so a truncated read can say so.
         """
         total = int(
@@ -11445,7 +11445,7 @@ Attach a workspace to a host, creating the host row if it is new.
             ).fetchone()["c"]
         )
         statement = """
-            SELECT a.*, activity.last_activity_at, unread.unread_count
+            SELECT a.*, activity.last_activity_at
             FROM agent_sessions a
             LEFT JOIN (
                 SELECT actor_session_id, MAX(created_at) AS last_activity_at
@@ -11453,27 +11453,31 @@ Attach a workspace to a host, creating the host row if it is new.
                 WHERE project_id = ? AND actor_session_id IS NOT NULL
                 GROUP BY actor_session_id
             ) activity ON activity.actor_session_id = a.id
-            LEFT JOIN (
-                SELECT a2.id AS session_id, COUNT(e.id) AS unread_count
-                FROM agent_sessions a2
-                LEFT JOIN events e
-                  ON e.project_id = a2.project_id
-                 AND e.project_seq > a2.last_read_cursor
-                WHERE a2.project_id = ?
-                GROUP BY a2.id
-            ) unread ON unread.session_id = a.id
             WHERE a.project_id = ?
             ORDER BY a.created_at DESC, a.id DESC
         """
-        params: list[Any] = [project_id, project_id, project_id]
+        params: list[Any] = [project_id, project_id]
         if limit is not None:
             params.append(max(1, int(limit)))
             statement += " LIMIT ?"
         rows = [dict(row) for row in connection.execute(statement, params).fetchall()]
+        if not rows:
+            return rows, total
+        min_cursor = min(int(row.get("last_read_cursor") or 0) for row in rows)
+        event_numbers = [
+            int(event["project_seq"])
+            for event in connection.execute(
+                "SELECT project_seq FROM events "
+                "WHERE project_id = ? AND project_seq > ? ORDER BY project_seq",
+                (project_id, min_cursor),
+            ).fetchall()
+        ]
         for row in rows:
-            # The grouped join yields NULL for a Session with no events, which
-            # is what the correlated MAX() subquery yielded too.
-            row["unread_count"] = int(row.get("unread_count") or 0)
+            # Count actual rows, not latest_seq - cursor: legacy gaps and
+            # cursors beyond the newest event must still give exact counts.
+            row["unread_count"] = len(event_numbers) - bisect_right(
+                event_numbers, int(row.get("last_read_cursor") or 0)
+            )
         return rows, total
 
     def _snapshot(
