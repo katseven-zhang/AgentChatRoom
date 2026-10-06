@@ -4,6 +4,7 @@ import base64
 import hashlib
 import json
 import threading
+from html.parser import HTMLParser
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from urllib.parse import parse_qs, urlparse
@@ -113,6 +114,30 @@ def test_pending_cannot_connect_wrong_code_denied_and_expired(remote):
         connection.execute("UPDATE remote_oauth_authorizations SET expires_at=0 WHERE id=?", (record["request_id"],))
     assert "过期" in public.get(url).text
     assert local.post(f'/api/v1/admin/remote/authorizations/{record["request_id"]}/decision', json={"approve": True}).status_code == 409
+
+
+def test_consent_uses_navigation_for_cross_origin_oauth_callback(remote):
+    local, public, _service, _app = remote
+    _client, _verifier, url, record = pending_authorization(local, public)
+    class Links(HTMLParser):
+        href = None
+        def handle_starttag(self, tag, attrs):
+            assert tag != "form", "form-action CSP can block cross-origin OAuth redirects"
+            if tag == "a":
+                self.href = dict(attrs)["href"]
+    parser = Links()
+    consent = public.get(url)
+    assert "form-action 'self'" in consent.headers["content-security-policy"]
+    parser.feed(consent.text)
+    assert parser.href and parser.href.startswith("/oauth/complete?")
+    assert parse_qs(urlparse(parser.href).query) == parse_qs(urlparse(url).query)
+    approved = local.post(f'/api/v1/admin/remote/authorizations/{record["request_id"]}/decision', json={
+        "approve": True, "verification_code": record["verification_code"],
+    })
+    assert approved.status_code == 200
+    completed = public.get(parser.href, follow_redirects=False)
+    assert completed.status_code == 302
+    assert completed.headers["location"].startswith("https://client.example/callback?")
 
 
 def test_code_resource_pkce_single_use_hash_storage_rotation_and_revocation(remote):
@@ -264,8 +289,8 @@ def test_invalid_pkce_and_resource_do_not_consume_valid_code(remote):
     assert public.post("/token", data=form).status_code == 200
 
 
-def test_concurrent_code_redemption_only_mints_one_token_pair(remote):
-    local, public, _service, _app = remote
+def test_concurrent_code_redemption_only_mints_one_token_pair(remote, monkeypatch):
+    local, public, _service, app = remote
     client_id, verifier, url, record = pending_authorization(local, public)
     local.post(f'/api/v1/admin/remote/authorizations/{record["request_id"]}/decision', json={
         "approve": True, "verification_code": record["verification_code"],
@@ -275,9 +300,47 @@ def test_concurrent_code_redemption_only_mints_one_token_pair(remote):
     form = {"grant_type": "authorization_code", "client_id": client_id, "code": code,
             "redirect_uri": "https://client.example/callback", "code_verifier": verifier,
             "resource": "https://room.example/mcp"}
+    original = app.state.provider._load_code
+    barrier = threading.Barrier(2)
+    def both_read_valid_code(*args):
+        result = original(*args)
+        barrier.wait(timeout=5)
+        return result
+    monkeypatch.setattr(app.state.provider, "_load_code", both_read_valid_code)
     with ThreadPoolExecutor(max_workers=2) as pool:
         statuses = list(pool.map(lambda _: public.post("/token", data=form).status_code, range(2)))
     assert sorted(statuses) == [200, 400]
+
+
+def test_concurrent_refresh_rotation_returns_invalid_grant_not_server_error(remote, monkeypatch):
+    import asyncio
+    local, public, _service, app = remote
+    tokens, client_id, _form = authorize(local, public)
+    original = app.state.provider.load_refresh_token
+    barrier = threading.Barrier(2)
+    async def both_read_valid_refresh(*args):
+        result = await original(*args)
+        await asyncio.to_thread(barrier.wait, 5)
+        return result
+    monkeypatch.setattr(app.state.provider, "load_refresh_token", both_read_valid_refresh)
+    form = {"grant_type": "refresh_token", "client_id": client_id, "refresh_token": tokens["refresh_token"], "resource": "https://room.example/mcp"}
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        responses = list(pool.map(lambda _: public.post("/token", data=form), range(2)))
+    assert sorted(response.status_code for response in responses) == [200, 400]
+    assert next(response for response in responses if response.status_code == 400).json()["error"] == "invalid_grant"
+
+
+def test_oauth_capacity_errors_survive_database_rollback(remote):
+    local, public, _service, app = remote
+    client_id, verifier, url, _record = pending_authorization(local, public)
+    app.state.provider.settings = replace(app.state.provider.settings, remote_oauth_max_clients=1, remote_oauth_max_pending=1)
+    registered = public.post("/register", json={"client_name":"Over limit", "redirect_uris":["https://client.example/callback"], "token_endpoint_auth_method":"none"})
+    assert registered.status_code == 400 and registered.json()["error"] == "invalid_client_metadata"
+    challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).decode().rstrip("=")
+    authorized = public.get("/authorize", params={"client_id":client_id, "redirect_uri":"https://client.example/callback", "state":"capacity", "response_type":"code",
+        "code_challenge":challenge, "code_challenge_method":"S256", "scope":" ".join(REMOTE_COORDINATOR_SCOPES), "resource":"https://room.example/mcp"}, follow_redirects=False)
+    assert authorized.status_code == 302
+    assert parse_qs(urlparse(authorized.headers["location"]).query)["error"] == ["temporarily_unavailable"]
 
 
 def test_oauth_persistence_expiry_revoke_endpoint_and_session_recovery(remote, tmp_path):

@@ -32,6 +32,13 @@ def secret_hash(value: str) -> str:
     return hashlib.sha256(value.encode()).hexdigest()
 
 
+class _ProviderFailure(Exception):
+    """Carry frozen SDK exceptions through database context-manager rollback."""
+    def __init__(self, error: RegistrationError | AuthorizeError | TokenError) -> None:
+        super().__init__(error.error_description)
+        self.error = error
+
+
 class RemoteOAuthProvider:
     def __init__(self, service: Any) -> None:
         self.service = service
@@ -41,7 +48,12 @@ class RemoteOAuthProvider:
         self.resource = self.issuer + "/mcp"
 
     async def _thread(self, function: Any, *args: Any, **kwargs: Any) -> Any:
-        return await asyncio.to_thread(partial(function, *args, **kwargs))
+        try:
+            return await asyncio.to_thread(partial(function, *args, **kwargs))
+        except _ProviderFailure as failure:
+            # contextlib assigns __traceback__ during rollback; SDK errors are
+            # frozen dataclasses, so raise them only after that context exits.
+            raise failure.error from failure
 
     def _audit(self, connection: Any, client_id: str, kind: str, **payload: Any) -> None:
         connection.execute(
@@ -68,21 +80,21 @@ class RemoteOAuthProvider:
 
     def _register_client(self, client: OAuthClientInformationFull) -> None:
         if client.token_endpoint_auth_method != "none":
-            raise RegistrationError("invalid_client_metadata", "Use public-client authentication: none, with S256 PKCE")
+            raise _ProviderFailure(RegistrationError("invalid_client_metadata", "Use public-client authentication: none, with S256 PKCE"))
         name = (client.client_name or "Remote coordinator").strip()
         metadata = client.model_dump_json()
         if not 1 <= len(name) <= 128 or len(metadata.encode()) > 16384 or not 1 <= len(client.redirect_uris) <= 10:
-            raise RegistrationError("invalid_client_metadata", "Client metadata is too large or incomplete")
+            raise _ProviderFailure(RegistrationError("invalid_client_metadata", "Client metadata is too large or incomplete"))
         for value in client.redirect_uris:
             url = urlparse(str(value))
             if url.username or url.password or url.fragment or not (
                 url.scheme == "https" or (url.scheme == "http" and url.hostname in {"127.0.0.1", "localhost", "::1"})
             ):
-                raise RegistrationError("invalid_redirect_uri", "Use HTTPS callbacks or loopback HTTP callbacks")
+                raise _ProviderFailure(RegistrationError("invalid_redirect_uri", "Use HTTPS callbacks or loopback HTTP callbacks"))
         with self.database.connect(write=True) as connection:
             count = connection.execute("SELECT COUNT(*) AS n FROM remote_oauth_clients WHERE revoked_at IS NULL").fetchone()["n"]
             if int(count) >= self.settings.remote_oauth_max_clients:
-                raise RegistrationError("invalid_client_metadata", "Client limit reached; ask the local operator to revoke unused connections")
+                raise _ProviderFailure(RegistrationError("invalid_client_metadata", "Client limit reached; ask the local operator to revoke unused connections"))
             connection.execute(
                 "INSERT INTO remote_oauth_clients(client_id,metadata_json,software_key,display_name,created_at) VALUES(?,?,?,?,?)",
                 (client.client_id, metadata, new_id("remote_software"), name, iso_now()),
@@ -94,25 +106,25 @@ class RemoteOAuthProvider:
 
     def _authorize(self, client: OAuthClientInformationFull, params: AuthorizationParams) -> str:
         if params.resource != self.resource:
-            raise AuthorizeError("invalid_request", "resource must match the advertised MCP resource")
+            raise _ProviderFailure(AuthorizeError("invalid_request", "resource must match the advertised MCP resource"))
         scopes = params.scopes or list(REMOTE_COORDINATOR_SCOPES)
         if not set(scopes).issubset(REMOTE_COORDINATOR_SCOPES) or "room:read" not in scopes:
-            raise AuthorizeError("invalid_scope", "Request only the advertised coordinator scopes, including room:read")
+            raise _ProviderFailure(AuthorizeError("invalid_scope", "Request only the advertised coordinator scopes, including room:read"))
         if not re.fullmatch(r"[A-Za-z0-9_-]{43}", params.code_challenge):
-            raise AuthorizeError("invalid_request", "A valid S256 PKCE challenge is required")
+            raise _ProviderFailure(AuthorizeError("invalid_request", "A valid S256 PKCE challenge is required"))
         params.scopes = scopes
         ticket = secrets.token_urlsafe(32)
         request_id = new_id("oauth_request")
         with self.database.connect(write=True) as connection:
             row = connection.execute("SELECT revoked_at FROM remote_oauth_clients WHERE client_id=?", (client.client_id,)).fetchone()
             if row is None or row["revoked_at"]:
-                raise AuthorizeError("unauthorized_client", "This client is revoked or unknown")
+                raise _ProviderFailure(AuthorizeError("unauthorized_client", "This client is revoked or unknown"))
             count = connection.execute(
                 "SELECT COUNT(*) AS n FROM remote_oauth_authorizations WHERE status IN ('pending','approved') AND expires_at>?",
                 (int(time.time()),),
             ).fetchone()["n"]
             if int(count) >= self.settings.remote_oauth_max_pending:
-                raise AuthorizeError("temporarily_unavailable", "Pending authorization limit reached")
+                raise _ProviderFailure(AuthorizeError("temporarily_unavailable", "Pending authorization limit reached"))
             connection.execute(
                 "INSERT INTO remote_oauth_authorizations(id,client_id,ticket_hash,verification_code,params_json,status,expires_at,created_at) "
                 "VALUES(?,?,?,?,?,'pending',?,?)",
@@ -245,10 +257,10 @@ class RemoteOAuthProvider:
                 (secret_hash(code.code), client.client_id),
             ).fetchone()
             if row is None or int(row["code_expires_at"] or 0) <= time.time():
-                raise TokenError("invalid_grant", "Authorization code is expired or already used")
+                raise _ProviderFailure(TokenError("invalid_grant", "Authorization code is expired or already used"))
             changed = connection.execute("UPDATE remote_oauth_authorizations SET status='consumed' WHERE id=? AND status='code_issued'", (row["id"],))
             if changed.rowcount != 1:
-                raise TokenError("invalid_grant", "Authorization code is already used")
+                raise _ProviderFailure(TokenError("invalid_grant", "Authorization code is already used"))
             self._audit(connection, client.client_id or "", "authorization.consumed", request_id=row["id"])
             return self._mint(connection, client.client_id or "", row["id"], code.scopes)
 
@@ -283,10 +295,10 @@ class RemoteOAuthProvider:
         with self.database.connect(write=True) as connection:
             row = self._load_token(token.token, "refresh")
             if row is None or row["client_id"] != client.client_id or not set(scopes).issubset(json.loads(row["scopes_json"])):
-                raise TokenError("invalid_grant", "Refresh token is expired, revoked or already rotated")
+                raise _ProviderFailure(TokenError("invalid_grant", "Refresh token is expired, revoked or already rotated"))
             changed = connection.execute("UPDATE remote_oauth_tokens SET revoked_at=? WHERE token_hash=? AND revoked_at IS NULL", (iso_now(), row["token_hash"]))
             if changed.rowcount != 1:
-                raise TokenError("invalid_grant", "Refresh token is already rotated")
+                raise _ProviderFailure(TokenError("invalid_grant", "Refresh token is already rotated"))
             connection.execute("UPDATE remote_oauth_tokens SET revoked_at=? WHERE grant_id=? AND revoked_at IS NULL", (iso_now(), row["grant_id"]))
             self._audit(connection, client.client_id or "", "tokens.rotated", request_id=row["grant_id"])
             return self._mint(connection, client.client_id or "", row["grant_id"], scopes)

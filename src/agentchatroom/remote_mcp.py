@@ -8,7 +8,7 @@ import time
 from contextlib import asynccontextmanager
 from functools import partial
 from typing import Any
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, urlencode, urlparse
 
 import uvicorn
 from mcp.server.auth.middleware.auth_context import get_access_token
@@ -281,12 +281,15 @@ def create_remote_app(service: Any, provider: RemoteOAuthProvider | None = None)
             if result["status"] in {"denied", "expired", "code_issued", "consumed"}:
                 text = "此请求已拒绝、过期或完成。请从客户端重新发起连接。"
             esc = html.escape
+            # A form submission carries form-action CSP through HTTP redirects
+            # in browsers and can block the registered cross-origin callback.
+            # Navigation keeps CSP strict while allowing the OAuth redirect.
+            continue_url = "/oauth/complete?" + urlencode({"request_id": request_id, "ticket": ticket})
             body = f'''<!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>Room 远程授权</title>
                 <body><main><h1>Room 远程授权</h1><p>{esc(text)}</p><h2>{esc(str(result.get("verification_code", "")))}</h2>
                 <p>客户端：{esc(str(result.get("display_name", "")))}</p><p>回调：{esc(str(result.get("redirect_uri", "")))}</p>
                 <p>权限：{esc(" · ".join(result.get("scopes", [])))}</p>
-                <form method="get" action="/oauth/complete"><input type="hidden" name="request_id" value="{esc(request_id)}">
-                <input type="hidden" name="ticket" value="{esc(ticket)}"><button>已在本机批准，继续连接</button></form></main></body></html>'''
+                <p><a href="{esc(continue_url)}">已在本机批准，继续连接</a></p></main></body></html>'''
             return HTMLResponse(body, headers={**headers, "Content-Security-Policy": "default-src 'none'; form-action 'self'; frame-ancestors 'none'"})
         except DomainError as error:
             return JSONResponse(error.as_dict(), status_code=error.status_code, headers={"Cache-Control": "no-store"})
