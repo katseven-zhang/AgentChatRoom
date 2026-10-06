@@ -7010,6 +7010,34 @@ Attach a workspace to a host, creating the host row if it is new.
             task = self._require_task(connection, project_id, task_id)
             return self._task_with_dependencies(connection, task)
 
+    def _latest_work_report(self, connection: Any, project_id: str, task_id: str) -> Any:
+        event = connection.execute(
+            "SELECT payload_json FROM events WHERE project_id=? AND task_id=? "
+            "AND event_type IN ('work.reported','work.report') ORDER BY id DESC LIMIT 1",
+            (project_id, task_id),
+        ).fetchone()
+        report_id = json_load(event["payload_json"], {}).get("report_id") if event else None
+        if not report_id:
+            return None
+        return connection.execute(
+            "SELECT * FROM work_reports WHERE id=? AND project_id=? AND task_id=?",
+            (report_id, project_id, task_id),
+        ).fetchone()
+
+    def get_task_evidence(self, project_id: str, task_id: str) -> dict[str, Any]:
+        """Bounded task evidence for adapters that cannot inspect local worktrees."""
+        with self.database.connect() as connection:
+            task = self.get_task(project_id, task_id)
+            reports = connection.execute(
+                "SELECT * FROM work_reports WHERE project_id=? AND task_id=? "
+                "ORDER BY created_at DESC,id DESC LIMIT ?",
+                (project_id, task_id, self.settings.snapshot_recent_limit),
+            ).fetchall()
+            latest = self._latest_work_report(connection, project_id, task_id)
+            return {"task": task, "reports": [self._work_report_dict(row) for row in reports],
+                    "latest_work_report_id": latest["id"] if latest else None,
+                    "latest_work_report": self._work_report_dict(latest) if latest else None}
+
     def get_task_with_documents(self, project_id: str, task_id: str) -> dict[str, Any]:
         """Task contract plus the current binding-document injection payload."""
         with self.database.connect() as connection:
@@ -9829,6 +9857,7 @@ Attach a workspace to a host, creating the host row if it is new.
         verdict: str,
         criteria: list[dict[str, Any]],
         notes: str = "",
+        repository_evidence: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         if verdict not in REVIEW_VERDICTS:
             raise DomainError("invalid_review_verdict", "Unsupported review verdict")
@@ -9855,6 +9884,15 @@ Attach a workspace to a host, creating the host row if it is new.
             self._require_independent_reviewer(
                 connection, project_id, task, reviewer
             )
+            if repository_evidence is not None:
+                from .remote_review import validate_repository_review
+
+                report = self._latest_work_report(connection, project_id, task_id)
+                project = self._require_project(connection, project_id)
+                repository_evidence = validate_repository_review(
+                    dict(project), dict(report) if report is not None else None,
+                    repository_evidence, criteria, self.settings.list_input_max_count,
+                )
             expected = json_load(task["acceptance_criteria_json"], [])
             if verdict == "approved" and (
                 any(assessed.get(item) != "passed" for item in expected)
@@ -9928,6 +9966,8 @@ Attach a workspace to a host, creating the host row if it is new.
                     "review_id": review_id,
                     "verdict": verdict,
                     "criteria": criteria,
+                    **({"repository_evidence": repository_evidence}
+                       if repository_evidence is not None else {}),
                     "notes": notes.strip(),
                     # from_* pairs: task_history.state_changes() reports nothing
                     # for an event carrying only the new value, so a review that

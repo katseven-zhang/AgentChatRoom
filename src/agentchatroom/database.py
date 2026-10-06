@@ -15,7 +15,7 @@ if TYPE_CHECKING:
     from .config import Settings
 
 
-SCHEMA_VERSION = 26
+SCHEMA_VERSION = 27
 # One source for both the connect timeout and the busy timeout: a writer that
 # loses the race waits this long before the contention is reported.
 SQLITE_BUSY_TIMEOUT_SECONDS = 10
@@ -494,7 +494,56 @@ CREATE TABLE IF NOT EXISTS project_document_heads (
 );
 """
 
+REMOTE_OAUTH_SCHEMA = """
+CREATE TABLE IF NOT EXISTS remote_oauth_clients (
+    client_id TEXT PRIMARY KEY,
+    metadata_json TEXT NOT NULL,
+    software_key TEXT NOT NULL UNIQUE,
+    display_name TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    approved_at TEXT,
+    revoked_at TEXT
+);
+CREATE TABLE IF NOT EXISTS remote_oauth_authorizations (
+    id TEXT PRIMARY KEY,
+    client_id TEXT NOT NULL REFERENCES remote_oauth_clients(client_id),
+    ticket_hash TEXT NOT NULL,
+    verification_code TEXT NOT NULL,
+    params_json TEXT NOT NULL,
+    status TEXT NOT NULL,
+    expires_at BIGINT NOT NULL,
+    code_hash TEXT UNIQUE,
+    code_expires_at BIGINT,
+    created_at TEXT NOT NULL,
+    decided_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_remote_oauth_authorizations_status
+    ON remote_oauth_authorizations(status, expires_at);
+CREATE TABLE IF NOT EXISTS remote_oauth_tokens (
+    token_hash TEXT PRIMARY KEY,
+    client_id TEXT NOT NULL REFERENCES remote_oauth_clients(client_id),
+    grant_id TEXT NOT NULL REFERENCES remote_oauth_authorizations(id),
+    kind TEXT NOT NULL,
+    scopes_json TEXT NOT NULL,
+    resource_url TEXT NOT NULL,
+    expires_at BIGINT NOT NULL,
+    created_at TEXT NOT NULL,
+    revoked_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_remote_oauth_tokens_grant
+    ON remote_oauth_tokens(grant_id, revoked_at);
+CREATE TABLE IF NOT EXISTS remote_oauth_events (
+    id TEXT PRIMARY KEY,
+    client_id TEXT NOT NULL,
+    event_type TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+"""
+SCHEMA += REMOTE_OAUTH_SCHEMA
+
 MIGRATIONS = {
+    27: REMOTE_OAUTH_SCHEMA,
     26: "SELECT 1;",  # Portable conditional column migration below.
     2: """
         ALTER TABLE agent_sessions ADD COLUMN token_expires_at TEXT NOT NULL DEFAULT '1970-01-01T00:00:00Z';

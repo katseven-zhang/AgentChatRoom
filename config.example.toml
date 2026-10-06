@@ -144,3 +144,15 @@ default_theme = "system"
 auto_backup_enabled = false
 auto_backup_interval_seconds = 3600
 auto_backup_max_kept = 10
+
+[remote]
+# OAuth coordinator listener; default disabled. Publish only this loopback port through HTTPS.
+enabled = false
+host = "127.0.0.1"
+port = 8766
+public_base_url = ""
+authorization_ttl_seconds = 600
+access_ttl_seconds = 3600
+refresh_ttl_seconds = 2592000
+max_clients = 100
+max_pending = 100

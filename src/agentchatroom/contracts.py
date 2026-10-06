@@ -379,6 +379,20 @@ class ReviewCriterion(TypedDict, total=False):
     evidence: NotRequired[str]
 
 
+REMOTE_COORDINATOR_SCOPES = (
+    "room:read", "message:write", "task:publish", "task:assign", "review:github",
+)
+
+
+class RepositoryReviewEvidence(TypedDict):
+    """Repository evidence pinned to the latest report, without filesystem access."""
+
+    work_report_id: str
+    commit_hash: str
+    repository_url: str
+    evidence_urls: list[str]
+
+
 class KnowledgeProvenance(TypedDict, total=False):
     """Where a Knowledge Asset version came from, kept append-only."""
 

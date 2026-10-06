@@ -522,6 +522,24 @@
 
         <section class="data-section unframed management-section">
           <div class="section-heading">
+            <div><h3>远程接入</h3><p class="secondary-text">跨项目消息、任务规划及 GitHub 验收；首次连接需在本机批准授权</p></div>
+            <button class="secondary-button" id="refresh-remote-button" type="button">刷新授权请求</button>
+          </div>
+          <form id="remote-settings-form">
+            <label class="check-control"><input id="remote-enabled" type="checkbox"> 开启远程 MCP</label>
+            <label>公网 HTTPS 地址 <input id="remote-public-url" type="url" placeholder="https://room.example.com"></label>
+            <label>本机监听地址 <input id="remote-host" type="text" required></label>
+            <label>本机监听端口 <input id="remote-port" type="number" min="1" max="65535" required></label>
+            <p class="form-hint">保存后重启 Room 服务生效。公网代理只连接此端口；本地管理页面仍使用原端口。</p>
+            <button class="secondary-button" type="submit">保存远程配置</button>
+          </form>
+          <p id="remote-status" class="secondary-text"></p>
+          <h4>待审批授权</h4><div id="remote-pending" class="management-list"></div>
+          <h4>客户端连接</h4><div id="remote-clients" class="management-list"></div>
+        </section>
+
+        <section class="data-section unframed management-section">
+          <div class="section-heading">
             <div>
               <h3>自动备份策略</h3>
               <p class="secondary-text">作用于整个数据库的自动备份调度，与单个 Project 无关</p>

@@ -14,6 +14,7 @@ import threading
 import time
 import traceback
 from contextlib import asynccontextmanager
+from dataclasses import replace
 from functools import partial
 from pathlib import Path
 from typing import Any, Callable, Literal, Mapping
@@ -26,7 +27,9 @@ from pydantic import BaseModel, ConfigDict, Field
 from starlette.datastructures import MutableHeaders
 
 from . import __version__
-from .config import Settings, build_service_base_url, load_settings, rewrite_config_text
+from .config import Settings, build_service_base_url, load_settings, rewrite_config_text, validate_remote_settings
+from .remote_auth import RemoteOAuthProvider
+from .remote_mcp import RemoteMcpRuntime
 from .database import create_database
 from .desktop import DirectoryPickerUnavailable, pick_directory
 from .errors import DomainError
@@ -455,6 +458,19 @@ class ManagementAuthASGIMiddleware:
 
 class AdminLogin(StrictModel):
     token: str
+
+
+class RemoteSettingsUpdate(StrictModel):
+    enabled: bool
+    host: str
+    port: int
+    public_base_url: str
+
+
+class RemoteAuthorizationDecision(StrictModel):
+    approve: bool
+    verification_code: str = ""
+    display_name: str = ""
 
 
 class ProjectDocumentUpsert(StrictModel):
@@ -1351,12 +1367,15 @@ def create_app(
     except ImportError:  # pragma: no cover - sse_starlette ships with the MCP SDK
         pass
     resolved = settings or load_settings()
+    validate_remote_settings(resolved)
     resolved_directory_picker = directory_picker or pick_directory
     resolved_local_mcp_configurator = (
         local_mcp_configurator or LocalMcpConfigurator()
     )
     service = AgentChatRoomService(create_database(resolved), resolved)
     service.initialize()
+    remote_provider = RemoteOAuthProvider(service)
+    remote_runtime = RemoteMcpRuntime(service, remote_provider) if resolved.remote_mcp_enabled else None
     management_token = os.getenv(resolved.management_token_env, "")
     if resolved.management_auth_required and len(management_token) < 24:
         raise ValueError(
@@ -1462,6 +1481,8 @@ def create_app(
         )
         try:
             with running_service(resolved):
+                if remote_runtime is not None:
+                    await asyncio.to_thread(remote_runtime.start)
                 http_presence_manager.start()
                 if mcp_http_app is None:
                     yield
@@ -1469,6 +1490,8 @@ def create_app(
                     async with mcp_server.session_manager.run():
                         yield
         finally:
+            if remote_runtime is not None:
+                await asyncio.to_thread(remote_runtime.stop)
             http_presence_manager.stop()
             event_hub.stop()
             auto_backup_stop.set()
@@ -1486,6 +1509,8 @@ def create_app(
     )
     app.state.settings = resolved
     app.state.service = service
+    app.state.remote_provider = remote_provider
+    app.state.remote_runtime = remote_runtime
     app.state.mcp_server = mcp_server
     app.state.http_presence_manager = http_presence_manager
     app.state.directory_picker = resolved_directory_picker
@@ -2008,6 +2033,40 @@ def create_app(
                 "Management authentication is required for this endpoint",
                 status_code=401,
             )
+
+    @app.get("/api/v1/admin/remote")
+    def remote_status(request: Request) -> dict[str, Any]:
+        _require_management(request)
+        return {**remote_provider.status(), "running": bool(remote_runtime and remote_runtime.server.started),
+                "configuration": {"enabled": resolved.remote_mcp_enabled, "host": resolved.remote_mcp_host,
+                    "port": resolved.remote_mcp_port, "public_base_url": resolved.remote_mcp_public_base_url}}
+
+    @app.put("/api/v1/admin/remote/settings")
+    def remote_settings(request: Request, body: RemoteSettingsUpdate) -> dict[str, Any]:
+        _require_management(request)
+        candidate = replace(resolved, remote_mcp_enabled=body.enabled, remote_mcp_host=body.host,
+                            remote_mcp_port=body.port, remote_mcp_public_base_url=body.public_base_url.rstrip("/"))
+        try:
+            validate_remote_settings(candidate)
+        except ValueError as error:
+            raise DomainError("invalid_remote_configuration", str(error), status_code=422) from error
+        target = resolved.config_path or resolved.data_dir / "config.toml"
+        rewrite_config_text(target, lambda text: upsert_toml_section(text, "remote", {
+            "enabled": candidate.remote_mcp_enabled, "host": candidate.remote_mcp_host,
+            "port": candidate.remote_mcp_port, "public_base_url": candidate.remote_mcp_public_base_url,
+        }))
+        return {"saved": True, "restart_required": True, "configuration": body.model_dump(),
+                "required_action": "restart_the_Room_service_to_apply_configuration_and_environment_overrides"}
+
+    @app.post("/api/v1/admin/remote/authorizations/{request_id}/decision")
+    def remote_decide(request: Request, request_id: str, body: RemoteAuthorizationDecision) -> dict[str, Any]:
+        _require_management(request)
+        return remote_provider.decide(request_id, **body.model_dump())
+
+    @app.post("/api/v1/admin/remote/clients/{client_id}/revoke")
+    def remote_revoke(request: Request, client_id: str) -> dict[str, Any]:
+        _require_management(request)
+        return remote_provider.revoke_client(client_id)
 
     @app.get("/api/v1/admin/backups")
     def list_managed_backups(request: Request) -> dict[str, Any]:

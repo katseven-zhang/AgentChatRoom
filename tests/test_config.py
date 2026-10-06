@@ -441,6 +441,9 @@ def _settings_attr_for(section: str, key: str) -> str:
         return f"database_{key}"
     if section == "knowledge":
         return f"knowledge_{key}"
+    if section == "remote":
+        prefix = "remote_mcp" if key in {"enabled", "host", "port", "public_base_url"} else "remote_oauth"
+        return f"{prefix}_{key}"
     if (section, key) == ("coordination", "mcp_message_context_limit"):
         return "mcp_message_limit"
     return key
@@ -476,6 +479,12 @@ def test_every_config_file_schema_key_maps_into_settings(monkeypatch, tmp_path):
             "pool_min_size": 2,
             "pool_max_size": 5,
             "connect_timeout_seconds": 2.5,
+        },
+        "remote": {
+            "enabled": False, "host": "127.0.0.1", "port": 18766,
+            "public_base_url": "https://remote.example.invalid",
+            "authorization_ttl_seconds": 300, "access_ttl_seconds": 1800,
+            "refresh_ttl_seconds": 86400, "max_clients": 32, "max_pending": 16,
         },
         "knowledge": {
             "kinds": ["decision", "pitfall"],

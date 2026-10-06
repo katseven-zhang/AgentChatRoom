@@ -82,6 +82,8 @@ const elements = Object.fromEntries(
     "settings-dialog", "settings-form", "settings-project-name", "settings-lease-policy", "settings-roles",
     "settings-default-priority", "settings-mcp-message-limit", "settings-audit-retention", "settings-auto-backup", "settings-backup-max-kept", "settings-backup-hint",
     "system-settings-button", "system-settings-dialog", "system-settings-close", "save-backup-policy-button",
+    "remote-settings-form", "remote-enabled", "remote-public-url", "remote-host", "remote-port",
+    "remote-status", "remote-pending", "remote-clients", "refresh-remote-button",
     "archive-dialog", "archive-form", "archive-project-name", "permanent-delete-input",
     "remove-project-hint", "remove-project-submit",
     "integration-dialog", "integration-data-dir", "integration-log-path",
@@ -2666,6 +2668,7 @@ function parseKeptCount(value) {
 let backupSettingsRequest = 0;
 elements["system-settings-button"].addEventListener("click", () => {
   elements["system-settings-dialog"].showModal();
+  refreshRemoteAccess(true).catch(handleError);
   const requestId = ++backupSettingsRequest;
   api("/api/v1/admin/backup-settings").then((settings) => {
     if (requestId !== backupSettingsRequest) return;
@@ -2674,6 +2677,69 @@ elements["system-settings-button"].addEventListener("click", () => {
     elements["settings-backup-hint"].textContent = `${settings.effective || ""} · 配置文件：${settings.config_path || "-"}`;
   }).catch(handleError);
   if (state.projectId) refreshManagement().catch(handleError);
+});
+
+async function refreshRemoteAccess(fillConfiguration = false) {
+  const remote = await api("/api/v1/admin/remote");
+  if (fillConfiguration) {
+    elements["remote-enabled"].checked = remote.configuration.enabled;
+    elements["remote-public-url"].value = remote.configuration.public_base_url;
+    elements["remote-host"].value = remote.configuration.host;
+    elements["remote-port"].value = remote.configuration.port;
+  }
+  elements["remote-status"].textContent = `${remote.running ? "远程 MCP 已启动" : "远程 MCP 未启动"} · ${remote.configuration.public_base_url ? remote.mcp_url : "尚未配置公网地址"}`;
+  elements["remote-pending"].innerHTML = remote.pending.length ? remote.pending.map((item) => `
+    <article class="management-card" data-remote-request="${escapeHtml(item.request_id)}">
+      <strong>${escapeHtml(item.display_name)}</strong>
+      <p>回调地址：${escapeHtml(item.redirect_uri)}</p><p>权限：${escapeHtml(item.scopes.join(" · "))}</p>
+      <p class="form-hint">核对客户端授权窗口的验证码，再批准其访问全部活动项目。</p>
+      <label>验证码 <input data-remote-code type="text" inputmode="numeric" maxlength="6" placeholder="授权窗口中的 6 位数字"></label>
+      <label>Agent 显示名称 <input data-remote-name value="${escapeHtml(item.display_name)}" maxlength="128"></label>
+      <button class="primary-button" type="button" data-remote-approve>批准连接</button>
+      <button class="secondary-button" type="button" data-remote-deny>拒绝</button>
+    </article>`).join("") : '<p class="secondary-text">没有待审批请求。客户端发起 OAuth 连接后，点击刷新。</p>';
+  elements["remote-clients"].innerHTML = remote.clients.length ? remote.clients.map((item) => `
+    <article class="management-card"><strong>${escapeHtml(item.display_name)}</strong>
+      <p>${item.revoked_at ? "已撤销" : item.approved_at ? "已批准" : "已登记，等待授权"}</p>
+      ${item.revoked_at ? "" : `<button class="secondary-button" type="button" data-remote-revoke="${escapeHtml(item.client_id)}">撤销连接</button>`}
+    </article>`).join("") : '<p class="secondary-text">尚无远程客户端。</p>';
+}
+
+elements["refresh-remote-button"].addEventListener("click", () => refreshRemoteAccess().catch(handleError));
+elements["remote-settings-form"].addEventListener("submit", async (event) => {
+  event.preventDefault();
+  try {
+    await api("/api/v1/admin/remote/settings", {method: "PUT", body: JSON.stringify({
+      enabled: elements["remote-enabled"].checked, host: elements["remote-host"].value.trim(),
+      port: Number(elements["remote-port"].value), public_base_url: elements["remote-public-url"].value.trim(),
+    })});
+    showToast("远程配置已保存，请在控制台重启 Room 服务。环境变量优先于配置文件。", "success");
+  } catch (error) { handleError(error); }
+});
+elements["remote-pending"].addEventListener("click", async (event) => {
+  const button = event.target.closest("[data-remote-approve], [data-remote-deny]");
+  if (!button) return;
+  const card = button.closest("[data-remote-request]");
+  button.disabled = true;
+  try {
+    await api(`/api/v1/admin/remote/authorizations/${encodeURIComponent(card.dataset.remoteRequest)}/decision`, {
+      method: "POST", body: JSON.stringify({approve: button.hasAttribute("data-remote-approve"),
+        verification_code: card.querySelector("[data-remote-code]").value.trim(),
+        display_name: card.querySelector("[data-remote-name]").value.trim()}),
+    });
+    await refreshRemoteAccess();
+    showToast("授权决定已保存；返回客户端授权窗口继续连接。", "success");
+  } catch (error) { button.disabled = false; handleError(error); }
+});
+elements["remote-clients"].addEventListener("click", async (event) => {
+  const button = event.target.closest("[data-remote-revoke]");
+  if (!button) return;
+  button.disabled = true;
+  try {
+    await api(`/api/v1/admin/remote/clients/${encodeURIComponent(button.dataset.remoteRevoke)}/revoke`, {method: "POST"});
+    await refreshRemoteAccess();
+    showToast("连接已撤销，现有 Token 和续期立即失效。", "success");
+  } catch (error) { button.disabled = false; handleError(error); }
 });
 elements["save-backup-policy-button"].addEventListener("click", async () => {
   const maxKept = parseKeptCount(elements["settings-backup-max-kept"].value);

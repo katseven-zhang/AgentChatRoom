@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import ipaddress
 import sys
 import threading
 import tomllib
@@ -36,6 +37,17 @@ CONFIG_FILE_SCHEMA: dict[str, dict[str, tuple[type, ...]]] = {
         "external_base_url": (str,),
         "trusted_proxy_headers": (bool,),
         "trusted_proxy_ips": (str,),
+    },
+    "remote": {
+        "enabled": (bool,),
+        "host": (str,),
+        "port": (int,),
+        "public_base_url": (str,),
+        "authorization_ttl_seconds": (int,),
+        "access_ttl_seconds": (int,),
+        "refresh_ttl_seconds": (int,),
+        "max_clients": (int,),
+        "max_pending": (int,),
     },
     "database": {
         "backend": (str,),
@@ -299,6 +311,15 @@ class Settings:
     external_base_url: str = ""
     trusted_proxy_headers: bool = True
     trusted_proxy_ips: str = "127.0.0.1"
+    remote_mcp_enabled: bool = False
+    remote_mcp_host: str = "127.0.0.1"
+    remote_mcp_port: int = 8766
+    remote_mcp_public_base_url: str = ""
+    remote_oauth_authorization_ttl_seconds: int = 600
+    remote_oauth_access_ttl_seconds: int = 3600
+    remote_oauth_refresh_ttl_seconds: int = 2592000
+    remote_oauth_max_clients: int = 100
+    remote_oauth_max_pending: int = 100
     database_backend: str = "sqlite"
     database_url_env: str = "AGENTCHATROOM_DATABASE_URL"
     database_pool_min_size: int = 1
@@ -589,6 +610,17 @@ def _merge_toml(path: Path) -> dict[str, Any]:
         ),
         "product_name": raw.get("interface", {}).get("product_name"),
         "default_theme": raw.get("interface", {}).get("default_theme"),
+        **{
+            key: raw.get("remote", {}).get(file_key)
+            for file_key, key in {
+                "enabled": "remote_mcp_enabled", "host": "remote_mcp_host",
+                "port": "remote_mcp_port", "public_base_url": "remote_mcp_public_base_url",
+                "authorization_ttl_seconds": "remote_oauth_authorization_ttl_seconds",
+                "access_ttl_seconds": "remote_oauth_access_ttl_seconds",
+                "refresh_ttl_seconds": "remote_oauth_refresh_ttl_seconds",
+                "max_clients": "remote_oauth_max_clients", "max_pending": "remote_oauth_max_pending",
+            }.items()
+        },
     }
 
 
@@ -1180,7 +1212,54 @@ def load_settings(
         raise ValueError("default theme must be system, light, or dark")
     if not 1 <= values["mcp_message_limit"] <= 10:
         raise ValueError("mcp_message_limit must be between 1 and 10")
-    return Settings(**values)
+    remote_fields = {
+        "enabled": ("remote_mcp_enabled", bool, False),
+        "host": ("remote_mcp_host", str, "127.0.0.1"),
+        "port": ("remote_mcp_port", int, 8766),
+        "public_base_url": ("remote_mcp_public_base_url", str, ""),
+        "authorization_ttl_seconds": ("remote_oauth_authorization_ttl_seconds", int, 600),
+        "access_ttl_seconds": ("remote_oauth_access_ttl_seconds", int, 3600),
+        "refresh_ttl_seconds": ("remote_oauth_refresh_ttl_seconds", int, 2592000),
+        "max_clients": ("remote_oauth_max_clients", int, 100),
+        "max_pending": ("remote_oauth_max_pending", int, 100),
+    }
+    for file_key, (key, kind, default) in remote_fields.items():
+        env_key = f"AGENTCHATROOM_{key.upper()}"
+        file_value = file_values.get(key, default)
+        values[key] = (
+            environment_bool(env_key, file_value)
+            if kind is bool else kind(os.getenv(env_key, file_value))
+        )
+    settings = Settings(**values)
+    validate_remote_settings(settings)
+    return settings
+
+
+def validate_remote_settings(settings: Settings) -> None:
+    try:
+        loopback = ipaddress.ip_address(settings.remote_mcp_host).is_loopback
+    except ValueError:
+        loopback = False
+    if not loopback:
+        raise ValueError("remote.host must be a loopback IP; publish through an HTTPS proxy")
+    if not 1 <= settings.remote_mcp_port <= 65535:
+        raise ValueError("remote.port must be between 1 and 65535")
+    if settings.remote_mcp_enabled and settings.remote_mcp_port == settings.port:
+        raise ValueError("remote.port must differ from the local management port")
+    for key in (
+        "remote_oauth_authorization_ttl_seconds", "remote_oauth_access_ttl_seconds",
+        "remote_oauth_refresh_ttl_seconds", "remote_oauth_max_clients", "remote_oauth_max_pending",
+    ):
+        if getattr(settings, key) <= 0:
+            raise ValueError(f"{key} must be positive")
+    url = urlparse(settings.remote_mcp_public_base_url)
+    if settings.remote_mcp_public_base_url and (
+        url.scheme != "https" or not url.hostname or url.username or url.password
+        or url.path not in ("", "/") or url.query or url.fragment
+    ):
+        raise ValueError("remote.public_base_url must be an HTTPS origin without credentials or a path")
+    if settings.remote_mcp_enabled and not settings.remote_mcp_public_base_url:
+        raise ValueError("remote.public_base_url is required when remote.enabled=true")
 
 
 _THREAD_CONFIG_LOCKS: dict[str, threading.Lock] = {}
