@@ -1213,8 +1213,9 @@ def test_cli_knowledge_review_pins_the_version_the_reviewer_read(
                     asset_id,
                     "--session-id",
                     reviewer["agent"]["id"],
-                    "--token",
-                    reviewer["token"],
+                    # URL-safe session secrets can begin with '-'; attach the
+                    # value so argparse cannot interpret it as another option.
+                    f"--token={reviewer['token']}",
                     "--verdict",
                     "approved",
                     "--criterion",
@@ -1240,8 +1241,7 @@ def test_cli_knowledge_review_pins_the_version_the_reviewer_read(
                 asset_id,
                 "--session-id",
                 reviewer["agent"]["id"],
-                "--token",
-                reviewer["token"],
+                f"--token={reviewer['token']}",
                 "--verdict",
                 "approved",
                 "--criterion",
