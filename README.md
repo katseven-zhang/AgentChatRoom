@@ -392,13 +392,17 @@ REST、CLI 或 Web 自定义。Agent 只提供实际 `project_path`；后端自�
 选择当前 Git 目录或同仓库子项目时保持既有 `logical_path` 派生语义。普通子目录
 不会被当作独立仓库，`.git` 文件形式的 worktree 与无 origin 仓库都受支持。
 
-已有父目录 Room 可在“项目设置 → 重新检查 Git 仓库 → 确认关联此仓库”关联实际
-仓库，保留原 Project 身份、`root_path`、任务、历史、成员凭据、Session 和租约。
+已有 Room 可在“项目设置 → 重新检查 Git 仓库 → 选择目标 → 确认仓库选择”关联或
+切换工作区内的仓库；可以从一个子仓库切换到另一个，也可返回父目录或当前目录的
+Git 仓库。保留原 Project 身份、`root_path`、任务、历史、成员凭据、Session 和租约。
 新增的 `repository_path` 是父工作区内的相对路径；`workspace_root` 表示工作区，
 `project_path`/`repository_root` 表示实际范围与 Git 根。后端更新 checkout 登记，
-Agent 不手改 `project.json`。已关联仓库不能静默换成另一仓库；候选已被其他活动
+Agent 不手改 `project.json`。重新检查显示当前选择，不自动切换；修改关联只允许
+通过有管理权限的正式入口明确确认。候选已被其他活动
 Room 占用时返回 `project_scope_conflict` 与下一步，登记冲突返回
-`project_registration_conflict`。旧历史只追加关联事件，不改写过去的证据。
+`project_registration_conflict`，工作区外或越界路径仍被拒绝。切换后父目录 Session 的
+后续 Git 证据使用新仓库；仍指向旧仓库的 Session/worktree 不能替新仓库提交报告，
+应在新选择的仓库中恢复连接。旧历史只追加选择事件，不改写过去的报告与证据。
 
 候选检查走共享领域服务，REST 为 `POST /api/v1/local/repositories/inspect`
 （`root_path`）、`POST /api/v1/projects/{id}/repository/inspect` 和
@@ -808,7 +812,7 @@ Agent 自报的 `worktree` 不会被服务盲目信任。Work Report 采集 Git 
 
 父工作区关联子仓库后，任务可以使用该工作区内同一仓库的独立 linked worktree（包括 `.git` 文件形式，有无 origin 均支持）。bootstrap 和工作区登记用同一已选仓库及 Git common directory 确认 contained worktree 归属；报告从实际任务 worktree 采集 HEAD、改动与文件哈希，无需先把任务提交合并到主工作树。相同远程地址的独立 clone、其它仓库及已登记工作区外路径仍不能替代该任务的 worktree。
 
-历史本地路径 Project 不会自动猜选子仓库。工作区没有 Git 且尚未关联仓库时，带 SHA 的 Work Report 返回 `repository_selection_required`（409），操作为「项目设置 → 重新检查 Git 仓库 → 关联实际仓库 → 确认关联此仓库」；父工作区和 Room 身份保持不变。已选仓库不可用返回 `repository_not_found`（409），要求重新检查；实际仓库中不存在的提交仍返回 `invalid_commit_hash`（400）。错误详情保留 `reported_commit_hash` 原始输入、`reason` 和审计事件编号；`commit_hash: unknown` 仅表示系统尚未验证的证据，不代表调用方传入了 unknown。关联结果由后端写入 checkout 登记，Agent 不得手改 `.agentchatroom/project.json`。
+历史本地路径 Project 不会自动猜选子仓库。工作区没有 Git 且尚未关联仓库时，带 SHA 的 Work Report 返回 `repository_selection_required`（409），操作为「项目设置 → 重新检查 Git 仓库 → 关联实际仓库 → 确认仓库选择」；父工作区和 Room 身份保持不变。已选仓库不可用返回 `repository_not_found`（409），要求重新检查；实际仓库中不存在的提交仍返回 `invalid_commit_hash`（400）。错误详情保留 `reported_commit_hash` 原始输入、`reason` 和审计事件编号；`commit_hash: unknown` 仅表示系统尚未验证的证据，不代表调用方传入了 unknown。关联结果由后端写入 checkout 登记，Agent 不得手改 `.agentchatroom/project.json`。
 
 采集 Git 证据时不使用 `text=True`。`text=True` 按**进程 locale** 解码，而 Windows 上那是控制台 ANSI 码页、并非 git 实际写出的 UTF-8：非 ASCII 分支名或路径会变成乱码写进不可改事件，而 `UnicodeDecodeError` 属于 `ValueError`，会绕过只捕获 `OSError`/`SubprocessError` 的处理，表现为 500。证据采集与 PostgreSQL 工具调用现统一经 `run_git_capture()` / 显式 `decode("utf-8", "replace")` 处理，git 失败降级为 `captured: false` 而不是中断报告。
 

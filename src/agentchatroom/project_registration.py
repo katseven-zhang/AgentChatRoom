@@ -760,6 +760,10 @@ def register_checkout_project(
         position = registrations.index(existing)
         merged = dict(existing)
         merged.update(entry)
+        if "repository_path" in project and not project["repository_path"]:
+            # An explicit return to the workspace must not retain the old
+            # child selection through the forward-compatible merge above.
+            merged.pop("repository_path", None)
         registrations[position] = merged
     document["registrations"] = sorted(
         registrations,

@@ -139,6 +139,112 @@ def test_existing_local_room_selection_retains_history_tasks_sessions_and_lease(
     assert load_checkout_registration(project_dir)["repository_path"] == "repo"
 
 
+@pytest.mark.parametrize("remote", [False, True])
+def test_repository_switch_preserves_room_and_routes_existing_parent_session(service, project_dir, remote):
+    first = project_dir / "first"
+    second = project_dir / "second"
+    first_commit = repository(first, remote=remote)
+    second_commit = repository(second, remote=remote)
+    project = service.create_project(root_path=str(project_dir), repository_path="first")
+    register_checkout_project(project_dir, project)
+    task, joined = claim(service, project)
+    report(service, project, task, joined, first_commit)
+    original_report = service.snapshot(project["id"])["reports"][0]
+    pending = service.create_task(project["id"], title="After repository switch",
+                                  acceptance_criteria=["Uses the explicitly selected repository"],
+                                  actor_session_id=joined["agent"]["id"], token=joined["token"])["task"]
+    service.claim_task(project["id"], pending["id"], joined["agent"]["id"], joined["token"])
+    lease = service.acquire_lease(project["id"], session_id=joined["agent"]["id"], token=joined["token"],
+                                 task_id=pending["id"], path_pattern="code.txt")["lease"]
+    with service.database.connect() as connection:
+        before = [dict(row) for row in connection.execute("SELECT * FROM events WHERE project_id = ? ORDER BY id", (project["id"],))]
+    # Populate the source/scope cache before switching, not just after it.
+    service.get_project(project["id"])
+    switched = service.select_project_repository(project["id"], "second")["project"]
+    for key in ("id", "project_key", "name", "root_path"):
+        assert switched[key] == project[key]
+    assert switched["repository_root"] == str(second)
+    assert service.get_project(project["id"])["repository_path"] == "second"
+    assert load_checkout_registration(project_dir)["repository_path"] == "second"
+    assert checkout_scope(project_dir) == stored_project_scope(switched)
+    assert resolve_checkout_project_key(project_dir) == (project["project_key"], True)
+    assert service.resolve_project_for_join(root_path=str(project_dir), registered_project_key=project["project_key"])["id"] == project["id"]
+    assert service.get_task(project["id"], pending["id"])["owner_session_id"] == joined["agent"]["id"]
+    assert any(item["id"] == lease["id"] and item["active"] for item in service.list_leases(project["id"]))
+    with service.database.connect() as connection:
+        after = [dict(row) for row in connection.execute("SELECT * FROM events WHERE project_id = ? ORDER BY id", (project["id"],))]
+    assert after[:len(before)] == before
+    assert after[-1]["event_type"] == "project.updated"
+    assert service.snapshot(project["id"])["reports"][0] == original_report
+    with pytest.raises(DomainError) as error:
+        report(service, switched, pending, joined, first_commit)
+    assert error.value.code == "invalid_commit_hash"
+    report(service, switched, pending, joined, second_commit)
+    evidence = next(item["system_evidence"] for item in service.snapshot(project["id"])["reports"]
+                    if item["task_id"] == pending["id"])
+    assert evidence["worktree"] == str(second)
+    assert evidence["repository_path"] == "second"
+    assert evidence["reported_commit_exists"]
+    restored = service.select_project_repository(project["id"], "first")["project"]
+    assert restored["id"] == project["id"] and restored["repository_root"] == str(first)
+    assert resolve_checkout_project_key(project_dir) == (project["project_key"], True)
+
+
+@pytest.mark.parametrize("direct_workspace", [False, True])
+def test_switch_rejects_old_contained_session_even_when_origins_match(service, project_dir, direct_workspace):
+    first = project_dir / "first"
+    second = project_dir / "second"
+    commit = repository(first, remote=True)
+    repository(second, remote=True)
+    git(second, "remote", "set-url", "origin", git(first, "config", "--get", "remote.origin.url"))
+    project = service.create_project(root_path=str(project_dir), repository_path="first")
+    if direct_workspace:
+        registered = service.register_workspace(project["id"], host_key="direct-host", host_name="Direct",
+                                                local_path=str(first))
+        joined = service.join_room(project["id"], agent_key="direct-builder", name="Direct builder", client="fixture",
+                                   model="unknown", worktree=str(first), host_id=registered["host"]["id"],
+                                   workspace_id=registered["workspace"]["id"])
+        task = service.create_task(project["id"], title="Old direct session", acceptance_criteria=["Evidence stays scoped"],
+                                   actor_session_id=joined["agent"]["id"], token=joined["token"])["task"]
+        service.claim_task(project["id"], task["id"], joined["agent"]["id"], joined["token"])
+    else:
+        task, joined = claim(service, project, worktree=str(first))
+    switched = service.select_project_repository(project["id"], "second")["project"]
+    with pytest.raises(DomainError) as error:
+        report(service, switched, task, joined, commit)
+    assert error.value.code == "untrusted_repository"
+    assert service.get_task(project["id"], task["id"])["phase"] == "claimed"
+
+
+def test_switch_back_to_local_directory_clears_registration_and_can_select_again(service, project_dir):
+    repository(project_dir / "first", remote=True)
+    repository(project_dir / "second")
+    project = service.create_project(root_path=str(project_dir), repository_path="first")
+    register_checkout_project(project_dir, project)
+    cleared = service.select_project_repository(project["id"], "")["project"]
+    assert cleared["project_source"] == "path" and cleared["repository_path"] == ""
+    assert not load_checkout_registration(project_dir).get("repository_path")
+    assert checkout_scope(project_dir) == stored_project_scope(cleared)
+    assert resolve_checkout_project_key(project_dir) == (project["project_key"], True)
+    selected = service.select_project_repository(project["id"], "second")["project"]
+    assert selected["id"] == project["id"] and selected["repository_path"] == "second"
+
+
+def test_switch_to_another_rooms_repository_preserves_selection_and_registration(service, project_dir):
+    repository(project_dir / "first")
+    repository(project_dir / "second")
+    project = service.create_project(root_path=str(project_dir), repository_path="first")
+    register_checkout_project(project_dir, project)
+    other = service.create_project(root_path=str(project_dir / "second"))
+    before = (project_dir / ".agentchatroom/project.json").read_bytes()
+    with pytest.raises(DomainError) as error:
+        service.select_project_repository(project["id"], "second")
+    assert error.value.code == "project_scope_conflict"
+    assert other["id"] in error.value.details["project_ids"]
+    assert service.get_project(project["id"])["repository_path"] == "first"
+    assert (project_dir / ".agentchatroom/project.json").read_bytes() == before
+
+
 @pytest.mark.parametrize("selection", ["../foreign", "/foreign", "C:/foreign", "repo/../../foreign"])
 def test_selection_rejects_escape(service, project, selection):
     with pytest.raises(DomainError) as error:
@@ -394,6 +500,10 @@ def test_rest_discovery_and_existing_room_association(settings, project_dir):
         assert selected.json()["project"]["id"] == created["id"]
         assert selected.json()["project"]["repository_path"] == "two"
         assert client.post(f"/api/v1/projects/{created['id']}/repository/inspect").status_code == 200
+        switched = client.put(f"/api/v1/projects/{created['id']}/repository", json={"repository_path": "one"})
+        assert switched.status_code == 200
+        assert switched.json()["project"]["id"] == created["id"]
+        assert switched.json()["project"]["repository_path"] == "one"
 
 
 def test_schema_25_migration_preserves_existing_rows(tmp_path):
@@ -458,13 +568,14 @@ def test_selected_local_repository_can_upgrade_origin_without_new_room(service, 
     assert resolved["repository_path"] == "repo" and resolved["git_remote"]
 
 
-def test_existing_root_git_cannot_be_retargeted_to_independent_child(service, project_dir):
+def test_explicit_management_selection_can_switch_root_git_and_independent_child(service, project_dir):
     repository(project_dir)
     project = service.create_project(root_path=str(project_dir))
     repository(project_dir / "child")
-    with pytest.raises(DomainError) as error:
-        service.select_project_repository(project["id"], "child")
-    assert error.value.code == "repository_selection_conflict"
+    switched = service.select_project_repository(project["id"], "child")["project"]
+    assert switched["id"] == project["id"] and switched["repository_path"] == "child"
+    restored = service.select_project_repository(project["id"], "")["project"]
+    assert restored["id"] == project["id"] and restored["repository_root"] == str(project_dir)
 
 
 def test_failed_checkout_write_leaves_database_and_files_unchanged(service, project, project_dir, monkeypatch):

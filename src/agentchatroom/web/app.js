@@ -2640,8 +2640,8 @@ document.getElementById("project-settings-button").addEventListener("click", () 
   elements["settings-repository-input"].value = project.repository_path || "";
   elements["settings-repository-select"].innerHTML = '<option value="__pending__">点击重新检查</option>';
   elements["settings-repository-hint"].textContent = project.repository_path
-    ? `已关联：${project.repository_path}。关联保留本 Room 的历史和会话。`
-    : "尚未选择子仓库；重新检查后可关联实际仓库，保留当前 Room 历史。";
+    ? `当前仓库：${project.repository_path}。重新检查后可明确切换；工作区、Room 和历史保留，后续 Git 证据使用新选择。`
+    : "重新检查后可选择或切换工作区内的 Git 仓库；工作区、Room 和历史保留。";
   setDialogFormError(elements["settings-repository-error"], "");
   elements["settings-project-name"].value = project.name;
   elements["settings-lease-policy"].value = project.settings.lease_conflict_policy;
@@ -3441,6 +3441,10 @@ function renderRepositoryCandidates(prefix, result) {
   ];
   select.innerHTML = options.join("");
   select.dataset.inspectedRoot = result.workspace_root;
+  if (prefix === "settings") {
+    const current = state.snapshot?.project.repository_path || "";
+    if (result.candidates.some((candidate) => candidate.relative_path === current)) select.value = current;
+  }
   elements[`${prefix}-repository-hint`].textContent = `${result.candidates.length} 个仓库候选。${result.complete
     ? "选择仓库后确认；不会自动选中第一个子仓库。"
     : "检查未覆盖全部目录，可填写具体相对路径或明确保留本地目录。"}`;
@@ -3485,7 +3489,7 @@ elements["settings-repository-save"].addEventListener("click", () => withBusy(as
     method: "PUT", body: JSON.stringify({ repository_path: selection }),
   });
   setDialogFormError(elements["settings-repository-error"], "");
-  showToast("仓库已关联，Room 历史已保留");
+  showToast("仓库选择已更新，工作区和 Room 历史已保留");
   await loadProjects(state.projectId);
 }).catch((error) => setDialogFormError(elements["settings-repository-error"], error.message)));
 

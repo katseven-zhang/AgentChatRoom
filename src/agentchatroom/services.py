@@ -2766,20 +2766,10 @@ class AgentChatRoomService:
             raise DomainError("project_registration_conflict", "Workspace registration belongs to another Room",
                               status_code=409, details={"required_action": "resolve_workspace_registration_conflict"})
         validate_project_coordination_instructions(root)
-        # Existing repository associations cannot be silently changed into a different repository.
+        # This is an explicit management selection, not an automatic scope repair.
+        # Containment, checkout ownership and scope collisions still apply when
+        # replacing an existing association or returning to the workspace root.
         old_selection = str(previous.get("repository_path") or "")
-        _old_remote, old_git_root, old_is_worktree = _project_git_info(root)
-        if not old_selection and old_is_worktree and (
-            old_git_root != git_root or logical != str(previous["logical_path"] or "")
-        ):
-            raise DomainError("repository_selection_conflict", "A Git-scoped Room cannot move to another repository or subproject",
-                              status_code=409, details={"required_action": "use_a_separate_room_for_another_repository"})
-        if old_selection and relative != old_selection:
-            raise DomainError("repository_selection_conflict", "This Room is already associated with another repository",
-                              status_code=409, details={"required_action": "use_a_separate_room_for_another_repository"})
-        if previous["git_remote"] and normalize_remote(previous["git_remote"]) != normalize_remote(remote):
-            raise DomainError("repository_selection_conflict", "Repository identity differs from the Room",
-                              status_code=409, details={"required_action": "use_a_separate_room_for_another_repository"})
         proposed = {**previous, "repository_path": relative, "git_remote": remote or None, "logical_path": logical}
         # Preflight ownership before touching files; recheck again in the final write transaction.
         with self.database.connect() as connection:
@@ -11228,7 +11218,26 @@ Attach a workspace to a host, creating the host row if it is new.
             ) from error
         if evidence_source != WORKSPACE_EVIDENCE_SERVER_VERIFIED:
             return reported, evidence_source
-        selection = str(dict(project).get("repository_path") or "")
+        project_data = dict(project)
+        selection = str(project_data.get("repository_path") or "")
+        project_root = Path(str(project_data["root_path"])).expanduser().resolve(strict=False)
+        try:
+            root.relative_to(project_root)
+        except ValueError:
+            pass
+        else:
+            # Local parent/direct-worktree Sessions must follow the current
+            # operator selection, not the repository cached at registration.
+            # In particular, two independent clones with the same origin are
+            # not interchangeable after an explicit workspace selection.
+            selected = repository_directory(project_root, selection)
+            if reported == project_root:
+                return selected, evidence_source
+            if selection or _project_git_info(selected)[2]:
+                if not _same_git_repository(reported, selected):
+                    raise DomainError("untrusted_repository", "Session worktree does not belong to the selected repository",
+                                      status_code=403, details={"required_action": "use_selected_repository"})
+            return reported, evidence_source
         if selection:
             selection = str(json_load(workspace["metadata_json"], {}).get("repository_path", selection))
             selected = repository_directory(root, selection)
