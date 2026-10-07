@@ -9625,6 +9625,15 @@ Attach a workspace to a host, creating the host row if it is new.
             worktree, evidence_source = self._trusted_worktree(
                 connection, project, agent
             )
+            if clean_files and project["git_remote"] and not re.fullmatch(
+                r"(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})", commit_hash.strip()
+            ):
+                raise DomainError(
+                    "work_report_commit_required",
+                    "Changed files in a registered remote repository require a full structured commit SHA",
+                    status_code=422,
+                    details={"required_action": "submit_full_commit_sha_for_changed_files"},
+                )
         if evidence_source == WORKSPACE_EVIDENCE_SERVER_VERIFIED:
             system_evidence = self._collect_git_evidence(
                 project, agent, commit_hash, worktree=worktree, files=clean_files
@@ -9882,6 +9891,7 @@ Attach a workspace to a host, creating the host row if it is new.
                 repository_evidence = validate_repository_review(
                     dict(project), dict(report) if report is not None else None,
                     repository_evidence, criteria, self.settings.list_input_max_count,
+                    verdict=verdict,
                 )
             expected = json_load(task["acceptance_criteria_json"], [])
             if verdict == "approved" and (

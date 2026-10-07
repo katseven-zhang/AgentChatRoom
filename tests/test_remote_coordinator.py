@@ -242,6 +242,165 @@ def test_repository_review_matches_latest_full_sha_and_independent_identity(remo
         assert json.loads(event["payload_json"])["repository_evidence"]["work_report_id"] == report_id
 
 
+@pytest.mark.parametrize("legacy_summary", ["Old report without a structured SHA", "Summary mentions commit {sha}"])
+def test_remote_can_return_legacy_empty_sha_report_then_review_new_report(remote, tmp_path, legacy_summary):
+    local, public, service, _app = remote
+    root = tmp_path / "legacy-repository"
+    sha = repository(root)
+    git(root, "remote", "add", "origin", "https://github.com/example/legacy-test.git")
+    project = service.create_project(root_path=str(root), name="Legacy review fixture")
+    task, owner = claim(service, project)
+    report_id = report(service, project, task, owner, sha)["report_id"]
+    # An isolated historical-data fixture, never a migration or repair of live history.
+    with service.database.connect(write=True) as connection:
+        connection.execute("UPDATE work_reports SET commit_hash='', summary=? WHERE id=?",
+                           (legacy_summary.format(sha=sha), report_id))
+    with service.database.connect() as connection:
+        old_report = tuple(connection.execute("SELECT * FROM work_reports WHERE id=?", (report_id,)).fetchone())
+        old_events = [tuple(row) for row in connection.execute("SELECT id, payload_json FROM events ORDER BY id")]
+    tokens, _client, _form = authorize(local, public)
+    token = tokens["access_token"]
+    evidence = {"work_report_id": report_id, "repository_url": "https://github.com/example/legacy-test",
+                "commit_hash": "", "evidence_urls": []}
+    arguments = {"project_id": project["id"], "task_id": task["id"], "verdict": "changes_requested",
+                 "criteria": [{"criterion": task["acceptance_criteria"][0], "status": "failed",
+                               "evidence": "The latest report has no structured commit_hash; summary text cannot pin a commit"}],
+                 "repository_evidence": evidence}
+    refused = call(public, token, "review_submit", **{**arguments, "verdict": "approved"})
+    assert refused["error"]["code"] == "review_commit_required"
+    returned = call(public, token, "review_submit", **arguments)
+    assert returned["ok"], returned
+    assert returned["result"]["execution_status"] == "in_progress"
+    assert returned["result"]["verification_status"] == "changes_requested"
+    assert service.get_task(project["id"], task["id"])["owner_session_id"] == owner["agent"]["id"]
+    with service.database.connect() as connection:
+        assert tuple(connection.execute("SELECT * FROM work_reports WHERE id=?", (report_id,)).fetchone()) == old_report
+        prefix = [tuple(row) for row in connection.execute("SELECT id, payload_json FROM events WHERE id<=? ORDER BY id", (old_events[-1][0],))]
+        assert prefix == old_events
+        event = connection.execute("SELECT payload_json FROM events WHERE event_type='review.submitted' AND task_id=?", (task["id"],)).fetchone()
+        provenance = json.loads(event[0])["repository_evidence"]
+        assert provenance["work_report_id"] == report_id
+        assert provenance["report_commit_hash"] == ""
+        assert provenance["commit_matches_report"] is False
+    (root / "code.txt").write_text("Supplementary implementation\n", encoding="utf-8")
+    git(root, "add", "code.txt")
+    git(root, "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "commit", "-qm", "Supplement")
+    new_sha = git(root, "rev-parse", "HEAD")
+    new_report_id = report(service, project, task, owner, new_sha)["report_id"]
+    stale = call(public, token, "review_submit", **arguments)
+    assert stale["error"]["code"] == "review_report_changed"
+    approved = call(public, token, "review_submit", **{**arguments, "verdict": "approved",
+        "criteria": [{"criterion": task["acceptance_criteria"][0], "status": "passed", "evidence": "Inspected the new report and exact fixture commit"}],
+        "repository_evidence": {**evidence, "work_report_id": new_report_id, "commit_hash": new_sha,
+                                "evidence_urls": [f"https://github.com/example/legacy-test/commit/{new_sha}"]}})
+    assert approved["ok"], approved
+    assert approved["result"]["verification_status"] == "approved"
+    assert approved["result"]["integration_status"] == "pending"
+
+
+def test_remote_returns_supplement_mismatch_but_preserves_approval_scope_guards(remote, tmp_path):
+    local, public, service, _app = remote
+    root = tmp_path / "supplement-repository"
+    sha = repository(root)
+    git(root, "remote", "add", "origin", "https://github.com/example/supplement-test.git")
+    project = service.create_project(root_path=str(root))
+    task, owner = claim(service, project)
+    report_id = report(service, project, task, owner, sha)["report_id"]
+    (root / "code.txt").write_text("New unreported implementation\n", encoding="utf-8")
+    git(root, "add", "code.txt")
+    git(root, "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "commit", "-qm", "New implementation")
+    supplement_sha = git(root, "rev-parse", "HEAD")
+    tokens, _client, _form = authorize(local, public)
+    token = tokens["access_token"]
+    evidence = {"work_report_id": report_id, "repository_url": "https://github.com/example/supplement-test",
+                "commit_hash": supplement_sha, "evidence_urls": [f"https://github.com/example/supplement-test/commit/{supplement_sha}"]}
+    arguments = {"project_id": project["id"], "task_id": task["id"], "verdict": "changes_requested",
+                 "criteria": [{"criterion": task["acceptance_criteria"][0], "status": "failed", "evidence": "Supplementary implementation differs from the latest formal report"}],
+                 "repository_evidence": evidence}
+    assert call(public, token, "review_submit", **{**arguments, "verdict": "approved"})["error"]["code"] == "review_commit_mismatch"
+    for mutation, code in (({"work_report_id": "stale"}, "review_report_changed"),
+                           ({"repository_url": "https://github.com/foreign/repo"}, "review_repository_mismatch"),
+                           ({"commit_hash": supplement_sha[:8]}, "review_commit_required"),
+                           ({"evidence_urls": ["https://github.com/foreign/repo/commit/"+supplement_sha]}, "review_evidence_repository_mismatch")):
+        refused = call(public, token, "review_submit", **{**arguments, "repository_evidence": {**evidence, **mutation}})
+        assert refused["error"]["code"] == code, refused
+    with pytest.raises(DomainError) as self_review:
+        service.submit_review(project["id"], task["id"], reviewer_session_id=owner["agent"]["id"], token=owner["token"],
+                              verdict="changes_requested", criteria=arguments["criteria"], repository_evidence=evidence)
+    assert self_review.value.code == "reviewer_not_independent"
+    other = tmp_path / "other-room"; other.mkdir()
+    other_project = service.create_project(root_path=str(other))
+    wrong_project = call(public, token, "review_submit", **{**arguments, "project_id": other_project["id"]})
+    assert wrong_project["error"]["code"] == "task_not_found"
+    returned = call(public, token, "review_submit", **arguments)
+    assert returned["ok"], returned
+    with service.database.connect() as connection:
+        event = connection.execute("SELECT payload_json FROM events WHERE event_type='review.submitted' AND task_id=?", (task["id"],)).fetchone()
+        provenance = json.loads(event[0])["repository_evidence"]
+        assert provenance["commit_hash"] == supplement_sha
+        assert provenance["report_commit_hash"] == sha
+        assert provenance["commit_matches_report"] is False
+
+
+def test_remote_can_request_more_evidence_for_no_code_report_without_sha(remote, tmp_path):
+    local, public, service, _app = remote
+    root = tmp_path / "analysis-repository"
+    repository(root)
+    git(root, "remote", "add", "origin", "https://github.com/example/analysis-test.git")
+    project = service.create_project(root_path=str(root))
+    task, owner = claim(service, project)
+    result = service.submit_work_report(project["id"], task["id"], session_id=owner["agent"]["id"], token=owner["token"],
+        summary="Analysis only, no file changed", files=[], no_code_change_reason="Read-only analysis", tests=[{"command":"inspected fixture", "exit_code":0}])
+    tokens, _client, _form = authorize(local, public)
+    arguments = {"project_id": project["id"], "task_id": task["id"], "verdict": "changes_requested",
+        "criteria": [{"criterion":task["acceptance_criteria"][0], "status":"failed", "evidence":"The no-code report does not provide the requested analysis"}],
+        "repository_evidence": {"work_report_id":result["report_id"], "repository_url":"https://github.com/example/analysis-test"}}
+    denied = call(public, tokens["access_token"], "review_submit", **{**arguments, "verdict":"approved"})
+    assert denied["error"]["code"] == "review_commit_required"
+    returned = call(public, tokens["access_token"], "review_submit", **arguments)
+    assert returned["ok"], returned
+
+
+@pytest.mark.parametrize("commit", ["", "short-sha"])
+def test_changed_files_in_remote_repository_require_structured_full_sha(remote, tmp_path, commit):
+    _local, _public, service, _app = remote
+    root = tmp_path / "new-repository"
+    sha = repository(root)
+    git(root, "remote", "add", "origin", "https://github.com/example/new-test.git")
+    project = service.create_project(root_path=str(root))
+    task, owner = claim(service, project)
+    with pytest.raises(DomainError) as rejected:
+        service.submit_work_report(project["id"], task["id"], session_id=owner["agent"]["id"], token=owner["token"],
+            summary=f"The summary mentions {sha} but does not pin it", files=["code.txt"], no_code_change_reason="Cannot bypass changed files",
+            tests=[{"command":"fixture validation", "exit_code":0}], commit_hash=commit)
+    assert rejected.value.code == "work_report_commit_required"
+    assert rejected.value.details["required_action"] == "submit_full_commit_sha_for_changed_files"
+    assert service.get_task_evidence(project["id"], task["id"])["latest_work_report_id"] is None
+    assert service.get_task(project["id"], task["id"])["execution_status"] == "claimed"
+
+
+def test_report_feedback_still_requires_review_scope_and_concrete_valid_criteria(remote, tmp_path):
+    local, public, service, _app = remote
+    root = tmp_path / "feedback-repository"
+    sha = repository(root)
+    git(root, "remote", "add", "origin", "https://github.com/example/feedback-test.git")
+    project = service.create_project(root_path=str(root))
+    task, owner = claim(service, project)
+    report_id = report(service, project, task, owner, sha)["report_id"]
+    arguments = {"project_id":project["id"], "task_id":task["id"], "verdict":"changes_requested",
+                 "criteria":[{"criterion":task["acceptance_criteria"][0], "status":"failed", "evidence":"Request a corrected formal report"}],
+                 "repository_evidence":{"work_report_id":report_id, "repository_url":"https://github.com/example/feedback-test"}}
+    read_only, _client, _form = authorize(local, public, ("room:read",))
+    denied = call(public, read_only["access_token"], "review_submit", **arguments)
+    assert denied["error"]["code"] == "remote_scope_required"
+    tokens, _client, _form = authorize(local, public)
+    for mutation, code in (({"status":"fail"}, "invalid_review_criteria"),
+                           ({"evidence":""}, "review_criterion_evidence_required")):
+        refused = call(public, tokens["access_token"], "review_submit", **{**arguments, "criteria":[{**arguments["criteria"][0], **mutation}]})
+        assert refused["error"]["code"] == code, refused
+    assert service.get_task(project["id"], task["id"])["verification_status"] == "pending"
+
+
 def test_remote_settings_persist_through_formal_management_endpoint(remote, tmp_path, monkeypatch):
     local, _public, service, _app = remote
     saved = local.put("/api/v1/admin/remote/settings", json={"enabled": True, "host": "127.0.0.1", "port": 19002, "public_base_url": "https://published.example"})

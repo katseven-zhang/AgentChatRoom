@@ -388,9 +388,9 @@ class RepositoryReviewEvidence(TypedDict):
     """Repository evidence pinned to the latest report, without filesystem access."""
 
     work_report_id: str
-    commit_hash: str
+    commit_hash: NotRequired[str]
     repository_url: str
-    evidence_urls: list[str]
+    evidence_urls: NotRequired[list[str]]
 
 
 class KnowledgeProvenance(TypedDict, total=False):

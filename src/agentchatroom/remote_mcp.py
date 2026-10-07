@@ -144,7 +144,8 @@ def create_remote_app(service: Any, provider: RemoteOAuthProvider | None = None)
         instructions="Remote coordination only. Call project_list, then use explicit project_id. "
             "Read/send Room messages, publish/assign tasks, assess GitHub reports. "
             "No filesystem, execution, claims, WorkReports, integration or administration tools. "
-            "Review the exact latest report and SHA through your GitHub connection before review_submit.",
+            "Approve only the exact latest report SHA inspected through GitHub. "
+            "Use changes_requested pinned to the latest report to return missing or mismatched evidence.",
         auth_server_provider=provider,
         auth=AuthSettings(issuer_url=provider.issuer, resource_server_url=provider.resource,
             required_scopes=["room:read"], revocation_options=RevocationOptions(enabled=True),
@@ -221,9 +222,13 @@ def create_remote_app(service: Any, provider: RemoteOAuthProvider | None = None)
     @tool("review:github")
     async def review_submit(project_id: str, task_id: str, verdict: str, criteria: list[ReviewCriterion],
                             repository_evidence: RepositoryReviewEvidence, notes: str = "") -> dict[str, Any]:
-        """Submit an independent GitHub verdict for the latest WorkReport and exact full SHA.
-        Evidence must include the registered repository's /commit/<SHA> URL and criterion-level
-        findings from your GitHub inspection. An approval does not integrate or deploy the work.
+        """Approve or return the latest WorkReport through an independent review.
+        Both verdicts require the latest work_report_id, registered repository_url and concrete
+        criterion evidence (status passed/failed). approved requires the report's exact full SHA
+        and /commit/<SHA> URL. changes_requested may omit SHA/URLs to request missing report
+        evidence, or reference a different inspected full SHA with its commit URL to identify
+        unreported supplementary work. It reopens execution for the existing owner to submit a
+        new report, preserving history. An approval does not integrate or deploy the work.
         """
         return await invoke("review:github", project_id, "review", task_id=task_id, verdict=verdict,
                             criteria=criteria, repository_evidence=dict(repository_evidence), notes=notes)

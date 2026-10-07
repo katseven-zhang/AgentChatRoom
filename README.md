@@ -34,12 +34,27 @@ WorkReport、集成或管理工具，也不自动唤醒客户端。它不是远�
 `task_list` 和 sync 的任务摘要受 `snapshot_recent_limit` 限制，并明确标记截断；
 使用状态过滤和 `task_get` 获取具体任务。项目规范可通过 `project_document_get` 读取。
 
-远程 `review_submit` 要求 `repository_evidence`：最新 `work_report_id`、完整 `commit_hash`、
-与项目 `git_remote` 匹配的 HTTPS `repository_url`、仓库内 `evidence_urls`（必须包含精确
-`/commit/<SHA>` 链接），以及逐项 `criteria` 的证据。审查者应先使用自己的 GitHub 工具
-查看对应代码、PR 和 CI；Room 校验证据归属与报告版本，不代替代码阅读或运行验证。
-审批在同一事务中核对最新报告和独立软件身份，拒绝过时报告、其他仓库、短 SHA 或缺少证据的结论。
+远程 `review_submit` 的两种结论都要求 `repository_evidence` 固定最新 `work_report_id`，
+提供与项目 `git_remote` 匹配的 HTTPS `repository_url`，并用逐项 `criteria` 说明证据；
+状态拼写为 `passed` / `failed`。`approved` 必须提供与报告结构化字段精确一致的完整
+`commit_hash` 和仓库内 `evidence_urls`（包含 `/commit/<SHA>`）。审查者应先使用自己的
+GitHub 工具查看对应代码、PR 和 CI；Room 校验证据归属与报告版本，不代替代码阅读或运行验证。
 批准只进入独立验证通过状态，集成和部署仍需各自完成。
+
+`changes_requested` 用于正式退回缺证或不符合要求的交付。历史报告的 SHA 为空、仅在摘要中
+提到提交、合法无代码报告，或补充实现尚未进入正式报告时，仍可绑定当前报告退回：没有待审
+提交时省略 `commit_hash` / `evidence_urls`（空字符串 / 空列表也可），在逐项证据中说明缺失；
+引用补充提交时提供其完整 SHA 和同仓库提交链接，不要求它与旧报告 SHA 一致。审计保留
+`report_commit_hash` 和 `commit_matches_report`，不会把补充 SHA 写回旧报告或推断摘要 SHA。
+两种结论均在同一事务中核对最新报告、项目归属和独立软件身份；过时报告、其他仓库、
+已提供但不完整的 SHA 或无具体逐项证据仍被拒绝。
+
+正式退回后任务执行状态恢复为 `in_progress`、验收状态为 `changes_requested`，原所有者保留；
+原所有者修改后通过本地 `work_report` 追加新报告，下一轮评审固定新报告与提交。待审状态
+不能覆盖旧报告；消息中的补充提交不会自动成为正式报告。关联远程仓库并报告修改文件时，
+`work_report` 必须填写完整的结构化 SHA，否则返回 `work_report_commit_required`，不会进入待审。
+`no_code_change_reason` 只为未修改文件的报告提供合法替代，不会豁免已上报修改文件的 SHA 要求；
+无 SHA 的报告可退回补证，不能据此获得 GitHub 验收通过。
 
 配置优先级为环境变量 > 文件 > 默认值。文件键/环境变量：
 
