@@ -1564,6 +1564,20 @@ function snapshotAgentName(sessionId) {
   return agent?.name || "";
 }
 
+function eventActorName(event, sessionName = "") {
+  // Events retain the author's name even when the bounded Session snapshot
+  // no longer includes that connection, or its current name has changed.
+  const capturedName = typeof event.payload?.actor?.name === "string"
+    ? event.payload.actor.name.trim()
+    : "";
+  if (capturedName) return capturedName;
+  const legacyName = typeof sessionName === "string" ? sessionName.trim() : "";
+  if (legacyName) return legacyName;
+  if (event.actor_session_id) return "未知 Agent";
+  const isMessage = event.event_type.startsWith("message.") && event.payload?.body !== undefined;
+  return isMessage ? "用户" : "系统";
+}
+
 function renderRecentActivity() {
   // #150：真实时间倒序流——每条事件独立展示（不折叠、无倍数统计），
   // 每页固定 5 行并支持翻页；末页不足 5 行用占位行补齐避免高度跳动。
@@ -1583,7 +1597,7 @@ function renderRecentActivity() {
   recentActivityPage = page.current;
   const rows = page.slice.map((event) => {
     const isMessage = event.event_type.startsWith("message.") && event.payload?.body !== undefined;
-    const actorName = snapshotAgentName(event.actor_session_id) || (isMessage ? "用户" : "系统");
+    const actorName = eventActorName(event, snapshotAgentName(event.actor_session_id));
     const modelBadge = isMessage ? messageModelBadge(event) : "";
     let summaryTitle = "";
     if (event.payload?.title) {
@@ -2560,14 +2574,15 @@ function renderEvents(agents, tasks) {
   stream.innerHTML = events.length
     ? events.map((event) => {
       const agent = agentMap[event.actor_session_id];
+      const actorName = eventActorName(event, agent?.name);
       const task = taskMap[event.task_id];
       if (event.event_type.startsWith("message.") && event.payload?.body !== undefined) {
         const kind = event.event_type.split(".")[1];
         const ackCount = state.snapshot.acknowledgements.filter((item) => item.event_id === event.project_seq).length;
         return `<article class="event-item kind-${escapeHtml(kind)}">
-          <span class="event-avatar ${avatarColorClass(event.actor_session_id || agent?.name)}">${escapeHtml(initials(agent?.name || "用户"))}</span>
+          <span class="event-avatar ${avatarColorClass(event.actor_session_id || actorName)}">${escapeHtml(initials(actorName))}</span>
           <div class="event-content">
-            <div class="event-meta"><span class="event-author"><strong>${escapeHtml(agent?.name || "用户")}</strong>${messageModelBadge(event)}${kind !== "message" ? ` <span class="type-badge ${escapeHtml(kind)}">${escapeHtml(messageKind(kind))}</span>` : ""}${event.payload?.priority <= 1 ? ` <span class="type-badge urgent">${event.payload.priority === 0 ? "紧急" : "高优先级"}</span>` : ""}</span><span class="event-stamp">${eventIdBadge(event.project_seq, event.id)}<time title="${escapeHtml(event.created_at)}">${escapeHtml(formatTime(event.created_at))}</time></span></div>
+            <div class="event-meta"><span class="event-author"><strong>${escapeHtml(actorName)}</strong>${messageModelBadge(event)}${kind !== "message" ? ` <span class="type-badge ${escapeHtml(kind)}">${escapeHtml(messageKind(kind))}</span>` : ""}${event.payload?.priority <= 1 ? ` <span class="type-badge urgent">${event.payload.priority === 0 ? "紧急" : "高优先级"}</span>` : ""}</span><span class="event-stamp">${eventIdBadge(event.project_seq, event.id)}<time title="${escapeHtml(event.created_at)}">${escapeHtml(formatTime(event.created_at))}</time></span></div>
             ${renderMessageBodySafely(event.id, event.payload?.body || "")}
             <p class="secondary-text">${escapeHtml(messageChannel(event.channel))}频道${event.payload?.requires_ack ? ` · 需要确认 · 已确认 ${ackCount}` : ""}${event.payload?.mentions?.length ? ` · @${escapeHtml(event.payload.mentions.join("、"))}` : ""}</p>
             ${event.payload?.files?.length ? `<p class="secondary-text">关联文件：${escapeHtml(event.payload.files.join("、"))}</p>` : ""}
@@ -2578,7 +2593,7 @@ function renderEvents(agents, tasks) {
       const conflict = event.event_type === "lease.conflict"
         ? ` · ${escapeHtml(event.payload?.path_pattern || "")} 与 ${escapeHtml((event.payload?.conflicts || []).map((item) => `${item.agent_name}:${item.path_pattern}`).join("、"))} 冲突`
         : "";
-      return `<div class="system-event">${eventIdBadge(event.project_seq, event.id)} <strong>${escapeHtml(agent?.name || "系统")}</strong> ${escapeHtml(eventLabel(event.event_type))}${task ? ` · ${escapeHtml(task.title)} · ${escapeHtml(taskPhaseLabel(task))}` : ""}${conflict} <span>· ${escapeHtml(formatTime(event.created_at))}</span></div>`;
+      return `<div class="system-event">${eventIdBadge(event.project_seq, event.id)} <strong>${escapeHtml(actorName)}</strong> ${escapeHtml(eventLabel(event.event_type))}${task ? ` · ${escapeHtml(task.title)} · ${escapeHtml(taskPhaseLabel(task))}` : ""}${conflict} <span>· ${escapeHtml(formatTime(event.created_at))}</span></div>`;
     }).join("")
     : '<div class="empty-state">当前筛选下没有动态</div>';
   const notice = elements["new-message-notice"];

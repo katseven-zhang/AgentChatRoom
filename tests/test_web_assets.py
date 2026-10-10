@@ -793,7 +793,7 @@ def test_web_supports_human_reading_and_guided_interactions():
     assert "当前连接" in javascript
     assert "累计" in javascript and "次接入" in javascript
     assert 'app.css?v=1.0.0-central54' in markup
-    assert 'app.js?v=1.0.0-central54' in markup
+    assert 'app.js?v=1.0.0-central55' in markup
     assert len(re.findall(r'<script\b[^>]*src="/assets/app\.js', markup)) == 1
     assert 'id="task-history-filter"' in markup
     assert "function loadTaskHistory(" in javascript
@@ -2870,7 +2870,7 @@ SHARED_RECENT_HELPERS = (
     "  totalPages > 1 ? `<div class=\"grid-pager\">第 ${current} / ${totalPages} 页${totalLabel}</div>` : '';\n"
 )
 
-RECENT_EXTRACTION_START = "function renderRecentActivity("
+RECENT_EXTRACTION_START = "function eventActorName("
 RECENT_EXTRACTION_END = "function renderMetrics("
 
 
@@ -2882,7 +2882,7 @@ def extract_recent_activity_block(javascript):
 
 def test_web_recent_activity_is_flat_reverse_chronological_stream():
     """#138/#150：最近活动忠实展示每一条真实事件（不折叠、无倍数统计），
-    严格时间倒序，操作主体按 actor_session_id 解析为 Agent 名字。"""
+    严格时间倒序，操作主体优先使用事件快照，旧事件按会话解析。"""
     javascript = (WEB_DIR / "app.js").read_text(encoding="utf-8")
     markup = (WEB_DIR / "index.html").read_text(encoding="utf-8")
 
@@ -2958,7 +2958,7 @@ def test_web_recent_activity_switch_projects_without_crosstalk(tmp_path):
 
 def test_web_recent_activity_headings_carry_agent_names_and_paging(tmp_path):
     """#138/#150: every overview-card heading shows the acting agent resolved
-    from actor_session_id, degrades to 系统/用户 for unknown sessions, keeps
+    from the actor snapshot or actor_session_id, distinguishes unknown Agents, keeps
     event/model badges, and pages 5 rows at a time with placeholders."""
     javascript = (WEB_DIR / "app.js").read_text(encoding="utf-8")
     block = extract_recent_activity_block(javascript)
@@ -2993,7 +2993,7 @@ def test_web_recent_activity_headings_carry_agent_names_and_paging(tmp_path):
         "assert.equal(html.includes('<strong>OpenCode</strong> task.claimed'), true);\n"
         "assert.equal(html.includes('<strong>Codex</strong> message.message [model]'), true);\n"
         "assert.equal(html.includes('<strong>系统</strong> lease.acquired'), true);\n"
-        "assert.equal(html.includes('<strong>用户</strong> message.message [model]'), true);\n"
+        "assert.equal(html.includes('<strong>未知 Agent</strong> message.message [model]'), true);\n"
         "assert.equal(html.includes('undefined'), false);\n"
         "// strict created_at desc: newest timestamp first even when ids disagree\n"
         "assert.ok(html.indexOf('#11') < html.indexOf('#12'));\n"
