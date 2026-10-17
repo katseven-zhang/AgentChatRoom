@@ -9730,7 +9730,7 @@ Attach a workspace to a host, creating the host row if it is new.
                     bool(clean_commit_repo) or delivery_mode == "local"
                 ),
             )
-            multi_repo = self._workspace_spans_repositories(project)
+            multi_repo = self.workspace_spans_repositories(project)
             session_is_git = False
             auto_repository: Path | None = None
             if evidence_source == WORKSPACE_EVIDENCE_SERVER_VERIFIED:
@@ -11393,7 +11393,13 @@ Attach a workspace to a host, creating the host row if it is new.
         return WORKSPACE_EVIDENCE_CLIENT_ASSERTED
 
     def matches_contained_project_worktree(self, project: Mapping[str, Any], checkout: Path) -> bool:
-        """Match a contained linked worktree to the operator's repository selection."""
+        """Match a contained worktree to the Project's workspace boundary.
+
+        The historical case is a linked worktree of the selected repository. A
+        multi-repository workspace (#377) also matches any real Git worktree
+        inside its root that no other active Room owns; without that, a client
+        opened on a sibling repository could never reach the Room.
+        """
         try:
             project_data = dict(project)
             root = Path(str(project_data["root_path"])).expanduser().resolve()
@@ -11403,16 +11409,28 @@ Attach a workspace to a host, creating the host row if it is new.
             if registration and registration.get("project_key") != project_data.get("project_key"):
                 return False
             selected = repository_directory(root, str(project_data.get("repository_path") or ""))
-            _remote, git_root, inside = _project_git_info(checkout)
-            if not inside or derive_logical_path(checkout, git_root).casefold() != str(
-                project_data.get("logical_path") or ""
-            ).casefold():
+            remote, git_root, inside = _project_git_info(checkout)
+            if not inside:
                 return False
-            return _same_git_repository(checkout, selected)
+            if _same_git_repository(checkout, selected):
+                return derive_logical_path(checkout, git_root).casefold() == str(
+                    project_data.get("logical_path") or ""
+                ).casefold()
+            if not self.workspace_spans_repositories(project_data):
+                return False
+            with self.database.connect() as connection:
+                owner = self._other_room_owning_repository(
+                    connection,
+                    str(project_data["id"]),
+                    git_root,
+                    remote,
+                    checkout,
+                )
+            return owner is None
         except (DomainError, OSError, ValueError, RuntimeError):
             return False
 
-    def _workspace_spans_repositories(
+    def workspace_spans_repositories(
         self, project: Mapping[str, Any]
     ) -> bool:
         """True for the explicit multi-repository workspace shape (#377).
@@ -11665,7 +11683,7 @@ Attach a workspace to a host, creating the host row if it is new.
             # In particular, two independent clones with the same origin are
             # not interchangeable after an explicit workspace selection.
             selected = repository_directory(project_root, selection)
-            multi_repo = self._workspace_spans_repositories(project_data)
+            multi_repo = self.workspace_spans_repositories(project_data)
             if reported == project_root:
                 # A multi-repository workspace keeps the reported root so the
                 # caller can let the commit choose its repository (#377); a

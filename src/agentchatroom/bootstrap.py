@@ -679,18 +679,40 @@ def bootstrap_local_room(
                 )
             )
         if not unique_keys:
-            return BootstrapOutcome(bootstrap_status_payload("project_not_registered"))
-
-        project_key, checkout = next(iter(unique_keys.items()))
-        try:
-            project = service.resolve_project_for_join(
-                root_path=str(checkout),
-                registered_project_key=project_key,
-            )
-        except DomainError as error:
-            if error.code.startswith("project_registration"):
-                return BootstrapOutcome(bootstrap_status_payload("registration_invalid"))
-            return _domain_bootstrap_failure(error)
+            # A multi-repository workspace may be opened at one of its sibling
+            # repositories, which has no checkout registration of its own. Only
+            # a unique registered multi-repository Project that contains this
+            # root may resume here; anything else keeps the explicit error.
+            fallback = [
+                (candidate, matched_checkout)
+                for candidate, matched_checkout in (
+                    match_registered_projects(service, roots) if roots else []
+                )
+                if service.workspace_spans_repositories(candidate)
+            ]
+            if len(fallback) > 1:
+                return BootstrapOutcome(
+                    bootstrap_status_payload(
+                        "ambiguous_workspace",
+                        details={"candidate_count": len(fallback)},
+                    )
+                )
+            if not fallback:
+                return BootstrapOutcome(
+                    bootstrap_status_payload("project_not_registered")
+                )
+            project, checkout = fallback[0]
+        else:
+            project_key, checkout = next(iter(unique_keys.items()))
+            try:
+                project = service.resolve_project_for_join(
+                    root_path=str(checkout),
+                    registered_project_key=project_key,
+                )
+            except DomainError as error:
+                if error.code.startswith("project_registration"):
+                    return BootstrapOutcome(bootstrap_status_payload("registration_invalid"))
+                return _domain_bootstrap_failure(error)
 
     # Local stdio resolves the parent checkout registration first. Keep its
     # Project identity, but inspect the actual advertised linked worktree.

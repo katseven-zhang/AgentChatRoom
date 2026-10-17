@@ -14,7 +14,9 @@ from pathlib import Path
 
 import pytest
 
+from agentchatroom.bootstrap import bootstrap_local_room
 from agentchatroom.errors import DomainError
+from agentchatroom.project_registration import register_checkout_project
 from tests.conftest import join_room_with_workspace
 
 
@@ -176,6 +178,76 @@ def test_repository_subdirectory_session_records_its_repository(
     )
     assert item["status"] == "captured"
     assert item["repository_relative_path"] == "pkg/code.txt"
+
+
+def test_bootstrap_from_a_sibling_repository_binds_to_the_workspace_room(
+    service, project_dir
+):
+    repository(project_dir / "a", remote=True)
+    sibling_commit = repository(project_dir / "b", remote=True)
+    project = service.create_project(
+        root_path=str(project_dir), repository_path="a"
+    )
+    register_checkout_project(project_dir, project)
+
+    outcome = bootstrap_local_room(
+        service,
+        software_key="fixture-client",
+        software_name="Fixture",
+        client="test-client",
+        workspace_roots=[project_dir / "b"],
+        cwd=project_dir / "b",
+    )
+
+    assert outcome.public["status"] == "ready", outcome.public
+    binding = outcome.binding
+    assert binding is not None
+    assert binding.project_id == project["id"]
+    task = service.create_task(
+        project["id"],
+        title="Started in a sibling repository",
+        acceptance_criteria=["The workspace Room accepts the work"],
+        actor_session_id=binding.session_id,
+        token=binding.token,
+    )["task"]
+    service.claim_task(
+        project["id"], task["id"], binding.session_id, binding.token
+    )
+    service.submit_work_report(
+        project["id"],
+        task["id"],
+        session_id=binding.session_id,
+        token=binding.token,
+        summary="Delivered from the sibling checkout",
+        files=["b/code.txt"],
+        tests=[{"command": "fixture validation", "exit_code": 0}],
+        commit_hash=sibling_commit,
+    )
+    evidence = service.snapshot(project["id"])["reports"][0]["system_evidence"]
+    assert evidence["reported_commit_exists"] is True
+    assert evidence["repository_path"] == "b"
+    assert evidence["repository_root"] == str((project_dir / "b").resolve())
+
+
+def test_bootstrap_prefers_a_repository_dedicated_room(service, project_dir):
+    repository(project_dir / "a", remote=True)
+    repository(project_dir / "b", remote=True)
+    service.create_project(root_path=str(project_dir), repository_path="a")
+    dedicated = service.create_project(root_path=str(project_dir / "b"))
+    register_checkout_project(project_dir / "b", dedicated)
+
+    outcome = bootstrap_local_room(
+        service,
+        software_key="fixture-client",
+        software_name="Fixture",
+        client="test-client",
+        workspace_roots=[project_dir / "b"],
+        cwd=project_dir / "b",
+    )
+
+    assert outcome.public["status"] == "ready", outcome.public
+    assert outcome.binding is not None
+    assert outcome.binding.project_id == dedicated["id"]
 
 
 def test_diagnostics_separate_usable_from_another_rooms_repositories(
