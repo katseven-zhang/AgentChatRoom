@@ -2540,7 +2540,7 @@ function renderReportEvidence(taskId) {
     : 0;
   const deliveryLabel = deliveryMode === "local"
     ? `本地交付（无 Git 提交）${git.delivery_verified === "local_only" ? ` · ${capturedFiles} 个文件 SHA256 已登记` : ` · ${git.reason || "服务端未采集"}`}`
-    : `Git 提交${report.commit_repo ? ` · 仓库 ${report.commit_repo}` : ""}`;
+    : `Git 提交${(report.commit_repo || git.repository_path) ? ` · 仓库 ${report.commit_repo || git.repository_path}` : ""}`;
   const fileEvidence = report.files.length
     ? escapeHtml(report.files.join("、"))
     : `<strong>无代码变更</strong> · ${escapeHtml(report.no_code_change_reason || "未说明原因")}`;
@@ -4384,8 +4384,9 @@ function renderHistoryEvidence(item) {
           : escapeHtml(git.reason || "服务端未采集");
         return `<div class="history-evidence"><h4>交付证据</h4><p>本地交付（无 Git 提交） · ${detail}</p></div>`;
       }
-      const origin = git.commit_repo
-        ? `仓库 ${git.commit_repo}`
+      const repository = git.commit_repo || git.repository_path;
+      const origin = repository
+        ? `仓库 ${repository}`
         : (git.branch || (git.head ? "集成提交" : "detached"));
       return `<div class="history-evidence"><h4>Git 证据</h4><p>${escapeHtml(origin)} · ${escapeHtml(git.head || git.commit_hash || "unknown")}${git.captured ? "" : ` · ${escapeHtml(git.reason || "未采集")}`}</p></div>`;
     }

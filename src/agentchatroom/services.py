@@ -9730,19 +9730,35 @@ Attach a workspace to a host, creating the host row if it is new.
                     bool(clean_commit_repo) or delivery_mode == "local"
                 ),
             )
+            multi_repo = self._workspace_spans_repositories(project)
+            session_is_git = False
+            auto_repository: Path | None = None
+            if evidence_source == WORKSPACE_EVIDENCE_SERVER_VERIFIED:
+                session_is_git = bool(_project_git_info(worktree)[2])
+                if (
+                    multi_repo
+                    and delivery_mode == "git"
+                    and commit_hash.strip()
+                    and not session_is_git
+                ):
+                    # The Session runs outside Git, so the commit—not the
+                    # Session path—chooses which workspace repository proves it.
+                    auto_repository = self._workspace_repository_for_commit(
+                        connection, project, workspace_root, commit_hash
+                    )
             if delivery_mode == "local":
                 # `local` is for deliveries Git cannot prove: deploy trees,
                 # build outputs, non-Git test directories. A file that sits in
-                # the selected repository could have been committed, so
-                # accepting it as "local" would be a way around commit
+                # any Git worktree in the workspace could have been committed,
+                # so accepting it as "local" would be a way around commit
                 # evidence rather than a delivery of a different kind.
                 local_conflicts = self._local_delivery_conflicts(
-                    project, clean_files
+                    project, clean_files, workspace_root=workspace_root
                 )
                 if local_conflicts:
                     raise DomainError(
                         "delivery_mode_conflict",
-                        "delivery_mode=local cannot cover files inside the selected repository",
+                        "delivery_mode=local cannot cover files inside a Git worktree in the workspace",
                         status_code=422,
                         details={
                             "delivery_mode": delivery_mode,
@@ -9750,17 +9766,15 @@ Attach a workspace to a host, creating the host row if it is new.
                             "repository_path": str(
                                 dict(project).get("repository_path") or ""
                             ),
-                            "required_action": "submit_git_delivery_with_commit_or_move_files_outside_the_selected_repository",
+                            "required_action": "submit_git_delivery_with_commit_or_move_files_outside_the_git_worktrees",
                         },
                     )
-            elif (
-                clean_files
-                and project["git_remote"]
-                and not COMMIT_HASH_PATTERN.fullmatch(commit_hash.strip())
-            ):
+            elif clean_files and (
+                project["git_remote"] or multi_repo
+            ) and not COMMIT_HASH_PATTERN.fullmatch(commit_hash.strip()):
                 raise DomainError(
                     "work_report_commit_required",
-                    "A Git delivery with changed files requires a full structured commit SHA; declare delivery_mode=local only when the files sit outside the selected repository",
+                    "A Git delivery with changed files requires a full structured commit SHA; declare delivery_mode=local only when the files sit outside the workspace's Git worktrees",
                     status_code=422,
                     details={
                         "delivery_mode": delivery_mode,
@@ -9771,7 +9785,7 @@ Attach a workspace to a host, creating the host row if it is new.
                         # branch on this exact value; the local channel is the
                         # alternative when Git cannot prove the delivery.
                         "required_action": "submit_full_commit_sha_for_changed_files",
-                        "alternative_action": "declare_local_delivery_for_files_outside_the_selected_repository",
+                        "alternative_action": "declare_local_delivery_for_files_outside_the_git_worktrees",
                     },
                 )
         if delivery_mode == "local":
@@ -9803,7 +9817,7 @@ Attach a workspace to a host, creating the host row if it is new.
             # Project's selected repository and never an automatic choice: the
             # explicit selection keeps controlling Git evidence by default.
             repository_root, remote = self._resolve_commit_repository(
-                project, workspace_root, clean_commit_repo
+                project_id, project, workspace_root, clean_commit_repo
             )
             if (
                 worktree.resolve() != workspace_root.resolve()
@@ -9831,8 +9845,27 @@ Attach a workspace to a host, creating the host row if it is new.
                 clean_files,
             )
         else:
+            evidence_worktree = worktree
+            if multi_repo:
+                if auto_repository is not None:
+                    evidence_worktree = auto_repository
+                elif not session_is_git:
+                    # The Session runs in a non-Git part of a multi-repository
+                    # workspace and the commit did not identify one repository;
+                    # fall back to the primary so the refusal names what was
+                    # searched instead of guessing.
+                    project_data = dict(project)
+                    evidence_worktree = repository_directory(
+                        Path(str(project_data["root_path"])),
+                        str(project_data.get("repository_path") or ""),
+                    )
             system_evidence = self._collect_git_evidence(
-                project, agent, commit_hash, worktree=worktree, files=clean_files
+                project,
+                agent,
+                commit_hash,
+                worktree=evidence_worktree,
+                files=clean_files,
+                allow_workspace_repository=multi_repo,
             )
         stored_commit = str(system_evidence.get("commit_hash") or "")
         if delivery_mode == "git" and commit_hash.strip() and (
@@ -11379,6 +11412,177 @@ Attach a workspace to a host, creating the host row if it is new.
         except (DomainError, OSError, ValueError, RuntimeError):
             return False
 
+    def _workspace_spans_repositories(
+        self, project: Mapping[str, Any]
+    ) -> bool:
+        """True for the explicit multi-repository workspace shape (#377).
+
+        A Project rooted at a non-Git workspace and naming a primary repository
+        stands for that whole workspace; its siblings are first-class work
+        targets, not second-class evidence. A Project whose own root is a Git
+        worktree keeps the single-repository contract.
+        """
+        project_data = dict(project)
+        selection = str(project_data.get("repository_path") or "")
+        if not selection:
+            return False
+        root = Path(str(project_data["root_path"])).expanduser().resolve(
+            strict=False
+        )
+        _remote, _git_root, root_is_worktree = _project_git_info(root)
+        return not root_is_worktree
+
+    def _other_room_owning_repository(
+        self,
+        connection: Any,
+        project_id: str,
+        repository_root: Path,
+        remote: str,
+        worktree: Path,
+    ) -> dict[str, Any] | None:
+        """Find an active Room that already scopes the repository being used.
+
+        A workspace may contain independent repositories, but not ones another
+        Room already owns: otherwise a parent Room could quietly absorb work
+        that belongs to a dedicated subproject Room.
+        """
+        try:
+            repository_root = repository_root.resolve(strict=False)
+            worktree = worktree.resolve(strict=False)
+        except OSError:
+            return None
+        root_key = os.path.normcase(str(repository_root))
+        normalized = normalize_remote(remote)
+        try:
+            logical = derive_logical_path(worktree, repository_root).casefold()
+        except DomainError:
+            logical = ""
+        for row in connection.execute(
+            "SELECT * FROM projects WHERE archived_at IS NULL AND id <> ?",
+            (project_id,),
+        ):
+            other = dict(row)
+            scope = stored_project_scope(other)
+            if scope["kind"] == "path":
+                if os.path.normcase(str(scope["identity"])) == root_key:
+                    return other
+                continue
+            if not normalized or scope["identity"] != normalized:
+                continue
+            other_logical = str(scope["logical_path"] or "").casefold()
+            if (
+                not other_logical
+                or logical == other_logical
+                or logical.startswith(f"{other_logical}/")
+                or other_logical.startswith(f"{logical}/")
+            ):
+                return other
+        return None
+
+    def _workspace_repository_for_commit(
+        self,
+        connection: Any,
+        project: Mapping[str, Any],
+        workspace_root: Path,
+        commit_hash: str,
+    ) -> Path | None:
+        """Let a commit pick its repository inside a multi-repository workspace.
+
+        Used only when the Session itself runs outside Git (the workspace root or
+        a non-Git directory). The commit is verified in every candidate
+        worktree, so no repository is chosen by name order or by being first; a
+        commit present in more than one distinct repository is refused as
+        ambiguous instead of being attributed to one of them.
+        """
+        commit = commit_hash.strip()
+        if not COMMIT_HASH_PATTERN.fullmatch(commit):
+            return None
+        project_data = dict(project)
+        project_root = Path(str(project_data["root_path"])).expanduser().resolve(
+            strict=False
+        )
+        scan_root = project_root
+        try:
+            workspace_key = workspace_root.resolve(strict=False)
+            workspace_key.relative_to(project_root)
+        except (OSError, ValueError):
+            pass
+        else:
+            scan_root = workspace_key
+        try:
+            inspection = self.inspect_repository_candidates(str(scan_root))
+        except (DomainError, OSError, ValueError):
+            return None
+        matches: list[Path] = []
+        for candidate in inspection.get("candidates", []):
+            path = Path(str(candidate.get("project_path") or ""))
+            remote, git_root, inside = _project_git_info(path)
+            if not inside:
+                continue
+            code, _stdout, _stderr = run_git_capture(
+                [
+                    "git",
+                    "-C",
+                    str(path),
+                    "rev-parse",
+                    "--verify",
+                    "--end-of-options",
+                    f"{commit}^{{commit}}",
+                ]
+            )
+            if code != 0:
+                continue
+            owner = self._other_room_owning_repository(
+                connection,
+                str(project_data["id"]),
+                git_root,
+                remote,
+                path,
+            )
+            if owner is not None:
+                continue
+            if any(_same_git_repository(path, existing) for existing in matches):
+                # The main worktree and a linked worktree of the same repository
+                # are one repository, not two candidates.
+                continue
+            matches.append(path)
+        if len(matches) > 1:
+            relative: list[str] = []
+            for path in matches:
+                try:
+                    relative.append(
+                        path.resolve().relative_to(project_root).as_posix()
+                    )
+                except (OSError, ValueError):
+                    relative.append(str(path))
+            raise DomainError(
+                "ambiguous_commit_repository",
+                "The commit exists in more than one repository in this workspace; name one with commit_repo",
+                status_code=409,
+                details={
+                    "commit_hash": commit,
+                    "repositories": relative[:20],
+                    "required_action": "pass_commit_repo_to_choose_the_repository",
+                },
+            )
+        return matches[0] if matches else None
+
+    @staticmethod
+    def _repository_owned_error(
+        owner: Mapping[str, Any], repository_path: str
+    ) -> DomainError:
+        return DomainError(
+            "repository_owned_by_another_room",
+            "Repository is owned by another active Room",
+            status_code=409,
+            details={
+                "repository_path": repository_path,
+                "project_id": owner.get("id"),
+                "project_name": owner.get("name"),
+                "required_action": "use_that_repository_room",
+            },
+        )
+
     def _trusted_worktree(
         self,
         connection: Any,
@@ -11461,10 +11665,36 @@ Attach a workspace to a host, creating the host row if it is new.
             # In particular, two independent clones with the same origin are
             # not interchangeable after an explicit workspace selection.
             selected = repository_directory(project_root, selection)
+            multi_repo = self._workspace_spans_repositories(project_data)
             if reported == project_root:
+                # A multi-repository workspace keeps the reported root so the
+                # caller can let the commit choose its repository (#377); a
+                # single-repository Project still defaults to its selection.
                 return (
-                    reported if allow_unselected_repository else selected
+                    reported
+                    if (allow_unselected_repository or multi_repo)
+                    else selected
                 ), evidence_source, root
+            if multi_repo:
+                # #377: the workspace, not the selected child, is the evidence
+                # boundary. Every real Git worktree inside it may work, unless
+                # another active Room already owns that repository.
+                remote, git_root, is_worktree = _project_git_info(reported)
+                if is_worktree:
+                    try:
+                        relative = git_root.relative_to(project_root).as_posix()
+                    except ValueError:
+                        relative = ""
+                    owner = self._other_room_owning_repository(
+                        connection,
+                        project_data["id"],
+                        git_root,
+                        remote,
+                        reported,
+                    )
+                    if owner is not None:
+                        raise self._repository_owned_error(owner, relative)
+                return reported, evidence_source, root
             if not allow_unselected_repository and (
                 selection or _project_git_info(selected)[2]
             ):
@@ -11528,11 +11758,26 @@ Attach a workspace to a host, creating the host row if it is new.
         *,
         worktree: Path | None = None,
         files: list[str] | None = None,
+        allow_workspace_repository: bool = False,
     ) -> dict[str, Any]:
         resolved = worktree or Path(agent["worktree"] or project["root_path"])
         project_data = dict(project)
+        project_root = Path(str(project_data["root_path"])).expanduser().resolve(
+            strict=False
+        )
+        selection = str(project_data.get("repository_path") or "")
+        primary = (
+            repository_directory(project_root, selection) if selection else None
+        )
         remote, git_root, is_worktree = _project_git_info(resolved)
-        if is_worktree:
+        is_primary = bool(
+            primary is not None
+            and is_worktree
+            and _same_git_repository(resolved, primary)
+        )
+        if is_worktree and not (
+            allow_workspace_repository and not is_primary
+        ):
             stored_scope = stored_project_scope(project_data)
             logical = derive_logical_path(resolved, git_root)
             expected_logical = str(project_data.get("logical_path") or "")
@@ -11550,9 +11795,77 @@ Attach a workspace to a host, creating the host row if it is new.
         evidence = self._collect_git_evidence_from_worktree(resolved, commit_hash)
         evidence["schema_version"] = 2
         evidence["workspace_root"] = str(project_data["root_path"])
-        evidence["repository_path"] = str(project_data.get("repository_path") or "")
-        evidence["file_evidence"] = self._repository_file_evidence(resolved, files or [])
+        evidence["repository_root"] = str(git_root) if is_worktree else ""
+        evidence["repository_remote"] = remote
+        evidence["repository_path"] = selection
+        if is_worktree and not is_primary:
+            # #377: a sibling repository inside the same workspace. The caller
+            # already proved it is inside the registered workspace and not owned
+            # by another Room; record which repository the evidence came from.
+            try:
+                evidence["repository_path"] = git_root.relative_to(
+                    project_root
+                ).as_posix()
+            except ValueError:
+                evidence["repository_path"] = ""
+        if is_primary or not is_worktree:
+            evidence["file_evidence"] = self._repository_file_evidence(
+                resolved, files or [], prefix=selection
+            )
+        else:
+            evidence["file_evidence"] = self._workspace_repository_file_evidence(
+                project_root,
+                Path(str(git_root)),
+                str(evidence["repository_path"]),
+                files or [],
+            )
         return evidence
+
+    def _workspace_repository_file_evidence(
+        self,
+        project_root: Path,
+        repository_root: Path,
+        relative: str,
+        files: list[str],
+    ) -> list[dict[str, Any]]:
+        """File evidence for a repository that is not the primary one (#377).
+
+        Report paths are project-root relative by contract, so a path under the
+        repository's workspace path is hashed from that repository. Anything
+        else is recorded as outside this repository instead of being looked up
+        under the workspace root or a same-named path inside the repository.
+        """
+        prefix = f"{relative}/" if relative else ""
+        inside: list[tuple[str, str]] = []
+        outside: dict[str, dict[str, Any]] = {}
+        for name in files:
+            if prefix and not name.startswith(prefix):
+                outside[name] = {"path": name, "status": "outside_repository"}
+            else:
+                inside.append(
+                    (name, name[len(prefix):] if prefix else name)
+                )
+        captured = {
+            item["path"]: item
+            for item in self._repository_file_evidence(
+                repository_root,
+                [relative_name for _reported, relative_name in inside],
+            )
+        }
+        by_reported: dict[str, dict[str, Any]] = {}
+        for reported, relative_name in inside:
+            item = dict(
+                captured.get(relative_name)
+                or {"path": relative_name, "status": "missing_or_not_file"}
+            )
+            if relative_name != reported:
+                item["repository_relative_path"] = relative_name
+                item["path"] = reported
+            by_reported[reported] = item
+        return [
+            outside.get(name) or by_reported[name]
+            for name in files
+        ]
 
     def _selected_repository_roots(
         self, project: Mapping[str, Any]
@@ -11578,19 +11891,55 @@ Attach a workspace to a host, creating the host row if it is new.
         return [git_root] if inside else []
 
     def _local_delivery_conflicts(
-        self, project: Mapping[str, Any], files: list[str]
+        self,
+        project: Mapping[str, Any],
+        files: list[str],
+        *,
+        workspace_root: Path,
     ) -> list[str]:
-        root = Path(str(project["root_path"])).expanduser().resolve(strict=False)
+        """Files a local delivery cannot claim because Git could prove them.
+
+        The primary repository is checked as before. Each file's ancestors are
+        then walked up to the Project root looking for a Git marker: that
+        catches sibling and nested repositories, including linked worktrees
+        whose ``.git`` is a file, without a recursive scan.
+        """
+        project_data = dict(project)
+        root = Path(str(project_data["root_path"])).expanduser().resolve(
+            strict=False
+        )
+        try:
+            boundary = workspace_root.resolve(strict=False)
+            boundary.relative_to(root)
+        except (OSError, ValueError):
+            boundary = root
+        repository_roots = self._selected_repository_roots(project_data)
         conflicts: set[str] = set()
-        for repository_root in self._selected_repository_roots(project):
-            repository_root = repository_root.resolve()
-            for name in files:
+        for name in files:
+            try:
+                candidate = (root / name).resolve()
+                candidate.relative_to(boundary)
+            except (OSError, ValueError):
+                continue
+            for repository_root in repository_roots:
                 try:
-                    candidate = (root / name).resolve()
-                    candidate.relative_to(repository_root)
+                    candidate.relative_to(repository_root.resolve())
                 except (OSError, ValueError):
                     continue
                 conflicts.add(name)
+                break
+            else:
+                current = candidate.parent
+                while True:
+                    try:
+                        if (current / ".git").exists():
+                            conflicts.add(name)
+                            break
+                    except OSError:
+                        break
+                    if current == root or current.parent == current:
+                        break
+                    current = current.parent
         return sorted(conflicts)
 
     def _local_delivery_files(
@@ -11673,6 +12022,7 @@ Attach a workspace to a host, creating the host row if it is new.
 
     def _resolve_commit_repository(
         self,
+        project_id: str,
         project: Mapping[str, Any],
         workspace_root: Path,
         commit_repo: str,
@@ -11726,6 +12076,12 @@ Attach a workspace to a host, creating the host row if it is new.
                     "required_action": "use_the_repository_root_relative_path",
                 },
             )
+        with self.database.connect() as connection:
+            owner = self._other_room_owning_repository(
+                connection, project_id, git_root, remote, candidate
+            )
+        if owner is not None:
+            raise self._repository_owned_error(owner, commit_repo)
         return candidate, remote
 
     def _commit_repository_file_evidence(
@@ -11816,23 +12172,45 @@ Attach a workspace to a host, creating the host row if it is new.
         except (DomainError, OSError, ValueError):
             return {
                 "repositories_available": [],
+                "repositories_excluded": [],
                 "repository_scan_complete": False,
                 "repository_scan_truncated": True,
             }
         available: list[dict[str, Any]] = []
-        for candidate in inspection.get("candidates", [])[:20]:
-            path = Path(str(candidate.get("project_path") or ""))
-            remote, _git_root, _inside = _project_git_info(path)
-            available.append(
-                {
+        excluded: list[dict[str, Any]] = []
+        with self.database.connect() as connection:
+            for candidate in inspection.get("candidates", [])[:20]:
+                path = Path(str(candidate.get("project_path") or ""))
+                remote, git_root, inside = _project_git_info(path)
+                if not inside:
+                    continue
+                entry = {
                     "relative_path": candidate.get("relative_path") or "",
                     "logical_path": candidate.get("logical_path") or "",
                     "repository_root": candidate.get("repository_root") or "",
                     "remote": remote,
                 }
-            )
+                owner = self._other_room_owning_repository(
+                    connection,
+                    str(project_data["id"]),
+                    git_root,
+                    remote,
+                    path,
+                )
+                if owner is not None:
+                    excluded.append(
+                        {
+                            **entry,
+                            "reason": "owned_by_another_room",
+                            "project_id": owner.get("id"),
+                            "project_name": owner.get("name"),
+                        }
+                    )
+                else:
+                    available.append(entry)
         return {
             "repositories_available": available,
+            "repositories_excluded": excluded,
             "repository_scan_complete": bool(inspection.get("complete")),
             "repository_scan_truncated": bool(inspection.get("truncated")),
         }
@@ -11843,28 +12221,54 @@ Attach a workspace to a host, creating the host row if it is new.
         files: list[str],
         *,
         outside_status: str = "unreadable_or_outside_repository",
+        prefix: str = "",
     ) -> list[dict[str, Any]]:
-        evidence = []
+        """Hash reported files, accepting both path spellings (#377).
+
+        Report paths are project-root relative by contract, but historical
+        callers of a selected child repository pass paths relative to that
+        repository. When a path starts with the repository's workspace prefix it
+        is tried both stripped and as typed, and the first readable form wins,
+        so neither spelling silently stops producing evidence.
+        """
+        root = root.resolve()
+        evidence: list[dict[str, Any]] = []
         budget = self.settings.repository_evidence_max_file_bytes
         for name in files:
             item: dict[str, Any] = {"path": name}
-            try:
-                path = (root / name).resolve()
-                path.relative_to(root.resolve())
+            candidates: list[str] = []
+            if prefix and name.startswith(f"{prefix}/"):
+                candidates.append(name[len(prefix) + 1:])
+            candidates.append(name)
+            status = outside_status
+            for relative in candidates:
+                try:
+                    path = (root / relative).resolve()
+                    path.relative_to(root)
+                except (OSError, ValueError):
+                    continue
                 if not path.is_file():
-                    item["status"] = "missing_or_not_file"
-                elif path.stat().st_size > budget:
+                    status = "missing_or_not_file"
+                    continue
+                if path.stat().st_size > budget:
                     item["status"] = "byte_budget_exceeded"
-                else:
-                    with path.open("rb") as stream:
-                        content = stream.read(budget + 1)
-                    if len(content) > budget:
-                        item["status"] = "byte_budget_exceeded"
-                    else:
-                        budget -= len(content)
-                        item.update(status="captured", size_bytes=len(content), sha256=hashlib.sha256(content).hexdigest())
-            except (OSError, ValueError):
-                item["status"] = outside_status
+                    break
+                with path.open("rb") as stream:
+                    content = stream.read(budget + 1)
+                if len(content) > budget:
+                    item["status"] = "byte_budget_exceeded"
+                    break
+                budget -= len(content)
+                item.update(
+                    status="captured",
+                    size_bytes=len(content),
+                    sha256=hashlib.sha256(content).hexdigest(),
+                )
+                if relative != name:
+                    item["repository_relative_path"] = relative
+                break
+            else:
+                item["status"] = status
             evidence.append(item)
         return evidence
 

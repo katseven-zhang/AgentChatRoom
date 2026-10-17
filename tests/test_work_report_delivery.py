@@ -185,7 +185,7 @@ def test_local_delivery_refuses_commit_evidence_and_selected_repository_files(
     assert selected_file.value.code == "delivery_mode_conflict"
     assert selected_file.value.details["files"] == ["selected/code.txt"]
     assert selected_file.value.details["required_action"] == (
-        "submit_git_delivery_with_commit_or_move_files_outside_the_selected_repository"
+        "submit_git_delivery_with_commit_or_move_files_outside_the_git_worktrees"
     )
     assert service.get_task(project["id"], task["id"])["phase"] == "claimed"
 
@@ -366,11 +366,18 @@ def test_commit_repo_refuses_a_session_rooted_in_a_third_repository(
     assert service.get_task(project["id"], task["id"])["phase"] == "claimed"
 
 
-def test_other_repository_commit_without_commit_repo_is_refused_with_diagnostics(
-    service, project_dir
+def test_commit_absent_from_the_workspace_is_refused_with_diagnostics(
+    service, project_dir, tmp_path
 ):
+    """#377: a report whose commit is nowhere in the workspace still refuses.
+
+    The root Session can no longer borrow a sibling repository's commit only
+    because it is the first one found; an absent commit leaves the primary as
+    the searched worktree and reports what the caller could name instead.
+    """
     repository(project_dir / "selected", remote=True)
-    other_commit = repository(project_dir / "other")
+    repository(project_dir / "other")
+    outside_commit = repository(tmp_path / "outside")
     project = service.create_project(
         root_path=str(project_dir), repository_path="selected"
     )
@@ -382,8 +389,8 @@ def test_other_repository_commit_without_commit_repo_is_refused_with_diagnostics
             project,
             task,
             joined,
-            files=["other/code.txt"],
-            commit_hash=other_commit,
+            files=["code.txt"],
+            commit_hash=outside_commit,
         )
 
     assert error.value.code == "invalid_commit_hash"

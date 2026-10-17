@@ -31,6 +31,8 @@ REQUIRED_ACTIONS: dict[str, str] = {
     "task_dependencies_incomplete": "finish_the_listed_dependencies_first",
     "task_dependency_cycle": "drop_one_of_the_dependencies_in_the_cycle",
     "invalid_dependency_status": "pick_a_dependency_that_can_still_complete",
+    # Repository ownership
+    "repository_owned_by_another_room": "use_that_repository_room",
     # Leases
     "lease_conflict": "wait_for_the_lease_ttl_or_ask_the_holder_to_release",
     "lease_not_owner": "release_only_leases_your_session_holds",

@@ -176,22 +176,39 @@ def test_repository_switch_preserves_room_and_routes_existing_parent_session(ser
     assert after[:len(before)] == before
     assert after[-1]["event_type"] == "project.updated"
     assert service.snapshot(project["id"])["reports"][0] == original_report
-    with pytest.raises(DomainError) as error:
-        report(service, switched, pending, joined, first_commit)
-    assert error.value.code == "invalid_commit_hash"
-    report(service, switched, pending, joined, second_commit)
-    evidence = next(item["system_evidence"] for item in service.snapshot(project["id"])["reports"]
-                    if item["task_id"] == pending["id"])
-    assert evidence["worktree"] == str(second)
-    assert evidence["repository_path"] == "second"
-    assert evidence["reported_commit_exists"]
+    # The parent Session reports each repository's commit; the commit itself
+    # names the repository inside the workspace (#377), so switching the primary
+    # changes the default rather than invalidating the other repository.
+    report(service, switched, pending, joined, first_commit)
+    first_evidence = next(item["system_evidence"] for item in service.snapshot(project["id"])["reports"]
+                          if item["task_id"] == pending["id"])
+    assert first_evidence["worktree"] == str(first.resolve())
+    assert first_evidence["repository_path"] == "first"
+    assert first_evidence["reported_commit_exists"]
+    pending_second = service.create_task(project["id"], title="After primary commit",
+                                         acceptance_criteria=["Uses the new primary repository"],
+                                         actor_session_id=joined["agent"]["id"], token=joined["token"])["task"]
+    service.claim_task(project["id"], pending_second["id"], joined["agent"]["id"], joined["token"])
+    report(service, switched, pending_second, joined, second_commit)
+    second_evidence = next(item["system_evidence"] for item in service.snapshot(project["id"])["reports"]
+                           if item["task_id"] == pending_second["id"])
+    assert second_evidence["worktree"] == str(second.resolve())
+    assert second_evidence["repository_path"] == "second"
+    assert second_evidence["reported_commit_exists"]
     restored = service.select_project_repository(project["id"], "first")["project"]
     assert restored["id"] == project["id"] and restored["repository_root"] == str(first)
     assert resolve_checkout_project_key(project_dir) == (project["project_key"], True)
 
 
 @pytest.mark.parametrize("direct_workspace", [False, True])
-def test_switch_rejects_old_contained_session_even_when_origins_match(service, project_dir, direct_workspace):
+def test_switch_keeps_other_workspace_repository_sessions_usable(service, project_dir, direct_workspace):
+    """#377: switching the primary repository does not invalidate a sibling Session.
+
+    The old contract rejected a Session rooted in the repository the operator
+    just switched away from. A multi-repository workspace is now bounded by its
+    root, so that Session can still deliver its own repository's commit; the
+    primary selection only controls the default evidence source.
+    """
     first = project_dir / "first"
     second = project_dir / "second"
     commit = repository(first, remote=True)
@@ -210,10 +227,13 @@ def test_switch_rejects_old_contained_session_even_when_origins_match(service, p
     else:
         task, joined = claim(service, project, worktree=str(first))
     switched = service.select_project_repository(project["id"], "second")["project"]
-    with pytest.raises(DomainError) as error:
-        report(service, switched, task, joined, commit)
-    assert error.value.code == "untrusted_repository"
-    assert service.get_task(project["id"], task["id"])["phase"] == "claimed"
+    report(service, switched, task, joined, commit)
+    evidence = next(item["system_evidence"] for item in service.snapshot(project["id"])["reports"]
+                    if item["task_id"] == task["id"])
+    assert evidence["reported_commit_exists"] is True
+    assert evidence["repository_path"] == "first"
+    assert evidence["repository_root"] == str(first.resolve())
+    assert service.get_task(project["id"], task["id"])["phase"] == "awaiting_review"
 
 
 def test_switch_back_to_local_directory_clears_registration_and_can_select_again(service, project_dir):
@@ -285,7 +305,13 @@ def test_foreign_registration_blocks_selection(service, project_dir, tmp_path):
     assert error.value.code == "project_registration_conflict"
 
 
-def test_sibling_and_deeper_independent_repositories_cannot_supply_evidence(service, project_dir):
+def test_sibling_repository_session_cannot_borrow_the_primary_commit(service, project_dir):
+    """#377: a sibling Session reports its own repository, never the primary one.
+
+    Both roots are inside the workspace, so the Session is allowed to work; the
+    commit from the primary repository simply does not exist in the sibling, and
+    the error names the worktree that was actually searched.
+    """
     commit = repository(project_dir / "selected")
     repository(project_dir / "sibling")
     repository(project_dir / "selected" / "nested")
@@ -294,20 +320,29 @@ def test_sibling_and_deeper_independent_repositories_cannot_supply_evidence(serv
         task, joined = claim(service, project, worktree=str(project_dir / relative))
         with pytest.raises(DomainError) as error:
             report(service, project, task, joined, commit)
-        assert error.value.code == "untrusted_repository"
+        assert error.value.code == "invalid_commit_hash"
+        assert error.value.details["searched_worktree"] == str(
+            (project_dir / relative).resolve()
+        )
         assert service.get_task(project["id"], task["id"])["phase"] == "claimed"
 
 
-def test_other_child_commit_is_not_accepted_in_selected_repository(service, project_dir):
+def test_other_child_commit_is_attributed_to_its_repository(service, project_dir):
+    """#377: a root Session's sibling commit names its own repository.
+
+    The primary is no longer the only acceptable evidence source for a
+    multi-repository workspace; the commit is verified in the repository that
+    actually contains it.
+    """
     repository(project_dir / "chosen")
     other_commit = repository(project_dir / "other")
     project = service.create_project(root_path=str(project_dir), repository_path="chosen")
     task, joined = claim(service, project)
-    with pytest.raises(DomainError) as error:
-        report(service, project, task, joined, other_commit)
-    assert error.value.code == "invalid_commit_hash"
-    assert error.value.details["reported_commit_hash"] == other_commit
-    assert not service.snapshot(project["id"])["reports"]
+    report(service, project, task, joined, other_commit)
+    evidence = service.snapshot(project["id"])["reports"][0]["system_evidence"]
+    assert evidence["reported_commit_exists"] is True
+    assert evidence["repository_path"] == "other"
+    assert evidence["repository_root"] == str((project_dir / "other").resolve())
 
 
 def test_plain_parent_report_is_not_silently_bound_to_child(service, project_dir):
@@ -362,17 +397,26 @@ def test_parent_workspace_reports_actual_linked_worktree(service, project_dir, r
     assert code["sha256"] == hashlib.sha256((branch / "code.txt").read_bytes()).hexdigest()
 
 
-def test_same_remote_independent_clone_is_not_a_selected_worktree(service, project_dir):
+def test_independent_clone_inside_the_workspace_is_its_own_evidence_source(service, project_dir):
+    """#377: a clone inside the workspace is a first-class work target.
+
+    The clone is not interchangeable with the selected repository, but it can
+    prove its own commit; evidence records the clone and never pretends the
+    selected repository supplied it.
+    """
     child = project_dir / "selected"
     repository(child, remote=True)
     project = service.create_project(root_path=str(project_dir), repository_path="selected")
     clone = project_dir / "clone"
     git(project_dir, "clone", "-q", str(child), str(clone))
     git(clone, "remote", "set-url", "origin", "https://example.invalid/fixture/selected.git")
+    clone_commit = git(clone, "rev-parse", "HEAD")
     task, joined = claim(service, project, worktree=str(clone))
-    with pytest.raises(DomainError) as error:
-        report(service, project, task, joined, git(clone, "rev-parse", "HEAD"))
-    assert error.value.code == "untrusted_repository"
+    report(service, project, task, joined, clone_commit)
+    evidence = service.snapshot(project["id"])["reports"][0]["system_evidence"]
+    assert evidence["reported_commit_exists"] is True
+    assert evidence["repository_path"] == "clone"
+    assert evidence["repository_root"] == str(clone.resolve())
 
 
 def test_root_git_and_monorepo_subproject_stay_distinct(service, project_dir):

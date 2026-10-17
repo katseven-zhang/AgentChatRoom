@@ -59,7 +59,9 @@ GitHub 工具查看对应代码、PR 和 CI；Room 校验证据归属与报告�
 `commit_repo` 互斥，并且不得覆盖已选仓库工作树内的文件（否则返回 `delivery_mode_conflict`）。
 可选 `commit_repo` 用于显式声明本次提交位于工作区内另一个 Git 仓库（项目根相对路径）：服务端校验
 它位于本 Session 已登记 Workspace 内、是 Git 工作树根，并要求 Session 工作树属于该仓库或就是 Workspace
-根，然后在该仓库校验完整 SHA；未提供时仍只在已选仓库校验，绝不自动猜选第一个子仓库。`no_code_change_reason`
+根，然后在该仓库校验完整 SHA；未提供时，单仓库 Project 只在已选仓库校验，工作区根不是 Git 且已选
+主仓库的多仓库 Project 会自动在 Session 所在仓库（Session 不在 Git 时由提交唯一命中的仓库）校验
+（#377），绝不猜选其它仓库。`no_code_change_reason`
 只为未修改文件的报告提供合法替代，不会豁免已上报修改文件的 SHA 要求；无 SHA 的报告可退回补证，
 不能据此获得 GitHub 验收通过。
 
@@ -423,9 +425,10 @@ Git 仓库。保留原 Project 身份、`root_path`、任务、历史、成员�
 Agent 不手改 `project.json`。重新检查显示当前选择，不自动切换；修改关联只允许
 通过有管理权限的正式入口明确确认。候选已被其他活动
 Room 占用时返回 `project_scope_conflict` 与下一步，登记冲突返回
-`project_registration_conflict`，工作区外或越界路径仍被拒绝。切换后父目录 Session 的
-后续 Git 证据使用新仓库；仍指向旧仓库的 Session/worktree 不能替新仓库提交报告，
-应在新选择的仓库中恢复连接。旧历史只追加选择事件，不改写过去的报告与证据。
+`project_registration_conflict`，工作区外或越界路径仍被拒绝。切换只改变默认/展示的主仓库：
+父目录 Session 的后续 Git 证据使用新主仓库；工作区其它仓库中已有的 Session 仍可继续交付
+**自己所在仓库**的提交（#377），但任何 Session 都不能用别的仓库提交冒充主仓库。旧历史只
+追加选择事件，不改写过去的报告与证据。
 
 候选检查走共享领域服务，REST 为 `POST /api/v1/local/repositories/inspect`
 （`root_path`）、`POST /api/v1/projects/{id}/repository/inspect` 和
@@ -446,12 +449,24 @@ bootstrap 和 MCP Work Report 读取同一后端登记的选择，不改变 Sess
 
 Work Report 默认使用明确选定的实际仓库校验 `commit_hash`，采集提交文件、提交 diff
 统计、工作树 diff 统计以及文件/产物的大小和 SHA-256。显式 `commit_repo` 可以在同一次
-报告中改指同一 Workspace 内另一个真实 Git 仓库根，并在那个仓库采集同类证据；未提供时
-绝不自动换仓库。`files` 相对于证据中的实际 `worktree`；`commit_repo` 模式下仓库外文件会
+报告中改指同一 Workspace 内另一个真实 Git 仓库根，并在那个仓库采集同类证据。
+
+当 Project 根不是 Git 工作树、且已显式选择主仓库时，该 Project 代表整个工作区（#377）：
+Session worktree 位于同一已登记 Workspace 内任意真实 Git 工作树时，`work_report` 自动在该
+仓库校验完整 SHA，**不需要**传 `commit_repo`。Session 位于工作区根或非 Git 目录时，由提交在
+Workspace 内**唯一**命中的仓库决定证据（上游 #113 形态）；同一提交命中多个不同仓库返回
+`ambiguous_commit_repository`（409，列出候选与 `pass_commit_repo_to_choose_the_repository`），
+绝不按顺序选取；没有命中时才回退主仓库。证据记录实际 `repository_path` /
+`repository_root` / `remote`，仓库外文件标为 `outside_repository`。主仓库仍是 Room 身份与
+展示，也是无提交/提交无法归属时的默认证据源。工作区外路径、符号链接/联接穿越、客户端自报
+Workspace 上的服务端 Git 仍被拒绝；同一工作区内已属于其它活动 Room 的仓库返回
+`repository_owned_by_another_room`（409，`required_action=use_that_repository_room`），不会被
+父 Room 吞并。`files` 相对于证据中的实际 `worktree`；`commit_repo` 模式下仓库外文件会
 标为 `outside_commit_repository`，不会被同名文件冒充。缺失/非文件、越界或不可读文件明确
 标记，文件读取总预算由 `repository_evidence_max_file_bytes=8388608` 控制。父目录其它
-文件不会纳入该仓库；另一仓库的提交、Session 工作树和符号链接产物不能绕过 Room 边界。
-自动 Git/文件证据只证明本地采集事实，独立验收仍由不同软件身份完成。
+文件不会纳入该仓库；工作区外的另一仓库、符号链接/联接穿越产物不能绕过 Room 边界，工作区内
+的兄弟仓库与独立 clone 则按上面的多仓库规则归属到各自仓库。自动 Git/文件证据只证明本地采集
+事实，独立验收仍由不同软件身份完成。
 
 一个规范化代码项目作用域对应一个活动 Project/Room。同一 Git remote 与
 `logical_path`，或同一 Git 根目录（无 Git 时为所选目录本身）与 `logical_path`，
@@ -647,7 +662,7 @@ room_bootstrap
 | 创建 → 待认领 | `task_create` | 用户/Agent | 任务合同完整；操作者必须是已认证 Agent 会话（MCP 从运行时绑定自动派生 `actor_session_id`，REST 显式提供） | `invalid_task`、`missing_actor_session` | 无 owner、无指派，绝不隐式派发；无法确定操作者的创建被显式拒绝，不产生无主任务 |
 | 待认领 → 已认领 / 旧 owner → 新 owner | `task_claim` | 已认证 Agent | 无 owner 时 execution=todo 且依赖满足；有 owner 时限同软件身份、未完成执行态，并须显式 `reclaim=true`（旧 Session 断连）或 `takeover=true`（旧 Session 仍在线也可） | `task_already_claimed`、`task_owner_session_connected`、`task_reclaim_forbidden`、`task_dependencies_incomplete` | 无 owner 时并发只有一个胜出；显式接管在单一写事务内转移 owner 与该任务租约，追加 `task.reclaimed` 审计；不会因新 Session 建立而自动接管 |
 | 已认领 → 执行中/阻塞 | `task_update` | 当前 owner | 合法 legacy 迁移 | `invalid_transition`、`structured_transition_required` | 状态与 blocker_reason 更新 |
-| 执行中 → 待验收 | `work_report` | 当前 owner | execution∈{claimed,in_progress,blocked}；先认证并校验 owner/状态，再核验交付证据：`delivery_mode=git` 核验 commit（可选 `commit_repo` 显式指定工作区内另一个仓库），`delivery_mode=local` 登记逐文件 SHA256 且不要求 commit；证据齐全、worktree 受信 | `insufficient_work_evidence`、`not_task_owner`、`invalid_transition`、`repository_selection_required`、`repository_not_found`、`invalid_commit_hash`、`invalid_delivery_mode`、`delivery_mode_conflict`、`invalid_commit_repo` | 非 owner 在 commit 核验前即 403，不写 `commit_unverified` 事件；owner 的 commit 校验失败先写审计：未关联/仓库不可用返回 409，无效 SHA 返回 400（details 带 `searched_worktree`、`repositories_available` 与 `required_action`）；该拒绝审计在独立事务中先落库再抛出，所以返回体里的 `event_id` 一定查得到（带 `request_id` 的重试也一样，每次拒绝留下各自的 `work.commit_unverified` 事件，不会因幂等事务回滚而凭空消失）；local 交付把 `delivery_mode=local`、`delivery_verified=local_only` 与逐文件哈希写入报告与 `work.reported`；成功后释放任务租约、进度 100 |
+| 执行中 → 待验收 | `work_report` | 当前 owner | execution∈{claimed,in_progress,blocked}；先认证并校验 owner/状态，再核验交付证据：`delivery_mode=git` 核验 commit（多仓库工作区自动在 Session 所在仓库校验，`commit_repo` 可显式改指），`delivery_mode=local` 登记逐文件 SHA256 且不要求 commit；证据齐全、worktree 受信 | `insufficient_work_evidence`、`not_task_owner`、`invalid_transition`、`repository_selection_required`、`repository_not_found`、`repository_owned_by_another_room`、`invalid_commit_hash`、`invalid_delivery_mode`、`delivery_mode_conflict`、`invalid_commit_repo` | 非 owner 在 commit 核验前即 403，不写 `commit_unverified` 事件；owner 的 commit 校验失败先写审计：未关联/仓库不可用/被其它 Room 拥有返回 409，无效 SHA 返回 400（details 带 `searched_worktree`、`repositories_available`、`repositories_excluded` 与 `required_action`）；该拒绝审计在独立事务中先落库再抛出，所以返回体里的 `event_id` 一定查得到（带 `request_id` 的重试也一样，每次拒绝留下各自的 `work.commit_unverified` 事件，不会因幂等事务回滚而凭空消失）；local 交付把 `delivery_mode=local`、`delivery_verified=local_only` 与逐文件哈希写入报告与 `work.reported`；成功后释放任务租约、进度 100 |
 | 待验收 → 已退回 | `review_submit verdict=changes_requested` | 独立身份（≠任何提交工作报告的身份） | awaiting_review | `invalid_transition`、`reviewer_not_independent`、`reviewer_independence_unprovable` | execution 回 in_progress、保留 changes_requested；独立性按 `work_reports` 的提交身份集合判定，owner 只是当前持有者、不是作者——owner 为空或查不到时一律拒绝而非默认「独立」；无任何工作报告、或某条报告的 Session 已无法定位到软件身份（`member_id` 为空且 `agent_key` 为空）时，同样报 `reviewer_independence_unprovable` 并给出 `required_action`，因为无法证明独立就不该记录为已独立 |
 | 待验收 → 待集成 | `review_submit verdict=approved` | 独立身份 | awaiting_review；逐条验收标准 passed | `acceptance_criteria_not_satisfied` | verification=approved |
 | 待集成 → 已完成/集成失败 | `integration_submit` | **集成者本人凭据**；无凭据时必须是已认证管理端（REST 与 release/assign/update/handoff 共用 `_require_management` 门禁） | verification=approved | `management_auth_required`、`task_not_ready_for_integration`、`task_already_integrated`、`integration_tests_failed` | integration=done/failed；done 要求测试全过。集成携带的 commit 只有与已批准 Work Report 已校验过的 commit 一致时才算系统证据（`commit_verified:true`），否则明确记为调用方自报（`commit_self_reported:true`），任务历史不再把它渲染成“已采集”的 Git 证据 |
@@ -835,11 +850,11 @@ Agent Session Token 校验与 `last_used_at` 更新是分开的：校验走只�
 
 Agent 自报的 `worktree` 不会被服务盲目信任。Work Report 采集 Git 证据前必须有已登记 Workspace，路径只能是该 Workspace 的 `local_path` 或其子目录，上报的 `commit_hash` 必须能在该 worktree 内解析；否则拒绝，不会把伪造路径或伪造 commit 写成事实。显式 `commit_repo` 不放宽这条边界：它必须是项目根相对路径、位于本 Session 已登记 Workspace 内、经解析后仍是项目内真实目录、且 Git 确认它是工作树根；绝对路径、盘符、UNC、`..` 与符号链接穿越在解析前或用解析后包含检查拒绝。客户端自报的 Workspace 不会在服务端对 `commit_repo` 运行 Git。
 
-`delivery_mode=local` 只登记本 Session 已登记 Workspace 内的文件证据（存在性、大小、SHA256，共享同一证据字节预算），不运行 Git、不要求 commit；Workspace 外的文件标为 `outside_workspace` 而不是被服务端顺手读取。它明确不适用于已选仓库工作树内的文件：能提交的改动不能被降级成无 commit 的交付。local 只说明产物如何到达，不降低独立验收标准——评审仍可按任务要求补充 Git 证据。
+`delivery_mode=local` 只登记本 Session 已登记 Workspace 内的文件证据（存在性、大小、SHA256，共享同一证据字节预算），不运行 Git、不要求 commit；Workspace 外的文件标为 `outside_workspace` 而不是被服务端顺手读取。它明确不适用于工作区内任何 Git 工作树内的文件：服务端沿文件路径向上探测 `.git`（含嵌套仓库与 `.git` 文件形式的 linked worktree），能提交的改动不能被降级成无 commit 的交付。local 只说明产物如何到达，不降低独立验收标准——评审仍可按任务要求补充 Git 证据。
 
-父工作区关联子仓库后，任务可以使用该工作区内同一仓库的独立 linked worktree（包括 `.git` 文件形式，有无 origin 均支持）。bootstrap 和工作区登记用同一已选仓库及 Git common directory 确认 contained worktree 归属；报告从实际任务 worktree 采集 HEAD、改动与文件哈希，无需先把任务提交合并到主工作树。相同远程地址的独立 clone、其它仓库及已登记工作区外路径仍不能替代该任务的 worktree。
+父工作区关联子仓库后，任务可以使用该工作区内同一仓库的独立 linked worktree（包括 `.git` 文件形式，有无 origin 均支持）。bootstrap 和工作区登记用同一已选仓库及 Git common directory 确认 contained worktree 归属；报告从实际任务 worktree 采集 HEAD、改动与文件哈希，无需先把任务提交合并到主工作树。同一工作区内的兄弟仓库或独立 clone 各自作为自己的证据源（#377）；它们不能替代主仓库的身份，已登记工作区外路径继续拒绝。
 
-历史本地路径 Project 不会自动猜选子仓库。工作区没有 Git 且尚未关联仓库时，带 SHA 的 Work Report 返回 `repository_selection_required`（409），操作为「项目设置 → 重新检查 Git 仓库 → 关联实际仓库 → 确认仓库选择」；父工作区和 Room 身份保持不变。已选仓库不可用返回 `repository_not_found`（409），要求重新检查；实际仓库中不存在的提交仍返回 `invalid_commit_hash`（400）。错误详情保留 `reported_commit_hash` 原始输入、`reason` 和审计事件编号；在服务端可信工作区下还会返回 `searched_worktree` 与 `repositories_available`（项目内有界扫描到的仓库相对路径、`repository_root`、`logical_path`、`remote`）以及 `required_action`，让执行方直接决定改用哪个 `commit_repo` 或改走 `delivery_mode=local`，而不是反复试错；扫描受既有 `repository_scan_*` 配置约束。`commit_hash: unknown` 仅表示系统尚未验证的证据，不代表调用方传入了 unknown。关联结果由后端写入 checkout 登记，Agent 不得手改 `.agentchatroom/project.json`。
+历史本地路径 Project 不会自动猜选子仓库。工作区没有 Git 且尚未关联仓库时，带 SHA 的 Work Report 返回 `repository_selection_required`（409），操作为「项目设置 → 重新检查 Git 仓库 → 关联实际仓库 → 确认仓库选择」；父工作区和 Room 身份保持不变。已选仓库不可用返回 `repository_not_found`（409），要求重新检查；实际仓库中不存在的提交仍返回 `invalid_commit_hash`（400）。错误详情保留 `reported_commit_hash` 原始输入、`reason` 和审计事件编号；在服务端可信工作区下还会返回 `searched_worktree` 与 `repositories_available`（项目内有界扫描到的可用仓库相对路径、`repository_root`、`logical_path`、`remote`）、`repositories_excluded`（已被其它活动 Room 拥有的仓库及原因）以及 `required_action`，让执行方直接决定改用哪个 `commit_repo`、在哪个仓库重试或改走 `delivery_mode=local`，而不是反复试错；扫描受既有 `repository_scan_*` 配置约束。`commit_hash: unknown` 仅表示系统尚未验证的证据，不代表调用方传入了 unknown。关联结果由后端写入 checkout 登记，Agent 不得手改 `.agentchatroom/project.json`。
 
 采集 Git 证据时不使用 `text=True`。`text=True` 按**进程 locale** 解码，而 Windows 上那是控制台 ANSI 码页、并非 git 实际写出的 UTF-8：非 ASCII 分支名或路径会变成乱码写进不可改事件，而 `UnicodeDecodeError` 属于 `ValueError`，会绕过只捕获 `OSError`/`SubprocessError` 的处理，表现为 500。证据采集与 PostgreSQL 工具调用现统一经 `run_git_capture()` / 显式 `decode("utf-8", "replace")` 处理，git 失败降级为 `captured: false` 而不是中断报告。
 
