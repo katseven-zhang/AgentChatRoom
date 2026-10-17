@@ -513,6 +513,10 @@ def run_submit(args: argparse.Namespace, base_url: str) -> dict[str, Any]:
                     "tests": tests,
                     "commit_hash": str(args.commit or ""),
                     "no_code_change_reason": str(args.no_code_change or ""),
+                    "delivery_mode": str(
+                        getattr(args, "delivery_mode", "git") or "git"
+                    ),
+                    "commit_repo": str(getattr(args, "commit_repo", "") or ""),
                 },
                 authorization=authorization,
             )
@@ -1274,6 +1278,17 @@ def build_parser() -> argparse.ArgumentParser:
         "--commit", default="", help="Commit hash to reference in the report"
     )
     submit.add_argument(
+        "--delivery-mode",
+        choices=["git", "local"],
+        default="git",
+        help="git delivery requires --commit; local records per-file SHA256 without a commit",
+    )
+    submit.add_argument(
+        "--commit-repo",
+        default="",
+        help="Project-relative repository whose commit proves the changed files",
+    )
+    submit.add_argument(
         "--no-code-change", default="", help="Reason when the task changed no code"
     )
     submit.add_argument(
@@ -1548,6 +1563,14 @@ def build_parser() -> argparse.ArgumentParser:
     report.add_argument("--no-code-change-reason", default="")
     report.add_argument("--test", action="append", required=True, help="COMMAND::EXIT_CODE")
     report.add_argument("--commit", default="")
+    report.add_argument(
+        "--delivery-mode", choices=["git", "local"], default="git",
+        help="local records per-file SHA256 without requiring a commit",
+    )
+    report.add_argument(
+        "--commit-repo", default="",
+        help="Project-relative repository whose commit proves the changed files",
+    )
 
     review = commands.add_parser("review-submit", help="Submit independent review")
     review.add_argument("project_id")
@@ -2302,6 +2325,8 @@ def main(argv: list[str] | None = None) -> None:
                 "tests": parse_test_evidence(args.test),
                 "commit_hash": args.commit,
                 "no_code_change_reason": args.no_code_change_reason,
+                "delivery_mode": args.delivery_mode,
+                "commit_repo": args.commit_repo,
             },
         )
     elif args.command == "review-submit":

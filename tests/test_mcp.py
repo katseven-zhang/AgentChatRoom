@@ -176,6 +176,9 @@ def test_mcp_evidence_tools_publish_nested_scalar_schema():
     integration_item = integration.parameters["$defs"]["TestEvidence"]
     assert work_item["properties"]["exit_code"]["type"] == "integer"
     assert integration_item["properties"]["exit_code"]["type"] == "integer"
+    assert {"delivery_mode", "commit_repo"} <= set(
+        work_report.parameters["properties"]
+    )
 
 
 @pytest.mark.parametrize("tool_name", ["work_report", "integration_submit"])

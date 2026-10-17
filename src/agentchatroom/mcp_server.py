@@ -2672,9 +2672,17 @@ def work_report(
     tests: list[TestEvidence] | None = None,
     commit_hash: str = "",
     no_code_change_reason: str = "",
+    delivery_mode: str = "git",
+    commit_repo: str = "",
     request_id: str = "",
 ) -> dict[str, Any]:
-    """Submit test evidence plus changed files or an explicit no-code reason."""
+    """Submit test evidence plus changed files or an explicit no-code reason.
+
+    ``delivery_mode=local`` records a non-Git delivery (deploy trees, build
+    outputs, non-Git test directories) with per-file SHA256 evidence instead of
+    requiring a commit. ``commit_repo`` names another repository inside the
+    registered workspace whose commit proves the changed files.
+    """
     try:
         _authorize_remote(project_id, "task:write")
     except DomainError as error:
@@ -2690,6 +2698,8 @@ def work_report(
         tests=tests or [],
         commit_hash=commit_hash,
         no_code_change_reason=no_code_change_reason,
+        delivery_mode=delivery_mode,
+        commit_repo=commit_repo,
         request_id=_mcp_request_id(request_id),
     )
 

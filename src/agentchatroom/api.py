@@ -1017,6 +1017,8 @@ class WorkReportCreate(StrictModel):
     tests: list[dict[str, Any]]
     commit_hash: str = ""
     no_code_change_reason: str = ""
+    delivery_mode: Literal["git", "local"] = "git"
+    commit_repo: str = ""
 
 
 class ReviewCreate(StrictModel):

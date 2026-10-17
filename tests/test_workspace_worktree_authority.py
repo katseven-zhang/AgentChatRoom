@@ -119,12 +119,13 @@ def test_relative_reported_worktree_anchors_at_the_workspace_root(
         agent_row = connection.execute(
             "SELECT * FROM agent_sessions WHERE id = ?", (session_id,)
         ).fetchone()
-        trusted, _evidence = service._trusted_worktree(
+        trusted, _evidence, workspace_root = service._trusted_worktree(
             connection, project_row, agent_row
         )
 
     assert trusted == (root / "sub").resolve()
     assert trusted != (elsewhere / "sub").resolve()
+    assert workspace_root == root.resolve()
 
 
 def test_permanent_delete_never_touches_a_foreign_checkout(

@@ -15,7 +15,7 @@ if TYPE_CHECKING:
     from .config import Settings
 
 
-SCHEMA_VERSION = 27
+SCHEMA_VERSION = 28
 # One source for both the connect timeout and the busy timeout: a writer that
 # loses the race waits this long before the contention is reported.
 SQLITE_BUSY_TIMEOUT_SECONDS = 10
@@ -317,6 +317,7 @@ CREATE TABLE IF NOT EXISTS work_reports (
     files_json TEXT NOT NULL,
     no_code_change_reason TEXT NOT NULL DEFAULT '',
     commit_hash TEXT NOT NULL DEFAULT '',
+    delivery_mode TEXT NOT NULL DEFAULT 'git',
     tests_json TEXT NOT NULL,
     system_evidence_json TEXT NOT NULL DEFAULT '{}',
     created_at TEXT NOT NULL
@@ -919,6 +920,12 @@ MIGRATIONS = {
     26: """
         SELECT 1;
     """,
+    # Portable no-op: the real column addition runs in
+    # ensure_work_report_delivery_mode() so SQLite and PostgreSQL share one
+    # replayable path.
+    28: """
+        SELECT 1;
+    """,
 }
 
 
@@ -1057,6 +1064,38 @@ def ensure_repository_path_schema(connection: Any, *, postgres: bool = False) ->
         connection.execute("ALTER TABLE projects ADD COLUMN IF NOT EXISTS repository_path TEXT NOT NULL DEFAULT ''")
     elif not any(row["name"] == "repository_path" for row in connection.execute("PRAGMA table_info(projects)").fetchall()):
         connection.execute("ALTER TABLE projects ADD COLUMN repository_path TEXT NOT NULL DEFAULT ''")
+
+
+def ensure_work_report_delivery_mode(
+    connection: Any, *, postgres: bool = False
+) -> None:
+    """Add ``work_reports.delivery_mode`` on every schema shape (#376).
+
+    A report previously had no way to say whether its files arrived through a
+    Git commit or as a plain workspace delivery. ``git`` is the historical
+    meaning, so it is both the column default and the reading for every row
+    written before the column existed.
+
+    The addition is conditional rather than a bare ``ALTER``: the column is
+    listed in ``SCHEMA`` for a fresh install, and a database that already
+    advanced its version without the column must not fail to start with
+    "duplicate column name".
+    """
+    if postgres:
+        connection.execute(
+            "ALTER TABLE work_reports "
+            "ADD COLUMN IF NOT EXISTS delivery_mode TEXT NOT NULL DEFAULT 'git'"
+        )
+        return
+    columns = {
+        row["name"]
+        for row in connection.execute("PRAGMA table_info(work_reports)").fetchall()
+    }
+    if "delivery_mode" not in columns:
+        connection.execute(
+            "ALTER TABLE work_reports "
+            "ADD COLUMN delivery_mode TEXT NOT NULL DEFAULT 'git'"
+        )
 
 
 def ensure_event_number_schema(connection: Any, *, postgres: bool = False) -> None:
@@ -1314,6 +1353,10 @@ class Database:
             ensure_task_number_schema(connection)
             ensure_task_assignment_member_column(connection)
             ensure_event_number_schema(connection)
+            # Idempotent by construction: a database already stamped at the
+            # current version still needs the column if an older binary wrote
+            # the version row without it.
+            ensure_work_report_delivery_mode(connection)
             # After the member_id / agent_key columns are backfilled, so the
             # index statements below can never reference a missing column.
             ensure_member_lookup_indexes(connection)

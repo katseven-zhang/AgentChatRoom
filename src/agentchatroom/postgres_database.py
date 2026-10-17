@@ -19,6 +19,7 @@ from .database import (
     ensure_repository_path_schema,
     ensure_task_assignment_member_column,
     ensure_task_number_schema,
+    ensure_work_report_delivery_mode,
     migrate_knowledge_source_event_ids,
 )
 
@@ -172,6 +173,7 @@ class PostgresDatabase:
             ensure_task_number_schema(connection, postgres=True)
             ensure_task_assignment_member_column(connection, postgres=True)
             ensure_event_number_schema(connection, postgres=True)
+            ensure_work_report_delivery_mode(connection, postgres=True)
             # Mirrors the SQLite backend: a fresh PostgreSQL install never
             # replays MIGRATIONS, so it needs the member lookup indexes too.
             ensure_member_lookup_indexes(connection)

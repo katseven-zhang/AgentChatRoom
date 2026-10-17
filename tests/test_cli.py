@@ -524,6 +524,60 @@ def test_work_report_cli_allows_explicit_no_code_reason(monkeypatch, capsys):
     assert '"ok": true' in capsys.readouterr().out
 
 
+def test_work_report_cli_forwards_delivery_mode_and_commit_repo(monkeypatch):
+    bodies = []
+
+    def fake_request_json(base, method, path, body=None, *, request_id=None):
+        bodies.append(body)
+        return {"ok": True}
+
+    monkeypatch.setattr(cli, "request_json", fake_request_json)
+
+    main(
+        [
+            "work-report",
+            "project_example",
+            "task_example",
+            "Local delivery",
+            "--session-id",
+            "agent_example",
+            "--token",
+            "session-token",
+            "--test",
+            "Manual evidence review::0",
+            "--file",
+            "deploy/run.txt",
+            "--delivery-mode",
+            "local",
+        ]
+    )
+    main(
+        [
+            "work-report",
+            "project_example",
+            "task_example",
+            "Nested repository commit",
+            "--session-id",
+            "agent_example",
+            "--token",
+            "session-token",
+            "--test",
+            "Manual evidence review::0",
+            "--file",
+            "leg/code.txt",
+            "--commit",
+            "a" * 40,
+            "--commit-repo",
+            "leg",
+        ]
+    )
+
+    assert bodies[0]["delivery_mode"] == "local"
+    assert bodies[0]["commit_repo"] == ""
+    assert bodies[1]["delivery_mode"] == "git"
+    assert bodies[1]["commit_repo"] == "leg"
+
+
 def test_http_commands_use_the_configured_port_without_an_explicit_url(
     monkeypatch, tmp_path, capsys
 ):

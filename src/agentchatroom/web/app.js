@@ -2534,12 +2534,20 @@ function renderReportEvidence(taskId) {
   if (!report) return '<div class="evidence-block secondary-text">尚未找到工作报告</div>';
   const tests = report.tests.map((test) => `${test.exit_code === 0 ? "通过" : "失败"} · ${test.command}`).join("；");
   const git = report.system_evidence || {};
+  const deliveryMode = report.delivery_mode || git.delivery_mode || "git";
+  const capturedFiles = Array.isArray(git.file_evidence)
+    ? git.file_evidence.filter((item) => item.status === "captured").length
+    : 0;
+  const deliveryLabel = deliveryMode === "local"
+    ? `本地交付（无 Git 提交）${git.delivery_verified === "local_only" ? ` · ${capturedFiles} 个文件 SHA256 已登记` : ` · ${git.reason || "服务端未采集"}`}`
+    : `Git 提交${report.commit_repo ? ` · 仓库 ${report.commit_repo}` : ""}`;
   const fileEvidence = report.files.length
     ? escapeHtml(report.files.join("、"))
     : `<strong>无代码变更</strong> · ${escapeHtml(report.no_code_change_reason || "未说明原因")}`;
   return `<details class="evidence-block">
     <summary>查看工作证据</summary>
     <p><strong>摘要</strong> ${escapeHtml(report.summary)}</p>
+    <p><strong>交付</strong> ${escapeHtml(deliveryLabel)}</p>
     <p><strong>文件</strong> ${fileEvidence}</p>
     <p><strong>测试</strong> ${escapeHtml(tests)}</p>
     <p><strong>Git</strong> ${git.captured ? `${escapeHtml(git.branch || "detached")} · ${git.head && git.head !== "HEAD" ? `HEAD ${escapeHtml(shortId(git.head))}` : "暂无 commit"}${report.commit_hash ? ` · commit ${escapeHtml(shortId(report.commit_hash))}` : ""}` : escapeHtml(git.reason || "未采集")}</p>
@@ -4367,7 +4375,18 @@ function renderHistoryEvidence(item) {
     }
     if (section.kind === "git") {
       const git = section.items?.[0] || {};
-      const origin = git.branch || (git.head ? "集成提交" : "detached");
+      if (git.delivery_mode === "local") {
+        const capturedFiles = Array.isArray(git.file_evidence)
+          ? git.file_evidence.filter((item) => item.status === "captured").length
+          : 0;
+        const detail = git.delivery_verified === "local_only"
+          ? `已登记 ${capturedFiles} 个文件 SHA256`
+          : escapeHtml(git.reason || "服务端未采集");
+        return `<div class="history-evidence"><h4>交付证据</h4><p>本地交付（无 Git 提交） · ${detail}</p></div>`;
+      }
+      const origin = git.commit_repo
+        ? `仓库 ${git.commit_repo}`
+        : (git.branch || (git.head ? "集成提交" : "detached"));
       return `<div class="history-evidence"><h4>Git 证据</h4><p>${escapeHtml(origin)} · ${escapeHtml(git.head || git.commit_hash || "unknown")}${git.captured ? "" : ` · ${escapeHtml(git.reason || "未采集")}`}</p></div>`;
     }
     const text = (section.items || []).map((entry) => {
