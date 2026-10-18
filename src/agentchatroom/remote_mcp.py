@@ -25,6 +25,7 @@ from .config import validate_remote_settings
 from .contracts import REMOTE_COORDINATOR_SCOPES, RepositoryReviewEvidence, ReviewCriterion
 from .errors import DomainError
 from .remote_auth import RemoteOAuthProvider
+from .remote_review import review_repository_hint
 
 
 PRIVATE_FIELDS = frozenset({
@@ -74,7 +75,7 @@ class RemoteCoordinator:
                             "required_action": "use_an_explicit_project_id_for_each_project_operation"})}
                 if not project_id:
                     raise DomainError("remote_project_required", "Select a Project using project_list first")
-                self.service.get_project(project_id)
+                project = self.service.get_project(project_id)
                 key = (access.client_id, token["grant_id"], project_id)
                 joined = self.sessions.get(key)
                 if joined is not None:
@@ -115,7 +116,10 @@ class RemoteCoordinator:
                 elif operation == "assign":
                     result = self.service.assign_task(project_id, assigned_by_session_id=session_id, token=session_token, **kwargs)
                 elif operation == "task":
-                    result = self.service.get_task_evidence(project_id, kwargs["task_id"])
+                    result = review_repository_hint(
+                        self.service.get_task_evidence(project_id, kwargs["task_id"]),
+                        project,
+                    )
                 elif operation == "tasks":
                     tasks = self.service.list_tasks(project_id, phase=kwargs.get("phase"))
                     result = {"tasks": tasks[:self.service.settings.snapshot_recent_limit],
@@ -142,9 +146,10 @@ def create_remote_app(service: Any, provider: RemoteOAuthProvider | None = None)
         settings.product_name + " Remote", host=settings.remote_mcp_host, port=settings.remote_mcp_port,
         streamable_http_path="/mcp", stateless_http=True, json_response=True,
         instructions="Remote coordination only. Call project_list, then use explicit project_id. "
-            "Read/send Room messages, publish/assign tasks, assess GitHub reports. "
-            "No filesystem, execution, claims, WorkReports, integration or administration tools. "
-            "Approve only the exact latest report SHA inspected through GitHub. "
+            "Read/send Room messages, publish/assign tasks, assess the latest WorkReport against "
+            "the repository it verified. No filesystem, execution, claims, WorkReports, integration "
+            "or administration tools. Approve only the exact latest report SHA in its verified "
+            "repository; task_get returns review_repository with that safe HTTPS repository. "
             "Use changes_requested pinned to the latest report to return missing or mismatched evidence.",
         auth_server_provider=provider,
         auth=AuthSettings(issuer_url=provider.issuer, resource_server_url=provider.resource,
@@ -206,7 +211,9 @@ def create_remote_app(service: Any, provider: RemoteOAuthProvider | None = None)
 
     @tool("room:read", read=True)
     async def task_get(project_id: str, task_id: str) -> dict[str, Any]:
-        """Read a task, its latest WorkReport, criteria and reviews before assessing GitHub evidence."""
+        """Read a task, its latest WorkReport, criteria and reviews before assessing evidence.
+        review_repository carries the report's verified HTTPS repository (or a project fallback
+        with its source/warning); no local paths are exposed."""
         return await invoke("room:read", project_id, "task", task_id=task_id)
 
     @tool("room:read", read=True)
@@ -223,12 +230,15 @@ def create_remote_app(service: Any, provider: RemoteOAuthProvider | None = None)
     async def review_submit(project_id: str, task_id: str, verdict: str, criteria: list[ReviewCriterion],
                             repository_evidence: RepositoryReviewEvidence, notes: str = "") -> dict[str, Any]:
         """Approve or return the latest WorkReport through an independent review.
-        Both verdicts require the latest work_report_id, registered repository_url and concrete
-        criterion evidence (status passed/failed). approved requires the report's exact full SHA
-        and /commit/<SHA> URL. changes_requested may omit SHA/URLs to request missing report
-        evidence, or reference a different inspected full SHA with its commit URL to identify
-        unreported supplementary work. It reopens execution for the existing owner to submit a
-        new report, preserving history. An approval does not integrate or deploy the work.
+        Both verdicts pin the latest work_report_id. repository_url must name the HTTPS
+        repository the report itself verified (see task_get.review_repository); the Project's
+        primary repository is only a legacy fallback with a visible warning. approved requires
+        the report's exact full SHA and a /commit/<SHA> URL in that repository.
+        changes_requested may omit SHA/URLs to request missing report evidence, or reference a
+        different inspected full SHA with its commit URL to identify unreported supplementary
+        work; a report without verified repository provenance may name the inspected repository
+        and is recorded as reviewer-asserted. It reopens execution for the existing owner to
+        submit a new report, preserving history. An approval does not integrate or deploy work.
         """
         return await invoke("review:github", project_id, "review", task_id=task_id, verdict=verdict,
                             criteria=criteria, repository_evidence=dict(repository_evidence), notes=notes)

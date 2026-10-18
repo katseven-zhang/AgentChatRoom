@@ -17,6 +17,7 @@ from agentchatroom.config import Settings, load_settings
 from agentchatroom.contracts import REMOTE_COORDINATOR_SCOPES
 from agentchatroom.remote_auth import secret_hash
 from agentchatroom.remote_mcp import create_remote_app
+from agentchatroom.remote_review import repository_https_url
 from agentchatroom.errors import DomainError
 from tests.test_nested_repositories import claim, git, report, repository
 
@@ -340,6 +341,290 @@ def test_remote_returns_supplement_mismatch_but_preserves_approval_scope_guards(
         assert provenance["commit_hash"] == supplement_sha
         assert provenance["report_commit_hash"] == sha
         assert provenance["commit_matches_report"] is False
+
+
+def _multi_repository_fixture(service, tmp_path):
+    workspace = tmp_path / "multi-workspace"
+    workspace.mkdir()
+    gxx = workspace / "gxx"
+    leg = workspace / "leg"
+    gxx_sha = repository(gxx, remote=True)
+    leg_sha = repository(leg, remote=True)
+    git(gxx, "remote", "set-url", "origin", "https://github.com/example/gxx.git")
+    git(leg, "remote", "set-url", "origin", "https://github.com/example/leg.git")
+    project = service.create_project(root_path=str(workspace), repository_path="gxx")
+    return project, gxx, leg, gxx_sha, leg_sha
+
+
+def _leg_report(service, project, leg, leg_sha, report_path):
+    if report_path == "session_sibling":
+        task, joined = claim(service, project, worktree=str(leg))
+        result = report(service, project, task, joined, leg_sha)
+    else:
+        task, joined = claim(service, project)
+        extra = {"commit_repo": "leg"} if report_path == "commit_repo" else {}
+        result = service.submit_work_report(
+            project["id"],
+            task["id"],
+            session_id=joined["agent"]["id"],
+            token=joined["token"],
+            summary="Delivered in the sibling repository",
+            files=["leg/code.txt"],
+            tests=[{"command": "fixture validation", "exit_code": 0}],
+            commit_hash=leg_sha,
+            **extra,
+        )
+    return task, joined, result
+
+
+@pytest.mark.parametrize(
+    "report_path", ["session_sibling", "commit_repo", "workspace_commit"]
+)
+def test_remote_review_uses_the_reports_verified_repository(
+    remote, tmp_path, report_path
+):
+    """#378: the review follows the report's LEG repository, not the GXX primary."""
+    local, public, service, _app = remote
+    project, _gxx, leg, _gxx_sha, leg_sha = _multi_repository_fixture(
+        service, tmp_path
+    )
+    leg_url = "https://github.com/example/leg"
+    tokens, _client, _form = authorize(local, public)
+    token = tokens["access_token"]
+
+    task, _owner, result = _leg_report(
+        service, project, leg, leg_sha, report_path
+    )
+    fetched = call(
+        public, token, "task_get", project_id=project["id"], task_id=task["id"]
+    )
+    hint = fetched["result"]["review_repository"]
+    assert hint["work_report_id"] == result["report_id"]
+    assert hint["commit_hash"] == leg_sha
+    assert hint["repository_url"] == leg_url
+    assert hint["source"] == "report_verified"
+    assert "worktree" not in hint
+    assert "repository_root" not in hint
+    assert str(leg) not in json.dumps(fetched)
+    assert "system_evidence" not in fetched["result"]["latest_work_report"]
+
+    returned = call(
+        public,
+        token,
+        "review_submit",
+        project_id=project["id"],
+        task_id=task["id"],
+        verdict="changes_requested",
+        criteria=[
+            {
+                "criterion": task["acceptance_criteria"][0],
+                "status": "failed",
+                "evidence": "Line-level evidence is missing from the formal report",
+            }
+        ],
+        repository_evidence={
+            "work_report_id": result["report_id"],
+            "repository_url": leg_url,
+        },
+    )
+    assert returned["ok"], returned
+    assert returned["result"]["verification_status"] == "changes_requested"
+
+    task2, _owner2, result2 = _leg_report(
+        service, project, leg, leg_sha, report_path
+    )
+    evidence = {
+        "work_report_id": result2["report_id"],
+        "commit_hash": leg_sha,
+        "repository_url": leg_url,
+        "evidence_urls": [f"{leg_url}/commit/{leg_sha}"],
+    }
+    arguments = {
+        "project_id": project["id"],
+        "task_id": task2["id"],
+        "verdict": "approved",
+        "criteria": [
+            {
+                "criterion": task2["acceptance_criteria"][0],
+                "status": "passed",
+                "evidence": "Inspected the exact LEG commit and files",
+            }
+        ],
+        "repository_evidence": evidence,
+    }
+    for mutation, code in (
+        ({"repository_url": "https://github.com/example/gxx"}, "review_repository_mismatch"),
+        ({"repository_url": "https://github.com/foreign/repo"}, "review_repository_mismatch"),
+        (
+            {
+                "commit_hash": "b" * 40,
+                "evidence_urls": [f"{leg_url}/commit/{'b' * 40}"],
+            },
+            "review_commit_mismatch",
+        ),
+        (
+            {"evidence_urls": [f"https://github.com/example/gxx/commit/{leg_sha}"]},
+            "review_evidence_repository_mismatch",
+        ),
+    ):
+        refused = call(
+            public,
+            token,
+            "review_submit",
+            **{**arguments, "repository_evidence": {**evidence, **mutation}},
+        )
+        assert refused["error"]["code"] == code, refused
+    approved = call(public, token, "review_submit", **arguments)
+    assert approved["ok"], approved
+    assert approved["result"]["verification_status"] == "approved"
+    assert approved["result"]["integration_status"] == "pending"
+
+
+def test_remote_review_legacy_report_uses_project_fallback_with_warning(
+    remote, tmp_path
+):
+    local, public, service, _app = remote
+    root = tmp_path / "legacy-single"
+    sha = repository(root, remote=True)
+    git(root, "remote", "set-url", "origin", "https://github.com/example/single.git")
+    project = service.create_project(root_path=str(root))
+    task, owner = claim(service, project)
+    result = report(service, project, task, owner, sha)
+    with service.database.connect(write=True) as connection:
+        connection.execute(
+            "UPDATE work_reports SET system_evidence_json='{}' WHERE id=?",
+            (result["report_id"],),
+        )
+    tokens, _client, _form = authorize(local, public)
+    token = tokens["access_token"]
+    hint = call(
+        public, token, "task_get", project_id=project["id"], task_id=task["id"]
+    )["result"]["review_repository"]
+    assert hint["source"] == "project_fallback"
+    assert hint["warning"] == "report_repository_missing_using_project_primary"
+    assert hint["repository_url"] == "https://github.com/example/single"
+    approved = call(
+        public,
+        token,
+        "review_submit",
+        project_id=project["id"],
+        task_id=task["id"],
+        verdict="approved",
+        criteria=[
+            {
+                "criterion": task["acceptance_criteria"][0],
+                "status": "passed",
+                "evidence": "Inspected the single repository and exact commit",
+            }
+        ],
+        repository_evidence={
+            "work_report_id": result["report_id"],
+            "commit_hash": sha,
+            "repository_url": "https://github.com/example/single",
+            "evidence_urls": [f"https://github.com/example/single/commit/{sha}"],
+        },
+    )
+    assert approved["ok"], approved
+    with service.database.connect() as connection:
+        event = connection.execute(
+            "SELECT payload_json FROM events WHERE event_type='review.submitted' AND task_id=?",
+            (task["id"],),
+        ).fetchone()
+        provenance = json.loads(event["payload_json"])["repository_evidence"]
+        assert provenance["repository_evidence_source"] == "project_fallback"
+        assert provenance["repository_warning"] == (
+            "report_repository_missing_using_project_primary"
+        )
+
+
+def test_remote_return_without_report_repository_is_reviewer_asserted(
+    remote, tmp_path
+):
+    local, public, service, _app = remote
+    root = tmp_path / "local-only"
+    sha = repository(root)
+    project = service.create_project(root_path=str(root))
+    task, owner = claim(service, project)
+    result = report(service, project, task, owner, sha)
+    tokens, _client, _form = authorize(local, public)
+    token = tokens["access_token"]
+    hint = call(
+        public, token, "task_get", project_id=project["id"], task_id=task["id"]
+    )["result"]["review_repository"]
+    assert hint["repository_url"] == ""
+    assert hint["source"] == "none"
+
+    returned = call(
+        public,
+        token,
+        "review_submit",
+        project_id=project["id"],
+        task_id=task["id"],
+        verdict="changes_requested",
+        criteria=[
+            {
+                "criterion": task["acceptance_criteria"][0],
+                "status": "failed",
+                "evidence": "The local report has no repository provenance",
+            }
+        ],
+        repository_evidence={
+            "work_report_id": result["report_id"],
+            "repository_url": "https://github.com/example/reviewed",
+        },
+    )
+    assert returned["ok"], returned
+    with service.database.connect() as connection:
+        event = connection.execute(
+            "SELECT payload_json FROM events WHERE event_type='review.submitted' AND task_id=?",
+            (task["id"],),
+        ).fetchone()
+        provenance = json.loads(event["payload_json"])["repository_evidence"]
+        assert provenance["repository_evidence_source"] == "reviewer_asserted"
+        assert provenance["repository_warning"] == (
+            "report_repository_missing_reviewer_asserted"
+        )
+
+    task2, owner2 = claim(service, project)
+    result2 = report(service, project, task2, owner2, sha)
+    refused = call(
+        public,
+        token,
+        "review_submit",
+        project_id=project["id"],
+        task_id=task2["id"],
+        verdict="approved",
+        criteria=[
+            {
+                "criterion": task2["acceptance_criteria"][0],
+                "status": "passed",
+                "evidence": "Cannot approve without report repository provenance",
+            }
+        ],
+        repository_evidence={
+            "work_report_id": result2["report_id"],
+            "commit_hash": sha,
+            "repository_url": "https://github.com/example/reviewed",
+            "evidence_urls": [f"https://github.com/example/reviewed/commit/{sha}"],
+        },
+    )
+    assert refused["error"]["code"] == "review_repository_unknown"
+
+
+@pytest.mark.parametrize(
+    ("remote_url", "expected"),
+    [
+        ("https://github.com/example/leg.git", "https://github.com/example/leg"),
+        ("git@github.com:example/leg.git", "https://github.com/example/leg"),
+        ("ssh://git@github.com/example/leg.git", "https://github.com/example/leg"),
+        (
+            "https://gitlab.com/group/subgroup/leg.git",
+            "https://gitlab.com/group/subgroup/leg",
+        ),
+    ],
+)
+def test_repository_review_normalizes_git_remote_spellings(remote_url, expected):
+    assert repository_https_url(remote_url) == expected
 
 
 def test_remote_can_request_more_evidence_for_no_code_report_without_sha(remote, tmp_path):

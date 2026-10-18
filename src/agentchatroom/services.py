@@ -10130,7 +10130,8 @@ Attach a workspace to a host, creating the host row if it is new.
                 report = self._latest_work_report(connection, project_id, task_id)
                 project = self._require_project(connection, project_id)
                 repository_evidence = validate_repository_review(
-                    dict(project), dict(report) if report is not None else None,
+                    dict(project),
+                    self._work_report_dict(report) if report is not None else None,
                     repository_evidence, criteria, self.settings.list_input_max_count,
                     verdict=verdict,
                 )
