@@ -665,3 +665,38 @@ def test_rest_accepts_local_delivery(settings, project_dir):
         assert snapshot["reports"][0]["system_evidence"]["file_evidence"][0][
             "status"
         ] == "captured"
+
+
+def test_commit_repo_missing_repository_returns_actionable_diagnostics(
+    service, project_dir
+):
+    selected_commit = repository(project_dir / "selected", remote=True)
+    project = service.create_project(
+        root_path=str(project_dir), repository_path="selected"
+    )
+    task, joined = claim(service, project)
+
+    with pytest.raises(DomainError) as error:
+        report(
+            service,
+            project,
+            task,
+            joined,
+            files=["selected/code.txt"],
+            commit_hash=selected_commit,
+            commit_repo="missing",
+        )
+
+    assert error.value.code == "repository_not_found"
+    details = error.value.details
+    assert details["reported_commit_hash"] == selected_commit
+    assert details["reason"] == "not_a_git_worktree"
+    assert details["searched_worktree"].endswith("missing")
+    assert any(
+        item["relative_path"] == "selected"
+        for item in details["repositories_available"]
+    )
+    assert details["required_action"] == (
+        "use_a_git_repository_from_repositories_available"
+    )
+    assert service.get_task(project["id"], task["id"])["phase"] == "claimed"

@@ -2327,6 +2327,11 @@ button.event-id {
   overflow-wrap: anywhere;
 }
 
+.evidence-block .evidence-hash {
+  font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+  word-break: break-all;
+}
+
 #panel-reviews .section-heading h3 {
   font-size: var(--fs-md);
   line-height: var(--lh-tight);

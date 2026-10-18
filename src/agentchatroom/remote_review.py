@@ -165,10 +165,10 @@ def validate_repository_review(
         )
 
     if returning:
-        if has_identity(report_repo_id):
-            # The report's verified repository is authoritative; an omitted URL
-            # still returns the report, an explicitly different one is a
-            # misattribution and stays refused.
+        if repo_source == "report_verified" and has_identity(report_repo_id):
+            # Only a truly verified report repository is authoritative; an
+            # omitted URL still returns the report, an explicitly different one
+            # is a misattribution and stays refused.
             if provided_url and provided_id != report_repo_id:
                 fail(
                     "review_repository_mismatch",
@@ -183,14 +183,22 @@ def validate_repository_review(
                     "Use an HTTPS repository URL",
                     action="use_the_reports_verified_repository",
                 )
-            # The report has no usable repository evidence. A return may still
-            # name the repository the reviewer inspected, but it is recorded as
-            # caller-asserted and can never approve work.
-            effective_url, effective_id = (
-                repository_https_url(provided_url), provided_id,
-            )
-            repo_source = "reviewer_asserted"
-            repo_warning = "report_repository_missing_reviewer_asserted"
+            if repo_source == "project_fallback" and provided_id == report_repo_id:
+                # The reviewer kept the Project fallback for a legacy report;
+                # preserve its provenance instead of mislabelling it asserted.
+                effective_url, effective_id = report_repo, report_repo_id
+            else:
+                # The report has no verified repository (fallback/none/invalid).
+                # A return may name the repository the reviewer inspected, even
+                # when the Project has a primary; it is caller-asserted and can
+                # never approve work.
+                effective_url, effective_id = (
+                    repository_https_url(provided_url), provided_id,
+                )
+                repo_source = "reviewer_asserted"
+                repo_warning = "report_repository_missing_reviewer_asserted"
+        elif repo_source == "project_fallback" and has_identity(report_repo_id):
+            effective_url, effective_id = report_repo, report_repo_id
         else:
             effective_url, effective_id = "", ("", "")
             repo_source = "none"

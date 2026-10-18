@@ -537,6 +537,92 @@ def test_remote_review_legacy_report_uses_project_fallback_with_warning(
         )
 
 
+def test_remote_return_for_legacy_report_can_name_another_repository(
+    remote, tmp_path
+):
+    """#378: a Project primary must not force a legacy return back to itself."""
+    local, public, service, _app = remote
+    root = tmp_path / "fallback-with-primary"
+    sha = repository(root, remote=True)
+    git(root, "remote", "set-url", "origin", "https://github.com/example/gxx.git")
+    project = service.create_project(root_path=str(root))
+    task, owner = claim(service, project)
+    result = report(service, project, task, owner, sha)
+    with service.database.connect(write=True) as connection:
+        connection.execute(
+            "UPDATE work_reports SET system_evidence_json='{}' WHERE id=?",
+            (result["report_id"],),
+        )
+    tokens, _client, _form = authorize(local, public)
+    token = tokens["access_token"]
+    hint = call(
+        public, token, "task_get", project_id=project["id"], task_id=task["id"]
+    )["result"]["review_repository"]
+    assert hint["source"] == "project_fallback"
+    assert hint["repository_url"] == "https://github.com/example/gxx"
+
+    returned = call(
+        public,
+        token,
+        "review_submit",
+        project_id=project["id"],
+        task_id=task["id"],
+        verdict="changes_requested",
+        criteria=[
+            {
+                "criterion": task["acceptance_criteria"][0],
+                "status": "failed",
+                "evidence": "The report has no repository provenance; inspect LEG",
+            }
+        ],
+        repository_evidence={
+            "work_report_id": result["report_id"],
+            "repository_url": "https://github.com/example/leg",
+        },
+    )
+    assert returned["ok"], returned
+    with service.database.connect() as connection:
+        event = connection.execute(
+            "SELECT payload_json FROM events WHERE event_type='review.submitted' AND task_id=?",
+            (task["id"],),
+        ).fetchone()
+        provenance = json.loads(event["payload_json"])["repository_evidence"]
+        assert provenance["repository_evidence_source"] == "reviewer_asserted"
+        assert provenance["repository_warning"] == (
+            "report_repository_missing_reviewer_asserted"
+        )
+
+    task2, owner2 = claim(service, project)
+    result2 = report(service, project, task2, owner2, sha)
+    with service.database.connect(write=True) as connection:
+        connection.execute(
+            "UPDATE work_reports SET system_evidence_json='{}' WHERE id=?",
+            (result2["report_id"],),
+        )
+    refused = call(
+        public,
+        token,
+        "review_submit",
+        project_id=project["id"],
+        task_id=task2["id"],
+        verdict="approved",
+        criteria=[
+            {
+                "criterion": task2["acceptance_criteria"][0],
+                "status": "passed",
+                "evidence": "LEG cannot approve a fallback GXX report",
+            }
+        ],
+        repository_evidence={
+            "work_report_id": result2["report_id"],
+            "commit_hash": sha,
+            "repository_url": "https://github.com/example/leg",
+            "evidence_urls": [f"https://github.com/example/leg/commit/{sha}"],
+        },
+    )
+    assert refused["error"]["code"] == "review_repository_mismatch"
+
+
 def test_remote_return_without_report_repository_is_reviewer_asserted(
     remote, tmp_path
 ):

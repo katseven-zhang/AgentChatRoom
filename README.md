@@ -458,7 +458,9 @@ Session worktree 位于同一已登记 Workspace 内任意真实 Git 工作树�
 仓库校验完整 SHA，**不需要**传 `commit_repo`。Session 位于工作区根或非 Git 目录时，由提交在
 Workspace 内**唯一**命中的仓库决定证据（上游 #113 形态）；同一提交命中多个不同仓库返回
 `ambiguous_commit_repository`（409，列出候选与 `pass_commit_repo_to_choose_the_repository`），
-绝不按顺序选取；没有命中时才回退主仓库。证据记录实际 `repository_path` /
+绝不按顺序选取；没有命中时才回退主仓库。扫描预算不足以完整枚举时不会自动归属，返回
+`repository_scan_incomplete`（409）并要求显式 `commit_repo`；显式 `commit_repo` 始终优先于自动选择。
+证据记录实际 `repository_path` /
 `repository_root` / `remote`，仓库外文件标为 `outside_repository`。主仓库仍是 Room 身份与
 展示，也是无提交/提交无法归属时的默认证据源。工作区外路径、符号链接/联接穿越、客户端自报
 Workspace 上的服务端 Git 仍被拒绝；同一工作区内已属于其它活动 Room 的仓库返回

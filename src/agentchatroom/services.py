@@ -9740,9 +9740,14 @@ Attach a workspace to a host, creating the host row if it is new.
                     and delivery_mode == "git"
                     and commit_hash.strip()
                     and not session_is_git
+                    and not clean_commit_repo
+                    and self._selected_repository_is_git(project)
                 ):
                     # The Session runs outside Git, so the commit—not the
                     # Session path—chooses which workspace repository proves it.
+                    # An explicit commit_repo is authoritative and never enters
+                    # this automatic selection (it may be the only remedy when
+                    # the scan is incomplete or a commit is ambiguous).
                     auto_repository = self._workspace_repository_for_commit(
                         connection, project, workspace_root, commit_hash
                     )
@@ -9817,7 +9822,7 @@ Attach a workspace to a host, creating the host row if it is new.
             # Project's selected repository and never an automatic choice: the
             # explicit selection keeps controlling Git evidence by default.
             repository_root, remote = self._resolve_commit_repository(
-                project_id, project, workspace_root, clean_commit_repo
+                project_id, project, workspace_root, clean_commit_repo, commit_hash
             )
             if (
                 worktree.resolve() != workspace_root.resolve()
@@ -11431,6 +11436,27 @@ Attach a workspace to a host, creating the host row if it is new.
         except (DomainError, OSError, ValueError, RuntimeError):
             return False
 
+    def _selected_repository_is_git(self, project: Mapping[str, Any]) -> bool:
+        """Whether the configured primary repository is still a Git worktree.
+
+        A multi-repository auto-selection must not preempt a known
+        configuration error: when the operator's selected repository is missing
+        or no longer a worktree, the report should say so instead of falling
+        into a scan-completeness error about a different candidate.
+        """
+        project_data = dict(project)
+        selection = str(project_data.get("repository_path") or "")
+        if not selection:
+            return False
+        root = Path(str(project_data["root_path"])).expanduser().resolve(
+            strict=False
+        )
+        try:
+            selected = repository_directory(root, selection)
+        except (DomainError, OSError, ValueError):
+            return False
+        return bool(_project_git_info(selected)[2])
+
     def workspace_spans_repositories(
         self, project: Mapping[str, Any]
     ) -> bool:
@@ -11532,6 +11558,30 @@ Attach a workspace to a host, creating the host row if it is new.
             inspection = self.inspect_repository_candidates(str(scan_root))
         except (DomainError, OSError, ValueError):
             return None
+        if not inspection.get("complete") or inspection.get("truncated"):
+            # A bounded scan that hit a depth, count or time limit cannot prove
+            # that this is the only repository containing the commit. Refuse to
+            # attribute it automatically and let the caller name one.
+            discovered = [
+                {
+                    "relative_path": candidate.get("relative_path") or "",
+                    "repository_root": candidate.get("repository_root") or "",
+                    "logical_path": candidate.get("logical_path") or "",
+                }
+                for candidate in (inspection.get("candidates") or [])[:20]
+            ]
+            raise DomainError(
+                "repository_scan_incomplete",
+                "Repository scan was incomplete; name the repository explicitly with commit_repo",
+                status_code=409,
+                details={
+                    "commit_hash": commit,
+                    "scan_complete": bool(inspection.get("complete")),
+                    "truncated": bool(inspection.get("truncated")),
+                    "repositories_available": discovered,
+                    "required_action": "pass_commit_repo_to_choose_the_repository",
+                },
+            )
         matches: list[Path] = []
         for candidate in inspection.get("candidates", []):
             path = Path(str(candidate.get("project_path") or ""))
@@ -12045,6 +12095,7 @@ Attach a workspace to a host, creating the host row if it is new.
         project: Mapping[str, Any],
         workspace_root: Path,
         commit_repo: str,
+        commit_hash: str = "",
     ) -> tuple[Path, str]:
         """Resolve an explicitly named repository inside the workspace.
 
@@ -12068,18 +12119,43 @@ Attach a workspace to a host, creating the host row if it is new.
                 status_code=422,
                 details={
                     "commit_repo": commit_repo,
+                    "reported_commit_hash": commit_hash.strip(),
                     "required_action": "use_a_repository_inside_the_registered_workspace",
                 },
             )
         remote, git_root, is_worktree = _project_git_info(candidate)
         if not is_worktree:
+            # The caller asked for a specific repository and the path is not
+            # one. Answer with the same actionable diagnostics as an
+            # unverified commit, so the next step is visible instead of a
+            # required_action pointing at a list that was never returned.
+            diagnostics = self._repository_diagnostics(project_data)
+            available = diagnostics.get("repositories_available") or []
             raise DomainError(
                 "repository_not_found",
                 "commit_repo is not a Git worktree",
                 status_code=409,
                 details={
                     "commit_repo": commit_repo,
-                    "required_action": "use_a_git_repository_from_repositories_available",
+                    "reported_commit_hash": commit_hash.strip(),
+                    "reason": "not_a_git_worktree",
+                    "searched_worktree": str(candidate),
+                    "repositories_available": available,
+                    "repositories_excluded": diagnostics.get(
+                        "repositories_excluded"
+                    )
+                    or [],
+                    "repository_scan_complete": diagnostics.get(
+                        "repository_scan_complete"
+                    ),
+                    "repository_scan_truncated": diagnostics.get(
+                        "repository_scan_truncated"
+                    ),
+                    "required_action": (
+                        "use_a_git_repository_from_repositories_available"
+                        if available
+                        else "inspect_and_select_repository_in_project_settings"
+                    ),
                 },
             )
         if os.path.normcase(str(git_root.resolve())) != os.path.normcase(
@@ -12091,6 +12167,7 @@ Attach a workspace to a host, creating the host row if it is new.
                 status_code=422,
                 details={
                     "commit_repo": commit_repo,
+                    "reported_commit_hash": commit_hash.strip(),
                     "repository_root": str(git_root),
                     "required_action": "use_the_repository_root_relative_path",
                 },

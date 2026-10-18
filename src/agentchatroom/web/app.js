@@ -2535,20 +2535,25 @@ function renderReportEvidence(taskId) {
   const tests = report.tests.map((test) => `${test.exit_code === 0 ? "通过" : "失败"} · ${test.command}`).join("；");
   const git = report.system_evidence || {};
   const deliveryMode = report.delivery_mode || git.delivery_mode || "git";
-  const capturedFiles = Array.isArray(git.file_evidence)
-    ? git.file_evidence.filter((item) => item.status === "captured").length
-    : 0;
+  const capturedEvidence = Array.isArray(git.file_evidence)
+    ? git.file_evidence.filter((item) => item.status === "captured")
+    : [];
+  const capturedFiles = capturedEvidence.length;
   const deliveryLabel = deliveryMode === "local"
     ? `本地交付（无 Git 提交）${git.delivery_verified === "local_only" ? ` · ${capturedFiles} 个文件 SHA256 已登记` : ` · ${git.reason || "服务端未采集"}`}`
     : `Git 提交${(report.commit_repo || git.repository_path) ? ` · 仓库 ${report.commit_repo || git.repository_path}` : ""}`;
   const fileEvidence = report.files.length
     ? escapeHtml(report.files.join("、"))
     : `<strong>无代码变更</strong> · ${escapeHtml(report.no_code_change_reason || "未说明原因")}`;
+  const hashDetails = capturedEvidence.length
+    ? `<details><summary>逐文件 SHA256（${capturedEvidence.length}）</summary><ul class="readonly-list">${capturedEvidence.map((item) => `<li><code>${escapeHtml(item.path)}</code> · ${escapeHtml(String(item.size_bytes ?? "?"))} B<br><code class="evidence-hash">${escapeHtml(item.sha256 || "")}</code></li>`).join("")}</ul></details>`
+    : "";
   return `<details class="evidence-block">
     <summary>查看工作证据</summary>
     <p><strong>摘要</strong> ${escapeHtml(report.summary)}</p>
     <p><strong>交付</strong> ${escapeHtml(deliveryLabel)}</p>
     <p><strong>文件</strong> ${fileEvidence}</p>
+    ${hashDetails}
     <p><strong>测试</strong> ${escapeHtml(tests)}</p>
     <p><strong>Git</strong> ${git.captured ? `${escapeHtml(git.branch || "detached")} · ${git.head && git.head !== "HEAD" ? `HEAD ${escapeHtml(shortId(git.head))}` : "暂无 commit"}${report.commit_hash ? ` · commit ${escapeHtml(shortId(report.commit_hash))}` : ""}` : escapeHtml(git.reason || "未采集")}</p>
   </details>`;
@@ -4376,13 +4381,16 @@ function renderHistoryEvidence(item) {
     if (section.kind === "git") {
       const git = section.items?.[0] || {};
       if (git.delivery_mode === "local") {
-        const capturedFiles = Array.isArray(git.file_evidence)
-          ? git.file_evidence.filter((item) => item.status === "captured").length
-          : 0;
+        const capturedEvidence = Array.isArray(git.file_evidence)
+          ? git.file_evidence.filter((item) => item.status === "captured")
+          : [];
         const detail = git.delivery_verified === "local_only"
-          ? `已登记 ${capturedFiles} 个文件 SHA256`
+          ? `已登记 ${capturedEvidence.length} 个文件 SHA256`
           : escapeHtml(git.reason || "服务端未采集");
-        return `<div class="history-evidence"><h4>交付证据</h4><p>本地交付（无 Git 提交） · ${detail}</p></div>`;
+        const hashes = capturedEvidence.length
+          ? `<ul class="readonly-list">${capturedEvidence.map((item) => `<li><code>${escapeHtml(item.path)}</code> · <code class="evidence-hash">${escapeHtml(item.sha256 || "")}</code></li>`).join("")}</ul>`
+          : "";
+        return `<div class="history-evidence"><h4>交付证据</h4><p>本地交付（无 Git 提交） · ${detail}</p>${hashes}</div>`;
       }
       const repository = git.commit_repo || git.repository_path;
       const origin = repository

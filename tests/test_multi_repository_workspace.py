@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import subprocess
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -311,7 +312,85 @@ def test_workspace_root_session_uses_the_commit_repository(service, project_dir)
     assert service.get_task(project["id"], task["id"])["phase"] == "awaiting_review"
 
 
-def test_workspace_root_session_keeps_primary_evidence_for_its_own_commit(
+def test_explicit_commit_repo_wins_over_automatic_ambiguity(
+    service, project_dir
+):
+    repository(project_dir / "a", remote=True)
+    source = project_dir / "b"
+    shared_commit = repository(source)
+    git(project_dir, "clone", "-q", str(source), str(project_dir / "c"))
+    project = service.create_project(
+        root_path=str(project_dir), repository_path="a"
+    )
+    task, joined = claim(service, project)
+
+    report(
+        service,
+        project,
+        task,
+        joined,
+        files=["b/code.txt"],
+        commit_hash=shared_commit,
+        commit_repo="b",
+    )
+
+    evidence = service.snapshot(project["id"])["reports"][0]["system_evidence"]
+    assert evidence["reported_commit_exists"] is True
+    assert evidence["repository_path"] == "b"
+    assert service.get_task(project["id"], task["id"])["phase"] == "awaiting_review"
+
+
+def test_incomplete_repository_scan_requires_explicit_commit_repo(
+    service, project_dir
+):
+    repository(project_dir / "a", remote=True)
+    source = project_dir / "b"
+    shared_commit = repository(source)
+    (project_dir / "deep" / "level").mkdir(parents=True)
+    git(
+        project_dir,
+        "clone",
+        "-q",
+        str(source),
+        str(project_dir / "deep" / "level" / "clone"),
+    )
+    project = service.create_project(
+        root_path=str(project_dir), repository_path="a"
+    )
+    service.settings = replace(service.settings, repository_scan_max_depth=1)
+    task, joined = claim(service, project)
+
+    with pytest.raises(DomainError) as error:
+        report(
+            service,
+            project,
+            task,
+            joined,
+            files=["b/code.txt"],
+            commit_hash=shared_commit,
+        )
+
+    assert error.value.code == "repository_scan_incomplete"
+    assert error.value.details["required_action"] == (
+        "pass_commit_repo_to_choose_the_repository"
+    )
+    assert error.value.details["truncated"] is True
+    assert service.get_task(project["id"], task["id"])["phase"] == "claimed"
+
+    report(
+        service,
+        project,
+        task,
+        joined,
+        files=["b/code.txt"],
+        commit_hash=shared_commit,
+        commit_repo="b",
+    )
+    evidence = service.snapshot(project["id"])["reports"][0]["system_evidence"]
+    assert evidence["repository_path"] == "b"
+
+
+def test_workspace_root_session_uses_primary_for_its_own_commit(
     service, project_dir
 ):
     primary_commit = repository(project_dir / "a", remote=True)

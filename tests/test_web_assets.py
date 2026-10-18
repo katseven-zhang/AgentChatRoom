@@ -9,6 +9,21 @@ from pathlib import Path
 WEB_DIR = Path(__file__).parents[1] / "src" / "agentchatroom" / "web"
 
 
+def test_report_evidence_renders_each_captured_file_sha256():
+    """#376: the evidence card must show the hashes, not only their count."""
+    javascript = (WEB_DIR / "app.js").read_text(encoding="utf-8")
+    start = javascript.index("function renderReportEvidence(")
+    end = javascript.index("\nfunction visibleFeedEvents(", start)
+    body = javascript[start:end]
+    assert "item.sha256" in body
+    assert "逐文件 SHA256" in body
+    history_start = javascript.index('if (section.kind === "git") {')
+    history_end = javascript.index(
+        "const text = (section.items || [])", history_start
+    )
+    assert "item.sha256" in javascript[history_start:history_end]
+
+
 def test_http_onboarding_config_generation_and_secret_cleanup():
     result = subprocess.run(
         ["node", str(Path(__file__).with_name("http_onboarding_config.cjs"))],
