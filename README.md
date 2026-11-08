@@ -1177,6 +1177,8 @@ git rev-list --all > ../commit-map-after.txt
 
 本项目使用 MIT License，详见 `LICENSE`。
 
-### Review criterion matching
+### Review criterion diagnostics
 
-`review_submit` matches criterion text exactly after stripping leading/trailing whitespace on both the task and submission. Internal whitespace, case, punctuation, full-width characters and Unicode normalization are not changed. Order does not matter. Duplicate submitted criteria after trimming are rejected with `duplicate_review_criterion`. Approval requires coverage of every task criterion, no unknown submitted criteria, and all statuses `passed`. A rejected approval returns `unmatched_criteria`, `unassessed_criteria`, `not_passed_criteria`, plus diagnostic-only nearest-text suggestions with zero-based first differing Unicode code points. Suggestions never authorize approval. Existing task-phase, independent-reviewer and repository-evidence checks retain their separate errors. Failed validation creates no successful review event; preserve the returned error details for diagnosis.
+Review validation is unchanged: submitted criterion/status text is stripped at the ends, criterion keys match task text exactly, and duplicate submitted keys retain the last status. Approval requires every task criterion and every assessed status to be `passed`; extra passed entries and ordering retain their previous behavior. No NFC, full-width, case or internal whitespace normalization is applied.
+
+On `acceptance_criteria_not_satisfied`, the existing `expected`/`assessed` fields are supplemented with `unmatched_criteria` (submitted index and original text), `unassessed_criteria` (task criterion index and original text), and `not_passed_criteria` (effective status and criterion text; task index is null for an extra entry). Indices start at 1. `differences` provides diagnostic-only nearest expected text, both indices, and a zero-based first differing Unicode code point. These suggestions do not affect matching or approval. Task-phase, independent-reviewer and repository-evidence checks retain their separate errors. Failed validation creates no successful review event; retain the returned details for diagnosis.
