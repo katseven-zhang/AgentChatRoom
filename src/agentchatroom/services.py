@@ -1168,8 +1168,46 @@ class AgentChatRoomService:
                     status_code=422,
                     details={"criterion": criterion, "status": status},
                 )
+            if criterion in assessed:
+                raise DomainError(
+                    "duplicate_review_criterion", "Review criteria must be unique after trimming",
+                    status_code=422,
+                    details={"duplicate_criteria": [criterion]},
+                )
             assessed[criterion] = status
         return assessed
+
+    @staticmethod
+    def _review_criteria_diagnostics(expected, criteria, assessed):
+        """Compare symmetrically; suggestions never count as matches."""
+        import difflib
+
+        required = {item.strip() for item in expected}
+        unmatched = [item["criterion"] for item in criteria
+                     if str(item["criterion"]).strip() not in required]
+        missing = [item for item in expected if item.strip() not in assessed]
+        failed = [{"criterion": item, "status": assessed[item.strip()]}
+                  for item in expected
+                  if item.strip() in assessed and assessed[item.strip()] != "passed"]
+        differences = []
+        for supplied in unmatched:
+            candidates = difflib.get_close_matches(str(supplied).strip(), expected, n=1, cutoff=0)
+            if not candidates:
+                continue
+            target = candidates[0]
+            left, right = str(supplied).strip(), target.strip()
+            offset = next((i for i, (a, b) in enumerate(zip(left, right)) if a != b),
+                          min(len(left), len(right)))
+            differences.append({
+                "submitted": supplied, "nearest_expected": target,
+                "first_difference_index": offset,
+                "submitted_codepoint": f"U+{ord(left[offset]):04X}" if offset < len(left) else "END",
+                "expected_codepoint": f"U+{ord(right[offset]):04X}" if offset < len(right) else "END",
+            })
+        return {"expected": expected, "assessed": assessed,
+                "matching": "exact_after_strip", "unmatched_criteria": unmatched,
+                "unassessed_criteria": missing, "not_passed_criteria": failed,
+                "differences": differences}
 
     def _validate_test_evidence_list(
         self, tests: Any, *, field: str = "tests"
@@ -10141,15 +10179,15 @@ Attach a workspace to a host, creating the host row if it is new.
                     verdict=verdict,
                 )
             expected = json_load(task["acceptance_criteria_json"], [])
-            if verdict == "approved" and (
-                any(assessed.get(item) != "passed" for item in expected)
-                or any(value != "passed" for value in assessed.values())
-            ):
+            diagnostics = self._review_criteria_diagnostics(expected, criteria, assessed)
+            if verdict == "approved" and any(diagnostics[key] for key in (
+                "unmatched_criteria", "unassessed_criteria", "not_passed_criteria"
+            )):
                 raise DomainError(
                     "acceptance_criteria_not_satisfied",
                     "Approved reviews must mark every acceptance criterion as passed",
                     status_code=409,
-                    details={"expected": expected, "assessed": assessed},
+                    details=diagnostics,
                 )
             review_id = new_id("review")
             now = iso_now()

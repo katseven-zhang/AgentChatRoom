@@ -1176,3 +1176,7 @@ git rev-list --all > ../commit-map-after.txt
 ## License
 
 本项目使用 MIT License，详见 `LICENSE`。
+
+### Review criterion matching
+
+`review_submit` matches criterion text exactly after stripping leading/trailing whitespace on both the task and submission. Internal whitespace, case, punctuation, full-width characters and Unicode normalization are not changed. Order does not matter. Duplicate submitted criteria after trimming are rejected with `duplicate_review_criterion`. Approval requires coverage of every task criterion, no unknown submitted criteria, and all statuses `passed`. A rejected approval returns `unmatched_criteria`, `unassessed_criteria`, `not_passed_criteria`, plus diagnostic-only nearest-text suggestions with zero-based first differing Unicode code points. Suggestions never authorize approval. Existing task-phase, independent-reviewer and repository-evidence checks retain their separate errors. Failed validation creates no successful review event; preserve the returned error details for diagnosis.
